@@ -1,0 +1,113 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+// 获取所有 Java 学习路线文章
+const allPosts = await getCollection("posts", ({ data }) => {
+	return data.category === "Java学习路线" && (import.meta.env.PROD ? data.draft !== true : true);
+});
+
+// 按 slug 中的阶段编号排序
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = parseInt(a.slug.match(/java-roadmap-(\d+)/)?.[1] || "0");
+	const numB = parseInt(b.slug.match(/java-roadmap-(\d+)/)?.[1] || "0");
+	return numA - numB;
+});
+
+// 分离总览和阶段文章
+const overviewPost = sortedPosts.find(p => p.slug.includes("00-overview"));
+const stagePosts = sortedPosts.filter(p => !p.slug.includes("00-overview"));
+---
+
+<MainGridLayout title="Java 学习路线合集">
+	<div class="onload-animation">
+		<!-- 页面标题 -->
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">Java 学习路线</h1>
+			<p class="text-75 text-lg">前端工程师的 Java 重学笔记 · 共 {sortedPosts.length} 篇</p>
+		</div>
+
+		<!-- 总览卡片 -->
+		{overviewPost && (
+			<a href={getPostUrlBySlug(overviewPost.slug)} 
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white">
+								总览
+							</span>
+							<span class="text-sm text-50">
+								{overviewPost.data.published.toLocaleDateString("zh-CN")}
+							</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">
+							{overviewPost.data.title}
+						</h2>
+						<p class="text-75 text-sm line-clamp-2">
+							{overviewPost.data.description}
+						</p>
+					</div>
+					<div class="ml-4 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M5 12h14M12 5l7 7-7 7"/>
+						</svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<!-- 阶段文章列表 -->
+		<div class="space-y-4">
+			{stagePosts.map((post, index) => (
+				<a href={getPostUrlBySlug(post.slug)} 
+				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+					<div class="flex items-start gap-4">
+						<!-- 阶段编号 -->
+						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white transition-colors">
+							{index + 1}
+						</div>
+						
+						<!-- 文章内容 -->
+						<div class="flex-1 min-w-0">
+							<div class="flex items-center gap-2 mb-1">
+								<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
+									{post.data.title}
+								</h3>
+							</div>
+							<p class="text-75 text-sm mb-2 line-clamp-2">
+								{post.data.description}
+							</p>
+							<div class="flex items-center gap-3 text-xs text-50">
+								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+								{post.data.tags && post.data.tags.length > 0 && (
+									<span class="flex items-center gap-1">
+										{post.data.tags.slice(0, 3).map(tag => (
+											<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+												#{tag}
+											</span>
+										))}
+									</span>
+								)}
+							</div>
+						</div>
+						
+						<!-- 箭头 -->
+						<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<path d="M5 12h14M12 5l7 7-7 7"/>
+							</svg>
+						</div>
+					</div>
+				</a>
+			))}
+		</div>
+
+		<!-- 底部说明 -->
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
+			<p class="font-medium mb-1">💡 学习建议</p>
+			<p>按阶段顺序阅读，每篇结束在 IDE 里把示例敲一遍。已经熟悉的阶段可以直接跳到对应文章当作速查表使用。</p>
+		</div>
+	</div>
+</MainGridLayout>
