@@ -1,0 +1,187 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+// 获取所有面试宝典文章
+const allPosts = await getCollection("posts", ({ data }) => {
+	return data.category === "前端面试宝典" && (import.meta.env.PROD ? data.draft !== true : true);
+});
+
+// 按 slug 中的编号排序
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = parseInt(a.slug.match(/interview-guide-(\d+)/)?.[1] || "0");
+	const numB = parseInt(b.slug.match(/interview-guide-(\d+)/)?.[1] || "0");
+	return numA - numB;
+});
+
+// 分离总览和知识模块文章
+const overviewPost = sortedPosts.find(p => p.slug.includes("00-overview"));
+const topicPosts = sortedPosts.filter(p => !p.slug.includes("00-overview"));
+
+// 知识点分组
+const groups = [
+	{
+		name: "基础三剑客",
+		color: "#f97316",
+		slugPrefix: ["01-html-css", "02-javascript-core", "03-javascript-async"]
+	},
+	{
+		name: "框架与跨端",
+		color: "#10b981",
+		slugPrefix: ["04-vue", "05-react", "06-cross-platform"]
+	},
+	{
+		name: "工程化与网络",
+		color: "#3b82f6",
+		slugPrefix: ["07-build-tools", "08-network-http", "15-engineering-practice", "16-realtime"]
+	},
+	{
+		name: "后端知识",
+		color: "#8b5cf6",
+		slugPrefix: ["09-nginx", "10-mysql", "11-backend", "19-nodejs"]
+	},
+	{
+		name: "进阶必修",
+		color: "#ec4899",
+		slugPrefix: ["12-typescript", "13-performance", "14-handwritten-code", "17-system-design"]
+	},
+	{
+		name: "综合面试",
+		color: "#64748b",
+		slugPrefix: ["18-soft-skills"]
+	},
+];
+
+const getGroupForPost = (slug: string) => {
+	return groups.find(g => g.slugPrefix.some(p => slug.includes(p)));
+};
+---
+
+<MainGridLayout title="前端面试宝典">
+	<div class="onload-animation">
+		<!-- 页面标题 -->
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">前端面试宝典</h1>
+			<p class="text-75 text-lg">6 年中高级前端工程师面试全攻略 · 共 {sortedPosts.length} 篇</p>
+		</div>
+
+		<!-- 定位说明卡片 -->
+		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-orange-500/10 to-transparent">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-gradient-to-br from-orange-500 to-red-500 flex items-center justify-center text-white text-2xl">
+					🎯
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">中高级前端工程师面试知识库</h2>
+					<p class="text-75 text-sm mb-2">覆盖 HTML/CSS/JS 三剑客、Vue/React 框架、跨端开发、工程化与实时通信、Nginx、MySQL、后端知识、TypeScript/性能优化/手写代码/系统设计、软素质 HR 面</p>
+					<div class="flex flex-wrap gap-2 text-xs">
+						<span class="px-2 py-1 rounded bg-orange-500/15 text-orange-600 dark:text-orange-400">HTML/CSS</span>
+						<span class="px-2 py-1 rounded bg-yellow-500/15 text-yellow-600 dark:text-yellow-400">JavaScript</span>
+						<span class="px-2 py-1 rounded bg-green-500/15 text-green-600 dark:text-green-400">Vue/React</span>
+						<span class="px-2 py-1 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">工程化</span>
+						<span class="px-2 py-1 rounded bg-purple-500/15 text-purple-600 dark:text-purple-400">Nginx/MySQL</span>
+						<span class="px-2 py-1 rounded bg-red-500/15 text-red-600 dark:text-red-400">后端知识</span>
+						<span class="px-2 py-1 rounded bg-pink-500/15 text-pink-600 dark:text-pink-400">进阶必修</span>
+						<span class="px-2 py-1 rounded bg-slate-500/15 text-slate-600 dark:text-slate-400">HR 面</span>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<!-- 总览卡片 -->
+		{overviewPost && (
+			<a href={getPostUrlBySlug(overviewPost.slug)} 
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gradient-to-r from-orange-500 to-red-500 text-white">
+								总览
+							</span>
+							<span class="text-sm text-50">
+								{overviewPost.data.published.toLocaleDateString("zh-CN")}
+							</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">
+							{overviewPost.data.title}
+						</h2>
+						<p class="text-75 text-sm line-clamp-2">
+							{overviewPost.data.description}
+						</p>
+					</div>
+					<div class="ml-4 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M5 12h14M12 5l7 7-7 7"/>
+						</svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<!-- 按分组展示文章 -->
+		{groups.map(group => {
+			const groupPosts = topicPosts.filter(p => getGroupForPost(p.slug) === group);
+			return groupPosts.length > 0 && (
+				<div class="mb-8">
+					<div class="flex items-center gap-2 mb-4">
+						<div class="w-1 h-5 rounded-full" style={`background: ${group.color}`}></div>
+						<h2 class="text-lg font-bold text-90">{group.name}</h2>
+						<span class="text-sm text-50">({groupPosts.length} 篇)</span>
+					</div>
+					<div class="space-y-4">
+						{groupPosts.map((post) => {
+							const num = parseInt(post.slug.match(/interview-guide-(\d+)/)?.[1] || "0");
+							return (
+								<a href={getPostUrlBySlug(post.slug)} 
+								   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+									<div class="flex items-start gap-4">
+										<!-- 编号 -->
+										<div class="flex-shrink-0 w-11 h-11 rounded-full flex items-center justify-center font-bold text-base transition-colors"
+											 style={`background: ${group.color}22; color: ${group.color}`}>
+											{num.toString().padStart(2, "0")}
+										</div>
+										
+										<!-- 文章内容 -->
+										<div class="flex-1 min-w-0">
+											<h3 class="text-base font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-1">
+												{post.data.title}
+											</h3>
+											<p class="text-75 text-sm mb-2 line-clamp-2">
+												{post.data.description}
+											</p>
+											<div class="flex items-center gap-2 flex-wrap text-xs text-50">
+												<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+												{post.data.tags && post.data.tags.length > 0 && (
+													post.data.tags.slice(0, 4).map(tag => (
+														<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+															#{tag}
+														</span>
+													))
+												)}
+											</div>
+										</div>
+										
+										<!-- 箭头 -->
+										<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+											<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+												<path d="M5 12h14M12 5l7 7-7 7"/>
+											</svg>
+										</div>
+									</div>
+								</a>
+							);
+						})}
+					</div>
+				</div>
+			);
+		})}
+
+		<!-- 底部说明 -->
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm space-y-2">
+			<p class="font-medium">💡 使用建议</p>
+			<p>每篇文章包含 20+ 道高频面试题，配有详细解析和代码示例。建议先通读一遍建立知识框架，面试前重点复习标记的⭐高频题。</p>
+			<p class="text-50">难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考</p>
+		</div>
+	</div>
+</MainGridLayout>

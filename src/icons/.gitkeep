@@ -1,0 +1,7 @@
+保留此目录。
+
+astro-icon 默认把 src/icons 作为本地图标目录，缺失时启动会报
+[WARN] Failed to load icons from "src/icons" —— 无害，但日志不干净。
+
+当前所有图标均来自 @iconify-json 集合（fa6-brands / material-symbols 等），
+暂未使用本地图标。需要自定义图标时，把 .svg 文件放进此目录即可。

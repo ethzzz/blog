@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="NoteLab avatar">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="55%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- rounded-square background -->
+  <rect x="0" y="0" width="512" height="512" rx="120" ry="120" fill="url(#bg)"/>
+  <rect x="0" y="0" width="512" height="512" rx="120" ry="120" fill="url(#glow)"/>
+
+  <!-- abstract open book -->
+  <g fill="none" stroke="#ffffff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" transform="translate(256 250)">
+    <path d="M -120 36 C -70 6 -34 -6 0 18 C 34 -6 70 6 120 36 L 120 84 C 70 54 34 66 0 90 C -34 66 -70 54 -120 84 Z" fill="#ffffff" fill-opacity="0.92"/>
+    <!-- pen nib crossing the book -->
+    <path d="M 86 -78 L -64 70" stroke-width="20"/>
+    <path d="M 86 -78 l 22 6 l -10 22 Z" fill="#ffffff" stroke="none"/>
+  </g>
+</svg>
