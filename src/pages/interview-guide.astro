@@ -5,61 +5,80 @@ import { getPostUrlBySlug } from "@utils/url-utils";
 
 // 获取所有面试宝典文章
 const allPosts = await getCollection("posts", ({ data }) => {
-	return data.category === "前端面试宝典" && (import.meta.env.PROD ? data.draft !== true : true);
+	return (
+		data.category === "前端面试宝典" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
 });
 
 // 按 slug 中的编号排序
 const sortedPosts = allPosts.sort((a, b) => {
-	const numA = parseInt(a.slug.match(/interview-guide-(\d+)/)?.[1] || "0");
-	const numB = parseInt(b.slug.match(/interview-guide-(\d+)/)?.[1] || "0");
+	const numA = Number.parseInt(
+		a.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	const numB = Number.parseInt(
+		b.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0",
+		10,
+	);
 	return numA - numB;
 });
 
 // 分离总览和知识模块文章
-const overviewPost = sortedPosts.find(p => p.slug.includes("00-overview"));
-const topicPosts = sortedPosts.filter(p => !p.slug.includes("00-overview"));
+const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
+const topicPosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 
 // 知识点分组
 const groups = [
 	{
 		name: "基础三剑客",
 		color: "#f97316",
-		slugPrefix: ["01-html-css", "02-javascript-core", "03-javascript-async"]
+		slugPrefix: ["01-html-css", "02-javascript-core", "03-javascript-async"],
 	},
 	{
 		name: "框架与跨端",
 		color: "#10b981",
-		slugPrefix: ["04-vue", "05-react", "06-cross-platform"]
+		slugPrefix: ["04-vue", "05-react", "06-cross-platform"],
 	},
 	{
 		name: "工程化与网络",
 		color: "#3b82f6",
-		slugPrefix: ["07-build-tools", "08-network-http", "15-engineering-practice", "16-realtime"]
+		slugPrefix: [
+			"07-build-tools",
+			"08-network-http",
+			"15-engineering-practice",
+			"16-realtime",
+		],
 	},
 	{
 		name: "后端知识",
 		color: "#8b5cf6",
-		slugPrefix: ["09-nginx", "10-mysql", "11-backend", "19-nodejs"]
+		slugPrefix: ["09-nginx", "10-mysql", "11-backend", "19-nodejs"],
 	},
 	{
 		name: "进阶必修",
 		color: "#ec4899",
-		slugPrefix: ["12-typescript", "13-performance", "14-handwritten-code", "17-system-design"]
+		slugPrefix: [
+			"12-typescript",
+			"13-performance",
+			"14-handwritten-code",
+			"17-system-design",
+		],
 	},
 	{
 		name: "综合面试",
 		color: "#64748b",
-		slugPrefix: ["18-soft-skills"]
+		slugPrefix: ["18-soft-skills"],
 	},
 	{
 		name: "深水区实战",
 		color: "#0ea5e9",
-		slugPrefix: ["20-frontend-core-qa", "21-frontend-deep-practice"]
+		slugPrefix: ["20-frontend-core-qa", "21-frontend-deep-practice"],
 	},
 ];
 
 const getGroupForPost = (slug: string) => {
-	return groups.find(g => g.slugPrefix.some(p => slug.includes(p)));
+	return groups.find((g) => g.slugPrefix.some((p) => slug.includes(p)));
 };
 ---
 
@@ -137,7 +156,7 @@ const getGroupForPost = (slug: string) => {
 					</div>
 					<div class="space-y-4">
 						{groupPosts.map((post) => {
-							const num = parseInt(post.slug.match(/interview-guide-(\d+)/)?.[1] || "0");
+							const num = Number.parseInt(post.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0", 10);
 							return (
 								<a href={getPostUrlBySlug(post.slug)} 
 								   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
