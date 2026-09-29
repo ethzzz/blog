@@ -55,6 +55,34 @@ export const navBarConfig: NavBarConfig = {
 			name: "面试宝典",
 			url: "/interview-guide/",
 		},
+		{
+			name: "Higress 学习路线",
+			url: "/higress-roadmap/",
+		},
+		{
+			name: "Python 学习路线",
+			url: "/python-roadmap/",
+		},
+		{
+			name: "TypeScript 学习路线",
+			url: "/typescript-roadmap/",
+		},
+		{
+			name: "JavaScript 核心",
+			url: "/js-roadmap/",
+		},
+		{
+			name: "React 实战",
+			url: "/react-roadmap/",
+		},
+		{
+			name: "前端工程化",
+			url: "/engineering-roadmap/",
+		},
+		{
+			name: "浏览器与性能",
+			url: "/browser-roadmap/",
+		},
 		LinkPreset.About,
 	],
 };

@@ -1,0 +1,58 @@
+name: Deploy Blog to Server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一时间只允许一个部署，避免并发覆盖
+concurrency:
+  group: deploy-blog
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build site (astro build + pagefind)
+        run: npm run build
+
+      - name: Upload dist to server (staging)
+        uses: appleboy/scp-action@v1
+        with:
+          host: REDACTED-IP
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "dist/*"
+          target: "/tmp/blog-deploy"
+
+      - name: Publish to /var/www/blog and verify
+        uses: appleboy/ssh-action@v1
+        with:
+          host: REDACTED-IP
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            # 清空旧产物（含隐藏文件），再整体覆盖，避免 stale 文件残留
+            find /var/www/blog -mindepth 1 -delete
+            cp -r /tmp/blog-deploy/. /var/www/blog/
+            chown -R root:www-data /var/www/blog
+            chmod -R 755 /var/www/blog
+            rm -rf /tmp/blog-deploy
+            echo "==> verify HTTP status"
+            for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1$p)
+              echo "$p -> $code"
+            done
