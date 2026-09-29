@@ -22,7 +22,7 @@ pnpm-debug.log*
 
 .vercel
 
-package-lock.json
+# 注意：package-lock.json 不再忽略——CI 用 npm ci 构建，必须它在场
 bun.lockb
 yarn.lock
 
