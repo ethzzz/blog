@@ -1,0 +1,26 @@
+# 统一用 LF 换行，保证 biome/CI 在 Windows 与 Linux 行为一致
+* text=auto eol=lf
+
+# 明确按源码类型处理
+*.astro text
+*.svelte text
+*.ts text
+*.tsx text
+*.js text
+*.jsx text
+*.json text
+*.css text
+*.md text
+
+# 二进制资源不转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.svg text
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.ico binary

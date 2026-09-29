@@ -5,19 +5,28 @@ import { getPostUrlBySlug } from "@utils/url-utils";
 
 // 获取所有 React 实战学习路线文章
 const allPosts = await getCollection("posts", ({ data }) => {
-	return data.category === "React学习路线" && (import.meta.env.PROD ? data.draft !== true : true);
+	return (
+		data.category === "React学习路线" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
 });
 
 // 按 slug 中的阶段编号排序
 const sortedPosts = allPosts.sort((a, b) => {
-	const numA = parseInt(a.slug.match(/react-roadmap-(\d+)/)?.[1] || "0");
-	const numB = parseInt(b.slug.match(/react-roadmap-(\d+)/)?.[1] || "0");
+	const numA = Number.parseInt(
+		a.slug.match(/react-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	const numB = Number.parseInt(
+		b.slug.match(/react-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
 	return numA - numB;
 });
 
 // 分离总览和阶段文章
-const overviewPost = sortedPosts.find(p => p.slug.includes("00-overview"));
-const stagePosts = sortedPosts.filter(p => !p.slug.includes("00-overview"));
+const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
+const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 ---
 
 <MainGridLayout title="React 实战">
