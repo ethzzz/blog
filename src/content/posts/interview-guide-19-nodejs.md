@@ -1244,7 +1244,7 @@ http.createServer(async (req, res) => {
 ---
 
 > [!TIP]
-> 🎉 **恭喜！** 你已完成《前端面试宝典》全部 20 篇文章的学习（00 总览 + 19 专题）。
+> 掌握 Node.js 全栈能力后，如果想进一步了解资深前端在双栈选型、图形渲染、Hybrid 硬件跨端与 AI 研发上的实战思考，请继续阅读扩展专题：[资深前端核心能力问答](/blog/posts/interview-guide-20-frontend-core-qa/)（24 问覆盖 React/Vue 双栈、Next.js SSR、Konva/Three.js、N-API、工程化性能与 AI 协作流）。
 >
 > 返回 [面试宝典总览](/blog/posts/interview-guide-00-overview/) | [面试宝典合集页](/blog/interview-guide/)
 >
