@@ -45,14 +45,19 @@ jobs:
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
+            # scp-action 可能把 dist 内容物放到 /tmp/blog-deploy/dist 或 /tmp/blog-deploy，统一展平
+            if [ -d /tmp/blog-deploy/dist ]; then SRC=/tmp/blog-deploy/dist; else SRC=/tmp/blog-deploy; fi
             # 清空旧产物（含隐藏文件），再整体覆盖，避免 stale 文件残留
             find /var/www/blog -mindepth 1 -delete
-            cp -r /tmp/blog-deploy/. /var/www/blog/
+            cp -r "$SRC/." /var/www/blog/
             chown -R root:www-data /var/www/blog
             chmod -R 755 /var/www/blog
             rm -rf /tmp/blog-deploy
             echo "==> verify HTTP status"
-            for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml; do
+            fail=0
+            for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml /blog/typescript-roadmap/ /blog/python-roadmap/; do
               code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1$p)
               echo "$p -> $code"
+              [ "$code" = "200" ] || fail=1
             done
+            if [ $fail -eq 0 ]; then echo "ALL ROUTES OK"; else echo "SOME ROUTES FAILED"; exit 1; fi
