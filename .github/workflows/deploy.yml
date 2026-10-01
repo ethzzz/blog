@@ -62,10 +62,10 @@ jobs:
             chown -R root:www-data /var/www/blog
             chmod -R 755 /var/www/blog
             rm -rf /tmp/blog-deploy
-            echo "==> verify HTTP status"
+            echo "==> verify HTTP status (nginx 80 端口无条件 301 到 https，故直连本地 443 校验)"
             fail=0
             for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml /blog/typescript-roadmap/ /blog/python-roadmap/; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1$p)
+              code=$(curl -s -o /dev/null -w '%{http_code}' --resolve haolo.cloud:443:127.0.0.1 "https://haolo.cloud$p")
               echo "$p -> $code"
               [ "$code" = "200" ] || fail=1
             done
