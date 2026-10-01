@@ -32,3 +32,29 @@ yarn.lock
 
 # WorkBuddy 本地记忆/工作区数据（含服务器信息，绝不入库）
 .workbuddy/
+
+# 密钥与凭据：任何形式都不得入库（覆盖 SSH/GPG/TLS/环境变量）
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.pub
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.htpasswd
+authorized_keys
+known_hosts
+*.netrc
+*.npmrc.local
+secrets.yaml
+secrets.yml
+.mysecureshell\*
+ssh\config
+deploy-key*
+# 无扩展名的私钥文件（文件名即密钥本体，必须显式列出）
+github-blog-deploy
+deploy-key
