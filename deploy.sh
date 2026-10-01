@@ -11,8 +11,8 @@ if [ -f "C:/Users/thz/.workbuddy/binaries/node/versions/22.22.2-2/npm.cmd" ]; th
 	NPM="C:/Users/thz/.workbuddy/binaries/node/versions/22.22.2-2/npm.cmd"
 fi
 
-# 站点部署地址（换成你的域名后，记得同步改 astro.config.mjs 的 site）
-SITE_URL="http://117.72.32.87/blog"
+# 站点部署地址（公网域名；换域名时同步改 astro.config.mjs 的 site）
+SITE_URL="https://haolo.cloud/blog"
 
 echo "==> 清理并构建"
 rm -rf dist
@@ -30,7 +30,7 @@ echo "==> 解压并修正权限"
 ssh -n myapp "tar xzf /tmp/blog-dist.tar.gz -C /var/www/blog && chown -R root:www-data /var/www/blog && chmod -R 755 /var/www/blog"
 
 echo "==> 验证"
-ssh -n myapp "for p in /blog/ /blog/archive/ /blog/posts/hello-world/ /blog/rss.xml /blog/about/; do printf '%s -> ' \$p; curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1\$p; done"
+ssh -n myapp "for p in /blog/ /blog/archive/ /blog/rss.xml /blog/about/; do printf '%s -> ' \$p; curl -s -o /dev/null -w '%{http_code}\n' --resolve haolo.cloud:443:127.0.0.1 https://haolo.cloud\$p; done"
 
 echo ""
 echo "部署完成：$SITE_URL"
