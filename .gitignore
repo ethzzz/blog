@@ -29,3 +29,6 @@ yarn.lock
 # ide
 .idea
 *.iml
+
+# WorkBuddy 本地记忆/工作区数据（含服务器信息，绝不入库）
+.workbuddy/
