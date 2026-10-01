@@ -17,6 +17,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check deploy host secret
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ]; then
+            echo "::error::DEPLOY_HOST secret is missing. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -32,7 +41,7 @@ jobs:
       - name: Upload dist to server (staging)
         uses: appleboy/scp-action@v1
         with:
-          host: REDACTED-IP
+          host: ${{ secrets.DEPLOY_HOST }}
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           source: "dist/*"
@@ -41,7 +50,7 @@ jobs:
       - name: Publish to /var/www/blog and verify
         uses: appleboy/ssh-action@v1
         with:
-          host: REDACTED-IP
+          host: ${{ secrets.DEPLOY_HOST }}
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
