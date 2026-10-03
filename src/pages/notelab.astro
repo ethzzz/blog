@@ -1,0 +1,90 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+// notelab 分组：category === "notelab"，按 slug 里的编号排序
+const allPosts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === "notelab" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = Number.parseInt(a.slug.match(/notelab-(\d+)/)?.[1] ?? "0", 10);
+	const numB = Number.parseInt(b.slug.match(/notelab-(\d+)/)?.[1] ?? "0", 10);
+	return numB - numA; // 新写的排前面
+});
+---
+
+<MainGridLayout title="NoteLab 实战笔记">
+	<div class="onload-animation">
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">NoteLab 实战笔记</h1>
+			<p class="text-75 text-lg">
+				自研项目（Spring Boot + 双前端 + MySQL）的开发实录 · 共 {sortedPosts.length} 篇
+			</p>
+			<p class="text-50 text-sm mt-2">
+				记录踩过的坑、定下的约定和验证过能跑的做法，不写教程。
+			</p>
+		</div>
+
+		{sortedPosts.length === 0 ? (
+			<div class="card-base p-8 text-center text-75">还没有文章，第一篇在路上。</div>
+		) : (
+			<div class="space-y-4">
+				{
+					sortedPosts.map((post) => (
+						<a
+							href={getPostUrlBySlug(post.slug)}
+							class="block card-base card-shadow p-5 hover:shadow-lg transition-all group"
+						>
+							<div class="flex items-start gap-4">
+								<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white transition-colors">
+									{post.slug.match(/notelab-(\d+)/)?.[1] ?? "-"}
+								</div>
+
+								<div class="flex-1 min-w-0">
+									<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
+										{post.data.title}
+									</h3>
+									<p class="text-75 text-sm mb-2 line-clamp-2">
+										{post.data.description}
+									</p>
+									<div class="flex items-center gap-3 text-xs text-50">
+										<span>
+											{post.data.published.toLocaleDateString("zh-CN")}
+										</span>
+										{post.data.tags && post.data.tags.length > 0 && (
+											<span class="flex items-center gap-1">
+												{post.data.tags.slice(0, 3).map((tag) => (
+													<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+														#{tag}
+													</span>
+												))}
+											</span>
+										)}
+									</div>
+								</div>
+
+								<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+									<svg
+										width="20"
+										height="20"
+										viewBox="0 0 24 24"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="2"
+									>
+										<path d="M5 12h14M12 5l7 7-7 7" />
+									</svg>
+								</div>
+							</div>
+						</a>
+					))
+				}
+			</div>
+		)}
+	</div>
+</MainGridLayout>

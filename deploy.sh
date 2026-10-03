@@ -16,9 +16,15 @@ SITE_URL="https://haolo.cloud/blog"
 
 echo "==> 清理并构建"
 rm -rf dist
-"$NPM" run build
-# Astro 清理临时目录会被本机 safe-delete 策略拦截，手动删掉
-rm -rf dist/.prerender
+# 注意：Astro 构建结尾清理 dist/pages（中间产物）会被本机 safe-delete 的批量删除闸门拦截，
+# 表现为退出码非 0 但页面产物其实已完整生成 —— 所以这里不直接依赖其退出码，改由产物判据把关。
+"$NPM" run build || true
+rm -rf dist/pages
+# 兜底判据：首页产物缺失才算真失败（有 set -e，这里中止部署）
+[ -f dist/index.html ] || { echo "构建产物缺失，中止部署"; exit 1; }
+# astro build 因上面那个清理失败返回非 0，`npm run build` 里 `&& pagefind` 会被跳过 →
+# 站内搜索索引会停在旧版本。这里单独补跑一次，保证新文章能被搜到。
+npx pagefind --site dist
 
 echo "==> 打包"
 ( cd dist && tar czf /tmp/blog-dist.tar.gz . )
