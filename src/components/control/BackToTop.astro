@@ -3,7 +3,8 @@ import { Icon } from "astro-icon/components";
 ---
 
 <!-- There can't be a filter on parent element, or it will break `fixed` -->
-<div class="back-to-top-wrapper hidden lg:block">
+<!-- 原先是 hidden lg:block（小屏看不到），现在全屏尺寸都可用 -->
+<div class="back-to-top-wrapper">
     <div id="back-to-top-btn" class="back-to-top-btn hide flex items-center rounded-2xl overflow-hidden transition" onclick="backToTop()">
         <button aria-label="Back to Top" class="btn-card h-[3.75rem] w-[3.75rem]">
             <Icon name="material-symbols:keyboard-arrow-up-rounded" class="mx-auto"></Icon>
@@ -19,6 +20,8 @@ import { Icon } from "astro-icon/components";
     right: 0
     top: 0
     pointer-events: none
+    @media (max-width: 767px)
+        right: 0.5rem
 
 .back-to-top-btn
     color: var(--primary)
@@ -26,19 +29,26 @@ import { Icon } from "astro-icon/components";
     font-weight: bold
     border: none
     position: fixed
-    bottom: 10rem
+    /* 小屏留给底部内容一点余量，大屏沿用主题的 10rem */
+    bottom: 6.5rem
+    right: 0
     opacity: 1
     cursor: pointer
-    transform: translateX(5rem)
+    /* 关键：默认在可视区内，收起时才移出屏幕右侧。
+       之前这里写成 translateX(5rem)，导致按钮永远在屏幕外、根本点不到。 */
+    transform: translateX(0)
     pointer-events: auto
     i
         font-size: 1.75rem
     &.hide
-        transform: translateX(5rem) scale(0.9)
+        transform: translateX(5.5rem) scale(0.9)
         opacity: 0
         pointer-events: none
     &:active
-      transform: translateX(5rem) scale(0.9)
+      transform: translateX(0) scale(0.9)
+
+    @media (min-width: 768px)
+        bottom: 10rem
 
 </style>
 

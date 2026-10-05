@@ -45,10 +45,12 @@ export const navBarConfig: NavBarConfig = {
 		LinkPreset.Archive,
 		{
 			name: "Java 学习路线",
+			shortName: "Java",
 			url: "/java-roadmap/",
 		},
 		{
 			name: "RuoYi 学习路线",
+			shortName: "RuoYi",
 			url: "/ruoyi-roadmap/",
 		},
 		{
@@ -57,31 +59,43 @@ export const navBarConfig: NavBarConfig = {
 		},
 		{
 			name: "Higress 学习路线",
+			shortName: "Higress",
 			url: "/higress-roadmap/",
 		},
 		{
 			name: "Python 学习路线",
+			shortName: "Python",
 			url: "/python-roadmap/",
 		},
 		{
 			name: "TypeScript 学习路线",
+			shortName: "TypeScript",
 			url: "/typescript-roadmap/",
 		},
 		{
 			name: "JavaScript 核心",
+			shortName: "JavaScript",
 			url: "/js-roadmap/",
 		},
 		{
 			name: "React 实战",
+			shortName: "React",
 			url: "/react-roadmap/",
 		},
 		{
 			name: "前端工程化",
+			shortName: "前端工程化",
 			url: "/engineering-roadmap/",
 		},
 		{
 			name: "浏览器与性能",
+			shortName: "浏览器",
 			url: "/browser-roadmap/",
+		},
+		{
+			name: "NoteLab 实战",
+			shortName: "NoteLab",
+			url: "/notelab/",
 		},
 		LinkPreset.About,
 	],

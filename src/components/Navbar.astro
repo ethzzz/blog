@@ -24,26 +24,34 @@ let links: NavBarLink[] = navBarConfig.links.map(
     <div class="absolute h-8 left-0 right-0 -top-8 bg-[var(--card-bg)] transition"></div> <!-- used for onload animation -->
     <div class:list={[
         className,
-        "card-base !overflow-visible max-w-[var(--page-width)] h-[4.5rem] !rounded-t-none mx-auto flex items-center justify-between px-4"]}>
-        <a href={url('/')} class="btn-plain scale-animation rounded-lg h-[3.25rem] px-5 font-bold active:scale-95">
-            <div class="flex flex-row text-[var(--primary)] items-center text-md">
-                <Icon name="material-symbols:home-outline-rounded" class="text-[1.75rem] mb-1 mr-2" />
-                {siteConfig.title}
+        "card-base !overflow-visible max-w-[var(--page-width)] h-[4.5rem] !rounded-t-none mx-auto flex items-center gap-2 md:gap-4 px-4"]}>
+        <!-- 站点标题：空间不足时省略号收尾，绝不换行（换行会把导航挤成一列） -->
+        <a href={url('/')} class="btn-plain scale-animation rounded-lg h-[3.25rem] px-4 md:px-5 font-bold active:scale-95
+            shrink-0 min-w-0 max-w-[45vw] md:max-w-[32%] xl:max-w-[22rem] 2xl:max-w-none">
+            <div class="flex flex-row text-[var(--primary)] items-center text-md min-w-0">
+                <Icon name="material-symbols:home-outline-rounded" class="text-[1.75rem] mb-1 mr-2 shrink-0" />
+                <span class="truncate">{siteConfig.title}</span>
             </div>
         </a>
-        <div class="hidden md:flex">
+        <!-- 导航链接：白空格不换行，放不下时横向滚动（之前会整列堆叠） -->
+        <div class="hidden md:flex flex-1 min-w-0 items-center overflow-x-auto hide-scrollbar">
             {links.map((l) => {
                 return <a aria-label={l.name} href={l.external ? l.url : url(l.url)} target={l.external ? "_blank" : null}
-                          class="btn-plain scale-animation rounded-lg h-11 font-bold px-5 active:scale-95"
+                          class="btn-plain scale-animation shrink-0 whitespace-nowrap rounded-lg h-11 font-bold px-2.5 md:px-3.5 xl:px-5 active:scale-95"
                 >
                     <div class="flex items-center">
-                        {l.name}
+                        {l.shortName ? (
+                            <>
+                                <span class="min-[1920px]:hidden">{l.shortName}</span>
+                                <span class="hidden min-[1920px]:inline">{l.name}</span>
+                            </>
+                        ) : (l.name)}
                         {l.external && <Icon name="fa6-solid:arrow-up-right-from-square" class="text-[0.875rem] transition -translate-y-[1px] ml-1 text-black/[0.2] dark:text-white/[0.2]"></Icon>}
                     </div>
                 </a>;
             })}
         </div>
-        <div class="flex">
+        <div class="flex shrink-0">
             <!--<SearchPanel client:load>-->
             <Search client:only="svelte"></Search>
             {!siteConfig.themeColor.fixed && (

@@ -196,6 +196,15 @@ const bannerOffset =
 	}
 }
 
+/* iOS Safari 会在聚焦「计算后 font-size < 16px」的表单控件时自动放大整个页面，
+   且缩放后不会自动还原。这里统一把文本类控件钉在 16px（含未来新增的控件），
+   选择器特意写得比 .text-sm 这类工具类更具体，才能覆盖 Svelte 组件里的 text-sm。 */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+select:not([multiple]),
+textarea:not([rows]) {
+	font-size: 16px;
+}
+
 /* Override page-width for 2xl+ screens (1536px+) to leave room for TOC */
 @media (min-width: 1536px) {
 	:root {
@@ -267,6 +276,12 @@ function disableAnimation() {
 */
 
 const bannerEnabled = !!document.getElementById('banner-wrapper')
+
+// Declared up-front (before the swup setup below) so the swup hooks can reference them safely
+const backToTopBtn = document.getElementById('back-to-top-btn')
+const tocElement = document.getElementById('toc-wrapper')
+const navbarElement = document.getElementById('navbar-wrapper')
+let lastScrollTop = 0
 
 function setClickOutsideToClose(panel: string, ignores: string[]) {
 	document.addEventListener("click", event => {
@@ -435,6 +450,11 @@ const setup = () => {
 		if (toc) {
 			toc.classList.add('toc-not-ready')
 		}
+
+		// 换页后滚动位置归零，重置导航/回到顶部的状态，避免带着「已收起」的旧状态进新页
+		lastScrollTop = 0
+		navbarElement?.classList.remove('navbar-hidden')
+		backToTopBtn?.classList.add('hide')
 	});
 	window.swup.hooks.on('page:view', () => {
 		// hide the temp high element when the transition is done
@@ -464,44 +484,81 @@ if (window?.swup?.hooks) {
 	document.addEventListener('swup:enable', setup)
 }
 
-let backToTopBtn = document.getElementById('back-to-top-btn');
-let toc = document.getElementById('toc-wrapper');
-let navbar = document.getElementById('navbar-wrapper')
+const NAVBAR_HEIGHT = 72
+const MAIN_PANEL_EXCESS_HEIGHT = MAIN_PANEL_OVERLAPS_BANNER_HEIGHT * 16			// The height the main panel overlaps the banner
+const SCROLL_DELTA_EPSILON = 2			// 忽略滚动惯性/回弹带来的噪声抖动
+const BACK_TO_TOP_THRESHOLD = 240		// 越过标题区域（约 3 个导航栏高）后显示「回到顶部」
+
+// The scrolling element can be body (OverlayScrollbars) or documentElement, take the max
+function getScrollTop() {
+	return Math.max(
+		window.scrollY || 0,
+		document.documentElement.scrollTop || 0,
+		document.body.scrollTop || 0
+	);
+}
+
+function getNavbarHideThreshold() {
+	if (!bannerEnabled) {
+		// 没有 banner 时，标题区就是导航栏本身：滚过一个导航栏多一点才收起
+		return NAVBAR_HEIGHT + 48
+	}
+	let bannerHeight = BANNER_HEIGHT
+	if (document.body.classList.contains('lg:is-home') && window.innerWidth >= 1024) {
+		bannerHeight = BANNER_HEIGHT_HOME
+	}
+	const threshold = window.innerHeight * (bannerHeight / 100) - NAVBAR_HEIGHT - MAIN_PANEL_EXCESS_HEIGHT - 16
+	return Math.max(threshold, NAVBAR_HEIGHT + 48)
+}
+
 function scrollFunction() {
+	let scrollTop = getScrollTop()
 	let bannerHeight = window.innerHeight * (BANNER_HEIGHT / 100)
 
+	// 「回到顶部」：越过标题隐藏区域就出现，滚回去就消失
 	if (backToTopBtn) {
-		if (document.body.scrollTop > bannerHeight || document.documentElement.scrollTop > bannerHeight) {
+		const threshold = bannerEnabled ? bannerHeight : BACK_TO_TOP_THRESHOLD
+		if (scrollTop > threshold) {
 			backToTopBtn.classList.remove('hide')
 		} else {
 			backToTopBtn.classList.add('hide')
 		}
 	}
 
-	if (bannerEnabled && toc) {
-		if (document.body.scrollTop > bannerHeight || document.documentElement.scrollTop > bannerHeight) {
-			toc.classList.remove('toc-hide')
+	// 导航栏已经因下滑而收起时，把「回到顶部」兜上，方便用户一键回顶
+	if (backToTopBtn && navbarElement && scrollTop > BACK_TO_TOP_THRESHOLD) {
+		navbarElement.classList.add('navbar-hidden')
+	}
+
+	if (bannerEnabled && tocElement) {
+		if (scrollTop > bannerHeight) {
+			tocElement.classList.remove('toc-hide')
 		} else {
-			toc.classList.add('toc-hide')
+			tocElement.classList.add('toc-hide')
 		}
 	}
 
-	if (!bannerEnabled) return
-	if (navbar) {
-		const NAVBAR_HEIGHT = 72
-		const MAIN_PANEL_EXCESS_HEIGHT = MAIN_PANEL_OVERLAPS_BANNER_HEIGHT * 16			// The height the main panel overlaps the banner
+	if (!navbarElement) {
+		lastScrollTop = scrollTop
+		return
+	}
 
-		let bannerHeight = BANNER_HEIGHT
-		if (document.body.classList.contains('lg:is-home') && window.innerWidth >= 1024) {
-			bannerHeight = BANNER_HEIGHT_HOME
-		}
-		let threshold = window.innerHeight * (bannerHeight / 100) - NAVBAR_HEIGHT - MAIN_PANEL_EXCESS_HEIGHT - 16
-		if (document.body.scrollTop >= threshold || document.documentElement.scrollTop >= threshold) {
-			navbar.classList.add('navbar-hidden')
+	const delta = scrollTop - lastScrollTop
+	if (scrollTop <= NAVBAR_HEIGHT) {
+		// 顶部区域永远显示导航
+		navbarElement.classList.remove('navbar-hidden')
+	} else if (delta < -SCROLL_DELTA_EPSILON) {
+		// 向上滑 → 始终显示（含惯性回弹）
+		navbarElement.classList.remove('navbar-hidden')
+	} else if (delta > SCROLL_DELTA_EPSILON) {
+		// 向下滑 → 越过标题区域后收起
+		if (scrollTop > getNavbarHideThreshold()) {
+			navbarElement.classList.add('navbar-hidden')
 		} else {
-			navbar.classList.remove('navbar-hidden')
+			navbarElement.classList.remove('navbar-hidden')
 		}
 	}
+	lastScrollTop = scrollTop
 }
 window.onscroll = scrollFunction
 

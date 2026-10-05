@@ -54,6 +54,12 @@ export type NavBarLink = {
 	name: string;
 	url: string;
 	external?: boolean;
+	/**
+	 * 窄屏（<2xl）显示的短标签。
+	 * 导航项较多时，长标签会把导航栏挤成一列（标题被压扁 + 链接文字竖向堆叠），
+	 * 因此小于 2xl 用 shortName，2xl 及以上用完整 name。
+	 */
+	shortName?: string;
 };
 
 export type NavBarConfig = {
