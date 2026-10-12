@@ -33,23 +33,25 @@ let links: NavBarLink[] = navBarConfig.links.map(
                 <span class="truncate">{siteConfig.title}</span>
             </div>
         </a>
-        <!-- 导航链接：白空格不换行，放不下时横向滚动（之前会整列堆叠） -->
-        <div class="hidden md:flex flex-1 min-w-0 items-center overflow-x-auto hide-scrollbar">
-            {links.map((l) => {
-                return <a aria-label={l.name} href={l.external ? l.url : url(l.url)} target={l.external ? "_blank" : null}
-                          class="btn-plain scale-animation shrink-0 whitespace-nowrap rounded-lg h-11 font-bold px-2.5 md:px-3.5 xl:px-5 active:scale-95"
-                >
-                    <div class="flex items-center">
-                        {/*
-                            只渲染 shortName：容器上限 105rem（1680px），14 个链接的完整名
-                            总宽 ~1783px 永远放不下，任何断点切换完整名都只会把尾部链接
-                            推进横向滚动区并被裁切。shortName 缺省时仍显示完整名。
-                        */}
-                        {l.shortName ?? l.name}
-                        {l.external && <Icon name="fa6-solid:arrow-up-right-from-square" class="text-[0.875rem] transition -translate-y-[1px] ml-1 text-black/[0.2] dark:text-white/[0.2]"></Icon>}
-                    </div>
-                </a>;
-            })}
+        <!-- 导航链接：白空格不换行，放不下时横向滚动（之前会整列堆叠）。
+             外层相对定位承载两端渐隐提示，内层 scroller 支持鼠标拖拽/滚轮横滚。 -->
+        <div class="nav-links-wrap hidden md:flex flex-1 min-w-0 items-center relative">
+            <div id="nav-links-scroll" class="flex-1 min-w-0 flex items-center overflow-x-auto hide-scrollbar select-none">
+                {links.map((l) => {
+                    return <a aria-label={l.name} href={l.external ? l.url : url(l.url)} target={l.external ? "_blank" : null}
+                              class="btn-plain scale-animation shrink-0 whitespace-nowrap rounded-lg h-11 font-bold px-2.5 md:px-3.5 xl:px-5 active:scale-95"
+                    >
+                        <div class="flex items-center">
+                            {l.shortName ?? l.name}
+                            {l.external && <Icon name="fa6-solid:arrow-up-right-from-square" class="text-[0.875rem] transition -translate-y-[1px] ml-1 text-black/[0.2] dark:text-white/[0.2]"></Icon>}
+                        </div>
+                    </a>;
+                })}
+            </div>
+            <div id="nav-fade-left" class="nav-fade pointer-events-none absolute left-0 top-0 bottom-0 w-10 transition-opacity duration-200"
+                 style={`background: linear-gradient(to right, var(--card-bg), transparent); opacity: 0;`}></div>
+            <div id="nav-fade-right" class="nav-fade pointer-events-none absolute right-0 top-0 bottom-0 w-10 transition-opacity duration-200"
+                 style={`background: linear-gradient(to left, var(--card-bg), transparent); opacity: 0;`}></div>
         </div>
         <div class="flex shrink-0">
             <!--<SearchPanel client:load>-->
@@ -68,6 +70,17 @@ let links: NavBarLink[] = navBarConfig.links.map(
         <DisplaySettings client:only="svelte"></DisplaySettings>
     </div>
 </div>
+
+<style>
+	/* 链接区默认抓手光标，拖拽中变为握紧 */
+	.nav-links-wrap #nav-links-scroll {
+		cursor: grab;
+	}
+	.nav-links-wrap #nav-links-scroll.dragging {
+		cursor: grabbing;
+		user-select: none;
+	}
+</style>
 
 <script>
 function switchTheme() {
@@ -110,6 +123,103 @@ function loadButtonScript() {
 }
 
 loadButtonScript();
+
+/* 导航链接区「左右滑动」增强：
+   1) 鼠标按住拖拽即可横向滑动（触摸端走原生滑动，不劫持）；
+   2) 悬停滚轮直接横滚（仅当内容真的溢出时才拦截）；
+   3) 两端渐隐提示当前还有没有更多链接可滑。
+   导航栏跨页共享（swup 只换主内容），所以监听器只注册一次。 */
+function initNavLinksScroll() {
+	const scroller = document.getElementById("nav-links-scroll");
+	if (!scroller || scroller.dataset.scrollInit === "1") return;
+	scroller.dataset.scrollInit = "1";
+
+	const fadeLeft = document.getElementById("nav-fade-left");
+	const fadeRight = document.getElementById("nav-fade-right");
+
+	const updateFades = () => {
+		const canLeft = scroller.scrollLeft > 2;
+		const canRight =
+			scroller.scrollLeft + scroller.clientWidth <
+			scroller.scrollWidth - 2;
+		if (fadeLeft) fadeLeft.style.opacity = canLeft ? "1" : "0";
+		if (fadeRight) fadeRight.style.opacity = canRight ? "1" : "0";
+	};
+	updateFades();
+	scroller.addEventListener("scroll", updateFades, { passive: true });
+	window.addEventListener("resize", updateFades);
+	// 字体加载完成后链接宽度会变，初始的溢出判断需要重算
+	window.addEventListener("load", updateFades);
+	if (document.fonts?.ready) {
+		document.fonts.ready.then(updateFades);
+	}
+	// Search/LightDarkSwitch 是 client:only 组件，挂载晚于 fonts.ready，
+	// 挂载后才会把 flex-1 的链接容器挤压出溢出——用 ResizeObserver 兜住任何尺寸变化
+	if (typeof ResizeObserver !== "undefined") {
+		new ResizeObserver(updateFades).observe(scroller);
+	}
+
+	// 鼠标拖拽滑动（pointerType=mouse 才接管，触摸/笔走原生滚动）。
+	// 鼠标事件天然冒泡到 window，无需 setPointerCapture；
+	// 反而实测 capture 会让部分环境改派 pointercancel，导致 pointerup 不触发。
+	let isDown = false;
+	let moved = false;
+	let startX = 0;
+	let startLeft = 0;
+	scroller.addEventListener("pointerdown", (e) => {
+		if (e.pointerType !== "mouse" || e.button !== 0) return;
+		isDown = true;
+		moved = false;
+		startX = e.clientX;
+		startLeft = scroller.scrollLeft;
+	});
+	const endDrag = () => {
+		isDown = false;
+		scroller.classList.remove("dragging");
+	};
+	window.addEventListener("pointermove", (e) => {
+		if (!isDown) return;
+		const dx = e.clientX - startX;
+		if (!moved && Math.abs(dx) > 4) {
+			moved = true;
+			scroller.classList.add("dragging");
+		}
+		if (moved) scroller.scrollLeft = startLeft - dx;
+	});
+	window.addEventListener("pointerup", endDrag);
+	window.addEventListener("pointercancel", endDrag);
+	window.addEventListener("blur", endDrag);
+	// 按住链接拖动几像素会触发浏览器原生链接拖拽，抢占手势——导航里不需要它
+	scroller.addEventListener("dragstart", (e) => e.preventDefault());
+	scroller.addEventListener(
+		"click",
+		(e) => {
+			// 拖拽结束后的那一次 click 不应当触发链接跳转
+			if (moved) {
+				e.preventDefault();
+				e.stopPropagation();
+				moved = false;
+			}
+		},
+		true,
+	);
+
+	// 悬停滚轮横滚：仅当内容溢出时拦截，否则放行给页面正常滚动
+	scroller.addEventListener(
+		"wheel",
+		(e) => {
+			if (scroller.scrollWidth <= scroller.clientWidth) return;
+			const delta =
+				Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+			if (!delta) return;
+			e.preventDefault();
+			scroller.scrollLeft += delta;
+			updateFades();
+		},
+		{ passive: false },
+	);
+}
+initNavLinksScroll();
 </script>
 
 {import.meta.env.PROD && <script is:inline define:vars={{scriptUrl: url('/pagefind/pagefind.js')}}>

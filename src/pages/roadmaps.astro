@@ -1,0 +1,228 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { url } from "@utils/url-utils";
+
+// 汇总所有文章，按 category 统计各模块篇数（PROD 下排除草稿）
+const allPosts = await getCollection("posts", ({ data }) => {
+	return import.meta.env.PROD ? data.draft !== true : true;
+});
+
+const countByCategory = new Map<string, number>();
+let totalCount = 0;
+for (const post of allPosts) {
+	const category = post.data.category;
+	if (!category) continue;
+	countByCategory.set(category, (countByCategory.get(category) ?? 0) + 1);
+}
+
+interface RoadmapModule {
+	title: string;
+	abbr: string;
+	desc: string;
+	url: string;
+	category: string;
+	chips: string[];
+}
+
+interface ModuleGroup {
+	name: string;
+	modules: RoadmapModule[];
+}
+
+const groups: ModuleGroup[] = [
+	{
+		name: "前端核心",
+		modules: [
+			{
+				title: "TypeScript 从零基础到精通",
+				abbr: "TS",
+				desc: "从类型注解到类型体操，系统掌握 TypeScript",
+				url: "/typescript-roadmap/",
+				category: "TypeScript学习路线",
+				chips: ["泛型", "类型体操", "tsconfig"],
+			},
+			{
+				title: "JavaScript 核心机制",
+				abbr: "JS",
+				desc: "作用域、闭包、原型链、事件循环一本讲透",
+				url: "/js-roadmap/",
+				category: "JavaScript学习路线",
+				chips: ["闭包", "原型链", "事件循环"],
+			},
+			{
+				title: "React 实战路线",
+				abbr: "Re",
+				desc: "从 JSX 组件到 Hooks、状态管理与性能优化",
+				url: "/react-roadmap/",
+				category: "React学习路线",
+				chips: ["Hooks", "状态管理", "性能"],
+			},
+			{
+				title: "前端工程化",
+				abbr: "工",
+				desc: "构建原理、规范 lint、CI/CD、微前端与 Monorepo",
+				url: "/engineering-roadmap/",
+				category: "前端工程化学习路线",
+				chips: ["Vite", "CI/CD", "Monorepo"],
+			},
+			{
+				title: "浏览器与性能",
+				abbr: "浏",
+				desc: "渲染管线、缓存策略、安全与首屏优化实战",
+				url: "/browser-roadmap/",
+				category: "浏览器与性能学习路线",
+				chips: ["渲染", "缓存", "首屏"],
+			},
+		],
+	},
+	{
+		name: "进阶方向",
+		modules: [
+			{
+				title: "Node.js 全栈开发",
+				abbr: "Node",
+				desc: "前端向后端延伸的最短路径：NestJS / 数据库 / 部署",
+				url: "/node-roadmap/",
+				category: "Node全栈学习路线",
+				chips: ["NestJS", "MySQL", "Redis"],
+			},
+			{
+				title: "AI 应用开发",
+				abbr: "AI",
+				desc: "用前端工程能力把大模型做成真实产品：API / 流式 / RAG / Agent",
+				url: "/ai-app-roadmap/",
+				category: "AI应用开发学习路线",
+				chips: ["LLM", "SSE 流式", "RAG"],
+			},
+			{
+				title: "算法与手写题",
+				abbr: "Algo",
+				desc: "面试前 30 天也能刷完的算法套路与手写题全家桶",
+				url: "/algo-roadmap/",
+				category: "算法与手写题",
+				chips: ["LeetCode", "手写题", "面试"],
+			},
+		],
+	},
+	{
+		name: "后端与运维",
+		modules: [
+			{
+				title: "Java 入门",
+				abbr: "Java",
+				desc: "Java 基础语法、面向对象、集合与线程",
+				url: "/java-roadmap/",
+				category: "Java学习路线",
+				chips: ["OOP", "集合", "线程"],
+			},
+			{
+				title: "RuoYi 实战",
+				abbr: "RuoYi",
+				desc: "跑通经典后台管理系统：权限、字典、定时任务、代码生成",
+				url: "/ruoyi-roadmap/",
+				category: "RuoYi学习路线",
+				chips: ["Spring Boot", "权限", "MyBatis"],
+			},
+			{
+				title: "Higress 网关",
+				abbr: "Higress",
+				desc: "云原生网关：路由、流量治理与 WASM 插件开发",
+				url: "/higress-roadmap/",
+				category: "Higress学习路线",
+				chips: ["网关", "WASM", "可观测"],
+			},
+			{
+				title: "Python 全栈",
+				abbr: "Py",
+				desc: "100 天从新手到大师：后端 / 爬虫 / 数据科学全赛道",
+				url: "/python-roadmap/",
+				category: "Python学习路线",
+				chips: ["Django", "爬虫", "机器学习"],
+			},
+		],
+	},
+];
+
+const groupData = groups.map((group) => ({
+	...group,
+	modules: group.modules.map((m) => ({
+		...m,
+		count: countByCategory.get(m.category) ?? 0,
+	})),
+}));
+
+const moduleCount = groupData.reduce((sum, g) => sum + g.modules.length, 0);
+const articleCount = groupData.reduce(
+	(sum, g) => sum + g.modules.reduce((s, m) => s + m.count, 0),
+	0,
+);
+---
+
+<MainGridLayout title="学习路线总览">
+	<div class="onload-animation">
+		<!-- 页面标题 -->
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">学习路线总览</h1>
+			<p class="text-75 text-lg">
+				{moduleCount} 条系统路线 · {articleCount} 篇实战笔记，按阶段顺序刷完即可
+			</p>
+		</div>
+
+		{groupData.map((group) => (
+			<div class="mb-8">
+				<h2 class="text-lg font-bold text-90 mb-3 flex items-center gap-2">
+					<span class="inline-block w-1 h-4 rounded-md bg-[var(--primary)]"></span>
+					{group.name}
+				</h2>
+				<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+					{group.modules.map((m) => (
+						<a href={url(m.url)}
+						   class="card-base card-shadow p-5 flex items-start gap-4 hover:shadow-lg transition-all group">
+							<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-base group-hover:bg-[var(--primary)] group-hover:text-white transition-colors">
+								{m.abbr}
+							</div>
+							<div class="flex-1 min-w-0">
+								<div class="flex items-center justify-between gap-2 mb-1">
+									<h3 class="text-base font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
+										{m.title}
+									</h3>
+									<span class="flex-shrink-0 text-xs text-50">
+										{m.count} 篇
+									</span>
+								</div>
+								<p class="text-75 text-sm mb-2 line-clamp-2">
+									{m.desc}
+								</p>
+								<div class="flex flex-wrap gap-1.5 text-xs">
+									{m.chips.map((chip) => (
+										<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+											{chip}
+										</span>
+									))}
+								</div>
+							</div>
+							<div class="flex-shrink-0 self-center text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+								<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+									<path d="M5 12h14M12 5l7 7-7 7"></path>
+								</svg>
+							</div>
+						</a>
+					))}
+				</div>
+			</div>
+		))}
+
+		<!-- 底部说明 -->
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
+			<p class="font-medium mb-1">💡 使用建议</p>
+			<p>
+				每条路线都按「总览 → 阶段」编号排序，从 00-overview 进入即可按序阅读；
+				已经熟悉的部分可以直接当速查表。				面试冲刺优先刷「算法与手写题」+
+				<a href={url("/interview-guide/")} class="link text-[var(--primary)]">面试宝典</a>；
+				想看真实项目怎么落地，移步
+				<a href={url("/notelab/")} class="link text-[var(--primary)]">NoteLab 实战</a>。
+			</p>
+		</div>
+	</div>
+</MainGridLayout>

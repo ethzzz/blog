@@ -44,73 +44,18 @@ export const navBarConfig: NavBarConfig = {
 		LinkPreset.Home,
 		LinkPreset.Archive,
 		{
-			name: "Java 学习路线",
-			shortName: "Java",
-			url: "/java-roadmap/",
-		},
-		{
-			name: "RuoYi 学习路线",
-			shortName: "RuoYi",
-			url: "/ruoyi-roadmap/",
+			name: "学习路线",
+			shortName: "路线",
+			url: "/roadmaps/",
 		},
 		{
 			name: "面试宝典",
 			url: "/interview-guide/",
 		},
 		{
-			name: "Higress 学习路线",
-			shortName: "Higress",
-			url: "/higress-roadmap/",
-		},
-		{
-			name: "Python 学习路线",
-			shortName: "Python",
-			url: "/python-roadmap/",
-		},
-		{
-			name: "TypeScript 学习路线",
-			shortName: "TypeScript",
-			url: "/typescript-roadmap/",
-		},
-		{
-			name: "JavaScript 核心",
-			shortName: "JavaScript",
-			url: "/js-roadmap/",
-		},
-		{
-			name: "React 实战",
-			shortName: "React",
-			url: "/react-roadmap/",
-		},
-		{
-			name: "前端工程化",
-			shortName: "前端工程化",
-			url: "/engineering-roadmap/",
-		},
-		{
-			name: "浏览器与性能",
-			shortName: "浏览器",
-			url: "/browser-roadmap/",
-		},
-		{
 			name: "NoteLab 实战",
 			shortName: "NoteLab",
 			url: "/notelab/",
-		},
-		{
-			name: "Node 全栈路线",
-			shortName: "Node",
-			url: "/node-roadmap/",
-		},
-		{
-			name: "AI 应用开发",
-			shortName: "AI",
-			url: "/ai-app-roadmap/",
-		},
-		{
-			name: "算法与手写题",
-			shortName: "算法",
-			url: "/algo-roadmap/",
 		},
 		LinkPreset.About,
 	],
