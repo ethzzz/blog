@@ -1,0 +1,207 @@
+---
+title: '11 · 手写 Promise 全家桶'
+published: 2026-10-15T20:00:00+08:00
+description: '手写 Promise 全家桶：符合规范的 then 链与状态机、all/race/allSettled/any、并发限制器，手写题天花板详解。'
+tags: [手写题, Promise, 异步编程, JavaScript]
+category: 算法与手写题
+draft: false
+---
+
+> [!NOTE]
+> 手写 Promise 是手写题的天花板，区分度也最高。**状态机、then 链、thenable 处理、静态方法**四关要能讲能写。
+
+---
+
+## 1. 状态机与订阅模型
+
+Promise 本质是三状态状态机：`pending → fulfilled` 或 `pending → rejected`，**一旦变更不可逆**。
+
+```ts
+class MyPromise<T> {
+  state: "pending" | "fulfilled" | "rejected" = "pending";
+  value!: T;
+  reason!: unknown;
+  private cbs: Array<() => void> = [];        // pending 期间的订阅者
+
+  constructor(
+    executor: (resolve: (v: T | PromiseLike<T>) => void, reject: (r: unknown) => void) => void,
+  ) {
+    const resolve = (v: T | PromiseLike<T>): void => {
+      if (this.state !== "pending") return;   // 状态不可逆
+      this.state = "fulfilled";
+      this.value = v as T;
+      this.cbs.forEach((cb) => cb());         // 发布给等待者
+    };
+    const reject = (r: unknown): void => {
+      if (this.state !== "pending") return;
+      this.state = "rejected";
+      this.reason = r;
+      this.cbs.forEach((cb) => cb());
+    };
+    executor(resolve, reject);
+  }
+}
+```
+
+逐行讲：状态不可逆靠 `state !== "pending"` 守卫；`resolve` 异步调用时 then 回调还没注册，所以要**回调数组**存起来、状态变更时统一发布——"resolve 晚于 then 调用怎么办"答的就是这个发布订阅。`executor` 同步抛错也要转成 reject。
+
+---
+
+## 2. then 链：手写题的主战场
+
+then 的核心难点：**返回一个新 Promise**，回调返回值要被"吸收"（返回 Promise 时等它 settle）；回调抛错由链上后续 onRejected 接住；`onFulfilled` 缺省给"值穿透"、`onRejected` 缺省给"抛错"，所以 `.then()` 跳层后错误仍能被末尾 catch。
+
+```ts
+then(
+  onFulfilled?: (v: T) => unknown,            // 返回值可以是普通值或 Promise
+  onRejected?: (r: unknown) => unknown,
+): MyPromise {
+  const f = onFulfilled ?? ((v: T) => v);     // 值穿透
+  const r = onRejected ?? ((e: unknown) => { throw e; });
+
+  const p2 = new MyPromise((resolve, reject) => {
+    // 统一执行器：微任务模拟异步，try/catch 接住回调抛错
+    const exec = (handler: (v: unknown) => unknown, val: unknown) =>
+      queueMicrotask(() => {
+        try {
+          resolvePromise(p2, handler(val), resolve, reject);
+        } catch (e) {
+          reject(e);
+        }
+      });
+
+    if (this.state === "fulfilled") exec(f, this.value);
+    else if (this.state === "rejected") exec(r, this.reason);
+    else this.cbs.push(() => exec(f, this.value), () => exec(r, this.reason));
+  });
+  return p2;
+}
+```
+
+**resolvePromise：处理 thenable 的核心**（拉开差距的地方，规范还要求检测 `result === p2` 防循环引用）：
+
+```ts
+function resolvePromise(
+  p2: MyPromise, result: unknown,
+  resolve: (v: unknown) => void, reject: (r: unknown) => void,
+): void {
+  if (result instanceof MyPromise) {
+    result.then(resolve, reject);              // 自家 Promise：透传
+    return;
+  }
+  // 异类 thenable：有 then 方法即可
+  if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+    try {
+      (result as PromiseLike<unknown>).then(resolve, reject);
+    } catch (e) {
+      reject(e);
+    }
+    return;
+  }
+  resolve(result);                             // 普通值直接交付
+}
+```
+
+---
+
+## 3. 静态方法：all / race / allSettled / any
+
+四个方法一套模板：**计数器 + 按下标保序**，差异只在"何时 resolve/reject"。
+
+```ts
+static all<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<T[]> {
+  return new MyPromise((resolve, reject) => {
+    const list = [...promises];
+    const results: T[] = new Array(list.length);
+    let count = 0;
+    list.forEach((p, i) => {
+      MyPromise.resolve(p).then((v) => {
+        results[i] = v;                        // 按下标存，与输入顺序一致
+        if (++count === list.length) resolve(results);
+      }, reject);
+    });
+  });
+}
+
+// race 最简单：对每个 promise 挂 resolve/reject，第一个 settle 的获胜
+// for (const p of list) MyPromise.resolve(p).then(resolve, reject);
+
+// allSettled：与 all 同构，但失败也收进 results，全部 settle 后 resolve
+static allSettled<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<unknown[]> {
+  return new MyPromise((resolve) => {
+    const list = [...promises];
+    const results = new Array(list.length);
+    let count = 0;
+    const done = () => { if (++count === list.length) resolve(results); };
+    list.forEach((p, i) =>
+      MyPromise.resolve(p).then(
+        (v) => { results[i] = { status: "fulfilled", value: v }; done(); },
+        (r) => { results[i] = { status: "rejected", reason: r }; done(); },
+      ),
+    );
+  });
+}
+
+// any：一个成功即 resolve，全败才 reject AggregateError
+static any<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<T> {
+  return new MyPromise((resolve, reject) => {
+    const list = [...promises];
+    const errors: unknown[] = new Array(list.length);
+    let count = 0;
+    list.forEach((p, i) => {
+      MyPromise.resolve(p).then(resolve, (r) => {
+        errors[i] = r;
+        if (++count === list.length)
+          reject(new AggregateError(errors, "All promises were rejected"));
+      });
+    });
+  });
+}
+```
+
+细节分：`results[i] = v` 按下标存保证**结果顺序与输入一致**；`MyPromise.resolve(p)` 把非 Promise 值也包一层；空输入要特判。四兄弟一句话：**all 全成才成、一败即败；race 谁快听谁的；allSettled 全给结果不抛错；any 一成即成、全败抛 AggregateError**。
+
+---
+
+## 4. 并发限制器：promiseLimit
+
+**手写并发限制**（最多同时跑 N 个请求）是压轴题：
+
+```ts
+async function promiseLimit<T>(
+  tasks: Array<() => Promise<T>>, limit: number,
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let next = 0;                                // 共享的任务游标
+
+  async function worker() {                    // N 个工人抢任务
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();           // 领到下标后执行
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, tasks.length) }, () => worker()),
+  );
+  return results;
+}
+```
+
+逐行讲：起 `min(limit, tasks.length)` 个 worker，每个从共享游标 `next` 领任务、`await` 完成再领下一个；`next++` 在单线程事件循环里不会竞争。追问"怎么加超时"：用 `Promise.race([task(), timeout(ms)])` 包一层。
+
+---
+
+## 小结
+
+- 状态机三状态不可逆；pending 期间用回调数组实现发布订阅。
+- then：返回新 Promise、回调 try/catch、resolvePromise 吸收 thenable、缺省回调值穿透。
+- 四个静态方法 = 计数器 + 下标保序；并发限制器 = N 个 worker 抢共享游标。
+
+---
+
+## 练习
+
+1. 默写状态机 + 基础 then（含 resolvePromise），跑通返回 Promise 的 then 链。
+2. 默写 Promise.all 并验证结果保序；再写 `Promise.retry(fn, times)` 失败自动重试。
+3. 用 promiseLimit 包 10 个模拟请求，limit 为 3，打印并发数验证峰值不超 3。

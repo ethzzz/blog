@@ -97,6 +97,21 @@ export const navBarConfig: NavBarConfig = {
 			shortName: "NoteLab",
 			url: "/notelab/",
 		},
+		{
+			name: "Node 全栈路线",
+			shortName: "Node",
+			url: "/node-roadmap/",
+		},
+		{
+			name: "AI 应用开发",
+			shortName: "AI",
+			url: "/ai-app-roadmap/",
+		},
+		{
+			name: "算法与手写题",
+			shortName: "算法",
+			url: "/algo-roadmap/",
+		},
 		LinkPreset.About,
 	],
 };

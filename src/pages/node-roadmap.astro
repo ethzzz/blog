@@ -1,0 +1,178 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+// 获取所有 Node 学习路线文章
+const allPosts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === "Node全栈学习路线" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+
+// 按 slug 中的阶段编号排序
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = Number.parseInt(
+		a.slug.match(/node-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	const numB = Number.parseInt(
+		b.slug.match(/node-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	return numA - numB;
+});
+
+// 分离总览和阶段文章
+const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
+const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
+---
+
+<MainGridLayout title="Node.js 全栈开发路线合集">
+	<div class="onload-animation">
+		<!-- 页面标题 -->
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">Node.js 全栈开发路线</h1>
+			<p class="text-75 text-lg">前端工程师向后端延伸的最短路径 · 系统学习路径 · 共 {sortedPosts.length} 篇</p>
+		</div>
+
+		<!-- 项目信息卡片 -->
+		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white font-bold text-xl">
+					Node
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">Node.js 全栈开发路线</h2>
+					<p class="text-75 text-sm mb-2">前端工程师向后端延伸的最短路径：用你已经会的 JS/TS，从模块系统一路打到 NestJS + MySQL + Redis + Docker 上线</p>
+					<div class="flex flex-wrap gap-2 text-xs">
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Node.js</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">NestJS</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">MySQL</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Redis</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">PM2</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Docker</span>
+					</div>
+				</div>
+				<a href="https://nodejs.org" target="_blank" rel="noopener"
+				   class="flex-shrink-0 text-[var(--primary)] hover:opacity-75 transition-opacity">
+					<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+						<path d="M12 1.85c-.27 0-.55.07-.78.2l-7.8 4.51c-.48.28-.78.8-.78 1.36v9.01c0 .56.3 1.08.78 1.36l2.04 1.18c.99.48 1.35.48 1.8.48 1.46 0 2.3-.89 2.3-2.42V8.7c0-.13-.1-.23-.22-.23h-.98c-.13 0-.22.1-.22.23v8.83c0 .68-.71 1.36-1.86.78L3.92 17.1c-.07-.04-.12-.11-.12-.19V7.92c0-.08.05-.15.12-.19l7.8-4.5c.07-.04.16-.04.23 0l7.8 4.5c.07.04.12.11.12.19v9.01c0 .08-.05.15-.12.19l-7.8 4.51c-.07.04-.16.04-.23 0l-1.98-1.17c-.05-.03-.12-.04-.17-.01-.55.31-.64.34-1.14.51-.12.04-.31.11.07.32l2.56 1.51c.24.14.51.21.78.21.27 0 .55-.07.78-.21l7.8-4.51c.48-.28.78-.8.78-1.36V7.92c0-.56-.3-1.08-.78-1.36l-7.8-4.51c-.24-.13-.51-.2-.78-.2zM15.02 8.6c-2.16 0-3.45.91-3.45 2.44 0 1.65 1.28 2.1 3.35 2.3 2.48.24 2.67.61 2.67 1.1 0 .85-.68 1.21-2.28 1.21-2.01 0-2.45-.5-2.6-1.5-.02-.11-.11-.2-.22-.2h-1.01c-.12 0-.22.1-.22.23 0 1.27.69 2.79 4.05 2.79 2.42 0 3.81-.95 3.81-2.62 0-1.65-1.12-2.1-3.47-2.41-2.38-.31-2.62-.49-2.62-1.06 0-.48.21-1.11 1.97-1.11 1.58 0 2.16.34 2.4 1.4.02.1.11.17.21.17h1.02c.06 0 .12-.03.17-.07.04-.05.07-.11.06-.18-.16-1.93-1.4-2.83-4.07-2.83z"/>
+					</svg>
+				</a>
+			</div>
+		</div>
+
+		<!-- 总览卡片 -->
+		{overviewPost && (
+			<a href={getPostUrlBySlug(overviewPost.slug)}
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white">
+								总览
+							</span>
+							<span class="text-sm text-50">
+								{overviewPost.data.published.toLocaleDateString("zh-CN")}
+							</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">
+							{overviewPost.data.title}
+						</h2>
+						<p class="text-75 text-sm line-clamp-2">
+							{overviewPost.data.description}
+						</p>
+					</div>
+					<div class="ml-4 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M5 12h14M12 5l7 7-7 7"/>
+						</svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<!-- 阶段文章列表 -->
+		<div class="space-y-4">
+			{stagePosts.map((post, index) => (
+				<a href={getPostUrlBySlug(post.slug)}
+				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+					<div class="flex items-start gap-4">
+						<!-- 阶段编号 -->
+						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white transition-colors">
+							{index + 1}
+						</div>
+
+						<!-- 文章内容 -->
+						<div class="flex-1 min-w-0">
+							<div class="flex items-center gap-2 mb-1">
+								<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
+									{post.data.title}
+								</h3>
+							</div>
+							<p class="text-75 text-sm mb-2 line-clamp-2">
+								{post.data.description}
+							</p>
+							<div class="flex items-center gap-3 text-xs text-50">
+								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+								{post.data.tags && post.data.tags.length > 0 && (
+									<span class="flex items-center gap-1">
+										{post.data.tags.slice(0, 3).map(tag => (
+											<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+												#{tag}
+											</span>
+										))}
+									</span>
+								)}
+							</div>
+						</div>
+
+						<!-- 箭头 -->
+						<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<path d="M5 12h14M12 5l7 7-7 7"/>
+							</svg>
+						</div>
+					</div>
+				</a>
+			))}
+		</div>
+
+		<!-- 底部说明 -->
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
+			<p class="font-medium mb-1">💡 学习建议</p>
+			<p>按阶段顺序阅读：01-03 打语言与服务端地基（前端友好区），04-08 用 NestJS 补全后端工程化（IoC、数据库、安全、日志、校验），09-12 是进阶实战（大文件、队列、测试、部署）。每篇结束把示例代码在本地跑通一遍，最佳路径是边学边做一个"个人博客 API"项目，把 13 篇串成一个真实服务。已经熟悉的部分可直接当速查表使用。</p>
+		</div>
+
+		<!-- 项目链接 -->
+		<div class="mt-4 flex flex-wrap gap-4 text-sm">
+			<a href="https://nodejs.org" target="_blank" rel="noopener"
+			   class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M12 1.85c-.27 0-.55.07-.78.2l-7.8 4.51c-.48.28-.78.8-.78 1.36v9.01c0 .56.3 1.08.78 1.36l2.04 1.18c.99.48 1.35.48 1.8.48 1.46 0 2.3-.89 2.3-2.42V8.7c0-.13-.1-.23-.22-.23h-.98c-.13 0-.22.1-.22.23v8.83c0 .68-.71 1.36-1.86.78L3.92 17.1c-.07-.04-.12-.11-.12-.19V7.92c0-.08.05-.15.12-.19l7.8-4.5c.07-.04.16-.04.23 0l7.8 4.5c.07.04.12.11.12.19v9.01c0 .08-.05.15-.12.19l-7.8 4.51c-.07.04-.16.04-.23 0l-1.98-1.17c-.05-.03-.12-.04-.17-.01-.55.31-.64.34-1.14.51-.12.04-.31.11.07.32l2.56 1.51c.24.14.51.21.78.21.27 0 .55-.07.78-.21l7.8-4.51c.48-.28.78-.8.78-1.36V7.92c0-.56-.3-1.08-.78-1.36l-7.8-4.51c-.24-.13-.51-.2-.78-.2z"/>
+				</svg>
+				Node.js 官网
+			</a>
+			<a href="https://nestjs.com" target="_blank" rel="noopener"
+			   class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M12.7 2c-.3 0-.6.01-.9.03C6.03 2.4 2.1 6.62 2 11.66c-.06 3.9 2.05 7.32 5.29 9.11.22.13.49.15.74.08 2.15-.6 4.29-2.4 4.68-5.14.02-.15.13-.28.3-.31.24-.05.42.15.42.33.01 1.4-.62 3.05-1.97 4.32-.1.1-.07.27.06.32.42.17.83.32 1.24.42.26.07.53-.03.7-.25C15.4 18 19.4 13.7 22 10.9c.15-.17.18-.41.07-.6C20.1 6.4 16.7 3.7 15 2.36c-.66-.24-1.47-.36-2.3-.36zm.02 3.05c.29.01.57.04.85.1 2.94.6 4.85 3.46 4.26 6.4-.59 2.94-3.45 4.84-6.39 4.25a5.394 5.394 0 0 1-4.25-6.4c.52-2.58 2.78-4.4 5.33-4.35a.6.6 0 0 1 .2 0zm-.32 2.02c-1.55.1-2.87 1.3-3.06 2.92-.22 1.92 1.16 3.66 3.08 3.88 1.92.22 3.66-1.16 3.88-3.08.22-1.92-1.16-3.66-3.08-3.88-.27-.03-.55-.03-.82.16z"/>
+				</svg>
+				NestJS 官网
+			</a>
+			<a href="https://nodejs.org/docs/latest/api/" target="_blank" rel="noopener"
+			   class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+					<polyline points="14 2 14 8 20 8"/>
+					<line x1="16" y1="13" x2="8" y2="13"/>
+					<line x1="16" y1="17" x2="8" y2="17"/>
+					<polyline points="10 9 9 9 8 9"/>
+				</svg>
+				Node 官方文档
+			</a>
+		</div>
+	</div>
+</MainGridLayout>

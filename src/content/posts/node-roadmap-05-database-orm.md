@@ -1,0 +1,161 @@
+---
+title: '05 · 数据库集成与 ORM'
+published: 2026-10-13T14:00:00+08:00
+description: 'Node 服务端数据库实战：MySQL 建模基础、TypeORM 与 Prisma 深度对比、事务的正确用法、迁移管理与 N+1 查询排查，前端转后端的第一道数据关。'
+tags: [Node.js, TypeORM, Prisma, MySQL]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前端转后端，数据库是第一个真正的"新知识区"——不是语法问题，而是思维方式问题：你要开始为**数据的正确性**负责。我在项目里犯过的最贵错误是没搞清事务边界，导致订单和库存不一致。这篇以 MySQL + 两个主流 ORM 为主线，把日常 90% 的数据操作讲清楚。
+
+---
+
+## 1. 建模基础：从三张表开始
+
+以博客系统为例，MySQL 建表核心决策是**主键、关系、索引**三件事：
+
+```sql
+CREATE TABLE users (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  email      VARCHAR(255) NOT NULL UNIQUE,
+  nickname   VARCHAR(64)  NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE posts (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  author_id  BIGINT UNSIGNED NOT NULL,
+  title      VARCHAR(255) NOT NULL,
+  content    MEDIUMTEXT NOT NULL,
+  status     TINYINT NOT NULL DEFAULT 0 COMMENT '0草稿 1发布',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_posts_author FOREIGN KEY (author_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 查询热点：按作者查文章列表
+CREATE INDEX idx_posts_author ON posts(author_id, created_at);
+```
+
+前端最容易忽视的三条军规：
+
+1. **每个查询条件想一遍索引**。`WHERE author_id` 的查询没有索引就是全表扫描。联合索引遵循最左前缀：`(author_id, created_at)` 能同时服务"某作者的文章"和"某作者按时间排序"。
+2. **字符串永远 utf8mb4**。utf8 存不了 emoji，用户昵称带个 🐮 就报错——我踩过。
+3. **字段定死 NOT NULL + 默认值**。NULL 参与比较是三值逻辑，`WHERE status != 1` 查不出 status 为 NULL 的行，多少人栽在这。
+
+## 2. TypeORM vs Prisma：怎么选
+
+两个都是主流，风格截然不同：
+
+| 维度 | TypeORM | Prisma |
+| --- | --- | --- |
+| 心智模型 | Active Record / Data Mapper，"装饰器类 = 表" | 独立 schema 文件 → 自动生成客户端 |
+| 类型安全 | 中，查询结果类型有时要手标 | 强，查询与生成类型完全对齐 |
+| 迁移 | 手写迁移文件（`generate` 辅助） | `migrate dev` 自动 diff 生成 SQL |
+| 查询写法 | QueryBuilder，接近 SQL | 链式 include/select，声明式 |
+| 复杂 SQL | QueryBuilder 能写 | 用 `$queryRaw` 兜底 |
+| 学习曲线 | 概念多（Repository/EntityManager） | 相对平缓，schema 即文档 |
+
+我的结论：**新项目、TS 重度团队选 Prisma**（类型体验好、迁移省心、文档清晰）；**老项目、需要精细控制 SQL、团队已有 Hibernate/JPA 背景（Java 转 Node）选 TypeORM**。两者我都在生产用过，差异没到"选错就完蛋"的程度，但新人上手速度 Prisma 明显快。
+
+Prisma 的日常写法感受一下：
+
+```prisma
+// schema.prisma —— schema 即事实来源
+model Post {
+  id        BigInt   @id @default(autoincrement())
+  authorId  BigInt
+  author    User     @relation(fields: [authorId], references: [id])
+  title     String   @db.VarChar(255)
+  status    Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([authorId, createdAt])
+  @@map("posts")
+}
+```
+
+```ts
+await prisma.post.create({ data: { authorId: 1n, title: 'hello', status: 1 } });
+const list = await prisma.post.findMany({
+  where: { authorId: 1n, status: 1 },
+  orderBy: { createdAt: 'desc' },
+  take: 20,
+  include: { author: { select: { nickname: true } } },  // 关联一次查出，避免 N+1
+});
+```
+
+## 3. 事务：一致性是底线
+
+典型场景：发表文章要"写 posts 表 + 更新 users 表的文章计数"，两步必须同生共死：
+
+```ts
+// Prisma 交互式事务：回调里所有操作同一连接，任一抛错全部回滚
+await prisma.$transaction(async (tx) => {
+  const post = await tx.post.create({
+    data: { authorId: userId, title, content, status: 1 },
+  });
+  await tx.user.update({
+    where: { id: userId },
+    data: { postCount: { increment: 1 } },
+  });
+  return post;
+});
+```
+
+三条血泪纪律：
+
+1. **事务里不要调外部服务**。发 HTTP 请求、发消息队列都别放进事务——事务持锁期间等一个 3 秒的外部接口，数据库连接池会被拖垮。要发就发到事务外或用第 10 篇的事件/队列做最终一致。
+2. **控制事务粒度**。只包住真正需要原子性的几条语句，别把整个 Service 方法一锅炖。
+3. **注意隔离级别**。MySQL 默认 REPEATABLE READ，够用；涉及"先查再写"防并发的场景（如秒杀扣库存）要用 `SELECT ... FOR UPDATE` 行锁或乐观锁版本号，而不是盲目加隔离级别。
+
+## 4. 迁移：别再手动改表
+
+我的黑历史：早期项目直接在测试库手动 `ALTER TABLE`，上线时对不上，手写 SQL 漏了索引，服务起来就 500。**数据库结构必须进版本控制**，Prisma 流程：
+
+```bash
+npx prisma migrate dev --name add-posts    # 开发：对比 schema 生成迁移 SQL 并执行
+npx prisma migrate deploy                  # 生产：按序执行未应用的迁移，不碰 schema
+```
+
+原则：迁移文件和代码一起提交、一起 review；生产只跑 `migrate deploy`；紧急修数据用可回滚的迁移而不是直接连库改。**"改了 schema 忘了迁移"是团队协作里最常见的数据事故来源**。
+
+## 5. N+1 查询：性能问题的头号惯犯
+
+列表页查出 20 篇文章，然后每篇再查一次作者——1 + 20 次查询。ORM 不会自动救你：
+
+```ts
+// ❌ N+1：先查文章，再循环查作者
+const posts = await prisma.post.findMany({ take: 20 });
+for (const p of posts) {
+  p.author = await prisma.user.findUnique({ where: { id: p.authorId } });
+}
+
+// ✅ include 一次关联查出，Prisma 自动拼 JOIN 或批量 IN 查询
+const posts = await prisma.post.findMany({
+  take: 20,
+  include: { author: true },
+});
+```
+
+排查手段：Prisma 开 `log: ['query']`（TypeORM 用 `logging: true`）打印真实 SQL，接口响应慢时先数一数打了多少条 SQL——**90% 的慢接口是 N+1 或缺索引**，这句话我在组里说过无数遍。还有一层防御：给 Prisma 单独写个薄封装层（Repository），查询集中管理，方便统一加缓存和日志。
+
+---
+
+## 小结
+
+- 建三件事：索引覆盖查询条件、utf8mb4 防 emoji、NOT NULL 防三值逻辑。
+- 新项目选 Prisma（类型安全 + 迁移省心），需精细 SQL 控制选 TypeORM。
+- 事务只包原子操作，外部调用出事务；并发写用行锁/乐观锁。
+- 迁移文件进 git，生产只 `migrate deploy`，杜绝手动改表。
+- N+1 是慢接口头号原因，用 include 批量解决，开 query 日志排查。
+
+---
+
+## 练习
+
+1. 用 Docker 起一个 MySQL（`docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=dev mysql:8`），第 05 篇起你的博客项目就靠它。
+2. 为博客设计 comments 表（含外键和索引），用 Prisma schema 表达并执行第一次 `migrate dev`。
+3. 故意构造 N+1（循环查询 10 篇文章的作者），开 query 日志数 SQL 条数，再用 include 优化对比。
+4. 给"关注用户"操作写一个事务：同时写 follow 表和双方计数，思考若其中一步失败会发生什么。

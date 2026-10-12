@@ -1,0 +1,172 @@
+---
+title: '08 · 校验与错误处理'
+published: 2026-10-13T17:00:00+08:00
+description: 'Node 服务端校验与错误处理体系：class-validator 与 DTO 白名单校验、统一错误码设计、Nest 全局异常过滤器、错误传播策略，让接口边界固若金汤。'
+tags: [Node.js, class-validator, DTO, 异常处理]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前端也有表单校验，但服务端校验的意义完全不同：**前端口是体验，后端口是城墙**。curl 一敲，你精心做的前端校验形同虚设。我入职第一周就目睹了同行没有校验 `pageSize`，有人传了个 `99999999` 把数据库拖垮。这一篇讲"入口校验 + 错误出口"的完整闭环。
+
+---
+
+## 1. 信任边界：一切输入都是恶意的
+
+服务端的输入口比你想的多：URL 参数、query、body、header、cookie、文件。每个入口都假设攻击者会传：超长字符串、负数、深度嵌套对象、`__proto__`、类型混淆。
+
+校验三原则：
+
+1. **白名单思维**：只接受你明确定义的字段，多余的一律丢弃或报错（防 mass assignment——用户在 body 里偷偷塞 `role: "admin"` 就提权的经典漏洞）。
+2. **服务端为准**：前端校验全部当不存在，服务端独立完整校验。
+3. **fail fast**：校验失败立即 400，别让脏数据走进 Service。
+
+## 2. class-validator + DTO：声明式校验
+
+Nest 的标准组合：每个接口定义 DTO 类，用装饰器声明规则，ValidationPipe 统一执行：
+
+```ts
+import { IsString, IsInt, Min, Max, Length, IsOptional, IsIn, IsEmail } from 'class-validator';
+
+export class CreatePostDto {
+  @IsString()
+  @Length(1, 255, { message: '标题长度 1-255 字符' })
+  title!: string;
+
+  @IsString()
+  @Length(1, 50000)
+  content!: string;
+
+  @IsIn([0, 1], { message: '状态只能是 0 或 1' })
+  status!: 0 | 1;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+}
+
+export class ListPostQueryDto {
+  @IsInt() @Min(1) @Max(100)        // ⚠️ 不加 Max，pageSize=1e8 就是 DoS
+  pageSize!: number;
+
+  @IsInt() @Min(1)
+  page!: number;
+}
+```
+
+```ts
+// main.ts 全局启用管道
+app.useGlobalPipes(new ValidationPipe({
+  whitelist: true,          // 剥离 DTO 未定义的字段（防 mass assignment）
+  forbidNonWhitelisted: true, // 或选择报错而不是静默剥离，更严格
+  transform: true,          // 按 DTO 类型自动转换（query 里的 "5" → number 5）
+}));
+```
+
+`whitelist: true` 是我最强推的开关——没有它，`{ title, content, role: "admin" }` 里的 role 会被原样传进 Service。还有个高级玩法值得知道：`class-transformer` 支持嵌套校验（`@ValidateNested()` + `@Type(() => AddressDto)`），处理嵌套对象时别漏了。
+
+一个前端视角的共鸣：DTO 就是"请求体的 interface"，只不过 interface 是编译期的，class-validator 是运行时的——**TS 类型在运行时会被擦除，运行时防线必须靠校验器**。这是我见过 TS 老手最常犯的认知错误。
+
+## 3. 错误码设计：别让前端猜
+
+接口出错的响应必须结构化。我的模板：
+
+```json
+{
+  "code": 40001,
+  "message": "标题长度 1-255 字符",
+  "traceId": "a1b2c3"
+}
+```
+
+错误码分层设计（我的十年习惯：**5 位 = HTTP 状态码前两位 + 业务序号**）：
+
+| 错误码 | HTTP 状态 | 含义 | 前端应对 |
+| --- | --- | --- | --- |
+| 40001 | 400 | 参数校验失败 | 表单标红提示 |
+| 40101 | 401 | 未登录 / token 过期 | 跳登录页 |
+| 40301 | 403 | 无权限 | 提示无权限 |
+| 40401 | 404 | 资源不存在 | 显示空态 |
+| 42901 | 429 | 请求过频 | 限流提示 |
+| 50001 | 500 | 服务器内部错误 | 兜底提示 + 上报 traceId |
+
+为什么 HTTP 状态码之外还要业务码：状态码粗粒度（400 下有十几种业务错误），业务码让前端可以精准分支处理，而 traceId 让用户报障时你能立刻定位。
+
+## 4. 全局异常过滤器：错误的统一出口
+
+Nest 自带 `HttpException` 家族，业务代码抛出、框架捕获：
+
+```ts
+throw new NotFoundException(`文章 ${id} 不存在`);
+throw new ForbiddenException('无权删除他人文章');
+
+// 自定义业务异常：带错误码
+export class BizException extends HttpException {
+  constructor(code: number, message: string) {
+    super({ code, message }, Math.floor(code / 1000));
+  }
+}
+// 用法：throw new BizException(40001, '标题长度 1-255 字符')
+```
+
+真正的主力是**全局异常过滤器**，兜住所有没被 catch 的错误：
+
+```ts
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const res = ctx.getResponse<Response>();
+
+    if (exception instanceof HttpException) {
+      // 已知业务错误：原样透出（校验失败、404 等）
+      const body = exception.getResponse();
+      return res.status(exception.getStatus()).json({
+        code: typeof body === 'object' ? body.code : exception.getStatus() * 100,
+        message: typeof body === 'object' ? body.message : exception.message,
+        traceId: getTraceId(),
+      });
+    }
+    // 未知错误：绝不泄露堆栈给客户端！
+    getLogger().error({ err: exception }, '未捕获异常');
+    return res.status(500).json({ code: 50001, message: '服务器开小差了', traceId: getTraceId() });
+  }
+}
+// main.ts: app.useGlobalFilters(new AllExceptionsFilter());
+```
+
+**安全红线：500 响应绝不带堆栈**。默认 Express 会把 stack 打给客户端，等于把内部结构告诉攻击者。堆栈只进日志，配合上一篇的 traceId，日志里能查到全部细节。
+
+错误传播纪律也统一一下：**Service 层抛异常（表达"什么错了"），Filter 层翻译成 HTTP 响应（表达"怎么告诉客户端"）**。我 review 过最痛苦的代码是 Service 里到处 `res.status(500).json(...)`——层次全乱了，测试也没法写。
+
+## 5. 完整链路串一遍
+
+一个 POST `/posts` 请求的守卫链：
+
+```text
+请求 → Guard（鉴权）→ ValidationPipe（DTO 校验，失败抛 40001）
+     → Controller（翻译参数）→ Service（业务，抛 BizException/NotFound）
+     → 全部异常汇入 Filter → 统一 { code, message, traceId } → 响应
+```
+
+每一个环节都只做一件事，错误只有一个出口。这套结构建好之后，新增接口的成本是"写一个 DTO + 一个方法"，安全和错误处理全部自动继承——这就是工程化的复利。
+
+---
+
+## 小结
+
+- 服务端校验是城墙不是体验：白名单、服务端为准、fail fast。
+- class-validator + DTO + `whitelist: true` 防 mass assignment；`@Max` 限制 pageSize 防 DoS。
+- 错误码 5 位分层（HTTP 前缀 + 业务序号），响应固定 `{ code, message, traceId }`。
+- 全局 Filter 是唯一错误出口；500 绝不泄露堆栈；Service 抛错、Filter 翻译。
+
+---
+
+## 练习
+
+1. 给文章接口补齐 CreatePostDto 和 ListPostQueryDto，故意传 `pageSize=99999999` 验证被 400 拦截。
+2. 开启 `whitelist: true`，在 body 里塞 `role: "admin"` 创建文章，确认响应里没有该字段且没进 Service。
+3. 实现 BizException 和全局 Filter，抛一个业务错误，验证响应带 code 和 traceId。
+4. 用 curl 不带任何前端直接打你的接口，把你传出的所有 400/422 响应收集成"错误响应文档"——这就是给前端同事的对接文档。

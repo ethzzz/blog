@@ -1,0 +1,178 @@
+---
+title: '02 · 字符串高频题与正则妙用'
+published: 2026-10-15T11:00:00+08:00
+description: '前端字符串高频面试题：反转、回文判断、有效括号匹配，以及正则表达式在题解中的实战妙用。'
+tags: [算法, 字符串, 正则表达式, LeetCode]
+category: 算法与手写题
+draft: false
+---
+
+> [!NOTE]
+> 字符串题是前端面试的"主场题"——毕竟天天跟文本打交道。反转、回文、括号匹配这三类占了大头，而正则用得好，常常能让面试官眼前一亮。
+
+---
+
+## 1. 反转与翻转：reverse 三板斧
+
+**套路模板**：JS 里字符串不可变，反转要么转数组用 `reverse()`，要么手动双指针交换。
+
+```ts
+// 写法一：一行流（适合口头快速给出）
+function reverseStr(s: string): string {
+  return s.split("").reverse().join("");
+}
+
+// 写法二：双指针手动交换（面试官要求 O(1) 额外空间时用）
+function reverseArr(chars: string[]): void {
+  let l = 0, r = chars.length - 1;
+  while (l < r) {
+    [chars[l], chars[r]] = [chars[r], chars[l]];
+    l++; r--;
+  }
+}
+```
+
+例题：**反转字符串中的单词**。"the sky is blue" → "blue is sky the"。
+
+```ts
+function reverseWords(s: string): string {
+  return s.trim().split(/\s+/).reverse().join(" ");
+}
+```
+
+逐行讲：`trim()` 去首尾空格；`split(/\s+/)` 用正则按"一个或多个空白"切分，天然处理了单词间多个空格的情况；`reverse()` 反转单词顺序；`join(" ")` 用单空格拼接。这题的考点就是**能不能想到用正则切分**——用普通 `split(" ")` 会切出空字符串，还得再 filter 一遍。
+
+我面试时见过最漂亮的答案就是这一行，但注意：写完后要主动说一句"这里正则 `\s+` 把连续空格合并处理了"，展示你理解每一步在干嘛，而不是背下来的。
+
+---
+
+## 2. 回文判断：从双指针到正则预处理
+
+**套路模板**：回文 = 正读反读一样。预处理（去掉非字母数字、转小写）后对撞指针。
+
+例题：**验证回文串**。只考虑字母和数字，忽略大小写。
+
+```ts
+function isPalindrome(s: string): boolean {
+  // 预处理：只留字母数字并转小写
+  const cleaned = s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  let l = 0, r = cleaned.length - 1;
+  while (l < r) {
+    if (cleaned[l] !== cleaned[r]) return false;
+    l++; r--;
+  }
+  return true;
+}
+```
+
+逐行讲：正则 `[^a-z0-9]` 匹配所有非字母数字字符并替换为空串，一行完成"过滤 + 规范化"。之后就是对撞指针标准流程：两端不等立即返回 false。
+
+**变体：最多删除一个字符还能是回文吗？** 这是高频追问版。思路：双指针遇到不等时，有两种补救可能（跳左或跳右），任一成立即可。
+
+```ts
+function validPalindrome(s: string): boolean {
+  const check = (str: string, l: number, r: number): boolean => {
+    while (l < r) {
+      if (str[l] !== str[r]) return false;
+      l++; r--;
+    }
+    return true;
+  };
+  let l = 0, r = s.length - 1;
+  while (l < r) {
+    if (s[l] !== s[r]) {
+      // 差一步：跳过左边或跳过右边，试一次
+      return check(s, l + 1, r) || check(s, l, r - 1);
+    }
+    l++; r--;
+  }
+  return true;
+}
+```
+
+关键在遇到第一个不匹配的位置才试删除——前面的部分已经确认是回文的了。整个算法 O(n)。
+
+---
+
+## 3. 括号匹配：栈的预处理版
+
+有效括号题第 04 篇会从栈的角度细讲，这里先给字符串视角的解法，因为它考的概率太高：
+
+```ts
+function isValid(s: string): boolean {
+  const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  const stack: string[] = [];
+  for (const ch of s) {
+    if (ch === "(" || ch === "[" || ch === "{") {
+      stack.push(ch);                   // 左括号入栈
+    } else {
+      if (stack.pop() !== pairs[ch]) return false;  // 必须匹配栈顶
+    }
+  }
+  return stack.length === 0;            // 栈空才算全匹配
+}
+```
+
+注意两个易错点：右括号到来时**栈可能为空**（`pop()` 返回 `undefined`，与 `pairs[ch]` 不等，恰好返回 false，逻辑天然正确，但你要能解释为什么）；结尾**必须检查栈是否清空**，只匹配不收尾会有 `"("` 这种漏网之鱼。
+
+---
+
+## 4. 正则在题解里的妙用
+
+前端面试里正则用得好是明显的加分项，几个高频场景：
+
+**场景一：驼峰与短横线互转**（手写题常客）。
+
+```ts
+const kebabToCamel = (s: string) =>
+  s.replace(/-(\w)/g, (_, c) => c.toUpperCase());   // "font-size" -> "fontSize"
+
+const camelToKebab = (s: string) =>
+  s.replace(/([A-Z])/g, "-$1").toLowerCase();       // "fontSize" -> "font-size"
+```
+
+`replace` 的第二个参数可以是函数，`(_, c)` 第一个参数是整体匹配、后面是捕获组——很多候选人不知道函数签名，这里能讲清楚就赢了。
+
+**场景二：统计字符出现次数。** 用正则配合 `match` 比手写循环简洁：
+
+```ts
+function countChar(s: string, ch: string): number {
+  return (s.match(new RegExp(ch, "g")) ?? []).length;
+}
+// "hello world" 里数 o：s.match(/o/g) => ["o","o"]，长度 2
+```
+
+注意 `match` 找不到时返回 `null` 而不是空数组，`?? []` 兜底是必写细节。
+
+**场景三：手写模板字符串解析**（前端特色题）。
+
+```ts
+// "你好，${name}" + {name: "张三"} => "你好，张三"
+function render(tpl: string, data: Record<string, string>): string {
+  return tpl.replace(/\$\{(\w+)\}/g, (_, key) => data[key] ?? "");
+}
+```
+
+`\$\{(\w+)\}` 三个部分：转义 `${`、捕获组拿到变量名、匹配结尾 `}`。这类题本质考的就是正则捕获组 + replace 回调的组合拳。
+
+**正则陷阱提醒**：`new RegExp("a+b")` 里字符串会被再解析一次反斜杠，动态构造正则要写 `new RegExp("\\d+")`；全局匹配的 `lastIndex` 状态坑——同一个 `g` 正则对象反复 `test` 结果会变。面试提一嘴这两个坑，可靠性分拉满。
+
+---
+
+## 小结
+
+- 反转三板斧：`split/reverse/join` 一行流 + 双指针 O(1) 空间版。
+- 回文：正则预处理后对撞指针；变体"删一个字符"只在第一个不匹配处补救。
+- 括号匹配：栈 + 映射表，结尾必须检查栈空。
+- 正则妙用：`\s+` 切词、捕获组 + replace 回调做格式转换、`\$\{(\w+)\}` 解析模板。
+
+---
+
+## 练习（LeetCode 同类题清单）
+
+1. 344. 反转字符串 —— 双指针交换基本功。
+2. 125. 验证回文串 —— 正则预处理 + 对撞指针。
+3. 151. 反转字符串中的单词 —— 正则切分一行流。
+4. 680. 验证回文串 II —— 删一个字符变体，必做。
+5. 20. 有效的括号 —— 提前为栈篇热身。
+6. 557. 反转字符串中的单词 III —— 单词内反转，综合题。

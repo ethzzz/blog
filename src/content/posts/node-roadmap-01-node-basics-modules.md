@@ -1,0 +1,178 @@
+---
+title: '01 · Node 基础与模块系统'
+published: 2026-10-13T10:00:00+08:00
+description: 'Node 入门第一课：nvm 版本管理、CommonJS 与 ESM 双模块体系、npm scripts 与依赖管理、path 与 fs 核心用法，帮前端工程师快速补齐 Node 地基。'
+tags: [Node.js, 模块系统, npm, nvm]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前端工程师学 Node 最容易犯的错，是把它当成"浏览器里的 JS 换了个运行环境"。其实差异从第一行代码就开始了：模块系统、包管理、文件 IO 全是新世界。这一篇把地基打牢——nvm、双模块体系、npm scripts、path/fs，全是后面 12 篇每天都要用的东西。
+
+---
+
+## 1. 版本管理：先装 nvm 再装 Node
+
+我在公司见过的最经典事故之一：新人直接官网装了最新版 Node，结果跑公司老项目 `node-sass` 编译报错，折腾一下午。**Node 版本碎片化是常态，nvm 是解药**。
+
+```bash
+# Windows 用 nvm-windows，macOS/Linux 用 nvm
+nvm install 22        # 装一个 LTS 大版本
+nvm install 20.19.0   # 精确到小版本也可以
+nvm use 22            # 切换当前 shell 的版本
+nvm alias default 22  # 设置默认版本（nvm-windows 是 nvm use 默认记住）
+```
+
+版本怎么选，一张表说清：
+
+| 版本线 | 说明 | 建议 |
+| --- | --- | --- |
+| LTS（如 22.x） | 偶数版本，30 个月维护期，API 稳定 | **生产项目和日常开发都用它** |
+| Current（如 23.x） | 奇数版本，尝鲜新特性 | 本地玩具项目可以试 |
+| 旧 LTS（18 及以下） | 部分已停止维护 | 存量项目才需要，新项目别碰 |
+
+踩坑提醒：项目根目录加一个 `.nvmrc` 文件写上版本号（如 `22.14.0`），团队里 `nvm use` 一下就能对齐。这个 30 秒的习惯能省掉无数次"我这好好的呀"。
+
+## 2. CommonJS vs ESM：双模块体系的恩怨
+
+Node 有两套模块系统，这是前端转后端最懵的地方，我用"来历 + 现状 + 怎么选"三步讲清。
+
+**来历**：Node 2009 年诞生时 ECMAScript 还没有模块标准，于是社区搞了 CommonJS——`require`/`module.exports`。2015 年 ES6 正式推出 ESM（`import`/`export`），浏览器先支持，Node 直到 13.2 才默认稳定支持。
+
+**语法差异的三个关键点**：
+
+```js
+// CommonJS
+const fs = require('fs');          // 同步加载，运行时解析
+module.exports = { hello };
+
+// ESM
+import fs from 'node:fs';          // 静态分析，编译期确定依赖
+export { hello };
+export default hello;
+```
+
+| 特性 | CommonJS | ESM |
+| --- | --- | --- |
+| 加载时机 | 运行时，动态（可以 `if` 里 require） | 静态，顶层声明 |
+| 顶层 await | ❌ | ✅ |
+| 值的导出 | 值的拷贝（快照） | 值的引用（live binding） |
+| `__dirname` | ✅ 有 | ❌ 要用 `import.meta.url` 自己算 |
+| Tree-shaking | 不支持 | 支持静态分析可摇树 |
+
+**怎么选**：2026 年的新项目，**无脑 ESM**。操作方式：`package.json` 里加 `"type": "module"`，文件用 `.js` 就走 ESM（`.cjs` 强制 CommonJS，`.mjs` 强制 ESM）。老项目别硬迁移，CommonJS 在 Node 里不会被移除，完全可用。
+
+踩坑提醒：ESM 里 `__dirname` 没有了，替代写法记一下，天天用：
+
+```js
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+```
+
+另外 `require` 动态加载的能力，在 ESM 里对应 `await import()`，是个异步操作。
+
+## 3. npm scripts：被低估的工程入口
+
+前端同学天天 `npm run dev`，但很多没意识到 scripts 是个迷你 shell 工具箱。几个我常用却很少人系统的点：
+
+```json
+{
+  "scripts": {
+    "dev": "nest start --watch",
+    "build": "nest build",
+    "lint": "eslint . --fix",
+    "db:migrate": "prisma migrate dev",
+    "precommit": "npm run lint && npm run test"
+  }
+}
+```
+
+- **生命周期钩子**：`pre<name>` 和 `post<name>` 自动执行，`npm run commit` 会先跑 `precommit`。
+- **环境变量注入**：`NODE_ENV=production npm start`（跨平台要用 `cross-env` 包）。
+- **npx**：临时执行包命令不装全局，`npx prisma studio` 比全局装干净得多。
+- **npm vs pnpm vs yarn**：我 2023 年后全切 pnpm，磁盘省 60%+、安装快、幽灵依赖问题（你没用却能用未声明包）天然免疫。新项目建议 pnpm。
+
+依赖管理还有一条铁律：`dependencies` 是运行时必须的，`devDependencies` 是构建/开发用的，别混。部署时 `npm ci --omit=dev` 能显著减小镜像——第 12 篇会用到。
+
+## 4. path 与 fs：服务端的"手和脚"
+
+浏览器里你没有文件系统；进了 Node，`fs` 和 `path` 是最基础的两个模块。`node:` 前缀表示内置模块（推荐写法，防止被 npm 上的同名包劫持）。
+
+**path 常用 API**（跨平台路径处理，永远别手拼 `/` 或 `\`）：
+
+```js
+import path from 'node:path';
+path.join('/app', 'uploads', 'a.png');   // /app/uploads/a.png 拼接（自动处理斜杠）
+path.resolve('uploads', 'a.png');        // 从当前工作目录解析成绝对路径
+path.extname('a.png');                   // '.png'
+path.basename('/a/b/c.png', '.png');     // 'c'（可去掉扩展名）
+```
+
+`join` 和 `resolve` 的区别我背了很久：`join` 只是拼接，`resolve` 会解析成绝对路径（从右往左遇到根就停）。
+
+**fs 的三种姿势**：
+
+```js
+import fs from 'node:fs';
+import fsPromises from 'node:fs/promises';
+
+// 1. 同步版：阻塞事件循环，只允许在启动脚本时用
+const cfg = fs.readFileSync('./config.json', 'utf-8');
+
+// 2. 回调版：历史产物，别写新代码
+
+// 3. Promise 版：日常主力
+const stat = await fsPromises.stat('./uploads');
+await fsPromises.mkdir('./uploads/2026', { recursive: true });
+await fsPromises.writeFile('./a.txt', 'hello', 'utf-8');
+```
+
+踩坑提醒：`fsPromises.readFile` 读大文件会一次性占满内存——**超过几十 MB 的文件操作，改用第 02 篇要讲的 Stream**。这是我见过新手最容易把服务内存打爆的地方。
+
+```js
+// 写文件时的原子性技巧：先写临时文件再改名，避免写一半被读
+await fsPromises.writeFile('./data.json.tmp', content);
+await fsPromises.rename('./data.json.tmp', './data.json');
+```
+
+## 5. 第一个 Node 脚本：把学到的串起来
+
+```js
+// count-lines.mjs —— 统计一个目录下所有 .md 文件的总行数
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+const dir = process.argv[2] ?? '.';
+const files = await fs.readdir(dir);
+let total = 0;
+
+for (const f of files.filter(f => f.endsWith('.md'))) {
+  const content = await fs.readFile(path.join(dir, f), 'utf-8');
+  const lines = content.split('\n').length;
+  console.log(`${f}: ${lines} 行`);
+  total += lines;
+}
+console.log(`共 ${total} 行`);
+```
+
+运行 `node count-lines.mjs ./posts`。这个 20 行脚本里有命令行参数（`process.argv`）、异步 IO、path 处理——Node 日常脚本的全部要素。`process` 全局对象也露了一脸：`process.argv` 参数、`process.env` 环境变量（第 07 篇主角）、`process.cwd()` 工作目录，后面天天见。
+
+---
+
+## 小结
+
+- 用 nvm 管版本，项目放 `.nvmrc`；新项目一律 LTS + ESM（`"type": "module"`）。
+- CommonJS 运行时加载值拷贝，ESM 静态加载值引用；ESM 里 `__dirname` 要手动算。
+- npm scripts 有生命周期钩子；pnpm 解决幽灵依赖，值得切换。
+- `path.join`/`resolve` 别手拼路径；fs 用 `fs/promises`，大文件留给 Stream。
+
+---
+
+## 练习
+
+1. 用 nvm 装 22 并设为默认，在你的博客项目根目录创建 `.nvmrc`。
+2. 写一个脚本：遍历目录，找出所有大于 1MB 的文件并列出（提示：`stat` 的 `size` 字节，除 1024 换算）。
+3. 写一个 CommonJS 文件验证"值拷贝"：导出 `let count = 0` 的模块，在另一个文件里 require 两次并自增，观察值是否共享。再用 ESM 复现，对比 live binding。
+4. 给 `package.json` 加一个 `clean` script，删除 `dist` 目录（`node -e "fs.rmSync('dist',{recursive:true})"`），并验证 `preclean` 钩子会先执行。
