@@ -205,9 +205,13 @@ textarea:not([rows]) {
 	font-size: 16px;
 }
 
-/* Override page-width for 2xl+ screens (1536px+) to leave room for TOC */
+/* Override page-width for 2xl+ screens (1536px+) to leave room for TOC.
+   必须同时覆盖 body：define:vars 会把 --page-width 直接写到 html 和 body 两层，
+   只写 :root 时 body 仍持有 92vw/110rem 的旧值并被所有子元素继承，
+   导致 1920 等宽度下主容器过宽、TOC 被推出视口右缘。 */
 @media (min-width: 1536px) {
-	:root {
+	:root,
+	body {
 		--page-width: clamp(75rem, calc(100vw - 24rem), var(--page-width-max-with-toc)) !important;
 	}
 }
