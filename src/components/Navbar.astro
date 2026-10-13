@@ -104,7 +104,7 @@ links = links.map((l) =>
                             {/* 面板用 fixed + JS 定位：若放在滚动容器内部会被 overflow 裁剪。
                                 显隐由 JS 挂 .dropdown-open 控制（悬停/键盘聚焦），见 initNavDropdowns。 */}
                             <div class="nav-dropdown-panel">
-                                <div class:list={["card-base !rounded-xl shadow-xl border border-black/5 dark:border-white/10 p-4 w-max max-h-[min(70vh,42rem)] overflow-y-auto", panelMaxWidth(menu)]}>
+                                <div class:list={["card-base !rounded-xl shadow-xl border border-black/5 dark:border-white/10 p-4 w-max max-h-[min(70vh,42rem)] !overflow-y-auto", panelMaxWidth(menu)]}>
                                     <a href={url(l.url)}
                                        class="flex items-center gap-1 text-sm font-bold text-[var(--primary)] px-2 py-1 rounded-lg hover:bg-[var(--btn-plain-bg-hover)] transition">
                                         进入{l.name}
@@ -170,10 +170,11 @@ links = links.map((l) =>
 		user-select: none;
 	}
 
-	/* 下拉子菜单：fixed 定位逃出滚动容器的 overflow 裁剪，位置由 JS 计算。
+	/* 下拉子菜单：absolute 挂在 sticky 的 #navbar-wrapper 下（JS 启动时搬运出滚动容器），
+	   相对导航条自身定位——无论页面滚到哪、OverlayScrollbars 如何包裹，都严格贴在标题正下方。
 	   显隐走 .dropdown-open（JS 挂），不依赖 :hover——面板 DOM 不在触发元素内。 */
 	.nav-dropdown-panel {
-		position: fixed;
+		position: absolute;
 		z-index: 50;
 		visibility: hidden;
 		opacity: 0;
@@ -183,7 +184,7 @@ links = links.map((l) =>
 			transform 0.15s ease,
 			visibility 0.15s;
 	}
-	.nav-dropdown-wrap.dropdown-open .nav-dropdown-panel {
+	.nav-dropdown-panel.dropdown-open {
 		visibility: visible;
 		opacity: 1;
 		transform: translate(-50%, 0);
@@ -332,36 +333,45 @@ function initNavLinksScroll() {
 }
 initNavLinksScroll();
 
-/* 桌面端下拉子菜单：面板 fixed 定位（逃出滚动容器裁剪），JS 计算锚点位置并控制显隐。
+/* 桌面端下拉子菜单：面板在启动时搬运到 sticky 的 #navbar-wrapper 下（脱离
+   overflow 滚动容器，避免被裁剪 / 被滚动结构带走），absolute 相对导航条定位。
    触发：悬停 / 键盘聚焦导航项或面板本身；面板 DOM 不在触发元素内，
-   所以跨「链接 → 面板」的空隙用 120ms 延迟关闭来衔接。 */
+   跨「链接 → 面板」的空隙用 120ms 延迟关闭来衔接。 */
 function initNavDropdowns() {
 	const scroller = document.getElementById("nav-links-scroll");
+	const host = document.getElementById("navbar-wrapper");
 	const wraps = document.querySelectorAll<HTMLDivElement>(
 		"#nav-links-scroll .nav-dropdown-wrap",
 	);
-	if (!scroller || !wraps.length) return;
+	if (!scroller || !host || !wraps.length) return;
 	let openWrap: HTMLElement | null = null;
 	let closeTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	// 面板被搬运到 host 下后不再是 wrap 的后代，必须持引用查找
+	const panelOf = new Map<HTMLElement, HTMLElement>();
 
 	const position = (wrap: HTMLElement) => {
-		const panel = wrap.querySelector<HTMLElement>(".nav-dropdown-panel");
+		const panel = panelOf.get(wrap);
 		const anchor = wrap.querySelector<HTMLElement>(":scope > a");
 		if (!panel || !anchor) return;
-		const r = anchor.getBoundingClientRect();
-		panel.style.left = `${Math.round(r.left + r.width / 2)}px`;
-		panel.style.top = `${Math.round(r.bottom + 6)}px`;
+		// 面板挂在 host 下：坐标一律换算成相对 host 的偏移。
+		// host 是 sticky 元素且与锚点同帧测量，滚动状态不影响相对关系。
+		const hr = host.getBoundingClientRect();
+		const ar = anchor.getBoundingClientRect();
+		panel.style.left = `${Math.round(ar.left + ar.width / 2 - hr.left)}px`;
+		panel.style.top = `${Math.round(hr.height + 4)}px`;
 	};
 	const open = (wrap: HTMLElement) => {
 		// 拖拽横滑链接时不弹面板，避免滑动过程闪面板
 		if (scroller.classList.contains("dragging")) return;
-		if (openWrap && openWrap !== wrap) openWrap.classList.remove("dropdown-open");
+		if (openWrap && openWrap !== wrap) close(openWrap);
 		openWrap = wrap;
 		position(wrap);
 		wrap.classList.add("dropdown-open");
+		panelOf.get(wrap)?.classList.add("dropdown-open");
 	};
 	const close = (wrap: HTMLElement) => {
 		wrap.classList.remove("dropdown-open");
+		panelOf.get(wrap)?.classList.remove("dropdown-open");
 		if (openWrap === wrap) openWrap = null;
 	};
 	const scheduleClose = (wrap: HTMLElement) => {
@@ -372,6 +382,9 @@ function initNavDropdowns() {
 	wraps.forEach((wrap) => {
 		// 面板由模板保证存在；不在闭包外判空，避免 TS 跨闭包收窄失败
 		const panel = wrap.querySelector<HTMLElement>(".nav-dropdown-panel")!;
+		// 搬出滚动容器，挂到 sticky 的导航条宿主下（幂等），并记录引用
+		if (panel.parentElement !== host) host.appendChild(panel);
+		panelOf.set(wrap, panel);
 		wrap.addEventListener("mouseenter", () => open(wrap));
 		wrap.addEventListener("mouseleave", () => scheduleClose(wrap));
 		panel.addEventListener("mouseenter", () => clearTimeout(closeTimer));
@@ -382,7 +395,7 @@ function initNavDropdowns() {
 	document.addEventListener("focusin", (e) => {
 		const target = e.target as Node | null;
 		wraps.forEach((wrap) => {
-			const panel = wrap.querySelector<HTMLElement>(".nav-dropdown-panel");
+			const panel = panelOf.get(wrap);
 			if (!wrap.contains(target) && !(panel && panel.contains(target))) {
 				close(wrap);
 			}
