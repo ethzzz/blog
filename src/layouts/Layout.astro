@@ -149,6 +149,30 @@ const bannerOffset =
 
 		<link rel="alternate" type="application/rss+xml" title={profileConfig.name} href={`${Astro.site}rss.xml`}/>
 
+		<!-- 防止首屏入场动画播两次。
+		     现象：直接打开页面时，#navbar 等带 .onload-animation 的元素，其 fade-in-up
+		     会在第一次播到约 80% 时被重启一次（客户端水合/初始化期间样式重算所致），
+		     肉眼可见"淡入两次"。
+		     注意：这段必须放在 head 里同步执行（is:inline），普通 module script 要到
+		     DOMContentLoaded 才跑，会错过第一次动画（实测首次动画早于脚本约 220ms）。 -->
+		<script is:inline>
+			(function () {
+				var played = typeof WeakSet === 'function' ? new WeakSet() : null;
+				document.addEventListener('animationstart', function (e) {
+					var el = e.target;
+					if (!el || el.nodeType !== 1) return;
+					if (!el.classList || !el.classList.contains('onload-animation')) return;
+					if (!played) return;
+					if (played.has(el)) {
+						// 同一元素第二次开始：直接落到终态，避免看到重播
+						el.style.animation = 'none';
+						el.style.opacity = '1';
+						return;
+					}
+					played.add(el);
+				}, true);
+			})();
+		</script>
 	</head>
 	<body class=" min-h-screen transition " class:list={[{"lg:is-home": isHomePage, "enable-banner": enableBanner}]}
 		  data-overlayscrollbars-initialize
