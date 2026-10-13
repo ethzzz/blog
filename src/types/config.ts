@@ -60,6 +60,17 @@ export type NavBarLink = {
 	 * 因此小于 2xl 用 shortName，2xl 及以上用完整 name。
 	 */
 	shortName?: string;
+	/**
+	 * 桌面端悬停展开的分组子菜单（移动端 hamburger 面板里同样按组展示）。
+	 * 为空时该项仍是普通链接。
+	 */
+	children?: NavBarChildGroup[];
+};
+
+export type NavBarChildGroup = {
+	/** 分组标题（不可点击） */
+	title: string;
+	items: NavBarLink[];
 };
 
 export type NavBarConfig = {

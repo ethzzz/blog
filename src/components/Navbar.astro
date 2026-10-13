@@ -1,8 +1,13 @@
 ---
+import { type CollectionEntry, getCollection } from "astro:content";
 import { Icon } from "astro-icon/components";
 import { navBarConfig, siteConfig } from "../config";
 import { LinkPresets } from "../constants/link-presets";
-import { LinkPreset, type NavBarLink } from "../types/config";
+import {
+	LinkPreset,
+	type NavBarChildGroup,
+	type NavBarLink,
+} from "../types/config";
 import { url } from "../utils/url-utils";
 import LightDarkSwitch from "./LightDarkSwitch.svelte";
 import Search from "./Search.svelte";
@@ -18,6 +23,52 @@ let links: NavBarLink[] = navBarConfig.links.map(
 		}
 		return item;
 	},
+);
+
+// 「面试宝典」下拉子菜单：构建期从文章集合动态生成，与文章增删自动同步。
+// 分组按专题编号划归（对应 interview-guide-NN-* 的 NN）。
+const numOf = (entry: CollectionEntry<"posts">) =>
+	Number.parseInt(entry.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0", 10);
+
+const interviewPosts = (
+	await getCollection("posts", ({ data }) => {
+		return (
+			data.category === "前端面试宝典" &&
+			(import.meta.env.PROD ? data.draft !== true : true)
+		);
+	})
+).sort((a, b) => numOf(a) - numOf(b));
+
+const interviewGroupDef: { title: string; nums: number[] }[] = [
+	{ title: "语言基础", nums: [1, 2, 3, 12] },
+	{ title: "框架与跨端", nums: [4, 5, 6] },
+	{ title: "工程与后端", nums: [7, 8, 9, 10, 11, 19] },
+	{ title: "性能与实践", nums: [13, 14, 15, 16] },
+	{ title: "设计与综合", nums: [17, 18, 20, 21] },
+];
+
+const interviewChildren: NavBarChildGroup[] = interviewGroupDef
+	.map((g) => ({
+		title: g.title,
+		items: interviewPosts
+			.filter((p) => g.nums.includes(numOf(p)))
+			.map((p) => ({
+				// 存不带 base 的原始路径：模板渲染时统一经 url() 拼前缀，
+				// 与 config.ts 里其他 children 项的约定一致（getPostUrlBySlug 已含 base，不能混用）
+				name: p.data.title,
+				url: `/posts/${p.slug}/`,
+			})),
+	}))
+	.filter((g) => g.items.length > 0);
+
+// 分组数 > 3 的面板内容偏宽，限制最大宽度让其换行，避免贴边溢出视口
+const panelMaxWidth = (children: NavBarChildGroup[]) =>
+	children.length > 3
+		? "max-w-[min(calc(100vw-2rem),32rem)]"
+		: "max-w-[calc(100vw-2rem)]";
+
+links = links.map((l) =>
+	l.url === "/interview-guide/" ? { ...l, children: interviewChildren } : l,
 );
 ---
 <div id="navbar" class="z-50 onload-animation">
@@ -38,6 +89,44 @@ let links: NavBarLink[] = navBarConfig.links.map(
         <div class="nav-links-wrap hidden md:flex flex-1 min-w-0 items-center relative">
             <div id="nav-links-scroll" class="flex-1 min-w-0 flex items-center overflow-x-auto hide-scrollbar select-none">
                 {links.map((l) => {
+                    const menu = l.children && l.children.length > 0 ? l.children : null;
+                    if (menu) {
+                        return <div class="nav-dropdown-wrap relative shrink-0">
+                            <a aria-label={l.name} href={l.external ? l.url : url(l.url)} target={l.external ? "_blank" : null}
+                               class="btn-plain scale-animation whitespace-nowrap rounded-lg h-11 font-bold px-2.5 md:px-3.5 xl:px-5 active:scale-95"
+                            >
+                                <div class="flex items-center">
+                                    {l.shortName ?? l.name}
+                                    <Icon name="material-symbols:expand-more-rounded" class="nav-dropdown-chevron text-[1.1rem] transition-transform duration-150"></Icon>
+                                    {l.external && <Icon name="fa6-solid:arrow-up-right-from-square" class="text-[0.875rem] transition -translate-y-[1px] ml-1 text-black/[0.2] dark:text-white/[0.2]"></Icon>}
+                                </div>
+                            </a>
+                            {/* 面板用 fixed + JS 定位：若放在滚动容器内部会被 overflow 裁剪。
+                                显隐由 JS 挂 .dropdown-open 控制（悬停/键盘聚焦），见 initNavDropdowns。 */}
+                            <div class="nav-dropdown-panel">
+                                <div class:list={["card-base !rounded-xl shadow-xl border border-black/5 dark:border-white/10 p-4 w-max max-h-[min(70vh,42rem)] overflow-y-auto", panelMaxWidth(menu)]}>
+                                    <a href={url(l.url)}
+                                       class="flex items-center gap-1 text-sm font-bold text-[var(--primary)] px-2 py-1 rounded-lg hover:bg-[var(--btn-plain-bg-hover)] transition">
+                                        进入{l.name}
+                                        <Icon name="material-symbols:arrow-forward-rounded" class="text-[0.875rem]"></Icon>
+                                    </a>
+                                    <div class="flex flex-wrap gap-x-8 gap-y-3 mt-2 pt-2 border-t border-black/5 dark:border-white/10">
+                                        {menu.map((g) => (
+                                            <div class="min-w-0">
+                                                <div class="text-xs font-bold text-50 px-2 pb-1 whitespace-nowrap">{g.title}</div>
+                                                {g.items.map((it) => (
+                                                    <a href={it.external ? it.url : url(it.url)} target={it.external ? "_blank" : null}
+                                                       class="block px-2 py-1.5 rounded-lg text-sm text-75 whitespace-nowrap hover:bg-[var(--btn-plain-bg-hover)] hover:text-[var(--primary)] transition">
+                                                        {it.shortName ?? it.name}
+                                                    </a>
+                                                ))}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>;
+                    }
                     return <a aria-label={l.name} href={l.external ? l.url : url(l.url)} target={l.external ? "_blank" : null}
                               class="btn-plain scale-animation shrink-0 whitespace-nowrap rounded-lg h-11 font-bold px-2.5 md:px-3.5 xl:px-5 active:scale-95"
                     >
@@ -79,6 +168,28 @@ let links: NavBarLink[] = navBarConfig.links.map(
 	.nav-links-wrap #nav-links-scroll.dragging {
 		cursor: grabbing;
 		user-select: none;
+	}
+
+	/* 下拉子菜单：fixed 定位逃出滚动容器的 overflow 裁剪，位置由 JS 计算。
+	   显隐走 .dropdown-open（JS 挂），不依赖 :hover——面板 DOM 不在触发元素内。 */
+	.nav-dropdown-panel {
+		position: fixed;
+		z-index: 50;
+		visibility: hidden;
+		opacity: 0;
+		transform: translate(-50%, 6px);
+		transition:
+			opacity 0.15s ease,
+			transform 0.15s ease,
+			visibility 0.15s;
+	}
+	.nav-dropdown-wrap.dropdown-open .nav-dropdown-panel {
+		visibility: visible;
+		opacity: 1;
+		transform: translate(-50%, 0);
+	}
+	.nav-dropdown-wrap.dropdown-open .nav-dropdown-chevron {
+		transform: rotate(180deg);
 	}
 </style>
 
@@ -220,6 +331,78 @@ function initNavLinksScroll() {
 	);
 }
 initNavLinksScroll();
+
+/* 桌面端下拉子菜单：面板 fixed 定位（逃出滚动容器裁剪），JS 计算锚点位置并控制显隐。
+   触发：悬停 / 键盘聚焦导航项或面板本身；面板 DOM 不在触发元素内，
+   所以跨「链接 → 面板」的空隙用 120ms 延迟关闭来衔接。 */
+function initNavDropdowns() {
+	const scroller = document.getElementById("nav-links-scroll");
+	const wraps = document.querySelectorAll<HTMLDivElement>(
+		"#nav-links-scroll .nav-dropdown-wrap",
+	);
+	if (!scroller || !wraps.length) return;
+	let openWrap: HTMLElement | null = null;
+	let closeTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+
+	const position = (wrap: HTMLElement) => {
+		const panel = wrap.querySelector<HTMLElement>(".nav-dropdown-panel");
+		const anchor = wrap.querySelector<HTMLElement>(":scope > a");
+		if (!panel || !anchor) return;
+		const r = anchor.getBoundingClientRect();
+		panel.style.left = `${Math.round(r.left + r.width / 2)}px`;
+		panel.style.top = `${Math.round(r.bottom + 6)}px`;
+	};
+	const open = (wrap: HTMLElement) => {
+		// 拖拽横滑链接时不弹面板，避免滑动过程闪面板
+		if (scroller.classList.contains("dragging")) return;
+		if (openWrap && openWrap !== wrap) openWrap.classList.remove("dropdown-open");
+		openWrap = wrap;
+		position(wrap);
+		wrap.classList.add("dropdown-open");
+	};
+	const close = (wrap: HTMLElement) => {
+		wrap.classList.remove("dropdown-open");
+		if (openWrap === wrap) openWrap = null;
+	};
+	const scheduleClose = (wrap: HTMLElement) => {
+		clearTimeout(closeTimer);
+		closeTimer = setTimeout(() => close(wrap), 120);
+	};
+
+	wraps.forEach((wrap) => {
+		// 面板由模板保证存在；不在闭包外判空，避免 TS 跨闭包收窄失败
+		const panel = wrap.querySelector<HTMLElement>(".nav-dropdown-panel")!;
+		wrap.addEventListener("mouseenter", () => open(wrap));
+		wrap.addEventListener("mouseleave", () => scheduleClose(wrap));
+		panel.addEventListener("mouseenter", () => clearTimeout(closeTimer));
+		panel.addEventListener("mouseleave", () => scheduleClose(wrap));
+		wrap.addEventListener("focusin", () => open(wrap));
+		panel.addEventListener("focusin", () => open(wrap));
+	});
+	document.addEventListener("focusin", (e) => {
+		const target = e.target as Node | null;
+		wraps.forEach((wrap) => {
+			const panel = wrap.querySelector<HTMLElement>(".nav-dropdown-panel");
+			if (!wrap.contains(target) && !(panel && panel.contains(target))) {
+				close(wrap);
+			}
+		});
+	});
+	document.addEventListener("keydown", (e) => {
+		if (e.key === "Escape" && openWrap) close(openWrap);
+	});
+	window.addEventListener("resize", () => {
+		if (openWrap) position(openWrap);
+	});
+	window.addEventListener(
+		"scroll",
+		() => {
+			if (openWrap) position(openWrap);
+		},
+		{ passive: true },
+	);
+}
+initNavDropdowns();
 </script>
 
 {import.meta.env.PROD && <script is:inline define:vars={{scriptUrl: url('/pagefind/pagefind.js')}}>

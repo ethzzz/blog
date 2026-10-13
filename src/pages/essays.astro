@@ -1,0 +1,89 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+// 散篇内容聚合：教程 + 随笔（PROD 下排除草稿）
+const allPosts = await getCollection("posts", ({ data }) => {
+	const isLoose = data.category === "教程" || data.category === "随笔";
+	return isLoose && (import.meta.env.PROD ? data.draft !== true : true);
+});
+
+const sortedPosts = allPosts.sort(
+	(a, b) => b.data.published.valueOf() - a.data.published.valueOf(),
+);
+
+const tutorialCount = sortedPosts.filter(
+	(p) => p.data.category === "教程",
+).length;
+const essayCount = sortedPosts.filter((p) => p.data.category === "随笔").length;
+---
+
+<MainGridLayout title="随笔与教程">
+	<div class="onload-animation">
+		<!-- 页面标题 -->
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">随笔与教程</h1>
+			<p class="text-75 text-lg">
+				不成体系的零散沉淀 · {tutorialCount} 篇教程 + {essayCount} 篇随笔
+			</p>
+		</div>
+
+		<!-- 说明卡片 -->
+		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white font-bold text-xl">
+					随
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">随笔与教程 - 路线之外的散篇</h2>
+					<p class="text-75 text-sm">
+						这里收的是还没有长成完整模块的内容：搭建/部署类教程、工具用法和偶尔的随手记。
+						哪天某一类写多了，就会像其他模块一样升级成独立的学习路线。
+					</p>
+				</div>
+			</div>
+		</div>
+
+		<!-- 文章列表 -->
+		<div class="space-y-4">
+			{sortedPosts.map((post) => (
+				<a href={getPostUrlBySlug(post.slug)}
+				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+					<div class="flex items-start gap-4">
+						<div class="flex-shrink-0 px-2.5 py-1 rounded-full text-xs font-medium bg-[var(--btn-regular-bg)] text-[var(--btn-content)] self-center">
+							{post.data.category}
+						</div>
+
+						<div class="flex-1 min-w-0">
+							<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate mb-1">
+								{post.data.title}
+							</h3>
+							<p class="text-75 text-sm mb-2 line-clamp-2">
+								{post.data.description}
+							</p>
+							<div class="flex items-center gap-3 text-xs text-50">
+								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+								{post.data.tags && post.data.tags.length > 0 && (
+									<span class="flex items-center gap-1">
+										{post.data.tags.slice(0, 4).map((tag) => (
+											<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+												#{tag}
+											</span>
+										))}
+									</span>
+								)}
+							</div>
+						</div>
+
+						<div class="flex-shrink-0 self-center text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<path d="M5 12h14M12 5l7 7-7 7"></path>
+							</svg>
+						</div>
+					</div>
+				</a>
+			))}
+		</div>
+	</div>
+</MainGridLayout>

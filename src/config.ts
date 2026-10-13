@@ -1,3 +1,4 @@
+import { ROADMAP_GROUPS } from "./constants/roadmap-modules";
 import type {
 	ExpressiveCodeConfig,
 	LicenseConfig,
@@ -6,6 +7,12 @@ import type {
 	SiteConfig,
 } from "./types/config";
 import { LinkPreset } from "./types/config";
+
+// 「学习路线」下拉子菜单与总览页共用同一份模块注册表，改模块只改 roadmap-modules.ts
+const roadmapChildren = ROADMAP_GROUPS.map((group) => ({
+	title: group.name,
+	items: group.modules.map((m) => ({ name: m.title, url: m.url })),
+}));
 
 export const siteConfig: SiteConfig = {
 	title: "我的博客",
@@ -47,6 +54,7 @@ export const navBarConfig: NavBarConfig = {
 			name: "学习路线",
 			shortName: "路线",
 			url: "/roadmaps/",
+			children: roadmapChildren,
 		},
 		{
 			name: "面试宝典",
@@ -56,6 +64,11 @@ export const navBarConfig: NavBarConfig = {
 			name: "NoteLab 实战",
 			shortName: "NoteLab",
 			url: "/notelab/",
+		},
+		{
+			name: "随笔与教程",
+			shortName: "随笔",
+			url: "/essays/",
 		},
 		LinkPreset.About,
 	],
