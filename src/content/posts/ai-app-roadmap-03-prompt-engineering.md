@@ -1,6 +1,6 @@
 ---
 title: '03 · Prompt 工程'
-published: 2026-10-14T12:00:00+08:00
+published: 2026-10-12T12:00:00+08:00
 description: 'Prompt 工程实战：系统提示词设计原则、few-shot 示例选择、思维链引导、提示词版本管理与 A/B 测试。把 Prompt 当代码一样管理和回归。'
 tags: [AI应用, Prompt, 提示词]
 category: AI应用开发学习路线

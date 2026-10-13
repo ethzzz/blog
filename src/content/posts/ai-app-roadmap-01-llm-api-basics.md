@@ -1,6 +1,6 @@
 ---
 title: '01 · LLM API 基础'
-published: 2026-10-14T10:00:00+08:00
+published: 2026-10-12T10:00:00+08:00
 description: 'LLM API 基础：chat completions 报文结构、temperature 与 top_p 采样参数、token 与计费原理、上下文窗口管理。读懂任何一家大模型 API 文档的第一步。'
 tags: [AI应用, LLM, API, token]
 category: AI应用开发学习路线

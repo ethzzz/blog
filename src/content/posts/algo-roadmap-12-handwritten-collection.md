@@ -1,6 +1,6 @@
 ---
 title: '12 · 手写高频合集：深拷贝、call/bind、instanceof 等'
-published: 2026-10-15T21:00:00+08:00
+published: 2026-10-13T21:00:00+08:00
 description: '手写题高频合集：深拷贝处理循环引用、call/apply/bind 三件套、instanceof、EventEmitter、数组扁平化。'
 tags: [手写题, 深拷贝, JavaScript, 面试]
 category: 算法与手写题

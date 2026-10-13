@@ -1,6 +1,6 @@
 ---
 title: '11 · 网关与基础设施'
-published: 2026-10-14T20:00:00+08:00
+published: 2026-10-12T20:00:00+08:00
 description: 'LLM 网关与基础设施：MaaS 平台对比、token-plan 计费机制、自建网关的统一接入层设计、可观测性与用量统计。AI 应用的水电煤工程。'
 tags: [AI应用, 网关, MaaS, 计费]
 category: AI应用开发学习路线

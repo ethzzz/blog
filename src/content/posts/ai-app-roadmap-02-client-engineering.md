@@ -1,6 +1,6 @@
 ---
 title: '02 · 客户端封装工程化'
-published: 2026-10-14T11:00:00+08:00
+published: 2026-10-12T11:00:00+08:00
 description: 'LLM 客户端工程化：自封装客户端 vs 官方 SDK 的取舍、多 Key 池轮询实现、429 限流指数退避重试、超时与降级策略，以自研 QwenClient 为完整案例。'
 tags: [AI应用, LLM, 容错, TypeScript]
 category: AI应用开发学习路线

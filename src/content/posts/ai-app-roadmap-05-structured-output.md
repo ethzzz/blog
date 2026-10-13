@@ -1,6 +1,6 @@
 ---
 title: '05 · 结构化输出与函数调用'
-published: 2026-10-14T14:00:00+08:00
+published: 2026-10-12T14:00:00+08:00
 description: 'LLM 结构化输出实战：JSON mode 的正确用法、tool use / function calling 报文结构、用 Zod 与 JSON Schema 做输出校验与重试，让模型输出成为可编程契约。'
 tags: [AI应用, LLM, JSON, Zod]
 category: AI应用开发学习路线

@@ -1,6 +1,6 @@
 ---
 title: '06 · RAG 检索增强'
-published: 2026-10-14T15:00:00+08:00
+published: 2026-10-12T15:00:00+08:00
 description: 'RAG 检索增强全流程：embedding 向量原理、文档分块策略与大小选择、向量库选型对比、召回与重排优化。用检索让模型回答它没见过的问题。'
 tags: [AI应用, RAG, embedding, 向量检索]
 category: AI应用开发学习路线

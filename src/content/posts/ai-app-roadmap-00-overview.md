@@ -1,6 +1,6 @@
 ---
 title: '00 · 总览：前端视角的 AI 应用地图'
-published: 2026-10-14T09:00:00+08:00
+published: 2026-10-12T09:00:00+08:00
 description: 'AI 应用开发路线总览：前端工程师视角的大模型应用地图、这条路线适合谁、12 个阶段的学习地图与依赖关系，从 LLM API 到 RAG、Agent 与网关基建。'
 tags: [AI应用, LLM, 学习路线]
 category: AI应用开发学习路线

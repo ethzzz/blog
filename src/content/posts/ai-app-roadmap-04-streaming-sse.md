@@ -1,6 +1,6 @@
 ---
 title: '04 · 流式输出'
-published: 2026-10-14T13:00:00+08:00
+published: 2026-10-12T13:00:00+08:00
 description: 'LLM 流式输出完整实现：SSE 协议解析、fetch 流读取、前端打字机渲染、中断 AbortController 与断线重连续传。做出 ChatGPT 级别的流式体验。'
 tags: [AI应用, SSE, 流式输出, 前端]
 category: AI应用开发学习路线

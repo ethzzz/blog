@@ -1,6 +1,6 @@
 ---
 title: '10 · 手写防抖与节流'
-published: 2026-10-15T19:00:00+08:00
+published: 2026-10-13T19:00:00+08:00
 description: '手写防抖 debounce 与节流 throttle 完整版：immediate 立即执行、cancel 取消、leading/trailing 变体与 requestAnimationFrame 节流。'
 tags: [手写题, 防抖, 节流, JavaScript]
 category: 算法与手写题

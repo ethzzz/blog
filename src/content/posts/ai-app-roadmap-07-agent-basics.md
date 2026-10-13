@@ -1,6 +1,6 @@
 ---
 title: '07 · Agent 与工具循环'
-published: 2026-10-14T16:00:00+08:00
+published: 2026-10-12T16:00:00+08:00
 description: 'AI Agent 实战：ReAct 模式原理、function calling 工具循环实现、记忆管理与上下文裁剪，以及什么时候不该用 Agent——用确定性代码解决问题。'
 tags: [AI应用, Agent, 工具调用]
 category: AI应用开发学习路线

@@ -14,7 +14,7 @@ const allPosts = await getCollection("posts", ({ data }) => {
 const sortedPosts = allPosts.sort((a, b) => {
 	const numA = Number.parseInt(a.slug.match(/notelab-(\d+)/)?.[1] ?? "0", 10);
 	const numB = Number.parseInt(b.slug.match(/notelab-(\d+)/)?.[1] ?? "0", 10);
-	return numB - numA; // 新写的排前面
+	return numA - numB; // 与其他模块一致：总览(00)在前，按编号正序阅读
 });
 ---
 

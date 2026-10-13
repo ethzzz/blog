@@ -1,6 +1,6 @@
 ---
 title: '11 · 手写 Promise 全家桶'
-published: 2026-10-15T20:00:00+08:00
+published: 2026-10-13T20:00:00+08:00
 description: '手写 Promise 全家桶：符合规范的 then 链与状态机、all/race/allSettled/any、并发限制器，手写题天花板详解。'
 tags: [手写题, Promise, 异步编程, JavaScript]
 category: 算法与手写题
