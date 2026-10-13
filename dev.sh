@@ -6,10 +6,15 @@ set -e
 
 cd "$(dirname "$0")"
 
-# 优先用 WorkBuddy 托管的 node，没有就用系统 npm
+# 优先用 WorkBuddy 托管的 node，没有就用系统 npm。
+# 注意：托管目录名带版本号（如 22.22.2-2 → 22.22.2-6），客户端升级后会变，
+# 因此自动探测最新的一个，不要硬编码版本号。
 NPM="npm"
-if [ -f "C:/Users/thz/.workbuddy/binaries/node/versions/22.22.2-2/npm.cmd" ]; then
-	NPM="C:/Users/thz/.workbuddy/binaries/node/versions/22.22.2-2/npm.cmd"
+if [ -d "C:/Users/thz/.workbuddy/binaries/node/versions" ]; then
+	latest_node=$(ls -d "C:/Users/thz/.workbuddy/binaries/node/versions/"*/ 2>/dev/null | sort -V | tail -1)
+	if [ -n "$latest_node" ] && [ -f "${latest_node}npm.cmd" ]; then
+		NPM="${latest_node}npm.cmd"
+	fi
 fi
 
 # 重要：WorkBuddy 会通过 NODE_OPTIONS 注入 node-language-shim，其内置的 safe-delete

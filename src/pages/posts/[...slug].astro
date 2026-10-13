@@ -67,6 +67,14 @@ const jsonLd = {
                         {remarkPluginFrontmatter.minutes} {" " + i18n(remarkPluginFrontmatter.minutes === 1 ? I18nKey.minuteCount : I18nKey.minutesCount)}
                     </div>
                 </div>
+                <!-- 朗读全文：调用服务端 kokoro TTS，按标签切分正文后顺序播放 -->
+                <button id="tts-read-btn" type="button" aria-label="朗读全文" aria-busy="false"
+                        class="flex flex-row items-center cursor-pointer transition active:scale-95 hover:text-[var(--primary)]">
+                    <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
+                        <Icon name="material-symbols:text-to-speech"></Icon>
+                    </div>
+                    <span id="tts-read-label" class="text-sm">阅读</span>
+                </button>
             </div>
 
             <!-- title -->
@@ -134,3 +142,8 @@ const jsonLd = {
     </div>
 
 </MainGridLayout>
+
+<script>
+	// 朗读功能：只在文章详情页加载，通过 /blog/tts/ 反代调用服务端语音合成
+	import "../../scripts/tts-reader";
+</script>
