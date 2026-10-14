@@ -57,8 +57,8 @@ export const navBarConfig: NavBarConfig = {
 			children: roadmapChildren,
 		},
 		{
-			name: "练习解答",
-			shortName: "解答",
+			name: "练习实践",
+			shortName: "练习",
 			url: "/solutions/",
 		},
 		{
