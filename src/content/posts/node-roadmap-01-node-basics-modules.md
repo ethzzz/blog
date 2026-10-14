@@ -122,6 +122,9 @@ import fsPromises from 'node:fs/promises';
 const cfg = fs.readFileSync('./config.json', 'utf-8');
 
 // 2. 回调版：历史产物，别写新代码
+fs.readFile('./config.json', (file) => {
+  console.log('file', file)
+});
 
 // 3. Promise 版：日常主力
 const stat = await fsPromises.stat('./uploads');
