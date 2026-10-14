@@ -147,9 +147,9 @@ function pivotIndex(nums: number[]): number {
 
 ## 练习（LeetCode 同类题清单）
 
-1. 167. 两数之和 II —— 对撞指针入门，必做。
-2. 11. 盛最多水的容器 —— 练"为什么移动矮的"的话术。
-3. 26. 删除有序数组中的重复项 —— 快慢指针读写分离。
-4. 88. 合并两个有序数组 —— 从后往前的对撞变体。
-5. 724. 寻找数组的中心下标 —— 前缀和 O(1) 空间版。
-6. 15. 三数之和 —— 对撞指针 + 排序 + 去重，中等题高频。
+1. 167. 两数之和 II —— 对撞指针入门，必做。[查看解答 →](/blog/solutions/algo-01-ex01-two-sum-ii/)
+2. 11. 盛最多水的容器 —— 练"为什么移动矮的"的话术。[查看解答 →](/blog/solutions/algo-01-ex02-container-with-most-water/)
+3. 26. 删除有序数组中的重复项 —— 快慢指针读写分离。[查看解答 →](/blog/solutions/algo-01-ex03-remove-duplicates/)
+4. 88. 合并两个有序数组 —— 从后往前的对撞变体。[查看解答 →](/blog/solutions/algo-01-ex04-merge-sorted-array/)
+5. 724. 寻找数组的中心下标 —— 前缀和 O(1) 空间版。[查看解答 →](/blog/solutions/algo-01-ex05-pivot-index/)
+6. 15. 三数之和 —— 对撞指针 + 排序 + 去重，中等题高频。[查看解答 →](/blog/solutions/algo-01-ex06-three-sum/)
