@@ -112,6 +112,17 @@
     }
 }
 
+/* 导航栏键盘焦点环：UA 默认的 `outline: auto` 会画在元素盒子外侧，
+   而 #nav-links-scroll 为了横向滚动设了 overflow-x: auto——按规范另一轴会计算成
+   auto，盒子高度正好等于链接高度（实测 scroller 44px == link 44px），
+   于是焦点环的上/下两条边被整个裁掉，只剩左右两截断弧，看起来像一对括号。
+   改成贴边（negative offset）的实心环：画在盒子内部，任何滚动容器都裁不到，
+   颜色用主题主色，和站点视觉一致。 */
+#navbar :is(a, button):focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+
 .custom-md img, #post-cover img {
     @apply cursor-zoom-in
 }
