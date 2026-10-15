@@ -20,7 +20,12 @@ if grep -q "location \^~ /blog/solutions" "$CONF"; then
 	exit 0
 fi
 
-BACKUP="$CONF.bak-$(date +%Y%m%d-%H%M%S)"
+# ⚠️ 备份必须放在 sites-enabled **之外**：nginx 会加载该目录下的每一个文件，
+#    在里面留一个 .bak = 多一份 server 块 = nginx -t 直接报 duplicate default server，
+#    而且这个错误看起来跟本次改动毫无关系（排查时要想到「谁把备份放这儿了」）。
+BACKUP_DIR=/root/.nginx-backups
+mkdir -p "$BACKUP_DIR"
+BACKUP="$BACKUP_DIR/$(basename "$CONF").bak-$(date +%Y%m%d-%H%M%S)"
 cp "$CONF" "$BACKUP"
 echo "已备份 → $BACKUP"
 
