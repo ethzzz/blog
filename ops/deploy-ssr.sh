@@ -26,12 +26,16 @@ git pull --ff-only
 AFTER=$(git rev-parse HEAD)
 [ "$BEFORE" = "$AFTER" ] && echo "  已是最新 $AFTER" || echo "  $BEFORE → $AFTER"
 
-echo "==> 2/5 依赖（仅在 package-lock 变化时重装）"
-if git diff --name-only "$BEFORE" "$AFTER" -- package-lock.json | grep -q .; then
-  echo "  lock 有变 → npm ci"
-  npm ci --no-audit --no-fund
+echo "==> 2/5 依赖"
+# 判据是「package-lock.json 是否比 node_modules/.package-lock.json 新」，不是 git diff。
+# ⚠️ 用 git diff「本次 pull 有没有改 lock」会漏：手工 pull 过、或上一次部署中途失败再跑，
+#    diff 都是空的，于是新依赖永远装不上 —— 症状是 Cannot find module '@astrojs/node'，
+#    而日志里还理直气壮写着「lock 未变，跳过」。
+if [ ! -f node_modules/.package-lock.json ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
+	echo "  依赖有变 → npm ci"
+	npm ci --no-audit --no-fund
 else
-  echo "  lock 未变，跳过（省 ~40s）"
+	echo "  依赖已是最新，跳过（省 ~40s）"
 fi
 
 echo "==> 3/5 构建（static + SSR）"
