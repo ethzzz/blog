@@ -12,7 +12,10 @@ import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { Icon } from "astro-icon/components";
 import { profileConfig, siteConfig } from "../../config";
 import { fetchSolution } from "../../utils/practice-api";
-import { expressiveCodeAssets, renderMarkdown } from "../../utils/runtime-markdown";
+import {
+	expressiveCodeAssets,
+	renderMarkdown,
+} from "../../utils/runtime-markdown";
 import { getPostUrlBySlug, url } from "../../utils/url-utils";
 
 const slug = Astro.params.slug ?? "";
@@ -32,7 +35,9 @@ const ec = await expressiveCodeAssets();
 
 const prev = entry?.prev ?? null;
 const next = entry?.next ?? null;
-const relatedUrl = entry?.relatedPost ? getPostUrlBySlug(entry.relatedPost) : null;
+const relatedUrl = entry?.relatedPost
+	? getPostUrlBySlug(entry.relatedPost)
+	: null;
 
 const difficultyStyle =
 	{
@@ -42,20 +47,22 @@ const difficultyStyle =
 	}[entry?.difficulty ?? ""] ??
 	"bg-[var(--btn-regular-bg)] text-[var(--btn-content)]";
 
-const jsonLd = entry ? {
-	"@context": "https://schema.org",
-	"@type": "TechArticle",
-	headline: entry.title,
-	description: entry.description || entry.title,
-	keywords: entry.tags,
-	author: {
-		"@type": "Person",
-		name: profileConfig.name,
-		url: Astro.site,
-	},
-	datePublished: entry.published,
-	inLanguage: siteConfig.lang.replace("_", "-"),
-} : null;
+const jsonLd = entry
+	? {
+			"@context": "https://schema.org",
+			"@type": "TechArticle",
+			headline: entry.title,
+			description: entry.description || entry.title,
+			keywords: entry.tags,
+			author: {
+				"@type": "Person",
+				name: profileConfig.name,
+				url: Astro.site,
+			},
+			datePublished: entry.published,
+			inLanguage: siteConfig.lang.replace("_", "-"),
+		}
+	: null;
 ---
 <MainGridLayout
     title={entry ? entry.title : apiError ? "解答暂时无法加载" : "没有这篇解答"}

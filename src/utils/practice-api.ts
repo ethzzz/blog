@@ -42,8 +42,12 @@ export async function fetchSolutions(): Promise<PublicSolution[]> {
 }
 
 /** 单篇解答（含正文）。找不到返回 null（404 是正常情况，不当异常）。 */
-export async function fetchSolution(slug: string): Promise<PublicSolutionDetail | null> {
-	const res = await fetch(`${BASE}/api/practice/public/solutions/${encodeURIComponent(slug)}`);
+export async function fetchSolution(
+	slug: string,
+): Promise<PublicSolutionDetail | null> {
+	const res = await fetch(
+		`${BASE}/api/practice/public/solutions/${encodeURIComponent(slug)}`,
+	);
 	if (res.status === 404) return null;
 	if (!res.ok) throw new Error(`解答接口返回 HTTP ${res.status}`);
 	return (await res.json()) as PublicSolutionDetail;

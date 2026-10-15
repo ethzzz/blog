@@ -13,7 +13,7 @@
 import { createMarkdownProcessor } from "@astrojs/markdown-remark";
 import rehypeExpressiveCode, { createRenderer } from "rehype-expressive-code";
 import { expressiveCodeOptions } from "../expressive-code-config";
-import { rehypePlugins, remarkPlugins } from "../markdown-plugins";
+import { rehypePlugins, remarkPlugins } from "../markdown-plugins.mjs";
 
 export type MarkdownHeading = { depth: number; slug: string; text: string };
 
@@ -27,7 +27,9 @@ export type RenderedMarkdown = {
 type EcRenderer = Awaited<ReturnType<typeof createRenderer>>;
 
 let rendererPromise: Promise<EcRenderer> | null = null;
-let processorPromise: Promise<{ render: (md: string) => Promise<{ code: string; metadata: unknown }> }> | null = null;
+let processorPromise: Promise<{
+	render: (md: string) => Promise<{ code: string; metadata: unknown }>;
+}> | null = null;
 
 async function getRenderer(): Promise<EcRenderer> {
 	if (!rendererPromise) {
@@ -40,7 +42,6 @@ async function getProcessor() {
 	if (!processorPromise) {
 		processorPromise = (async () => {
 			const renderer = await getRenderer();
-			// biome-ignore lint/suspicious/noExplicitAny: 插件数组的元素是 unified 的 Plugin 联合类型，这里不做窄化
 			return (await createMarkdownProcessor({
 				remarkPlugins: remarkPlugins as never,
 				rehypePlugins: [
@@ -82,8 +83,11 @@ export async function renderMarkdown(md: string): Promise<RenderedMarkdown> {
  * 构建期这些由 astro-expressive-code 集成自动注入每个页面；运行时渲染的页面没有那一步，
  * 必须自己带上 —— 否则代码块会「有 HTML 但没样式」，渲染出一坨没高亮的纯文本。
  */
-export async function expressiveCodeAssets(): Promise<{ styles: string; scripts: string[] }> {
-	const r = await getRenderer() as unknown as {
+export async function expressiveCodeAssets(): Promise<{
+	styles: string;
+	scripts: string[];
+}> {
+	const r = (await getRenderer()) as unknown as {
 		baseStyles?: string;
 		themeStyles?: string;
 		jsModules?: (string | { code?: string })[];
@@ -91,7 +95,7 @@ export async function expressiveCodeAssets(): Promise<{ styles: string; scripts:
 	return {
 		styles: `${r.baseStyles ?? ""}${r.themeStyles ?? ""}`,
 		scripts: (r.jsModules ?? [])
-			.map((m) => (typeof m === "string" ? m : m?.code ?? ""))
+			.map((m) => (typeof m === "string" ? m : (m?.code ?? "")))
 			.filter(Boolean),
 	};
 }

@@ -8,8 +8,8 @@
 // 没有接口化的必要；接口化的只有 solutions。
 export const prerender = false;
 
-import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { Icon } from "astro-icon/components";
 import { fetchSolutions, type PublicSolution } from "../../utils/practice-api";
 import { getPostUrlBySlug, url } from "../../utils/url-utils";
@@ -41,15 +41,15 @@ const grouped = [...groups.entries()]
 		postUrl: urlBySlug.get(postSlug) ?? null,
 		list: list.sort(
 			(a, b) =>
-				a.order - b.order ||
-				a.title.localeCompare(b.title, "zh-Hans-CN"),
+				a.order - b.order || a.title.localeCompare(b.title, "zh-Hans-CN"),
 		),
 	}))
 	.sort((a, b) => a.postTitle.localeCompare(b.postTitle, "zh-Hans-CN"));
 
 const total = solutions.length;
 
-const difficultyStyle = {
+// 显式声明成 Record：接口返回的 difficulty 是 string，不加索引签名 TS 会报 7053
+const difficultyStyle: Record<string, string> = {
 	简单: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
 	中等: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
 	困难: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
