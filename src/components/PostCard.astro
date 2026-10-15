@@ -7,6 +7,7 @@ import { i18n } from "../i18n/translation";
 import { getDir } from "../utils/url-utils";
 import ImageWrapper from "./misc/ImageWrapper.astro";
 import PostMetadata from "./PostMeta.astro";
+import ViewCount from "./ViewCount.astro";
 
 interface Props {
 	class?: string;
@@ -65,7 +66,7 @@ const { remarkPluginFrontmatter } = await entry.render();
         </div>
 
         <!-- word count and read time  -->
-        <div class="text-sm text-black/30 dark:text-white/30 flex gap-4 transition">
+        <div class="text-sm text-black/30 dark:text-white/30 flex gap-4 items-center transition">
             <div>
                 {remarkPluginFrontmatter.words} {" " + i18n(remarkPluginFrontmatter.words === 1 ? I18nKey.wordCount : I18nKey.wordsCount)}
             </div>
@@ -73,6 +74,9 @@ const { remarkPluginFrontmatter } = await entry.render();
             <div>
                 {remarkPluginFrontmatter.minutes} {" " + i18n(remarkPluginFrontmatter.minutes === 1 ? I18nKey.minuteCount : I18nKey.minutesCount)}
             </div>
+            <!-- 浏览数：一页里会有多张卡片，ViewCount 的脚本会把它们合并成一次批量请求 -->
+            <div>|</div>
+            <ViewCount slug={entry.slug} />
         </div>
 
     </div>

@@ -1,0 +1,96 @@
+---
+// 文章浏览数：icon + 数字。
+//
+// 用法：<ViewCount slug={post.slug} />（列表卡片）
+//      <ViewCount slug={post.slug} primary />（文章详情页，多传 primary 才会**上报**）
+//
+// 为什么是客户端取数，而不是构建期/服务端渲染：
+//   1) 博客是静态站，202 篇文章如果构建期查接口，构建就会依赖后端可用性 —— 后端抖动一下整站发不出去；
+//   2) 浏览数本身是**实时**数据，构建期固化的那一刻就已经旧了。
+// 客户端取数的代价只是数字晚到几十毫秒，正文完全不受影响（接口挂了也就是数字不显示）。
+//
+// ⚠️ 取不到数字时**绝不显示 0**：0 的语义是「确实没人看过」，和「还没拿到」是两回事。
+//    先渲染 0 再跳成真实值，看起来就像数据错乱 —— 所以这里是「拿到才显示」。
+//
+// ⚠️ 同一页多个 ViewCount 会合并成**一次**批量请求（见下面的脚本），别在组件里各发各的。
+import { Icon } from "astro-icon/components";
+
+interface Props {
+	slug: string;
+	/** 详情页传 true：会把这篇记为「看过一次」（列表页只是展示，不计） */
+	primary?: boolean;
+	class?: string;
+}
+
+const { slug, primary = false, class: className = "" } = Astro.props;
+---
+<span
+	class:list={["view-count inline-flex flex-row items-center gap-1 text-black/30 dark:text-white/30", className]}
+	data-view-slug={slug}
+	data-view-primary={primary ? "1" : undefined}
+	hidden
+>
+	<Icon name="material-symbols:visibility-outline-rounded" class="text-[0.95rem]" />
+	<span class="vc-num tabular-nums">·</span>
+</span>
+
+<script>
+	const API = "/api/blog/public";
+	const KEY = "notelab_blog_visitor";
+
+	/** 访客标识：localStorage 里的随机串。清掉就算新访客 —— 宁可多算，不做指纹识别那套。 */
+	function visitorId(): string {
+		try {
+			let v = localStorage.getItem(KEY);
+			if (!v) {
+				v = (crypto.randomUUID?.() ?? `${Date.now()}${Math.random().toString(36)}`).replace(/-/g, "");
+				localStorage.setItem(KEY, v);
+			}
+			return v;
+		} catch {
+			// 隐私模式 / 存储被禁：给个一次性 id，至少本次能计数（刷新会算新访客，可接受）
+			return `anon${Math.random().toString(36).slice(2).padEnd(12, "0")}`;
+		}
+	}
+
+	function paint(el: HTMLElement, n: number) {
+		const num = el.querySelector(".vc-num");
+		if (num) num.textContent = n.toLocaleString();
+		el.hidden = false;
+	}
+
+	const els = Array.from(document.querySelectorAll<HTMLElement>("[data-view-slug]"));
+	if (els.length > 0) {
+		const slugs = [...new Set(els.map((e) => e.dataset.viewSlug as string))];
+
+		// 1) 先取已有数字（整页合并成一次请求）
+		fetch(`${API}/views?slugs=${encodeURIComponent(slugs.join(","))}`)
+			.then((r) => r.json())
+			.then((d) => {
+				const map: Record<string, number> = d?.views ?? {};
+				for (const el of els) {
+					const n = map[el.dataset.viewSlug as string];
+					if (typeof n === "number") paint(el, n);
+					// 没有记录的（还没人看过）不显示：见文件头那条「不显示 0」
+				}
+			})
+			.catch(() => {});
+
+		// 2) 详情页额外上报一次
+		const primary = document.querySelector<HTMLElement>('[data-view-primary="1"]');
+		if (primary) {
+			const slug = primary.dataset.viewSlug as string;
+			fetch(`${API}/view`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ slug, visitorId: visitorId() }),
+			})
+				.then((r) => (r.ok ? r.json() : null))
+				.then((d) => {
+					// 返回的是**计数后**的值，直接用它更新，省掉再查一次
+					if (typeof d?.views === "number") paint(primary, d.views);
+				})
+				.catch(() => {});
+		}
+	}
+</script>

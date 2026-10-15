@@ -4,6 +4,7 @@ import I18nKey from "../i18n/i18nKey";
 import { i18n } from "../i18n/translation";
 import { formatDateToYYYYMMDD } from "../utils/date-utils";
 import { getCategoryUrl, getTagUrl } from "../utils/url-utils";
+import ViewCount from "./ViewCount.astro";
 
 interface Props {
 	class: string;
@@ -13,6 +14,10 @@ interface Props {
 	category: string | null;
 	hideTagsForMobile?: boolean;
 	hideUpdateDate?: boolean;
+	/** 传了才显示浏览数 —— 浏览数按 slug 统计，没有 slug 就没什么可查的 */
+	slug?: string;
+	/** 详情页传 true：把这篇记为「看过一次」。列表卡片不传（只是展示，不计） */
+	viewPrimary?: boolean;
 }
 const {
 	published,
@@ -21,6 +26,8 @@ const {
 	category,
 	hideTagsForMobile = false,
 	hideUpdateDate = false,
+	slug,
+	viewPrimary = false,
 } = Astro.props;
 const className = Astro.props.class;
 ---
@@ -79,4 +86,7 @@ const className = Astro.props.class;
             {!(tags && tags.length > 0) && <div class="transition text-50 text-sm font-medium">{i18n(I18nKey.noTags)}</div>}
         </div>
     </div>
+
+    <!-- 浏览数（客户端取数 —— 静态站构建期拿不到，见 ViewCount.astro 的说明） -->
+    {slug && <ViewCount slug={slug} primary={viewPrimary} />}
 </div>
