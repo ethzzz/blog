@@ -1,80 +1,91 @@
 ---
-import { getCollection } from "astro:content";
+// 单篇解答：**运行时**从 Notelab 接口取正文，再用与构建期同一套 markdown 管线渲染
+// （代码高亮 / 提示块 / 标题锚点都由 src/utils/runtime-markdown.ts 复刻，见那里为什么这么做）。
+//
+// 没有 getStaticPaths：这个路由是 prerender=false，任意 slug 都由请求时现取。
+export const prerender = false;
+
 import Markdown from "@components/misc/Markdown.astro";
 import I18nKey from "@i18n/i18nKey";
 import { i18n } from "@i18n/translation";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { Icon } from "astro-icon/components";
 import { profileConfig, siteConfig } from "../../config";
-import { formatDateToYYYYMMDD } from "../../utils/date-utils";
+import { fetchSolution } from "../../utils/practice-api";
+import { expressiveCodeAssets, renderMarkdown } from "../../utils/runtime-markdown";
 import { getPostUrlBySlug, url } from "../../utils/url-utils";
 
-export async function getStaticPaths() {
-	const solutions = await getCollection("solutions", ({ data }) => {
-		return import.meta.env.PROD ? data.draft !== true : true;
-	});
+const slug = Astro.params.slug ?? "";
 
-	// 同一篇原文下的解答按 order 排序，互相串成前后页
-	const byPost = new Map<string, typeof solutions>();
-	for (const s of solutions) {
-		const key = s.data.relatedPost;
-		const list = byPost.get(key) ?? [];
-		list.push(s);
-		byPost.set(key, list);
-	}
-	for (const list of byPost.values()) {
-		list.sort((a, b) => a.data.order - b.data.order);
-	}
-
-	return solutions.map((entry) => {
-		const siblings = byPost.get(entry.data.relatedPost) ?? [entry];
-		const idx = siblings.findIndex((s) => s.slug === entry.slug);
-		return {
-			params: { slug: entry.slug },
-			props: {
-				entry,
-				prev: idx > 0 ? siblings[idx - 1] : null,
-				next: idx < siblings.length - 1 ? siblings[idx + 1] : null,
-			},
-		};
-	});
+let entry = null;
+let apiError = "";
+try {
+	entry = await fetchSolution(slug);
+} catch (e) {
+	apiError = e instanceof Error ? e.message : String(e);
 }
+if (!entry && !apiError) Astro.response.status = 404; // 真·未发布/不存在 → 404（别让搜索引擎收录）
+if (apiError) Astro.response.status = 502;
 
-const { entry, prev, next } = Astro.props;
-const { Content, headings } = await entry.render();
-const { remarkPluginFrontmatter } = await entry.render();
+const rendered = entry ? await renderMarkdown(entry.content ?? "") : null;
+const ec = await expressiveCodeAssets();
 
-const relatedUrl = entry.data.relatedPost
-	? getPostUrlBySlug(entry.data.relatedPost)
-	: null;
+const prev = entry?.prev ?? null;
+const next = entry?.next ?? null;
+const relatedUrl = entry?.relatedPost ? getPostUrlBySlug(entry.relatedPost) : null;
 
 const difficultyStyle =
 	{
 		简单: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
 		中等: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
 		困难: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
-	}[entry.data.difficulty] ??
+	}[entry?.difficulty ?? ""] ??
 	"bg-[var(--btn-regular-bg)] text-[var(--btn-content)]";
 
-const jsonLd = {
+const jsonLd = entry ? {
 	"@context": "https://schema.org",
 	"@type": "TechArticle",
-	headline: entry.data.title,
-	description: entry.data.description || entry.data.title,
-	keywords: entry.data.tags,
+	headline: entry.title,
+	description: entry.description || entry.title,
+	keywords: entry.tags,
 	author: {
 		"@type": "Person",
 		name: profileConfig.name,
 		url: Astro.site,
 	},
-	datePublished: formatDateToYYYYMMDD(entry.data.published),
-	inLanguage: entry.data.lang
-		? entry.data.lang.replace("_", "-")
-		: siteConfig.lang.replace("_", "-"),
-};
+	datePublished: entry.published,
+	inLanguage: siteConfig.lang.replace("_", "-"),
+} : null;
 ---
-<MainGridLayout title={entry.data.title} description={entry.data.description} lang={entry.data.lang} setOGTypeArticle={true} headings={headings}>
-    <script is:inline slot="head" type="application/ld+json" set:html={JSON.stringify(jsonLd)}></script>
+<MainGridLayout
+    title={entry ? entry.title : apiError ? "解答暂时无法加载" : "没有这篇解答"}
+    description={entry ? entry.description : "这篇解答不存在或还没有发布"}
+    setOGTypeArticle={!!entry}
+    headings={rendered?.headings ?? []}
+>
+    {/* expressive-code 的样式/脚本：构建期由集成自动注入每个页面，运行时渲染的页面得自己带 */}
+    <style is:inline slot="head" set:html={ec.styles}></style>
+    {ec.scripts.map((code) => <script is:inline slot="head" set:html={code}></script>)}
+    {jsonLd && <script is:inline slot="head" type="application/ld+json" set:html={JSON.stringify(jsonLd)}></script>}
+
+    {!entry ? (
+        <div class="flex w-full rounded-[var(--radius-large)] overflow-hidden relative mb-4">
+            <div class="card-base z-10 px-6 md:px-9 pt-6 pb-8 relative w-full text-center">
+                <div class="transition w-full block font-bold mb-3 text-3xl md:text-[2.25rem]/[2.75rem] text-black/90 dark:text-white/90">
+                    {apiError ? "解答暂时无法加载" : "没有这篇解答"}
+                </div>
+                <div class="text-black/60 dark:text-white/60 mb-6">
+                    {apiError
+                        ? `解答服务没有响应（${apiError}），请稍后再试。`
+                        : "它可能还没有发布，或者地址拼错了。"}
+                </div>
+                <a href={url("/solutions/")} class="btn-regular rounded-lg px-4 py-2 font-bold active:scale-95">
+                    回到练习实践
+                </a>
+            </div>
+        </div>
+    ) : (
+    <>
     <div class="flex w-full rounded-[var(--radius-large)] overflow-hidden relative mb-4">
         <div id="post-container" class="card-base z-10 px-6 md:px-9 pt-6 pb-4 relative w-full">
 
@@ -93,19 +104,19 @@ const jsonLd = {
                     <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
                         <Icon name="material-symbols:notes-rounded"></Icon>
                     </div>
-                    <div class="text-sm">{remarkPluginFrontmatter.words} {" " + i18n(I18nKey.wordsCount)}</div>
+                    <div class="text-sm">{rendered!.words} {" " + i18n(I18nKey.wordsCount)}</div>
                 </div>
                 <div class="flex flex-row items-center">
                     <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
                         <Icon name="material-symbols:schedule-outline-rounded"></Icon>
                     </div>
                     <div class="text-sm">
-                        {remarkPluginFrontmatter.minutes} {" " + i18n(remarkPluginFrontmatter.minutes === 1 ? I18nKey.minuteCount : I18nKey.minutesCount)}
+                        {rendered!.minutes} {" " + i18n(rendered!.minutes === 1 ? I18nKey.minuteCount : I18nKey.minutesCount)}
                     </div>
                 </div>
                 <div class="flex flex-row items-center">
                     <span class:list={["text-xs px-2 py-0.5 rounded-md font-bold", difficultyStyle]}>
-                        {entry.data.difficulty}
+                        {entry.difficulty}
                     </span>
                 </div>
             </div>
@@ -120,14 +131,21 @@ const jsonLd = {
                     md:before:w-1 before:h-5 before:rounded-md before:bg-[var(--primary)]
                     before:absolute before:top-[0.75rem] before:left-[-1.125rem]
                 ">
-                    {entry.data.title}
+                    {entry.title}
                 </div>
+                {entry.tags.length > 0 && (
+                    <div class="flex flex-row flex-wrap gap-2 mb-2">
+                        {entry.tags.map((t: string) => (
+                            <span class="text-xs px-2 py-0.5 rounded-md bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">{t}</span>
+                        ))}
+                    </div>
+                )}
             </div>
 
             <div class="border-[var(--line-divider)] border-dashed border-b-[1px] mb-5"></div>
 
             <Markdown class="mb-6 markdown-content onload-animation">
-                <Content />
+                <Fragment set:html={rendered!.html} />
             </Markdown>
 
         </div>
@@ -139,7 +157,7 @@ const jsonLd = {
             {prev && <div class="btn-card rounded-2xl w-full h-[3.75rem] max-w-full px-4 flex items-center !justify-start gap-4">
                 <Icon name="material-symbols:chevron-left-rounded" class="text-[2rem] text-[var(--primary)]" />
                 <div class="overflow-hidden transition overflow-ellipsis whitespace-nowrap max-w-[calc(100%_-_3rem)] text-black/75 dark:text-white/75">
-                    {prev.data.title}
+                    {prev.title}
                 </div>
             </div>}
         </a>
@@ -148,11 +166,13 @@ const jsonLd = {
            class:list={["w-full font-bold overflow-hidden active:scale-95", {"pointer-events-none": !next}]}>
             {next && <div class="btn-card rounded-2xl w-full h-[3.75rem] max-w-full px-4 flex items-center !justify-end gap-4">
                 <div class="overflow-hidden transition overflow-ellipsis whitespace-nowrap max-w-[calc(100%_-_3rem)] text-black/75 dark:text-white/75">
-                    {next.data.title}
+                    {next.title}
                 </div>
                 <Icon name="material-symbols:chevron-right-rounded" class="text-[2rem] text-[var(--primary)]" />
             </div>}
         </a>
     </div>
+    </>
+    )}
 
 </MainGridLayout>

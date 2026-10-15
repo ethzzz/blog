@@ -1,34 +1,26 @@
+import node from "@astrojs/node";
 import sitemap from "@astrojs/sitemap";
 import svelte from "@astrojs/svelte";
 import tailwind from "@astrojs/tailwind";
-import { pluginCollapsibleSections } from "@expressive-code/plugin-collapsible-sections";
-import { pluginLineNumbers } from "@expressive-code/plugin-line-numbers";
 import swup from "@swup/astro";
 import expressiveCode from "astro-expressive-code";
 import icon from "astro-icon";
 import { defineConfig } from "astro/config";
-import rehypeAutolinkHeadings from "rehype-autolink-headings";
-import rehypeComponents from "rehype-components"; /* Render the custom directive content */
-import rehypeKatex from "rehype-katex";
-import rehypeSlug from "rehype-slug";
-import remarkDirective from "remark-directive"; /* Handle directives */
-import remarkGithubAdmonitionsToDirectives from "remark-github-admonitions-to-directives";
-import remarkMath from "remark-math";
-import remarkSectionize from "remark-sectionize";
-import { expressiveCodeConfig } from "./src/config.ts";
-import { pluginLanguageBadge } from "./src/plugins/expressive-code/language-badge.ts";
-import { AdmonitionComponent } from "./src/plugins/rehype-component-admonition.mjs";
-import { GithubCardComponent } from "./src/plugins/rehype-component-github-card.mjs";
-import { parseDirectiveNode } from "./src/plugins/remark-directive-rehype.js";
-import { remarkExcerpt } from "./src/plugins/remark-excerpt.js";
-import { remarkReadingTime } from "./src/plugins/remark-reading-time.mjs";
-import { pluginCustomCopyButton } from "./src/plugins/expressive-code/custom-copy-button.js";
+import { expressiveCodeOptions } from "./src/expressive-code-config.ts";
+import { rehypePlugins, remarkPlugins } from "./src/markdown-plugins.ts";
 
 // https://astro.build/config
 export default defineConfig({
 	site: "https://haolo.cloud",
 	base: "/blog",
 	trailingSlash: "always",
+	// 混合渲染（hybrid）：整站仍是静态产物（默认 prerender=true），
+	// 只有 src/pages/solutions/ 下的两个页面显式 `export const prerender = false`。
+	// 为什么必须这样：解答内容改由数据库（Notelab 的 /api/practice/public/**）供给，
+	// 后台发布后要**立刻**可见 —— 构建期固化成 HTML 就必然要重建+重新部署。
+	// ⚠️ adapter 是「有页面要运行时渲染」的前提，没有它 `prerender = false` 直接报错。
+	//    standalone 模式产出 dist/server/entry.mjs，由 pm2 直接 node 起来（见 ops 部署脚本）。
+	adapter: node({ mode: "standalone" }),
 	integrations: [
 		tailwind({
 			nesting: true,
@@ -54,103 +46,16 @@ export default defineConfig({
 				"fa6-solid": ["*"],
 			},
 		}),
-		expressiveCode({
-			themes: [expressiveCodeConfig.theme, expressiveCodeConfig.theme],
-			plugins: [
-				pluginCollapsibleSections(),
-				pluginLineNumbers(),
-				pluginLanguageBadge(),
-				pluginCustomCopyButton()
-			],
-			defaultProps: {
-				wrap: true,
-				overridesByLang: {
-					'shellsession': {
-						showLineNumbers: false,
-					},
-				},
-			},
-			styleOverrides: {
-				codeBackground: "var(--codeblock-bg)",
-				borderRadius: "0.75rem",
-				borderColor: "none",
-				codeFontSize: "0.875rem",
-				codeFontFamily: "'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-				codeLineHeight: "1.5rem",
-				frames: {
-					editorBackground: "var(--codeblock-bg)",
-					terminalBackground: "var(--codeblock-bg)",
-					terminalTitlebarBackground: "var(--codeblock-topbar-bg)",
-					editorTabBarBackground: "var(--codeblock-topbar-bg)",
-					editorActiveTabBackground: "none",
-					editorActiveTabIndicatorBottomColor: "var(--primary)",
-					editorActiveTabIndicatorTopColor: "none",
-					editorTabBarBorderBottomColor: "var(--codeblock-topbar-bg)",
-					terminalTitlebarBorderBottomColor: "none"
-				},
-				textMarkers: {
-					delHue: 0,
-					insHue: 180,
-					markHue: 250
-				}
-			},
-			frames: {
-				showCopyToClipboardButton: false,
-			}
-		}),
+		// ⚠️ 配置在 src/expressive-code-config.ts —— 运行时渲染（src/utils/runtime-markdown.ts）
+		// 用的是同一份，两处漂移会导致「静态页的代码块与解答页不一样」。
+		expressiveCode(expressiveCodeOptions),
         svelte(),
 		sitemap(),
 	],
+	// ⚠️ 插件清单在 src/markdown-plugins.ts —— 同样被运行时渲染复用，别在这里写第二份。
 	markdown: {
-		remarkPlugins: [
-			remarkMath,
-			remarkReadingTime,
-			remarkExcerpt,
-			remarkGithubAdmonitionsToDirectives,
-			remarkDirective,
-			remarkSectionize,
-			parseDirectiveNode,
-		],
-		rehypePlugins: [
-			rehypeKatex,
-			rehypeSlug,
-			[
-				rehypeComponents,
-				{
-					components: {
-						github: GithubCardComponent,
-						note: (x, y) => AdmonitionComponent(x, y, "note"),
-						tip: (x, y) => AdmonitionComponent(x, y, "tip"),
-						important: (x, y) => AdmonitionComponent(x, y, "important"),
-						caution: (x, y) => AdmonitionComponent(x, y, "caution"),
-						warning: (x, y) => AdmonitionComponent(x, y, "warning"),
-					},
-				},
-			],
-			[
-				rehypeAutolinkHeadings,
-				{
-					behavior: "append",
-					properties: {
-						className: ["anchor"],
-					},
-					content: {
-						type: "element",
-						tagName: "span",
-						properties: {
-							className: ["anchor-icon"],
-							"data-pagefind-ignore": true,
-						},
-						children: [
-							{
-								type: "text",
-								value: "#",
-							},
-						],
-					},
-				},
-			],
-		],
+		remarkPlugins,
+		rehypePlugins,
 	},
 	vite: {
 		build: {

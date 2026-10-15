@@ -1,21 +1,34 @@
 ---
-import { getCollection } from "astro:content";
+// 解答清单：**运行时**从 Notelab 接口取（不再是 getCollection）。
+//
+// 为什么：解答在 Notelab 后台写、后台发布，博客只做呈现。走接口后「发布 → 刷新即见」，
+// 不需要重建博客、也不需要等 CI（此前那条路要 push 博客仓 + GitHub Actions 构建，3–5 分钟）。
+//
+// ⚠️ 路线文章的标题仍取本地内容集合 posts —— posts 是静态写作内容，
+// 没有接口化的必要；接口化的只有 solutions。
+export const prerender = false;
+
 import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getCollection } from "astro:content";
 import { Icon } from "astro-icon/components";
+import { fetchSolutions, type PublicSolution } from "../../utils/practice-api";
 import { getPostUrlBySlug, url } from "../../utils/url-utils";
 
-const solutions = await getCollection("solutions", ({ data }) => {
-	return import.meta.env.PROD ? data.draft !== true : true;
-});
+let solutions: PublicSolution[] = [];
+let apiError = "";
+try {
+	solutions = await fetchSolutions();
+} catch (e) {
+	apiError = e instanceof Error ? e.message : String(e);
+}
+
 const posts = await getCollection("posts");
 const titleBySlug = new Map(posts.map((p) => [p.slug, p.data.title]));
 const urlBySlug = new Map(posts.map((p) => [p.slug, getPostUrlBySlug(p.slug)]));
 
-type SolutionEntry = (typeof solutions)[number];
-
-const groups = new Map<string, SolutionEntry[]>();
+const groups = new Map<string, PublicSolution[]>();
 for (const s of solutions) {
-	const key = s.data.relatedPost || "__standalone__";
+	const key = s.relatedPost || "__standalone__";
 	const list = groups.get(key) ?? [];
 	list.push(s);
 	groups.set(key, list);
@@ -28,8 +41,8 @@ const grouped = [...groups.entries()]
 		postUrl: urlBySlug.get(postSlug) ?? null,
 		list: list.sort(
 			(a, b) =>
-				a.data.order - b.data.order ||
-				a.data.title.localeCompare(b.data.title, "zh-Hans-CN"),
+				a.order - b.order ||
+				a.title.localeCompare(b.title, "zh-Hans-CN"),
 		),
 	}))
 	.sort((a, b) => a.postTitle.localeCompare(b.postTitle, "zh-Hans-CN"));
@@ -56,6 +69,16 @@ const difficultyStyle = {
                 <div class="border-[var(--line-divider)] border-dashed border-b-[1px] mb-5"></div>
             </div>
 
+            {apiError && (
+                <div class="mb-4 px-4 py-3 rounded-lg bg-[var(--btn-regular-bg)] text-sm text-black/60 dark:text-white/60">
+                    解答列表暂时拉不到：{apiError}
+                </div>
+            )}
+
+            {total === 0 && !apiError && (
+                <div class="py-10 text-center text-sm text-black/40 dark:text-white/40">还没有已发布的解答</div>
+            )}
+
             <div class="flex flex-col gap-6 onload-animation">
                 {grouped.map((g) => (
                     <div class="card-base !bg-transparent p-4">
@@ -74,10 +97,10 @@ const difficultyStyle = {
                             {g.list.map((s) => (
                                 <a href={url(`/solutions/${s.slug}/`)}
                                    class="flex flex-row items-center gap-3 px-3 py-2 rounded-lg transition hover:bg-[var(--btn-regular-bg)] active:scale-95">
-                                    <span class="text-sm text-black/30 dark:text-white/30 w-6 shrink-0 text-right">{s.data.order || "-"}</span>
-                                    <span class="flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{s.data.title}</span>
-                                    <span class:list={["text-xs px-2 py-0.5 rounded-md shrink-0", difficultyStyle[s.data.difficulty] ?? difficultyStyle["中等"]]}>
-                                        {s.data.difficulty}
+                                    <span class="text-sm text-black/30 dark:text-white/30 w-6 shrink-0 text-right">{s.order || "-"}</span>
+                                    <span class="flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{s.title}</span>
+                                    <span class:list={["text-xs px-2 py-0.5 rounded-md shrink-0", difficultyStyle[s.difficulty] ?? difficultyStyle["中等"]]}>
+                                        {s.difficulty}
                                     </span>
                                 </a>
                             ))}

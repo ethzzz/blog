@@ -6,6 +6,11 @@ on:
   workflow_dispatch:
 
 # 同一时间只允许一个部署，避免并发覆盖
+# ⚠️ cancel-in-progress: false 意味着「一个卡住会阻塞后面所有部署」——
+#    GitHub runner → 服务器 22 端口的 scp 是间歇性不通的（实测卡在 Upload 那步 8 分钟以上，
+#    而服务器 /tmp/blog-deploy 根本没被创建、load 只有 0.05）。
+#    真卡住时到 Actions 页面取消，然后用服务器本地部署兜底：
+#      ssh myapp 'bash /root/blog-src/ops/deploy-ssr.sh'
 concurrency:
   group: deploy-blog
   cancel-in-progress: false
@@ -38,35 +43,59 @@ jobs:
       - name: Build site (astro build + pagefind)
         run: npm run build
 
+      # 加了 @astrojs/node adapter 后产物分成两份：
+      #   dist/client/ = 整站静态文件（nginx 直接发）
+      #   dist/server/ = 只有 solutions 两个页面的 SSR 产物（由 pm2 的 notelab-blog-ssr 跑）
       - name: Upload dist to server (staging)
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          source: "dist/*"
+          source: "dist/client/*,dist/server/*"
           target: "/tmp/blog-deploy"
 
-      - name: Publish to /var/www/blog and verify
+      - name: Publish to /var/www/blog, refresh SSR, verify
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            # scp-action 可能把 dist 内容物放到 /tmp/blog-deploy/dist 或 /tmp/blog-deploy，统一展平
-            if [ -d /tmp/blog-deploy/dist ]; then SRC=/tmp/blog-deploy/dist; else SRC=/tmp/blog-deploy; fi
-            # 清空旧产物（含隐藏文件），再整体覆盖，避免 stale 文件残留
+            set -e
+            # scp-action 可能把内容放到 /tmp/blog-deploy/dist/... 或 /tmp/blog-deploy/...，统一展平
+            if [ -d /tmp/blog-deploy/dist/client ]; then SRC=/tmp/blog-deploy/dist; else SRC=/tmp/blog-deploy; fi
+
+            # 静态产物：清空旧产物（含隐藏文件）再整体覆盖，避免 stale 文件残留
+            # ⚠️ 复制的是 client/，不是整个 dist —— dist 根下可能残留上一次 static 构建的旧页面
             find /var/www/blog -mindepth 1 -delete
-            cp -r "$SRC/." /var/www/blog/
+            cp -r "$SRC/client/." /var/www/blog/
             chown -R root:www-data /var/www/blog
             chmod -R 755 /var/www/blog
+
+            # SSR 产物：进程从 /root/blog-src/dist/server 启动（见 ops/deploy-ssr.sh）
+            mkdir -p /root/blog-src/dist/server
+            cp -r "$SRC/server/." /root/blog-src/dist/server/
+            # start-or-restart：首次部署时进程还不存在（CI 也可能先于 ops/deploy-ssr.sh 跑）
+            if pm2 describe notelab-blog-ssr >/dev/null 2>&1; then
+              pm2 restart notelab-blog-ssr --update-env
+            else
+              PORT=3012 HOST=127.0.0.1 pm2 start /root/blog-src/dist/server/entry.mjs \
+                --name notelab-blog-ssr --cwd /root/blog-src
+              pm2 save
+            fi
+
             rm -rf /tmp/blog-deploy
             echo "==> verify HTTP status (nginx 80 端口无条件 301 到 https，故直连本地 443 校验)"
             fail=0
-            for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml /blog/typescript-roadmap/ /blog/python-roadmap/; do
+            for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml /blog/typescript-roadmap/; do
               code=$(curl -s -o /dev/null -w '%{http_code}' --resolve haolo.cloud:443:127.0.0.1 "https://haolo.cloud$p")
               echo "$p -> $code"
               [ "$code" = "200" ] || fail=1
             done
+            # solutions 单独判：它依赖 nginx 已把该前缀反代给 SSR 进程（那是 ops/nginx-blog-ssr.sh
+            # 的职责，与「发个版」是两件事）。没配好时只警告，别让部署因为另一件事而失败。
+            code=$(curl -s -o /dev/null -w '%{http_code}' --resolve haolo.cloud:443:127.0.0.1 "https://haolo.cloud/blog/solutions/")
+            echo "/blog/solutions/ -> $code"
+            [ "$code" = "200" ] || echo "::warning::/blog/solutions/ 不是 200 —— 检查 nginx 反代：bash /root/blog-src/ops/nginx-blog-ssr.sh"
             if [ $fail -eq 0 ]; then echo "ALL ROUTES OK"; else echo "SOME ROUTES FAILED"; exit 1; fi
