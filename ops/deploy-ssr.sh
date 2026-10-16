@@ -84,14 +84,15 @@ for i in $(seq 1 20); do
   [ "$i" = "20" ] && { echo "  ❌ SSR 进程没起来（最后状态码 $code）"; pm2 logs "$SSR_NAME" --lines 20 --nostream; exit 1; }
 done
 
-echo "==> 6/6 搜索索引：把**已发布解答**并回去"
-# 为什么每次部署都要跑：上面的 `npm run build` 里含 `pagefind --site dist/client`，
-# 而解答页是运行时渲染（不在 dist/client 里）→ **构建一次就把题解从索引里抹掉**。
-# 所以索引的完整形态 = 构建期静态页 + 这一步抓的解答页；少跑这一步，题解就搜不到。
+echo "==> 6/6 搜索索引 + sitemap：把**已发布解答**并回去"
+# 为什么每次部署都要跑：上面的 `npm run build` 里含 `pagefind --site dist/client`（搜索索引）
+# 与 @astrojs/sitemap（只枚举预渲染路由）—— 两者都**不知道运行时渲染的解答页**，
+# 所以构建一次就把题解从索引与 sitemap 里一起抹掉。
+# 完整形态 = 构建期静态页 + 这一步抓的解答页；少跑这一步，题解就搜不到、也进不了 sitemap。
 # ⚠️ REINDEX_LOCK=0：本脚本已持有部署锁，让子脚本别再抢同一把锁（否则互等到死锁）。
-# ⚠️ 刻意不 fail-fast：索引没建成不影响站点本身，只影响题解能不能被搜到。
-REINDEX_LOCK=0 bash "$REPO/ops/reindex-search.sh" \
-  || echo "  ⚠️ 搜索索引重建失败：站点本身没事，只是题解搜不到（可手动跑 ops/reindex-search.sh）"
+# ⚠️ 刻意不 fail-fast：索引没建成不影响站点本身，只影响题解能不能被搜到/被发现。
+REINDEX_LOCK=0 bash "$REPO/ops/refresh-indexes.sh" \
+  || echo "  ⚠️ 索引/sitemap 重建失败：站点本身没事，只是题解搜不到（可手动跑 ops/refresh-indexes.sh）"
 
 echo
 echo "完成。若 /blog/solutions/ 在公网仍 404，说明 nginx 还没把该前缀反代给本进程："
