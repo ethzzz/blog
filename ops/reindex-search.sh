@@ -49,6 +49,8 @@ rm -rf "$TMP"
 cp -al "$SRC" "$TMP"
 
 echo "==> 3/5 抓解答的 SSR HTML 进副本"
+# 自检判据要用的基线：静态产物里**带 data-pagefind-body** 的页数（pagefind 只索引这类页）
+STATIC_TAGGED=$(grep -rl 'data-pagefind-body' "$SRC" --include='*.html' 2>/dev/null | wc -l)
 GOT=0
 while read -r slug; do
 	[ -n "$slug" ] || continue
@@ -70,8 +72,23 @@ echo "  抓到 $GOT 篇"
 
 echo "==> 4/5 跑 pagefind（输出到副本的 pagefind-new，避免就地改硬链接的文件）"
 cd "$REPO"
-npx --no-install pagefind --site "$TMP" --output-subdir pagefind-new 2>&1 | tail -14
+if ! npx --no-install pagefind --site "$TMP" --output-subdir pagefind-new > "$TMP/pagefind.log" 2>&1; then
+	echo "❌ pagefind 失败："; tail -20 "$TMP/pagefind.log"; exit 1
+fi
+tail -10 "$TMP/pagefind.log"
 [ -f "$TMP/pagefind-new/pagefind.js" ] || { echo "❌ 没生成 pagefind.js，放弃"; exit 1; }
+
+# 自检①：页数必须 ≥「静态里带标记的页数 + 抓到的解答数」。
+# ⚠️ 别用 `grep 索引目录里的 slug` 做判据 —— pagefind 的索引是压缩/编码过的，
+#    题解**在索引里**也 grep 不到（2026-10-16 实测：页数 203→209 说明成功，grep 却零命中，
+#    差点把一次成功判成失败）。页数才是可靠信号。
+INDEXED=$(grep -oE 'Indexed [0-9]+ pages' "$TMP/pagefind.log" | grep -oE '[0-9]+' | head -1)
+NEED=$((STATIC_TAGGED + GOT))
+echo "  索引页数=$INDEXED（静态带标记 $STATIC_TAGGED + 解答 $GOT = 期望 ≥ $NEED）"
+if [ "${INDEXED:-0}" -lt "$NEED" ]; then
+	echo "❌ 索引页数不足，说明解答没被索引进去（不动线上索引）"
+	exit 1
+fi
 
 echo "==> 5/5 原子换入线上索引"
 rm -rf "$WEB/.pagefind-new" "$WEB/pagefind.old"
@@ -83,18 +100,21 @@ chown -R root:www-data "$WEB/pagefind"
 chmod -R 755 "$WEB/pagefind"
 echo "  ✅ $(du -sh "$WEB/pagefind" | cut -f1) 已换入"
 
-echo "==> 自检：抽查抽查前 3 篇解答是否真的进了索引"
+echo "==> 自检②：索引里确实有解答页（看 pagefind-entry.json 的页数并抽查抓取结果）"
+if [ -f "$WEB/pagefind/pagefind-entry.json" ]; then
+	echo "  线上 pagefind-entry.json: $(head -c 200 "$WEB/pagefind/pagefind-entry.json")"
+fi
 BAD=0
 while read -r slug; do
 	[ -n "$slug" ] || continue
-	if grep -rq "$slug" "$WEB/pagefind" 2>/dev/null; then
-		echo "  ✓ $slug"
+	if [ -s "$TMP/solutions/$slug/index.html" ]; then
+		echo "  ✓ 抓到了 $slug 的 HTML（已交给 pagefind；内容级验证见搜索实测）"
 	else
-		echo "  ✗ $slug 不在索引里"
+		echo "  ✗ $slug 的 HTML 不在副本里"
 		BAD=1
 	fi
 done < <(sed -n '1,3p' "$TMP.slugs")
-[ "$BAD" = "0" ] || { echo "❌ 自检失败：解答没进索引"; exit 1; }
+[ "$BAD" = "0" ] || { echo "❌ 自检失败"; exit 1; }
 
 rm -rf "$TMP"
 echo "完成：已发布解答已进入站内搜索索引（不需要重建整站）"
