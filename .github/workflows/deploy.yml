@@ -18,6 +18,14 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # ⚠️ 必须设超时：GitHub 默认 job 超时是 **6 小时**，配合上面的 cancel-in-progress: false，
+    #    一次真卡住会把后面所有部署排队堵住半天（2026-10-14 实测过这种堵法）。
+    # 为什么是 35 而不是 10：**上传步骤本身就慢**。2026-10-16 读 Actions API 逐步骤实测：
+    #    成功的运行里 `Upload dist to server` 要 11.5 / 11.7 / 12.8 / 12.8 / 13.1 / 21.6 / 24.9 分钟，
+    #    失败那次卡到 25.6 分钟才报错 —— 定 10 分钟会把本来能成的部署全部杀掉。
+    #    35 = 已观测最慢成功（24.9）+ 约 40% 余量。真要下调，先回去看那几个数。
+    # 另：admin 侧发布已改走服务器本地构建（实测 80 秒），CI 只负责仓库侧提交。
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v4
