@@ -10,20 +10,36 @@
 const BASE = process.env.NOTELAB_API ?? process.env.PRACTICE_API ?? "http://127.0.0.1:8001";
 
 export type DraftPreview = {
+	/** post（博客文章）或 solution（练习解答）—— 决定用哪套布局渲染 */
+	kind: string;
 	title: string;
 	description: string;
 	tags: string[];
 	category: string;
 	draft: boolean;
 	published: string;
+	/** 仅解答用 */
+	difficulty: string;
+	/** 仅解答用：关联的路线文章 slug（解答页据此显示「返回原题」） */
+	relatedPost: string;
 	body: string;
 	slug: string;
 };
 
-/** 取一份预览草稿。token 不存在/已过期 → null（页面据此说「预览已过期」，不当异常）。 */
-export async function fetchPreview(token: string): Promise<DraftPreview | null> {
+/**
+ * 取一份预览内容。token 不存在/已过期 → null（页面据此说「预览已过期」，不当异常）。
+ *
+ * ⚠️ `expectKind` 不符也当作 null：文章与解答是**两条**预览路由，各认自己的类型。
+ * 拿文章 token 去解答路由渲染会出一张字段不全的页，不如 404 干脆。
+ */
+export async function fetchPreview(
+	token: string,
+	expectKind: "post" | "solution" = "post",
+): Promise<DraftPreview | null> {
 	const res = await fetch(`${BASE}/api/blog/preview/${encodeURIComponent(token)}`);
 	if (res.status === 404) return null;
 	if (!res.ok) throw new Error(`预览接口返回 HTTP ${res.status}`);
-	return (await res.json()) as DraftPreview;
+	const data = (await res.json()) as DraftPreview;
+	if (data.kind && data.kind !== expectKind) return null;
+	return data;
 }

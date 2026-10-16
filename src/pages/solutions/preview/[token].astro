@@ -1,0 +1,145 @@
+---
+// 练习解答预览（`/blog/solutions/preview/<token>/`）：正文**运行时**从 Notelab 取
+// （记录里的解答，可能还没发布），用与线上解答页**同一套布局 + 同一套 markdown 管线**渲染。
+//
+// 为什么与文章预览是两条路由：解答页的布局本来就不一样（难度徽章、「返回原题」链接、没有发布日期/分类），
+// 硬塞进一个路由会让两边都变脏。两条路由各认自己的 kind（见 notelab-preview-api.ts），
+// token 也不能跨类型用。
+//
+// ⚠️ 预览的是**未发布内容**：授权手段只有不可猜的 token（java 侧 128 位随机 + 30 分钟 TTL），
+//    所以必须 noindex。
+// ⚠️ 内链与插图：正文里若有插图，URL 是 B 端受登录保护的 `/api/practice/images/{id}` ——
+//    预览 iframe 与后台同源，浏览器会带上会话，所以**未发布的图也能显示**；
+//    公开解答页走的是另一条匿名出口（`/api/practice/public/images/<公开名>`）。
+export const prerender = false;
+
+import Markdown from "@components/misc/Markdown.astro";
+import I18nKey from "@i18n/i18nKey";
+import { i18n } from "@i18n/translation";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { Icon } from "astro-icon/components";
+import { fetchPreview } from "../../../utils/notelab-preview-api";
+import { expressiveCodeAssets, renderMarkdown } from "../../../utils/runtime-markdown";
+import { getPostUrlBySlug } from "../../../utils/url-utils";
+
+const token = Astro.params.token ?? "";
+
+let entry = null;
+let apiError = "";
+try {
+	entry = await fetchPreview(token, "solution");
+} catch (e) {
+	apiError = e instanceof Error ? e.message : String(e);
+}
+if (!entry && !apiError) Astro.response.status = 404; // 过期/不存在/类型不符 → 404
+if (apiError) Astro.response.status = 502;
+
+const rendered = entry ? await renderMarkdown(entry.body ?? "") : null;
+const ec = await expressiveCodeAssets();
+const relatedUrl = entry?.relatedPost ? getPostUrlBySlug(entry.relatedPost) : null;
+
+const difficultyStyle =
+	{
+		简单: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
+		中等: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
+		困难: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
+	}[entry?.difficulty ?? ""] ?? "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]";
+---
+
+<MainGridLayout
+    title={entry ? `预览：${entry.title}` : apiError ? "预览暂时无法加载" : "预览已过期"}
+    description={entry?.description || "未发布解答的预览"}
+    headings={rendered?.headings ?? []}
+>
+    <meta slot="head" name="robots" content="noindex,nofollow" />
+    {/* expressive-code 的样式/脚本：构建期由集成注入每个页面，运行时渲染的页面得自己带 */}
+    <style is:inline slot="head" set:html={ec.styles}></style>
+    {ec.scripts.map((code) => <script is:inline slot="head" set:html={code}></script>)}
+
+    {/* 预览徽标 —— 唯一与线上不同的可见元素，且刻意放在卡片**之外** */}
+    <div class="flex items-center gap-2 mb-3 px-1 text-sm">
+        <Icon name="material-symbols:visibility-outline-rounded" class="text-[1.25rem] text-[var(--primary)]"></Icon>
+        <span class="font-bold text-[var(--primary)]">预览</span>
+        <span class="text-black/50 dark:text-white/50">未发布的解答 · 渲染与线上解答页一致</span>
+    </div>
+
+    {!entry ? (
+        <div class="flex w-full rounded-[var(--radius-large)] overflow-hidden relative mb-4">
+            <div class="card-base z-10 px-6 md:px-9 pt-6 pb-8 relative w-full text-center">
+                <div class="transition w-full block font-bold mb-3 text-3xl md:text-[2.25rem]/[2.75rem] text-black/90 dark:text-white/90">
+                    {apiError ? "预览暂时无法加载" : "预览已过期"}
+                </div>
+                <div class="text-black/60 dark:text-white/60 mb-6">
+                    {apiError
+                        ? `预览服务没有响应（${apiError}），请稍后再试。`
+                        : "预览只保留 30 分钟。回后台重新点一次「博客预览」即可拿到新地址。"}
+                </div>
+            </div>
+        </div>
+    ) : (
+    <div class="flex w-full rounded-[var(--radius-large)] overflow-hidden relative mb-4">
+        <div id="post-container" class="card-base z-10 px-6 md:px-9 pt-6 pb-4 relative w-full">
+
+            {/* 返回原题（与线上解答页同一处、同一文案） */}
+            {relatedUrl && (
+                <a href={relatedUrl}
+                   class="inline-flex flex-row items-center gap-2 mb-4 text-sm font-bold text-[var(--primary)] transition active:scale-95">
+                    <Icon name="material-symbols:chevron-left-rounded" class="text-[1.25rem]" />
+                    返回原题与练习清单
+                </a>
+            )}
+
+            {/* word count and reading time + 难度（与线上解答页同一行） */}
+            <div class="flex flex-row text-black/30 dark:text-white/30 gap-5 mb-3 transition onload-animation">
+                <div class="flex flex-row items-center">
+                    <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
+                        <Icon name="material-symbols:notes-rounded"></Icon>
+                    </div>
+                    <div class="text-sm">{rendered!.words} {" " + i18n(I18nKey.wordsCount)}</div>
+                </div>
+                <div class="flex flex-row items-center">
+                    <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
+                        <Icon name="material-symbols:schedule-outline-rounded"></Icon>
+                    </div>
+                    <div class="text-sm">
+                        {rendered!.minutes} {" " + i18n(rendered!.minutes === 1 ? I18nKey.minuteCount : I18nKey.minutesCount)}
+                    </div>
+                </div>
+                <div class="flex flex-row items-center">
+                    <span class:list={["text-xs px-2 py-0.5 rounded-md font-bold", difficultyStyle]}>
+                        {entry.difficulty || "中等"}
+                    </span>
+                </div>
+            </div>
+
+            {/* title */}
+            <div class="relative onload-animation">
+                <div
+                    class="transition w-full block font-bold mb-3
+                    text-3xl md:text-[2.25rem]/[2.75rem]
+                    text-black/90 dark:text-white/90
+                    md:before:w-1 before:h-5 before:rounded-md before:bg-[var(--primary)]
+                    before:absolute before:top-[0.75rem] before:left-[-1.125rem]
+                ">
+                    {entry.title}
+                </div>
+                {entry.tags.length > 0 && (
+                    <div class="flex flex-row flex-wrap gap-2 mb-2">
+                        {entry.tags.map((t: string) => (
+                            <span class="text-xs px-2 py-0.5 rounded-md bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">{t}</span>
+                        ))}
+                    </div>
+                )}
+            </div>
+
+            <div class="border-[var(--line-divider)] border-dashed border-b-[1px] mb-5"></div>
+
+            <Markdown class="mb-6 markdown-content onload-animation">
+                <Fragment set:html={rendered!.html} />
+            </Markdown>
+
+        </div>
+    </div>
+    )}
+
+</MainGridLayout>
