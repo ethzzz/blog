@@ -51,19 +51,18 @@ jobs:
       - name: Build site (astro build + pagefind)
         run: npm run build
 
-      # 加了 @astrojs/node adapter 后产物分成两份：
-      #   dist/client/ = 整站静态文件（nginx 直接发）
-      #   dist/server/ = 只有 solutions 两个页面的 SSR 产物（由 pm2 的 notelab-blog-ssr 跑）
-      - name: Upload dist to server (staging)
-        uses: appleboy/scp-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: root
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          source: "dist/client/*,dist/server/*"
-          target: "/tmp/blog-deploy"
-
-      - name: Publish to /var/www/blog, refresh SSR, verify
+      # ⚠️ 这里**不再把 runner 的产物 scp 到服务器**（2026-10-16 改）。
+      #
+      # 为什么：CI 运行会排队，而上传实测要 11–25 分钟 —— 也就是说「这一版产物」来自十来分钟前的
+      # 某个提交。把它复制到服务器，等于把线上**回退**到那一版。这不是理论风险，实测发生过：
+      # 一次 CI 发布把 /root/blog-src/dist/server 覆盖成 /home/runner/... 的构建（manifest 里的
+      # 路径就是证据），刚上线的 /blog/preview 路由当场消失；同样地，它也会静默盖掉后台刚发布的文章。
+      #
+      # 现在的分工：runner 上只做「这一版内容能不能构建」的校验（上面那步，快且不碰生产）；
+      # 发布统一交给**服务器上的构建脚本** —— 它先 `git pull` 到最新 origin/main 再构建发布，
+      # 与后台「发布并部署」走同一条路，因此永远不会发布一个不对应当前提交的产物。
+      # 服务器那侧还有 flock（ops/deploy-ssr.sh 开头）把多个触发者排成一队。
+      - name: Deploy on server (same build path as the admin backend)
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -71,39 +70,22 @@ jobs:
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
             set -e
-            # scp-action 可能把内容放到 /tmp/blog-deploy/dist/... 或 /tmp/blog-deploy/...，统一展平
-            if [ -d /tmp/blog-deploy/dist/client ]; then SRC=/tmp/blog-deploy/dist; else SRC=/tmp/blog-deploy; fi
+            bash /root/blog-src/ops/deploy-ssr.sh
 
-            # 静态产物：清空旧产物（含隐藏文件）再整体覆盖，避免 stale 文件残留
-            # ⚠️ 复制的是 client/，不是整个 dist —— dist 根下可能残留上一次 static 构建的旧页面
-            find /var/www/blog -mindepth 1 -delete
-            cp -r "$SRC/client/." /var/www/blog/
-            chown -R root:www-data /var/www/blog
-            chmod -R 755 /var/www/blog
-
-            # SSR 产物：进程从 /root/blog-src/dist/server 启动（见 ops/deploy-ssr.sh）
-            mkdir -p /root/blog-src/dist/server
-            cp -r "$SRC/server/." /root/blog-src/dist/server/
-            # start-or-restart：首次部署时进程还不存在（CI 也可能先于 ops/deploy-ssr.sh 跑）
-            if pm2 describe notelab-blog-ssr >/dev/null 2>&1; then
-              pm2 restart notelab-blog-ssr --update-env
-            else
-              PORT=3012 HOST=127.0.0.1 pm2 start /root/blog-src/dist/server/entry.mjs \
-                --name notelab-blog-ssr --cwd /root/blog-src
-              pm2 save
-            fi
-
-            rm -rf /tmp/blog-deploy
             echo "==> verify HTTP status (nginx 80 端口无条件 301 到 https，故直连本地 443 校验)"
             fail=0
-            for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml /blog/typescript-roadmap/; do
+            for p in /blog/ /blog/archive/ /blog/about/ /blog/rss.xml; do
               code=$(curl -s -o /dev/null -w '%{http_code}' --resolve haolo.cloud:443:127.0.0.1 "https://haolo.cloud$p")
               echo "$p -> $code"
               [ "$code" = "200" ] || fail=1
             done
-            # solutions 单独判：它依赖 nginx 已把该前缀反代给 SSR 进程（那是 ops/nginx-blog-ssr.sh
-            # 的职责，与「发个版」是两件事）。没配好时只警告，别让部署因为另一件事而失败。
-            code=$(curl -s -o /dev/null -w '%{http_code}' --resolve haolo.cloud:443:127.0.0.1 "https://haolo.cloud/blog/solutions/")
-            echo "/blog/solutions/ -> $code"
-            [ "$code" = "200" ] || echo "::warning::/blog/solutions/ 不是 200 —— 检查 nginx 反代：bash /root/blog-src/ops/nginx-blog-ssr.sh"
+            # solutions / preview 单独判：它们依赖 nginx 已把前缀反代给 SSR 进程（那是
+            # ops/nginx-blog-ssr.sh 的职责，与「发个版」是两件事）。没配好时只警告。
+            for p in /blog/solutions/ /blog/preview/00000000000000000000000000000000/; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --resolve haolo.cloud:443:127.0.0.1 "https://haolo.cloud$p")
+              echo "$p -> $code"
+              # 预览那个用不存在的 token，404 才是对的（说明 SSR 路由在）
+              case "$p" in */preview/*) [ "$code" = "404" ] || echo "::warning::$p 不是 404 —— 检查 nginx 反代：bash /root/blog-src/ops/nginx-blog-ssr.sh" ;; esac
+              case "$p" in */solutions/) [ "$code" = "200" ] || echo "::warning::$p 不是 200 —— 检查 nginx 反代：bash /root/blog-src/ops/nginx-blog-ssr.sh" ;; esac
+            done
             if [ $fail -eq 0 ]; then echo "ALL ROUTES OK"; else echo "SOME ROUTES FAILED"; exit 1; fi

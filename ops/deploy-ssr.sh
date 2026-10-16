@@ -19,6 +19,17 @@ WEB=/var/www/blog
 SSR_NAME=notelab-blog-ssr
 SSR_PORT=3012
 
+# ⚠️ 服务器上只有这一条**构建路径**，但它有多个**触发者**：后台的部署任务（BlogDeployService）、
+#    GitHub Actions（push 后 ssh 进来跑同一个脚本）、以及人手动跑。
+#    两个构建同时 `find /var/www/blog -mindepth 1 -delete` + 覆盖写，会拼出一个半成品站点
+#    （上一个还活着、下一个已经在清目录）。所以用 flock 把触发者**排成一队**：
+#    后来者等着，而不是插进去。等超过 15 分钟就报错退出，别把 CI 卡到超时。
+#    注：后台那侧还有自己的单线程队列 +「部署期间写入 409」—— 那些保护的是**仓库**，
+#    这把锁保护的是**服务器产物**，两件事。
+exec 9>/var/lock/blog-deploy.lock
+flock -w 900 9 || { echo "❌ 等部署锁超时（另一个部署还在跑，见 /var/lock/blog-deploy.lock）"; exit 1; }
+echo "==> 0/5 已拿到部署锁（/var/lock/blog-deploy.lock）"
+
 echo "==> 1/5 拉取最新代码（$REPO）"
 cd "$REPO"
 BEFORE=$(git rev-parse HEAD)
