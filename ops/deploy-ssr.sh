@@ -28,16 +28,16 @@ SSR_PORT=3012
 #    这把锁保护的是**服务器产物**，两件事。
 exec 9>/var/lock/blog-deploy.lock
 flock -w 900 9 || { echo "❌ 等部署锁超时（另一个部署还在跑，见 /var/lock/blog-deploy.lock）"; exit 1; }
-echo "==> 0/5 已拿到部署锁（/var/lock/blog-deploy.lock）"
+echo "==> 0/6 已拿到部署锁（/var/lock/blog-deploy.lock）"
 
-echo "==> 1/5 拉取最新代码（$REPO）"
+echo "==> 1/6 拉取最新代码（$REPO）"
 cd "$REPO"
 BEFORE=$(git rev-parse HEAD)
 git pull --ff-only
 AFTER=$(git rev-parse HEAD)
 [ "$BEFORE" = "$AFTER" ] && echo "  已是最新 $AFTER" || echo "  $BEFORE → $AFTER"
 
-echo "==> 2/5 依赖"
+echo "==> 2/6 依赖"
 # 判据是「package-lock.json 是否比 node_modules/.package-lock.json 新」，不是 git diff。
 # ⚠️ 用 git diff「本次 pull 有没有改 lock」会漏：手工 pull 过、或上一次部署中途失败再跑，
 #    diff 都是空的，于是新依赖永远装不上 —— 症状是 Cannot find module '@astrojs/node'，
@@ -49,7 +49,7 @@ else
 	echo "  依赖已是最新，跳过（省 ~40s）"
 fi
 
-echo "==> 3/5 构建（static + SSR）"
+echo "==> 3/6 构建（static + SSR）"
 NODE_OPTIONS=--max-old-space-size=1536 npm run build
 # ⚠️ 两个产物都要在：只有 client 说明 adapter 没生效（那么 solutions 会 404），
 #    只有 server 说明静态站没生成（整站挂）。
@@ -57,7 +57,7 @@ NODE_OPTIONS=--max-old-space-size=1536 npm run build
 [ -f dist/server/entry.mjs ] || { echo "❌ 缺 dist/server/entry.mjs（Node adapter 没生效）"; exit 1; }
 echo "  ✅ dist/client + dist/server 就绪"
 
-echo "==> 4/5 发布静态产物到 $WEB"
+echo "==> 4/6 发布静态产物到 $WEB"
 # ⚠️ 复制的是 dist/client，**不是 dist** —— dist 根下可能残留上一次 static 构建的旧产物
 #    （含早已改为 SSR 的 solutions/ 目录），照搬上去会让旧页面盖住新路由。
 find "$WEB" -mindepth 1 -delete
@@ -66,7 +66,7 @@ chown -R root:www-data "$WEB"
 chmod -R 755 "$WEB"
 echo "  ✅ $(find "$WEB" -type f | wc -l) 个文件"
 
-echo "==> 5/5 SSR 进程（$SSR_NAME : $SSR_PORT）"
+echo "==> 5/6 SSR 进程（$SSR_NAME : $SSR_PORT）"
 # PRACTICE_API 指向同机的 Java（默认值就是这个，写出来是为了以后换机器时看得见）
 export HOST=127.0.0.1 PORT=$SSR_PORT PRACTICE_API=${PRACTICE_API:-http://127.0.0.1:8001}
 if pm2 describe "$SSR_NAME" >/dev/null 2>&1; then
@@ -83,6 +83,15 @@ for i in $(seq 1 20); do
   sleep 0.5
   [ "$i" = "20" ] && { echo "  ❌ SSR 进程没起来（最后状态码 $code）"; pm2 logs "$SSR_NAME" --lines 20 --nostream; exit 1; }
 done
+
+echo "==> 6/6 搜索索引：把**已发布解答**并回去"
+# 为什么每次部署都要跑：上面的 `npm run build` 里含 `pagefind --site dist/client`，
+# 而解答页是运行时渲染（不在 dist/client 里）→ **构建一次就把题解从索引里抹掉**。
+# 所以索引的完整形态 = 构建期静态页 + 这一步抓的解答页；少跑这一步，题解就搜不到。
+# ⚠️ REINDEX_LOCK=0：本脚本已持有部署锁，让子脚本别再抢同一把锁（否则互等到死锁）。
+# ⚠️ 刻意不 fail-fast：索引没建成不影响站点本身，只影响题解能不能被搜到。
+REINDEX_LOCK=0 bash "$REPO/ops/reindex-search.sh" \
+  || echo "  ⚠️ 搜索索引重建失败：站点本身没事，只是题解搜不到（可手动跑 ops/reindex-search.sh）"
 
 echo
 echo "完成。若 /blog/solutions/ 在公网仍 404，说明 nginx 还没把该前缀反代给本进程："
