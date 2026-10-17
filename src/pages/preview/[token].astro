@@ -29,6 +29,15 @@ import { expressiveCodeAssets, renderMarkdown } from "../../utils/runtime-markdo
 
 const token = Astro.params.token ?? "";
 
+/**
+ * embed=1：**只输出文章内容区**（给后台「文章起草」右侧的实时预览用）。
+ *
+ * 做法刻意是「保留整套布局与全局样式，只用 CSS 把导航/侧栏/目录/页脚藏掉」，
+ * 而不是换一个精简 layout —— 正文排版依赖 Fuwari 的全局 CSS 变量与 Tailwind 产物，
+ * 自建一个轻外壳就得复刻那一切，等于又造一套「和线上不一致」的预览，正好违背这个路由的初衷。
+ */
+const embed = Astro.url.searchParams.get("embed") === "1";
+
 let entry = null;
 let apiError = "";
 try {
@@ -48,6 +57,28 @@ function safeDate(v?: string): Date {
 	return Number.isNaN(d.getTime()) ? new Date() : d;
 }
 const publishedDate = entry ? safeDate(entry.published) : new Date();
+
+/**
+ * embed 模式的那一小段覆盖样式。
+ *
+ * 选择器一律用 MainGridLayout 里的稳定 **id**（`#main-panel` / `#main-grid` / `#swup-container`），
+ * 别按 class 猜 —— Tailwind 的 class 会随样式调整漂移，而 id 是布局契约。
+ *   · `#main-panel` 的 `top` 是硬编码的 5.5rem（给人间导航留的高度），藏掉导航后必须归零；
+ *   · `#main-grid > :not(#swup-container)` 一次性排掉「左侧栏 + 两个页脚」，
+ *     不用逐个点名（SideBar 渲染成什么标签、页脚有几份，都不必关心）；
+ *   · `onload-animation` 是进场淡入，局部替换 innerHTML 时会重新播一遍 → 关掉，否则每次更新都闪。
+ */
+const EMBED_CSS = `
+#top-row, #banner-wrapper, #toc-wrapper, #toc, .footer { display: none !important }
+#main-panel { top: 0 !important }
+#main-grid { grid-template-columns: 1fr !important; gap: 0 !important; padding: 0 !important }
+#main-grid > :not(#swup-container) { display: none !important }
+#swup-container { grid-column: 1 / -1 !important }
+#content-wrapper { padding: 0 !important }
+#post-card { margin: 0 !important; border-radius: 0 !important }
+#post-container { border-radius: 0 !important; padding: 1rem 1.25rem !important }
+.onload-animation { animation: none !important; opacity: 1 !important }
+`;
 ---
 
 <MainGridLayout
@@ -59,13 +90,17 @@ const publishedDate = entry ? safeDate(entry.published) : new Date();
     {/* expressive-code 的样式/脚本：构建期由集成注入每个页面，运行时渲染的页面得自己带 */}
     <style is:inline slot="head" set:html={ec.styles}></style>
     {ec.scripts.map((code) => <script is:inline slot="head" set:html={code}></script>)}
+    {embed && <style is:inline slot="head" set:html={EMBED_CSS}></style>}
 
-    {/* 预览徽标 —— 唯一与线上不同的可见元素，且刻意放在文章卡片**之外** */}
-    <div class="flex items-center gap-2 mb-3 px-1 text-sm">
-        <Icon name="material-symbols:visibility-outline-rounded" class="text-[1.25rem] text-[var(--primary)]"></Icon>
-        <span class="font-bold text-[var(--primary)]">预览</span>
-        <span class="text-black/50 dark:text-white/50">未发布草稿 · 正文渲染与线上文章页一致</span>
-    </div>
+    {/* 预览徽标 —— 唯一与线上不同的可见元素，且刻意放在文章卡片**之外**。
+        embed（后台右侧实时预览）时不渲染：那里只有正文的宽度，多一行提示只会挤掉内容 */}
+    {!embed && (
+        <div class="flex items-center gap-2 mb-3 px-1 text-sm">
+            <Icon name="material-symbols:visibility-outline-rounded" class="text-[1.25rem] text-[var(--primary)]"></Icon>
+            <span class="font-bold text-[var(--primary)]">预览</span>
+            <span class="text-black/50 dark:text-white/50">未发布草稿 · 正文渲染与线上文章页一致</span>
+        </div>
+    )}
 
     {!entry ? (
         <div class="flex w-full rounded-[var(--radius-large)] overflow-hidden relative mb-4">
@@ -81,7 +116,7 @@ const publishedDate = entry ? safeDate(entry.published) : new Date();
             </div>
         </div>
     ) : (
-    <div class="flex w-full rounded-[var(--radius-large)] overflow-hidden relative mb-4">
+    <div id="post-card" class="flex w-full rounded-[var(--radius-large)] overflow-hidden relative mb-4">
         <div id="post-container" class="card-base z-10 px-6 md:px-9 pt-6 pb-4 relative w-full">
 
             {/* word count and reading time（与线上文章页同一行，含朗读按钮） */}
@@ -90,13 +125,13 @@ const publishedDate = entry ? safeDate(entry.published) : new Date();
                     <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
                         <Icon name="material-symbols:notes-rounded"></Icon>
                     </div>
-                    <div class="text-sm">{rendered!.words} {" " + i18n(I18nKey.wordsCount)}</div>
+                    <div id="preview-words" class="text-sm">{rendered!.words} {" " + i18n(I18nKey.wordsCount)}</div>
                 </div>
                 <div class="flex flex-row items-center">
                     <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
                         <Icon name="material-symbols:schedule-outline-rounded"></Icon>
                     </div>
-                    <div class="text-sm">
+                    <div id="preview-minutes" class="text-sm">
                         {rendered!.minutes} {" " + i18n(rendered!.minutes === 1 ? I18nKey.minuteCount : I18nKey.minutesCount)}
                     </div>
                 </div>
@@ -112,6 +147,7 @@ const publishedDate = entry ? safeDate(entry.published) : new Date();
             {/* title */}
             <div class="relative onload-animation">
                 <div
+                    id="preview-title"
                     class="transition w-full block font-bold mb-3
                     text-3xl md:text-[2.25rem]/[2.75rem]
                     text-black/90 dark:text-white/90
@@ -134,7 +170,7 @@ const publishedDate = entry ? safeDate(entry.published) : new Date();
                 <div class="border-[var(--line-divider)] border-dashed border-b-[1px] mb-5"></div>
             </div>
 
-            <Markdown class="mb-6 markdown-content onload-animation">
+            <Markdown id="preview-body" class="mb-6 markdown-content onload-animation">
                 <Fragment set:html={rendered!.html} />
             </Markdown>
 
@@ -149,4 +185,32 @@ const publishedDate = entry ? safeDate(entry.published) : new Date();
 <script>
 	// 与文章详情页同一个朗读脚本（预览页的正文 DOM 结构与它一致）
 	import "../../scripts/tts-reader";
+</script>
+
+{/*
+  embed 模式：接收后台发来的新正文，**只替换正文**，不刷新整页。
+  刷新整页会白屏 + 丢滚动位置，而打字时每次停顿都会更新一次，那样根本没法用。
+
+  ⚠️ 必须是 `is:inline`：普通 <script> 会被 Astro 打包并**提升**到模块里，
+     外层 {embed && ...} 的条件包裹随之失效（等于所有访客都加载这段）。
+*/}
+<script is:inline define:vars={{ embed }}>
+	if (embed) {
+		window.addEventListener("message", function (e) {
+			// 只认同源消息（后台与博客同域，iframe 里 location.origin 就是本站）
+			if (e.origin !== window.location.origin) return;
+			var d = e.data;
+			if (!d || d.type !== "notelab-preview") return;
+			var body = document.querySelector("#preview-body");
+			if (body && typeof d.html === "string") body.innerHTML = d.html;
+			function setText(sel, v) {
+				if (typeof v !== "string") return;
+				var el = document.querySelector(sel);
+				if (el) el.textContent = v;
+			}
+			setText("#preview-title", d.title);
+			setText("#preview-words", d.words);
+			setText("#preview-minutes", d.minutes);
+		});
+	}
 </script>
