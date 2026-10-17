@@ -10,6 +10,7 @@ export const prerender = false;
 
 import { getCollection } from "astro:content";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
+import ViewCount from "@components/ViewCount.astro";
 import { Icon } from "astro-icon/components";
 import { fetchSolutions, type PublicSolution } from "../../utils/practice-api";
 import { getPostUrlBySlug, url } from "../../utils/url-utils";
@@ -99,6 +100,8 @@ const difficultyStyle: Record<string, string> = {
                                    class="flex flex-row items-center gap-3 px-3 py-2 rounded-lg transition hover:bg-[var(--btn-regular-bg)] active:scale-95">
                                     <span class="text-sm text-black/30 dark:text-white/30 w-6 shrink-0 text-right">{s.order || "-"}</span>
                                     <span class="flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{s.title}</span>
+                                    {/* 列表只展示、不上报（primary 只在详情页传），整页合并成一次批量请求 */}
+                                    <ViewCount slug={s.slug} class="shrink-0" />
                                     <span class:list={["text-xs px-2 py-0.5 rounded-md shrink-0", difficultyStyle[s.difficulty] ?? difficultyStyle["中等"]]}>
                                         {s.difficulty}
                                     </span>

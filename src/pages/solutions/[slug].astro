@@ -6,6 +6,7 @@
 export const prerender = false;
 
 import Markdown from "@components/misc/Markdown.astro";
+import ViewCount from "@components/ViewCount.astro";
 import I18nKey from "@i18n/i18nKey";
 import { i18n } from "@i18n/translation";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
@@ -126,6 +127,9 @@ const jsonLd = entry
                         {entry.difficulty}
                     </span>
                 </div>
+                {/* 浏览数：与文章页同一个组件、同一张统计表（按对外 slug 计数）。
+                    解答页是运行时渲染的，这个数字只能客户端取，见 ViewCount.astro 的说明。 */}
+                <ViewCount slug={entry.slug} primary />
             </div>
 
             <!-- title -->
