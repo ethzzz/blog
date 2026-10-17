@@ -1,7 +1,12 @@
 ---
-import { type CollectionEntry, getCollection } from "astro:content";
+import { getCollection } from "astro:content";
 import { Icon } from "astro-icon/components";
 import { navBarConfig, siteConfig } from "../config";
+import {
+	INTERVIEW_CATEGORY,
+	INTERVIEW_GROUPS,
+	interviewNumOf,
+} from "../constants/interview-groups";
 import { LinkPresets } from "../constants/link-presets";
 import {
 	LinkPreset,
@@ -26,40 +31,28 @@ let links: NavBarLink[] = navBarConfig.links.map(
 );
 
 // 「面试宝典」下拉子菜单：构建期从文章集合动态生成，与文章增删自动同步。
-// 分组按专题编号划归（对应 interview-guide-NN-* 的 NN）。
-const numOf = (entry: CollectionEntry<"posts">) =>
-	Number.parseInt(entry.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0", 10);
-
+// 分组定义来自 @constants/interview-groups —— 与面试宝典页面**共用一份**。
+// 原来这里另写了一套 5 组（页面是 7 组），同一篇文章在两处归属不同，见该文件头部注释。
 const interviewPosts = (
 	await getCollection("posts", ({ data }) => {
 		return (
-			data.category === "前端面试宝典" &&
+			data.category === INTERVIEW_CATEGORY &&
 			(import.meta.env.PROD ? data.draft !== true : true)
 		);
 	})
-).sort((a, b) => numOf(a) - numOf(b));
+).sort((a, b) => interviewNumOf(a.slug) - interviewNumOf(b.slug));
 
-const interviewGroupDef: { title: string; nums: number[] }[] = [
-	{ title: "语言基础", nums: [1, 2, 3, 12] },
-	{ title: "框架与跨端", nums: [4, 5, 6] },
-	{ title: "工程与后端", nums: [7, 8, 9, 10, 11, 19] },
-	{ title: "性能与实践", nums: [13, 14, 15, 16] },
-	{ title: "设计与综合", nums: [17, 18, 20, 21] },
-];
-
-const interviewChildren: NavBarChildGroup[] = interviewGroupDef
-	.map((g) => ({
-		title: g.title,
-		items: interviewPosts
-			.filter((p) => g.nums.includes(numOf(p)))
-			.map((p) => ({
-				// 存不带 base 的原始路径：模板渲染时统一经 url() 拼前缀，
-				// 与 config.ts 里其他 children 项的约定一致（getPostUrlBySlug 已含 base，不能混用）
-				name: p.data.title,
-				url: `/posts/${p.slug}/`,
-			})),
-	}))
-	.filter((g) => g.items.length > 0);
+const interviewChildren: NavBarChildGroup[] = INTERVIEW_GROUPS.map((g) => ({
+	title: g.name,
+	items: interviewPosts
+		.filter((p) => g.nums.includes(interviewNumOf(p.slug)))
+		.map((p) => ({
+			// 存不带 base 的原始路径：模板渲染时统一经 url() 拼前缀，
+			// 与 config.ts 里其他 children 项的约定一致（getPostUrlBySlug 已含 base，不能混用）
+			name: p.data.title,
+			url: `/posts/${p.slug}/`,
+		})),
+})).filter((g) => g.items.length > 0);
 
 // 分组数 > 3 的面板内容偏宽，限制最大宽度让其换行，避免贴边溢出视口
 const panelMaxWidth = (children: NavBarChildGroup[]) =>

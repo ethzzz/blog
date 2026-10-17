@@ -2,84 +2,48 @@
 import { getCollection } from "astro:content";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { getPostUrlBySlug } from "@utils/url-utils";
+import {
+	INTERVIEW_CATEGORY,
+	INTERVIEW_GROUPS,
+	interviewGroupOf,
+	interviewNumOf,
+} from "@constants/interview-groups";
 
-// 获取所有面试宝典文章
+// 面试宝典文章（category 字面量集中在 constants 里，与导航下拉共用一份）
 const allPosts = await getCollection("posts", ({ data }) => {
 	return (
-		data.category === "前端面试宝典" &&
+		data.category === INTERVIEW_CATEGORY &&
 		(import.meta.env.PROD ? data.draft !== true : true)
 	);
 });
 
-// 按 slug 中的编号排序
-const sortedPosts = allPosts.sort((a, b) => {
-	const numA = Number.parseInt(
-		a.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0",
-		10,
-	);
-	const numB = Number.parseInt(
-		b.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0",
-		10,
-	);
-	return numA - numB;
-});
+// 按专题编号排序
+const sortedPosts = allPosts.sort(
+	(a, b) => interviewNumOf(a.slug) - interviewNumOf(b.slug),
+);
 
-// 分离总览和知识模块文章
+// 总览（00-overview）单独展示，其余进分组
 const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
 const topicPosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 
-// 知识点分组
-const groups = [
-	{
-		name: "基础三剑客",
-		color: "#f97316",
-		slugPrefix: ["01-html-css", "02-javascript-core", "03-javascript-async"],
-	},
-	{
-		name: "框架与跨端",
-		color: "#10b981",
-		slugPrefix: ["04-vue", "05-react", "06-cross-platform"],
-	},
-	{
-		name: "工程化与网络",
-		color: "#3b82f6",
-		slugPrefix: [
-			"07-build-tools",
-			"08-network-http",
-			"15-engineering-practice",
-			"16-realtime",
-		],
-	},
-	{
-		name: "后端知识",
-		color: "#8b5cf6",
-		slugPrefix: ["09-nginx", "10-mysql", "11-backend", "19-nodejs"],
-	},
-	{
-		name: "进阶必修",
-		color: "#ec4899",
-		slugPrefix: [
-			"12-typescript",
-			"13-performance",
-			"14-handwritten-code",
-			"17-system-design",
-		],
-	},
-	{
-		name: "综合面试",
-		color: "#64748b",
-		slugPrefix: ["18-soft-skills"],
-	},
-	{
-		name: "深水区实战",
-		color: "#0ea5e9",
-		slugPrefix: ["20-frontend-core-qa", "21-frontend-deep-practice"],
-	},
-];
-
-const getGroupForPost = (slug: string) => {
-	return groups.find((g) => g.slugPrefix.some((p) => slug.includes(p)));
-};
+/**
+ * 分组数据。分组定义在 `@constants/interview-groups`（页面与导航栏共用）。
+ *
+ * ⚠️ `interviewGroupOf` 匹配不到时原来会**静默丢掉**这篇文章（归档页还在，
+ * 但本页看不见）。这里收进「未分组」并在构建日志告警 —— 文章消失比多一个灰组难查得多。
+ */
+const grouped = INTERVIEW_GROUPS.map((group) => ({
+	group,
+	posts: topicPosts.filter((p) => interviewGroupOf(p.slug) === group),
+}));
+const ungrouped = topicPosts.filter((p) => !interviewGroupOf(p.slug));
+if (ungrouped.length > 0) {
+	console.warn(
+		`[interview-guide] ${ungrouped.length} 篇文章没匹配到分组，已放进「未分组」：` +
+			ungrouped.map((p) => p.slug).join(", ") +
+			" —— 请把专题编号加进 src/constants/interview-groups.ts 的 INTERVIEW_GROUPS",
+	);
+}
 ---
 
 <MainGridLayout title="前端面试宝典">
@@ -144,9 +108,8 @@ const getGroupForPost = (slug: string) => {
 			</a>
 		)}
 
-		<!-- 按分组展示文章 -->
-		{groups.map(group => {
-			const groupPosts = topicPosts.filter(p => getGroupForPost(p.slug) === group);
+		<!-- 按分组展示文章（分组定义见 @constants/interview-groups，与导航下拉共用） -->
+		{grouped.map(({ group, posts: groupPosts }) => {
 			return groupPosts.length > 0 && (
 				<div class="mb-8">
 					<div class="flex items-center gap-2 mb-4">
@@ -156,7 +119,7 @@ const getGroupForPost = (slug: string) => {
 					</div>
 					<div class="space-y-4">
 						{groupPosts.map((post) => {
-							const num = Number.parseInt(post.slug.match(/interview-guide-(\d+)/)?.[1] ?? "0", 10);
+							const num = interviewNumOf(post.slug);
 							return (
 								<a href={getPostUrlBySlug(post.slug)} 
 								   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
@@ -201,6 +164,25 @@ const getGroupForPost = (slug: string) => {
 				</div>
 			);
 		})}
+
+		<!-- 未分组兜底：只有 slug 编号不在任何分组里才会走到这里（构建时会 console.warn） -->
+		{ungrouped.length > 0 && (
+			<div class="mb-8">
+				<div class="flex items-center gap-2 mb-4">
+					<div class="w-1 h-5 rounded-full" style="background: #94a3b8"></div>
+					<h2 class="text-lg font-bold text-90">未分组</h2>
+					<span class="text-sm text-50">({ungrouped.length} 篇)</span>
+				</div>
+				<div class="space-y-4">
+					{ungrouped.map((post) => (
+						<a href={getPostUrlBySlug(post.slug)} class="block card-base card-shadow p-5 hover:shadow-lg transition-all">
+							<h3 class="text-base font-bold text-90 mb-1">{post.data.title}</h3>
+							<p class="text-75 text-sm line-clamp-2">{post.data.description}</p>
+						</a>
+					))}
+				</div>
+			</div>
+		)}
 
 		<!-- 底部说明 -->
 		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm space-y-2">
