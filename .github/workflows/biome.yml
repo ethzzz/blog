@@ -15,6 +15,8 @@ jobs:
       - name: Setup Biome
         uses: biomejs/setup-biome@f382a98e582959e6aaac8e5f8b17b31749018780 # v2.5.0
         with:
-          version: latest
+          # 固定版本，与 package.json 的 @biomejs/biome 保持一致；升级时两处一起改。
+          # 用 latest 会让「没改代码的提交」因为新版规则/格式变化突然变红。
+          version: 2.2.5
       - name: Run Biome
         run: biome ci ./src --reporter=github
