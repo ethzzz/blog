@@ -56,7 +56,7 @@ draft: false
 
 ## 这个站现在有什么
 
-- **学习路线**：TypeScript / JavaScript / React / 工程化 / 浏览器与性能 / Node 全栈 / AI 应用开发 / 算法手写题 / Java / RuoYi / Higress / Python，共 12 条，入口在导航「路线」
+- **学习路线**：TypeScript / JavaScript / React / 工程化 / 浏览器与性能 / Node 全栈 / AI 应用开发 / 算法手写题 / Java / RuoYi / Higress / Docker / Python，共 13 条，入口在导航「路线」
 - **面试宝典**：22 个专题的面试向整理
 - **NoteLab 实战**：自研全栈项目的踩坑实录
 - **随笔与教程**：路线之外的零散沉淀

@@ -121,6 +121,14 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 				chips: ["网关", "WASM", "可观测"],
 			},
 			{
+				title: "Docker 与容器化部署",
+				abbr: "Docker",
+				desc: "从镜像、容器、网络到 Compose 与生产部署：把项目装进容器",
+				url: "/docker-roadmap/",
+				category: "Docker学习路线",
+				chips: ["镜像", "Compose", "部署"],
+			},
+			{
 				title: "Python 全栈",
 				abbr: "Py",
 				desc: "100 天从新手到大师：后端 / 爬虫 / 数据科学全赛道",

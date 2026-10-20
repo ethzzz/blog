@@ -6,7 +6,7 @@
 
 ## 这里有什么
 
-- **[学习路线](/blog/roadmaps/)**：12 条系统路线 —— TypeScript、JavaScript、React、前端工程化、浏览器与性能、Node 全栈、AI 应用开发、算法与手写题，以及 Java / RuoYi / Higress / Python
+- **[学习路线](/blog/roadmaps/)**：13 条系统路线 —— TypeScript、JavaScript、React、前端工程化、浏览器与性能、Node 全栈、AI 应用开发、算法与手写题，以及 Java / RuoYi / Higress / Docker / Python
 - **[面试宝典](/blog/interview-guide/)**：22 个专题的面试向整理，从语言基础到系统设计
 - **[NoteLab 实战](/blog/notelab/)**：自研全栈项目（Spring Boot + 双前端）的踩坑实录
 - **[随笔与教程](/blog/essays/)**：路线之外的零散沉淀
