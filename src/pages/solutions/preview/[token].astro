@@ -19,7 +19,10 @@ import { i18n } from "@i18n/translation";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { Icon } from "astro-icon/components";
 import { fetchPreview } from "../../../utils/notelab-preview-api";
-import { expressiveCodeAssets, renderMarkdown } from "../../../utils/runtime-markdown";
+import {
+	expressiveCodeAssets,
+	renderMarkdown,
+} from "../../../utils/runtime-markdown";
 import { getPostUrlBySlug } from "../../../utils/url-utils";
 
 const token = Astro.params.token ?? "";
@@ -36,14 +39,17 @@ if (apiError) Astro.response.status = 502;
 
 const rendered = entry ? await renderMarkdown(entry.body ?? "") : null;
 const ec = await expressiveCodeAssets();
-const relatedUrl = entry?.relatedPost ? getPostUrlBySlug(entry.relatedPost) : null;
+const relatedUrl = entry?.relatedPost
+	? getPostUrlBySlug(entry.relatedPost)
+	: null;
 
 const difficultyStyle =
 	{
 		简单: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
 		中等: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
 		困难: "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]",
-	}[entry?.difficulty ?? ""] ?? "bg-[var(--btn-regular-bg)] text-[var(--btn-content)]";
+	}[entry?.difficulty ?? ""] ??
+	"bg-[var(--btn-regular-bg)] text-[var(--btn-content)]";
 ---
 
 <MainGridLayout

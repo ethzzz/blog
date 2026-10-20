@@ -17,15 +17,15 @@
  */
 
 /** 面试宝典文章的 category 值（原来在页面与导航里各写了一遍字面量） */
-export const INTERVIEW_CATEGORY = "前端面试宝典"
+export const INTERVIEW_CATEGORY = "前端面试宝典";
 
 export type InterviewGroup = {
-	name: string
+	name: string;
 	/** 分组主题色：页面用它做竖条与编号圆背景 */
-	color: string
+	color: string;
 	/** 专题编号，对应 slug 里的 `interview-guide-NN-*` */
-	nums: number[]
-}
+	nums: number[];
+};
 
 /**
  * 分组定义 —— 以**页面**的 7 组为准（导航原来的 5 组是它的压缩版，名字还不同）。
@@ -39,11 +39,11 @@ export const INTERVIEW_GROUPS: InterviewGroup[] = [
 	{ name: "进阶必修", color: "#ec4899", nums: [12, 13, 14, 17] },
 	{ name: "综合面试", color: "#64748b", nums: [18] },
 	{ name: "深水区实战", color: "#0ea5e9", nums: [20, 21] },
-]
+];
 
 /** 从 slug 取专题编号：`interview-guide-12-typescript` → 12；取不到返回 0 */
 export function interviewNumOf(slug: string): number {
-	return Number.parseInt(slug.match(/interview-guide-(\d+)/)?.[1] ?? "0", 10)
+	return Number.parseInt(slug.match(/interview-guide-(\d+)/)?.[1] ?? "0", 10);
 }
 
 /**
@@ -54,6 +54,6 @@ export function interviewNumOf(slug: string): number {
  *          （归档页还在，但面试宝典页上看不见）。页面那边会把它们收进「未分组」并在构建时告警。
  */
 export function interviewGroupOf(slug: string): InterviewGroup | undefined {
-	const n = interviewNumOf(slug)
-	return INTERVIEW_GROUPS.find((g) => g.nums.includes(n))
+	const n = interviewNumOf(slug);
+	return INTERVIEW_GROUPS.find((g) => g.nums.includes(n));
 }

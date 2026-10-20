@@ -1,13 +1,13 @@
 ---
 import { getCollection } from "astro:content";
-import MainGridLayout from "@layouts/MainGridLayout.astro";
-import { getPostUrlBySlug } from "@utils/url-utils";
 import {
 	INTERVIEW_CATEGORY,
 	INTERVIEW_GROUPS,
 	interviewGroupOf,
 	interviewNumOf,
 } from "@constants/interview-groups";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
 
 // 面试宝典文章（category 字面量集中在 constants 里，与导航下拉共用一份）
 const allPosts = await getCollection("posts", ({ data }) => {

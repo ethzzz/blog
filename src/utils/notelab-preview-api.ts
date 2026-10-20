@@ -7,7 +7,10 @@
 //    构建机上没设就永远是 undefined（换端口/换机都得重新构建）。见 practice-api.ts 的说明。
 // ⚠️ 复用同一个后端地址变量：NOTELAB_API 是更准确的名字（这个后端不只服务练习实践），
 //    但要兼容已经配好的 PRACTICE_API —— 两个都不设才回落到默认本机端口。
-const BASE = process.env.NOTELAB_API ?? process.env.PRACTICE_API ?? "http://127.0.0.1:8001";
+const BASE =
+	process.env.NOTELAB_API ??
+	process.env.PRACTICE_API ??
+	"http://127.0.0.1:8001";
 
 export type DraftPreview = {
 	/** post（博客文章）或 solution（练习解答）—— 决定用哪套布局渲染 */
@@ -36,7 +39,9 @@ export async function fetchPreview(
 	token: string,
 	expectKind: "post" | "solution" = "post",
 ): Promise<DraftPreview | null> {
-	const res = await fetch(`${BASE}/api/blog/preview/${encodeURIComponent(token)}`);
+	const res = await fetch(
+		`${BASE}/api/blog/preview/${encodeURIComponent(token)}`,
+	);
 	if (res.status === 404) return null;
 	if (!res.ok) throw new Error(`预览接口返回 HTTP ${res.status}`);
 	const data = (await res.json()) as DraftPreview;
