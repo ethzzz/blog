@@ -21,8 +21,8 @@ SSR_PORT=3012
 
 # ⚠️ 服务器上只有这一条**构建路径**，但它有多个**触发者**：后台的部署任务（BlogDeployService）、
 #    GitHub Actions（push 后 ssh 进来跑同一个脚本）、以及人手动跑。
-#    两个构建同时 `find /var/www/blog -mindepth 1 -delete` + 覆盖写，会拼出一个半成品站点
-#    （上一个还活着、下一个已经在清目录）。所以用 flock 把触发者**排成一队**：
+#    两个构建同时覆盖写 /var/www/blog，会拼出一个半成品站点
+#    （上一个还活着、下一个已经在替换文件）。所以用 flock 把触发者**排成一队**：
 #    后来者等着，而不是插进去。等超过 15 分钟就报错退出，别把 CI 卡到超时。
 #    注：后台那侧还有自己的单线程队列 +「部署期间写入 409」—— 那些保护的是**仓库**，
 #    这把锁保护的是**服务器产物**，两件事。
@@ -63,11 +63,17 @@ echo "  ✅ dist/client + dist/server 就绪"
 echo "==> 4/6 发布静态产物到 $WEB"
 # ⚠️ 复制的是 dist/client，**不是 dist** —— dist 根下可能残留上一次 static 构建的旧产物
 #    （含早已改为 SSR 的 solutions/ 目录），照搬上去会让旧页面盖住新路由。
-find "$WEB" -mindepth 1 -delete
-cp -r dist/client/. "$WEB/"
+#
+# ⚠️ 不能清空 _astro：文件名带内容哈希，删掉旧文件后，浏览器或 swup 缓存里的旧 HTML
+#    仍会请求旧哈希 → 404 → 整页无样式（2026-10-21 实测）。
+#    两遍 rsync：先把新产物完整覆盖上去；再删除过期页面（排除 _astro）；
+#    旧资源按 mtime 保留 7 天，兜住客户端 HTML 缓存。
+rsync -a "$REPO/dist/client/" "$WEB/"
+rsync -a --delete-delay --exclude='_astro/' "$REPO/dist/client/" "$WEB/"
+find "$WEB/_astro" -type f -mtime +7 -delete
 chown -R root:www-data "$WEB"
 chmod -R 755 "$WEB"
-echo "  ✅ $(find "$WEB" -type f | wc -l) 个文件"
+echo "  ✅ $(find "$WEB" -type f | wc -l) 个文件（含保留的旧 _astro 资源）"
 
 echo "==> 5/6 SSR 进程（$SSR_NAME : $SSR_PORT）"
 # PRACTICE_API 指向同机的 Java（默认值就是这个，写出来是为了以后换机器时看得见）
