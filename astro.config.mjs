@@ -52,7 +52,8 @@ export default defineConfig({
 		expressiveCode(expressiveCodeOptions),
         svelte(),
 		// MDX 与 Markdown 共用下方 markdown.remarkPlugins / rehypePlugins（默认 extendMarkdownConfig）。
-		mdx(),
+		// optimize：把静态 JSX 在编译期折叠成 HTML，降低构建期组件/模块驻留内存。
+		mdx({ optimize: true }),
 		sitemap(),
 	],
 	// ⚠️ 插件清单在 src/markdown-plugins.ts —— 同样被运行时渲染复用，别在这里写第二份。
