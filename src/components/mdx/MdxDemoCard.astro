@@ -1,0 +1,16 @@
+---
+interface Props {
+	label?: string;
+	expression: string;
+	result: string;
+}
+const { label = "MDX 编译期求值", expression, result } = Astro.props;
+---
+<div class="not-prose my-6 rounded-xl border border-[var(--primary)] bg-[var(--btn-regular-bg)] px-4 py-3">
+	<div class="mb-2 text-xs font-medium tracking-wide text-50">{label}</div>
+	<div class="flex flex-wrap items-center gap-2 font-mono text-sm">
+		<code class="text-[var(--primary)]">{expression}</code>
+		<span class="text-50">→</span>
+		<strong class="text-base text-90">{result}</strong>
+	</div>
+</div>

@@ -1,3 +1,4 @@
+import mdx from "@astrojs/mdx";
 import node from "@astrojs/node";
 import sitemap from "@astrojs/sitemap";
 import svelte from "@astrojs/svelte";
@@ -50,6 +51,8 @@ export default defineConfig({
 		// 用的是同一份，两处漂移会导致「静态页的代码块与解答页不一样」。
 		expressiveCode(expressiveCodeOptions),
         svelte(),
+		// MDX 与 Markdown 共用下方 markdown.remarkPlugins / rehypePlugins（默认 extendMarkdownConfig）。
+		mdx(),
 		sitemap(),
 	],
 	// ⚠️ 插件清单在 src/markdown-plugins.ts —— 同样被运行时渲染复用，别在这里写第二份。

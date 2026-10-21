@@ -7,6 +7,8 @@ category: React学习路线
 draft: false
 ---
 
+import MdxDemoCard from "@components/mdx/MdxDemoCard.astro";
+
 ## JSX 的本质
 
 新人常把 JSX 当"HTML 模板"。其实它只是语法糖，编译后是普通 JS：
@@ -78,3 +80,17 @@ function Card({ title, children }) {
 1. 不用 JSX，用 `React.createElement` 手写一个 `<ul>` 含两个 `<li>` 的组件。
 2. 写一个 `Modal` 组件，用 `children` 接收弹窗内容、`title` prop 接收标题。
 3. 把一个"又长又多 props"的组件按单一职责拆成 3 个小组件。
+
+---
+
+## 附：MDX 实验
+
+这篇文章已从 `.md` 切换为 `.mdx`。下面这个卡片不是 Markdown 语法，而是被 MDX 引入并渲染的 Astro 组件：
+
+<MdxDemoCard
+	label="MDX：JSX 表达式在构建期求值"
+	expression="{ 6 * 7 }"
+	result={String(6 * 7)}
+/>
+
+同一份文件里也能直接写 JSX：<span className="font-semibold text-[var(--primary)]">{["MDX", "JSX", "Astro"].join(" + ")}</span>，上面卡片里的 `42` 同样来自表达式而不是手写文本。
