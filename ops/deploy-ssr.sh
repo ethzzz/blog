@@ -50,7 +50,10 @@ else
 fi
 
 echo "==> 3/6 构建（static + SSR）"
-NODE_OPTIONS=--max-old-space-size=1536 npm run build
+# ⚠️ 全量文章迁为 MDX 后编译内存明显上升：1536MB 会在静态页生成阶段
+#    「Reached heap limit」直接崩（2026-10-21 实测，堆顶 1530MB）。
+#    服务器 3.8G 内存 + 4G swap，调到 2560 留余量；再遇 OOM 先看 free -h 再调。
+NODE_OPTIONS=--max-old-space-size=2560 npm run build
 # ⚠️ 两个产物都要在：只有 client 说明 adapter 没生效（那么 solutions 会 404），
 #    只有 server 说明静态站没生成（整站挂）。
 [ -f dist/client/index.html ] || { echo "❌ 缺 dist/client/index.html（静态站没生成）"; exit 1; }
