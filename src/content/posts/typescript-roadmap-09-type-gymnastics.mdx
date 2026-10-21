@@ -63,7 +63,7 @@ type Name = Nested["user"]["name"]; // string（链式索引访问）
 
 ## 4. 手搓工具类型（核心练习）
 
-### MyPick<T, K>
+### `MyPick<T, K>`
 ```ts
 type MyPick<T, K extends keyof T> = {
   [P in K]: T[P];
@@ -71,14 +71,14 @@ type MyPick<T, K extends keyof T> = {
 type R = MyPick<{ a: 1; b: 2 }, "a">; // { a: 1 }
 ```
 
-### MyReadonly<T>
+### `MyReadonly<T>`
 ```ts
 type MyReadonly<T> = {
   readonly [K in keyof T]: T[K];
 };
 ```
 
-### MyOmit<T, K>
+### `MyOmit<T, K>`
 ```ts
 type MyOmit<T, K extends keyof T> = Pick<T, Exclude<keyof T, K>>;
 // 或
@@ -87,7 +87,7 @@ type MyOmit2<T, K extends keyof T> = {
 };
 ```
 
-### MyAwaited<T>（处理 Promise 嵌套）
+### `MyAwaited<T>`（处理 Promise 嵌套）
 ```ts
 type MyAwaited<T> =
   T extends Promise<infer U>
@@ -98,7 +98,7 @@ type MyAwaited<T> =
 type R = MyAwaited<Promise<Promise<number>>>; // number
 ```
 
-### MyCapitalize<T>（用内置大小写映射）
+### `MyCapitalize<T>`（用内置大小写映射）
 ```ts
 type MyCapitalize<T extends string> =
   T extends `${infer F}${infer Rest}`
@@ -142,5 +142,5 @@ type R = MyCapitalize<"hello">; // "Hello"
 
 1. 实现 `MyExclude<T, U>`（`T extends U ? never : T`）。
 2. 实现 `MyRecord<K extends keyof any, V>`（`{ [P in K]: V }`）。
-3. 用模板字面量实现 `type Handler<T extends string> = \`on${Capitalize<T>}\``。
+3. 用模板字面量实现 `Handler<T extends string>` 类型，结果为 `on${Capitalize<T>}` 这样的键名。
 4. 实现递归 `MyDeepReadonly<T>`，让嵌套对象全部只读。

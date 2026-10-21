@@ -124,9 +124,9 @@ await fetch('/api/upload/merge', {
 | CDN 直传？ | 前端向业务服务器申请签名 → 直传 OSS/S3 → 回调业务服务器 |
 
 **架构演进：**
-- MVP：直接 POST 表单（<10MB）
-- V1：分片上传 + 服务端合并（<1GB）
-- V2：+ 断点续传 + hash 秒传（<10GB）
+- MVP：直接 POST 表单（&lt;10MB）
+- V1：分片上传 + 服务端合并（&lt;1GB）
+- V2：+ 断点续传 + hash 秒传（&lt;10GB）
 - V3：+ CDN 直传 + 客户端并发控制（无上限）
 - V4：+ Web Worker + 增量 hash + 上传队列持久化（IndexedDB）
 
@@ -234,7 +234,7 @@ app.directive('permission', {
 | 权限变更后如何同步？ | 关键操作前实时校验 + WebSocket 推送权限变更事件强制刷新 |
 | 权限粒度多细？ | 一般到"按钮/接口"级，字段级权限成本高、少用 |
 | 大量权限点如何管理？ | 后端菜单表 + 权限标识（perm_code），前端只做展示，不硬编码 |
-| 路由跳转闪烁？ | 动态 addRoute 后要 next({ ...to, replace: true }) 重新触发 |
+| 路由跳转闪烁？ | 动态 addRoute 后要 `next({ ...to, replace: true })` 重新触发 |
 
 ---
 
