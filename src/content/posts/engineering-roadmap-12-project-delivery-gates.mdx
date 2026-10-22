@@ -1,0 +1,422 @@
+---
+title: '12 · 毕业项目：把「能跑」的仓库改造成「能持续交付」'
+published: 2026-10-23T02:30:00+08:00
+description: '前面 11 篇讲了每个零件（包管理、lint、类型、CI、构建、发布），但真实项目里它们必须组成一条链：本地门禁 → CI 四道关 → 产物分析 → 版本化发布 → 一键回滚。这个项目拿一个能跑的仓库当对象，把这条链补齐，并用"故意搞坏"的方式证明门禁真的会拦人。'
+tags: [前端工程化, CI/CD, 代码质量, 构建优化, 发布回滚]
+category: 前端工程化学习路线
+draft: false
+---
+
+> [!NOTE]
+> **项目对象**：[React 毕业项目](/blog/posts/react-roadmap-12-project-task-board/)里的 `task-board`（任何你自己的仓库都能换成它）。
+> 它现在已经"能跑"，但还处在**只有作者能维护**的状态：格式靠自觉、类型靠运气、发版靠手敲、出错靠回滚 git。
+>
+> 这篇要把它变成：**任何人 clone 下来都能一致地跑、提交、构建、发布、回滚**。
+
+---
+
+## 做到什么算过
+
+1. 新人 clone → `npm ci` → 一条命令跑起来，不存在"我这里能跑"。
+2. 提交前，格式/类型/测试**自动**在本地被检查，不合格就提交不了。
+3. CI 上四道关（lint、类型、测试、构建）任何一道红，PR 都合不进去。
+4. 产物体积有**预算**，超了 CI 红——而不是半年后才发现首页 3MB。
+5. 能从产物里看出"哪个 chunk 最大、为什么大"。
+6. 发布是**版本化目录 + 原子切换**，出问题一条命令回滚到上一版。
+7. 能说清"为什么这次构建和上次不一样"（可复现构建）。
+8. 你能在 10 分钟内**故意**让这道链子红一次，并演示它怎么拦住你。
+
+> 第 8 条是核心：门禁的价值不在"配好了"，而在"真的拦得住"。
+
+---
+
+## 阶段 1：本地门禁（把纪律变成自动）
+
+### 1. 选一套格式化 + lint：Biome（并说清取舍）
+
+| 方案 | 优点 | 代价 |
+|---|---|---|
+| ESLint + Prettier | 生态最大，插件多（a11y、import 排序） | 两套配置、两遍扫描、规则打架常事 |
+| **Biome** | 一个二进制干两件事、快、配置少 | 插件生态小，React a11y 规则不全 |
+
+> 选型原则：**新项目优先 Biome**（够用且快）；需要 `eslint-plugin-jsx-a11y`、`@typescript-eslint` 深度自定义才上 ESLint。
+
+```json
+// biome.json
+{
+	"$schema": "https://biomejs.dev/schemas/2.2.5/schema.json",
+	"files": { "includes": ["**", "!**/dist/**", "!**/node_modules/**", "!**/coverage/**"] },
+	"formatter": { "enabled": true, "indentStyle": "tab", "lineWidth": 100 },
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"correctness": { "noUnusedVariables": "error", "useExhaustiveDependencies": "error" },
+			"suspicious": { "noExplicitAny": "error", "noConsole": "warn" },
+			"style": { "useConst": "error", "useImportType": "error" }
+		}
+	},
+	"javascript": { "formatter": { "quoteStyle": "double", "semicolons": "always" } }
+}
+```
+
+**`useExhaustiveDependencies` 一定要开 error**：React 那篇里讲过的"依赖数组漏变量"，靠人眼是守不住的。
+
+### 2. 类型从"提醒"变成"门禁"
+
+```json
+// tsconfig.json
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"jsx": "react-jsx",
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": true,
+		"noImplicitOverride": true,
+		"noFallthroughCasesInSwitch": true,
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true,
+		"noEmit": true
+	},
+	"include": ["src", "vite.config.ts"]
+}
+```
+
+`noUncheckedIndexedAccess` 会让 `arr[0]` 的类型变成 `T | undefined`——一开始会冒出十几个报错，**那正是你原来会崩的地方**。
+
+### 3. 提交前自动跑（不靠自觉）
+
+```bash
+npm i -D simple-git-hooks lint-staged
+```
+
+```json
+// package.json 片段
+{
+	"scripts": {
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"build": "tsc --noEmit && vite build"
+	},
+	"simple-git-hooks": {
+		"pre-commit": "npx lint-staged",
+		"commit-msg": "npx commitlint --edit $1"
+	},
+	"lint-staged": {
+		"*.{ts,tsx,js,jsx,json,css}": ["biome check --write --no-errors-on-unmatched"]
+	}
+}
+```
+
+```bash
+npx simple-git-hooks   # 装钩子（写进 .git/hooks，团队每个人都要跑一次）
+```
+
+> 钩子**只做快检查**（格式化 + 改动的文件 lint），不要在这里跑全量测试——一次提交等 3 分钟，大家一定会 `--no-verify`。
+
+### 4. 提交信息也进规范
+
+```bash
+npm i -D @commitlint/cli @commitlint/config-conventional
+```
+
+```js
+// commitlint.config.cjs
+module.exports = { extends: ["@commitlint/config-conventional"] };
+```
+
+`feat:` / `fix:` / `refactor:` / `chore:` 不是形式主义：它是**自动生成变更日志**和"按类型过滤发布内容"的输入。
+
+### 5. 环境一致性：三个文件解决"我这里能跑"
+
+```
+.nvmrc          → 22
+.editorconfig   → 缩进/换行统一
+.gitattributes  → * text=auto eol=lf   （Windows 同事不再把整份文件改成 CRLF）
+```
+
+```json
+// package.json 里声明引擎
+{ "engines": { "node": ">=20 <23", "npm": ">=10" } }
+```
+
+### ✅ 阶段 1 验收清单
+
+- [ ] 新 clone 后 `npm ci` + `npm run dev` 一次成功（不借助任何口头说明）。
+- [ ] 故意写一个未使用的变量 → `npm run lint` **报错**（不是警告）。
+- [ ] 故意把 `arr[0].id` 改成 `arr[0].id`（数组可能为空）→ `npm run typecheck` 报错。
+- [ ] 写一个 `useEffect` 少写依赖 → lint 报错（`useExhaustiveDependencies`）。
+- [ ] `git commit -m "改了点东西"` → 被 commitlint 拦下；改成 `fix: 修正列表分页越界` → 通过。
+- [ ] 提交一个格式混乱的文件 → pre-commit 自动改好并重新暂存。
+- [ ] Windows 下改文件后 `git diff` 里没有"整份文件都变了"。
+
+---
+
+## 阶段 2：CI 四道关（把门禁搬到服务器上）
+
+> 本地钩子可以被 `--no-verify` 绕过，**CI 才是最终防线**。
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true # 新提交自动取消旧的，省 runner 时间
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Lint
+        run: npx biome ci .
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm run test -- --reporter=dot
+      - name: Build
+        run: npm run build
+      - name: Size budget
+        run: npx size-limit
+      - uses: actions/upload-artifact@v4
+        if: matrix.node == 22
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+```
+
+### 1. 体积预算：把"性能"变成硬约束
+
+```bash
+npm i -D size-limit @size-limit/file
+```
+
+```json
+// .size-limit.json
+[
+	{ "name": "主包（首次加载）", "path": "dist/assets/index-*.js", "limit": "180 kB" },
+	{ "name": "样式", "path": "dist/assets/*.css", "limit": "40 kB" },
+	{ "name": "全量 JS", "path": "dist/assets/*.js", "limit": "320 kB" }
+]
+```
+
+超预算时 `size-limit` 退出码非 0 → CI 红。**阈值怎么定**：先跑一次拿当前值，然后 `当前值 × 1.1` 作为初始预算，之后只降不升。
+
+### 2. 缓存与"可复现"
+
+- `cache: npm` 缓存的是 `~/.npm`，`npm ci` 仍然会**严格按 lockfile 安装**（这也是 CI 必须用 `ci` 而不是 `install` 的原因）。
+- GitHub Action 版本**锁大版本**（`@v4`），关键动作（发布、部署）建议锁 commit sha。
+- 构建产物带 `SOURCE_DATE_EPOCH` 或至少保证不把 `Date.now()` 写进产物，便于比对两次构建。
+
+### 3. 失败演练（最重要的一步）
+
+| 故意做的事 | 期望结果 |
+|---|---|
+| 加一个 `const x: any = 1` | Lint 红（`noExplicitAny`） |
+| 删掉 `package-lock.json` 再 push | `npm ci` 失败（证明 lockfile 是硬依赖） |
+| 给 `src/main.tsx` 加 200KB 的假数据 | Size budget 红，并打印超出多少 |
+| 写一个必失败的测试 | Test 红，PR 无法合并 |
+| 提交信息写成"update" | 本地 commitlint 拦（CI 也可以加一步 `commitlint --from origin/main`） |
+
+> 做完这张表，你才真正拥有"门禁"。**没演练过的门禁，等于没有。**
+
+### ✅ 阶段 2 验收清单
+
+- [ ] PR 上四个检查（Lint / Typecheck / Test / Build）都出现在 GitHub Checks 里。
+- [ ] 在分支上故意引入一个类型错误 → PR 显示红叉，无法合并（配 branch protection：Require status checks）。
+- [ ] 连续推两次提交 → 第一次的 CI 被自动取消（`cancel-in-progress`）。
+- [ ] CI 时间在 3 分钟内（缓存命中时），并且依赖没变时不会重新下载全部包。
+- [ ] 下载 CI 的 `dist` artifact，与本地 `npm run build` 的产物体积差异在 1% 内。
+- [ ] 体积超预算时，本地 `npx size-limit` 也能复现红灯（不是只有 CI 才红）。
+
+---
+
+## 阶段 3：构建与发布（让它能被别人用，也能退回去）
+
+### 1. 构建：先看清，再分包
+
+```bash
+npm i -D rollup-plugin-visualizer
+```
+
+```ts
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { visualizer } from "rollup-plugin-visualizer";
+
+export default defineConfig({
+	plugins: [react(), visualizer({ filename: "dist/stats.html", gzipSize: true })],
+	build: {
+		target: "es2020",
+		sourcemap: true, // 生产也要，出问题才能定位；体积大就改成 "hidden"
+		rollupOptions: {
+			output: {
+				manualChunks: {
+					react: ["react", "react-dom", "react-router-dom"],
+					query: ["@tanstack/react-query"],
+				},
+			},
+		},
+	},
+});
+```
+
+打开 `dist/stats.html`，你应该能回答三个问题：
+
+1. 最大的 chunk 是谁？为什么大？
+2. 有没有把只在一个页面用的库打进了主包？
+3. gzip 后实际传输多少？
+
+**分包原则**：按"变更频率"和"使用频次"分——框架（几乎不变）单独一块，能被浏览器长期缓存；页面级代码用 `lazy` 按路由拆；**别机械按目录拆**，碎块太多反而增加请求数。
+
+### 2. 发布：版本化目录 + 原子切换 + 一条命令回滚
+
+```bash
+#!/usr/bin/env bash
+# ops/release.sh —— 用法：bash release.sh（在 CI 里跑也一样）
+set -euo pipefail
+
+APP=/var/www/task-board
+SHA=$(git rev-parse --short HEAD)
+REL="$APP/releases/$SHA"
+
+npm ci
+npm run build
+
+mkdir -p "$APP/releases"
+rm -rf "$REL"
+cp -r dist "$REL"
+
+# 原子切换：ln -sfn 是原子操作，不会出现"半个新版本"的窗口
+ln -sfn "$REL" "$APP/current"
+
+# 校验（非 200 就失败，别让坏版本留在线上）
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)
+[ "$code" = "200" ] || { echo "健康检查失败：$code"; exit 1; }
+
+# 只保留最近 5 个版本
+ls -1dt "$APP/releases"/* | tail -n +6 | xargs -r rm -rf
+echo "released $SHA -> $REL"
+```
+
+```bash
+# 回滚：把软链指回上一版（5 秒完成）
+PREV=$(ls -1dt /var/www/task-board/releases/* | sed -n 2p)
+ln -sfn "$PREV" /var/www/task-board/current
+```
+
+nginx 只认 `current`：
+
+```nginx
+server {
+    listen 8080;
+    root /var/www/task-board/current;
+    index index.html;
+
+    # 带 hash 的资源可以永久缓存
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        try_files $uri =404;
+    }
+
+    # SPA 回退：任何未知路径都交给 index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache";
+    }
+}
+```
+
+**为什么必须版本化目录**：直接 `rsync` 覆盖时，用户在 1 秒的窗口里会拿到"新 HTML + 旧 JS"（或反之），表现为白屏或 `ChunkLoadError`。原子切换没有这个窗口。
+
+### 3. 镜像版（要容器时）
+
+```dockerfile
+FROM node:22-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY ops/nginx.conf /etc/nginx/conf.d/default.conf
+RUN chown -R nginx:nginx /usr/share/nginx/html
+USER nginx
+```
+
+### ✅ 阶段 3 验收清单
+
+- [ ] `dist/stats.html` 能看出最大的三个模块，且主包不含只在编辑页用到的依赖。
+- [ ] 发一次版：`releases/` 下多一个以 sha 命名的目录，`current` 软链指向它。
+- [ ] **回滚演练**：切到上一版，页面 200 且功能正常，全程不超过 1 分钟。
+- [ ] 发布脚本里把健康检查改成必然失败（比如路径写错）→ 脚本退出码非 0（不会把坏版本留在线上）。
+- [ ] 同一个 commit 构建两次，产物文件名 hash 一致（可复现）。
+- [ ] 浏览器强刷时，`/assets/*` 命中 `immutable` 缓存；HTML 每次拿最新。
+- [ ] 发布后 5 个以上版本时，旧目录被自动清理。
+
+---
+
+## 常见坑
+
+1. **CI 用 `npm install`**：会偷偷改 lockfile，构建结果不可复现。一律 `npm ci`。
+2. **只配 ESLint 不配类型门禁**：`any` 满天飞，lint 全绿。
+3. **pre-commit 跑全量测试**：慢到大家用 `--no-verify`，等于没有钩子。
+4. **钩子没装到每个人机器上**：`simple-git-hooks` 需要每人跑一次；靠 CI 兜底，别指望本地。
+5. **体积预算定死当前值**：加一个功能就红，很快被调高到失去意义。用 `当前值 × 1.1` 起步。
+6. **`manualChunks` 把每个页面都拆出来**：首屏反而多几个请求；先测量再拆。
+7. **发布直接覆盖目录**：白屏/`ChunkLoadError` 的经典来源。用 releases + 软链。
+8. **`try_files` 忘了 SPA 回退**：用户直接访问 `/tasks/123` 得到 404。
+9. **`/assets/*` 也 `no-cache`**：每次刷新都重新下载，白白多几百 KB。
+10. **健康检查只看进程活着**：进程活着但首页 500，照样发上去了。要查 HTTP 状态码，最好再查关键接口。
+
+---
+
+## 毕业自测：10 题
+
+1. `npm ci` 与 `npm install` 的三个差别？
+2. 为什么 lint 规则里 `useExhaustiveDependencies` 要设成 error？
+3. `noUncheckedIndexedAccess` 打开后报的那些错，为什么是"本来就存在的 bug"？
+4. commitlint 除了好看，还能带来什么自动化收益？
+5. CI 里 `concurrency.cancel-in-progress` 解决什么问题？
+6. 体积预算超了，你先看什么？（`stats.html` 里最大的模块 + 是否被主包引入）
+7. `manualChunks` 按什么维度分最有效？
+8. 为什么发布要用 `releases/<sha>` + 软链，而不是 `rsync` 覆盖？
+9. 回滚时要不要重新构建？（不需要，产物已在 releases 里——这正是版本化目录的价值）
+10. 怎么证明构建可复现？（同 commit 构建两次，比对产物 hash 与文件名）
+
+---
+
+## 做完之后
+
+这个仓库现在具备一条完整的链：**本地门禁 → CI 四道关 → 产物分析 → 原子发布 → 秒级回滚**。
+
+- 你可以在简历/面试里具体讲"我把首页主包从 X kB 压到 Y kB，怎么量的、怎么拆的"。
+- 你可以在团队里推行这套东西——因为它**不靠自觉**：每个人都跑同样的命令，CI 守最后一道。
+- 下一步：加预览环境（每个 PR 一个临时域名）、加变更日志自动生成（`changesets`）、加前端监控（Sentry）+ 性能上报（见[浏览器与性能那篇](/blog/posts/browser-roadmap-12-project-perf-budget/)）。
+
+> 工程化的毕业标准：**别人接手你的仓库，不需要问你任何"怎么跑/怎么发"的问题。**

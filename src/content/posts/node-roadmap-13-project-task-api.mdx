@@ -1,0 +1,782 @@
+---
+title: '13 · 毕业项目：把 12 篇拼成一个能上线的任务 API（与前端同一份契约）'
+published: 2026-10-23T02:20:00+08:00
+description: '模块里的 IoC、数据库、鉴权、校验、日志、队列、测试、部署这些零件，单独看都对，合起来才知道哪里会打架。这个项目用 NestJS + Prisma 从零写一个任务 API：DTO 校验、统一错误、JWT + 刷新令牌、结构化日志、定时清理、e2e 测试、pm2/Docker 上线，契约和 React 那个毕业项目完全对齐——做完你就有一次真正的前后端联调。'
+tags: [Node.js, NestJS, Prisma, JWT, 项目实战]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> **这个项目的特别之处**：它的接口契约和 [React 毕业项目](/blog/posts/react-roadmap-12-project-task-board/) **完全一致**
+> （`GET /tasks?_page&_limit&status&q` → `{ items, total, hasNext }`）。
+>
+> 也就是说：前端那篇的代码**不用改一行**，只要把 `VITE_API_BASE` 指向这个服务就能跑起来。
+> 你会第一次体会到"契约先行"到底省了什么。
+
+---
+
+## 做到什么算过
+
+1. 能从零起一个 NestJS 项目，说清 `Module / Controller / Provider` 各自负责什么。
+2. 用 Prisma 建表并跑迁移，能解释"为什么改 schema 要 `migrate` 而不是手动改库"。
+3. DTO 校验失败时，返回**统一格式**的错误体，且前端能按字段定位问题。
+4. 实现 JWT access token + httpOnly 刷新令牌，并解释"为什么 refresh token 不能放 localStorage"。
+5. 日志里每次请求都能按 `requestId` 串起来（含耗时、状态码、用户）。
+6. 能写两类测试：service 单测（不碰数据库）、e2e（真起服务，走 HTTP）。
+7. 能把这个服务部署上线，并用 `curl` 逐条验收契约，最后被前端成功调用。
+
+---
+
+## 契约先行（先定接口，再写代码）
+
+| 方法 | 路径 | 入参 | 返回 |
+|---|---|---|---|
+| GET | `/tasks` | `_page`、`_limit`、`status`、`q` | `{ items: Task[], total: number, hasNext: boolean }` |
+| GET | `/tasks/:id` | — | `Task`，不存在 → 404 |
+| POST | `/tasks` | `title/status/priority/assignee/desc` | 201 + 新建的 `Task` |
+| PATCH | `/tasks/:id` | 上述字段的部分 | 200 + 更新后的 `Task` |
+| DELETE | `/tasks/:id` | — | 204 |
+| POST | `/auth/login` | `username/password` | `{ accessToken }` + `Set-Cookie: refresh_token` |
+| POST | `/auth/refresh` | Cookie | 新的 `accessToken` |
+| GET | `/health` | — | `{ status: "ok", db: "up" }` |
+
+错误体统一为：
+
+```json
+{ "statusCode": 422, "message": "提交的数据不合法", "errors": { "title": ["标题不能为空"] }, "requestId": "..." }
+```
+
+> **先写这张表**，前后端就能并行。这张表就是这个项目的"需求文档"。
+
+---
+
+## 准备：项目骨架
+
+```bash
+npm i -g @nestjs/cli
+nest new task-api --package-manager npm
+cd task-api
+npm i @nestjs/config @nestjs/jwt @nestjs/throttler @nestjs/schedule @nestjs/terminus \
+      class-validator class-transformer bcrypt cookie-parser nestjs-pino pino-http
+npm i -D prisma @types/cookie-parser @types/bcrypt supertest @types/supertest
+npx prisma init --datasource-provider sqlite
+```
+
+目录（按职责分，不按文件类型堆）：
+
+```
+src/
+├─ main.ts
+├─ app.module.ts
+├─ prisma/{prisma.module.ts,prisma.service.ts}
+├─ common/
+│  ├─ filters/all-exceptions.filter.ts
+│  └─ dto/pagination.dto.ts
+├─ tasks/
+│  ├─ dto/{create-task.dto.ts,update-task.dto.ts,query-task.dto.ts}
+│  ├─ tasks.module.ts / tasks.controller.ts / tasks.service.ts
+│  └─ tasks.service.spec.ts
+├─ auth/
+│  ├─ auth.module.ts / auth.controller.ts / auth.service.ts
+│  ├─ jwt.guard.ts / public.decorator.ts / current-user.decorator.ts
+└─ test/tasks.e2e-spec.ts
+```
+
+---
+
+## 阶段 1：能跑通 CRUD（数据库 + 校验 + 统一错误）
+
+### 1. `prisma/schema.prisma`
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"      // 上线可切 mysql/postgresql，只改这里 + 环境变量
+  url      = env("DATABASE_URL")
+}
+
+model Task {
+  id        String   @id @default(cuid())
+  title     String
+  status    String   @default("todo")     // todo | doing | done
+  priority  String   @default("mid")      // low | mid | high
+  assignee  String
+  desc      String   @default("")
+  createdBy String   @default("system")
+  deletedAt DateTime?                      // 软删：真实项目别物理删
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  role         String   @default("member") // admin | member
+  createdAt    DateTime @default(now())
+}
+```
+
+```bash
+# .env
+DATABASE_URL="file:./dev.db"
+JWT_ACCESS_SECRET="换成 32 位随机串"
+JWT_REFRESH_SECRET="另一串"
+CORS_ORIGIN="http://localhost:5173"
+npx prisma migrate dev --name init
+npx prisma db seed            # 见下，造 12 条与前端一致的种子数据
+```
+
+### 2. Prisma service：全应用只用一个连接池
+
+```ts
+// src/prisma/prisma.service.ts
+import { Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { PrismaClient } from "@prisma/client";
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+	async onModuleInit() {
+		await this.$connect();
+	}
+	async onModuleDestroy() {
+		await this.$disconnect();
+	}
+}
+```
+
+### 3. DTO：入参边界就在这一层挡住
+
+```ts
+// src/tasks/dto/create-task.dto.ts
+import { IsIn, IsOptional, IsString, MaxLength, MinLength } from "class-validator";
+
+export class CreateTaskDto {
+	@IsString()
+	@MinLength(4, { message: "标题至少 4 个字" })
+	@MaxLength(60, { message: "标题不要超过 60 个字" })
+	title!: string;
+
+	@IsOptional()
+	@IsIn(["todo", "doing", "done"])
+	status?: "todo" | "doing" | "done";
+
+	@IsOptional()
+	@IsIn(["low", "mid", "high"])
+	priority?: "low" | "mid" | "high";
+
+	@IsString()
+	@MinLength(1, { message: "请填写负责人" })
+	assignee!: string;
+
+	@IsOptional()
+	@IsString()
+	@MaxLength(500, { message: "描述不要超过 500 字" })
+	desc?: string;
+}
+```
+
+```ts
+// src/tasks/dto/query-task.dto.ts
+import { Type } from "class-transformer";
+import { IsIn, IsInt, IsOptional, IsString, Max, Min } from "class-validator";
+
+export class QueryTaskDto {
+	@IsOptional()
+	@Type(() => Number)
+	@IsInt()
+	@Min(1)
+	page: number = 1;
+
+	@IsOptional()
+	@Type(() => Number)
+	@IsInt()
+	@Min(1)
+	@Max(100)
+	limit: number = 5;
+
+	@IsOptional()
+	@IsIn(["all", "todo", "doing", "done"])
+	status: "all" | "todo" | "doing" | "done" = "all";
+
+	@IsOptional()
+	@IsString()
+	q?: string;
+}
+```
+
+> `_page`/`_limit`（前端契约）与 `page`/`limit`（代码里更好写）之间做一次映射，写在一个 `@Transform` 或 controller 里都行——**但只在一处做**，别散落。
+
+### 4. service：查询、软删、返回契约
+
+```ts
+// src/tasks/tasks.service.ts
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { PrismaService } from "../prisma/prisma.service";
+import { CreateTaskDto } from "./dto/create-task.dto";
+import { QueryTaskDto } from "./dto/query-task.dto";
+import { UpdateTaskDto } from "./dto/update-task.dto";
+
+@Injectable()
+export class TasksService {
+	constructor(private readonly prisma: PrismaService) {}
+
+	async list(query: QueryTaskDto) {
+		const where = {
+			deletedAt: null,
+			...(query.status !== "all" ? { status: query.status } : {}),
+			...(query.q ? { title: { contains: query.q } } : {}),
+		};
+		const skip = (query.page - 1) * query.limit;
+
+		// 一次事务拿两样东西：当前页 + 总数，保证 total 与 items 对得上
+		const [items, total] = await this.prisma.$transaction([
+			this.prisma.task.findMany({
+				where,
+				skip,
+				take: query.limit,
+				orderBy: { createdAt: "desc" },
+			}),
+			this.prisma.task.count({ where }),
+		]);
+
+		return { items, total, hasNext: skip + items.length < total };
+	}
+
+	async findOne(id: string) {
+		const task = await this.prisma.task.findFirst({ where: { id, deletedAt: null } });
+		if (!task) throw new NotFoundException("任务不存在（可能已被删除）");
+		return task;
+	}
+
+	create(dto: CreateTaskDto, createdBy: string) {
+		return this.prisma.task.create({ data: { ...dto, createdBy } });
+	}
+
+	async update(id: string, dto: UpdateTaskDto) {
+		await this.findOne(id); // 先确认存在，再更新：避免 update 静默返回 null
+		return this.prisma.task.update({ where: { id }, data: dto });
+	}
+
+	async remove(id: string) {
+		await this.findOne(id);
+		await this.prisma.task.update({ where: { id }, data: { deletedAt: new Date() } });
+	}
+}
+```
+
+### 5. controller：只做协议转换，不写业务
+
+```ts
+// src/tasks/tasks.controller.ts
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
+import { JwtGuard } from "../auth/jwt.guard";
+import { CurrentUser } from "../auth/current-user.decorator";
+import { TasksService } from "./tasks.service";
+import { CreateTaskDto } from "./dto/create-task.dto";
+import { UpdateTaskDto } from "./dto/update-task.dto";
+import { QueryTaskDto } from "./dto/query-task.dto";
+
+@UseGuards(JwtGuard)
+@Controller("tasks")
+export class TasksController {
+	constructor(private readonly tasks: TasksService) {}
+
+	@Get()
+	list(@Query() query: QueryTaskDto) {
+		return this.tasks.list(query);
+	}
+
+	@Get(":id")
+	findOne(@Param("id") id: string) {
+		return this.tasks.findOne(id);
+	}
+
+	@Post()
+	create(@Body() dto: CreateTaskDto, @CurrentUser() user: { username: string }) {
+		return this.tasks.create(dto, user.username);
+	}
+
+	@Patch(":id")
+	update(@Param("id") id: string, @Body() dto: UpdateTaskDto) {
+		return this.tasks.update(id, dto);
+	}
+
+	@Delete(":id")
+	async remove(@Param("id") id: string) {
+		await this.tasks.remove(id);
+	}
+}
+```
+
+> `DELETE` 返回 204：在 controller 上加 `@HttpCode(204)`。
+
+### 6. 统一错误体（前端能按字段定位）
+
+先把"校验错误"整理成字段结构——**在管道里做，不要在过滤器里解析字符串**：
+
+```ts
+// src/common/validation.ts
+import { UnprocessableEntityException, type ValidationError } from "@nestjs/common";
+
+function flatten(errors: ValidationError[], prefix = ""): Record<string, string[]> {
+	const out: Record<string, string[]> = {};
+	for (const err of errors) {
+		const path = prefix ? `${prefix}.${err.property}` : err.property;
+		const messages = Object.values(err.constraints ?? {});
+		if (messages.length) out[path] = messages;
+		if (err.children?.length) Object.assign(out, flatten(err.children, path));
+	}
+	return out;
+}
+
+/** ValidationPipe 的异常工厂：把字段错误整理成 { 字段: [提示] } */
+export function validationExceptionFactory(errors: ValidationError[]) {
+	return new UnprocessableEntityException({
+		message: "提交的数据不合法",
+		errors: flatten(errors),
+	});
+}
+```
+
+```ts
+// src/common/filters/all-exceptions.filter.ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from "@nestjs/common";
+import type { Request, Response } from "express";
+
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+	private readonly logger = new Logger("Exception");
+
+	catch(exception: unknown, host: ArgumentsHost) {
+		const ctx = host.switchToHttp();
+		const res = ctx.getResponse<Response>();
+		const req = ctx.getRequest<Request & { requestId?: string }>();
+
+		const status =
+			exception instanceof HttpException ? exception.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
+
+		let message = "服务端出错了";
+		let errors: Record<string, string[]> | undefined;
+
+		if (exception instanceof HttpException) {
+			const body = exception.getResponse();
+			if (typeof body === "string") {
+				message = body;
+			} else if (body && typeof body === "object") {
+				const b = body as { message?: string | string[]; errors?: Record<string, string[]> };
+				message = Array.isArray(b.message) ? (b.message[0] ?? "请求不合法") : (b.message ?? exception.message);
+				errors = b.errors;
+			}
+		} else {
+			// 未知异常：源码细节只进日志，响应体里不外泄
+			this.logger.error({ err: exception, requestId: req.requestId }, "unhandled exception");
+		}
+
+		res.status(status).json({ statusCode: status, message, errors, requestId: req.requestId });
+	}
+}
+```
+
+> 这块是"最容易写成一坨"的地方。原则：**管道负责把校验错误结构化，过滤器只负责翻译成 HTTP 响应**，两边都不做业务判断。
+
+### ✅ 阶段 1 验收清单
+
+- [ ] `npx prisma migrate dev` 成功，`npx prisma studio` 能看到 12 条种子数据。
+- [ ] `curl "localhost:3000/tasks?_page=1&_limit=5"` 返回 `{items(5), total(12), hasNext:true}`。
+- [ ] `_page=3` 时 `hasNext` 为 `false`（总数对得上，不靠猜）。
+- [ ] 传 `title=abc`（3 个字）→ 400/422，且响应体里 `errors.title` 有中文提示。
+- [ ] `GET /tasks/不存在的id` → 404，`message` 是中文而不是英文默认值。
+- [ ] `DELETE` 后再 `GET` → 404；数据库里那行**还在**，只是 `deletedAt` 有值（软删）。
+- [ ] 所有返回字段名是 `camelCase`（`createdAt` 而不是 `created_at`），与前端类型一致。
+
+---
+
+## 阶段 2：鉴权 + 日志 + 限流（能被真实前端调用的门槛）
+
+### 1. JWT：access 短、refresh 放 httpOnly Cookie
+
+```ts
+// src/auth/auth.service.ts
+import { Injectable, UnauthorizedException } from "@nestjs/common";
+import { JwtService } from "@nestjs/jwt";
+import { compare } from "bcrypt";
+import { PrismaService } from "../prisma/prisma.service";
+
+@Injectable()
+export class AuthService {
+	constructor(
+		private readonly prisma: PrismaService,
+		private readonly jwt: JwtService,
+	) {}
+
+	async validate(username: string, password: string) {
+		const user = await this.prisma.user.findUnique({ where: { username } });
+		// 用户不存在也走一次 compare，避免"响应时间差"暴露账号是否存在
+		const ok = user ? await compare(password, user.passwordHash) : false;
+		if (!user || !ok) throw new UnauthorizedException("用户名或密码错误");
+		return user;
+	}
+
+	signAccess(user: { id: string; username: string; role: string }) {
+		return this.jwt.sign(
+			{ sub: user.id, username: user.username, role: user.role },
+			{ secret: process.env.JWT_ACCESS_SECRET, expiresIn: "15m" },
+		);
+	}
+
+	signRefresh(user: { id: string }) {
+		return this.jwt.sign({ sub: user.id }, { secret: process.env.JWT_REFRESH_SECRET, expiresIn: "7d" });
+	}
+}
+```
+
+```ts
+// src/auth/auth.controller.ts
+import { Body, Controller, Post, Res } from "@nestjs/common";
+import type { Response } from "express";
+import { AuthService } from "./auth.service";
+import { LoginDto } from "./dto/login.dto";
+import { Public } from "./public.decorator";
+
+@Controller("auth")
+export class AuthController {
+	constructor(private readonly auth: AuthService) {}
+
+	@Public()
+	@Post("login")
+	async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
+		const user = await this.auth.validate(dto.username, dto.password);
+		res.cookie("refresh_token", this.auth.signRefresh(user), {
+			httpOnly: true, // JS 读不到 → XSS 偷不走
+			sameSite: "lax",
+			secure: process.env.NODE_ENV === "production",
+			path: "/auth/refresh", // 只在刷新接口上带，减少暴露面
+			maxAge: 7 * 24 * 3600 * 1000,
+		});
+		return { accessToken: this.auth.signAccess(user), user: { username: user.username, role: user.role } };
+	}
+}
+```
+
+Guard 的最小实现（生产可以换 `@nestjs/passport`，原理不变）：
+
+```ts
+// src/auth/jwt.guard.ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
+import { JwtService } from "@nestjs/jwt";
+import { Reflector } from "@nestjs/core";
+import { IS_PUBLIC_KEY } from "./public.decorator";
+
+@Injectable()
+export class JwtGuard implements CanActivate {
+	constructor(
+		private readonly jwt: JwtService,
+		private readonly reflector: Reflector,
+	) {}
+
+	async canActivate(ctx: ExecutionContext) {
+		const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+			ctx.getHandler(),
+			ctx.getClass(),
+		]);
+		if (isPublic) return true;
+
+		const req = ctx.switchToHttp().getRequest();
+		const token = (req.headers.authorization ?? "").replace(/^Bearer /, "");
+		if (!token) throw new UnauthorizedException("缺少登录凭证");
+		try {
+			req.user = await this.jwt.verifyAsync(token, { secret: process.env.JWT_ACCESS_SECRET });
+			return true;
+		} catch {
+			throw new UnauthorizedException("登录已过期，请重新登录");
+		}
+	}
+}
+```
+
+### 2. 日志：一条日志能串起一次请求
+
+```ts
+// src/main.ts（关键片段）
+import { Logger } from "nestjs-pino";
+import { randomUUID } from "node:crypto";
+
+app.use((req, _res, next) => {
+	req.requestId = req.headers["x-request-id"] ?? randomUUID();
+	next();
+});
+app.useLogger(app.get(Logger));
+```
+
+```ts
+// app.module.ts 里的 pino 配置
+LoggerModule.forRoot({
+	pinoHttp: {
+		genReqId: (req) => req.requestId ?? randomUUID(),
+		customProps: (req, res) => ({ requestId: res.getHeader("x-request-id") }),
+		redact: ["req.headers.authorization", "req.headers.cookie"],
+		transport: process.env.NODE_ENV === "production" ? undefined : { target: "pino-pretty" },
+	},
+});
+```
+
+**脱敏是硬要求**：`authorization`、`cookie` 必须 redact——日志泄 token 是真实事故。
+
+### 3. 其他三件"上线才有感觉"的事
+
+```ts
+// CORS：只放行前端来源，且允许携带 Cookie
+app.enableCors({ origin: process.env.CORS_ORIGIN?.split(","), credentials: true });
+
+// 限流：防止被刷（登录接口单独更严）
+ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]);
+
+// 全局管道：白名单 + 转换，未声明的字段直接丢掉（防越权字段注入）
+app.useGlobalPipes(
+	new ValidationPipe({
+		whitelist: true,
+		transform: true,
+		exceptionFactory: validationExceptionFactory, // 字段级错误体，见 common/validation.ts
+	}),
+);
+```
+
+### ✅ 阶段 2 验收清单
+
+- [ ] 不带 token 请求 `/tasks` → 401，`message` 是中文。
+- [ ] `POST /auth/login` 成功 → 响应头有 `Set-Cookie: refresh_token=...; HttpOnly`（DevTools 里 **JS 读不到** `document.cookie`）。
+- [ ] access token 过期（把 `expiresIn` 临时改成 `10s`）→ 401；`POST /auth/refresh` 拿到新 token 后能继续访问。
+- [ ] 日志里搜 `requestId`，能看到同一次请求的"进/出 + 耗时 + 状态码"。
+- [ ] 日志里 `authorization` 和 `cookie` 是 `[Redacted]`。
+- [ ] 前端 `http://localhost:5173` 能跨域访问；换成别的 origin 被拒（CORS 生效）。
+- [ ] 请求体里多塞一个 `role: "admin"` → 不会写进数据库（`whitelist` 生效）。
+- [ ] 60 秒内请求 200 次 → 开始收到 429。
+
+---
+
+## 阶段 3：定时清理 + 测试 + 上线（能交付才算毕业）
+
+### 1. 定时清理（把 07 篇的调度用起来）
+
+```ts
+// src/tasks/tasks.tasks.ts
+import { Injectable, Logger } from "@nestjs/common";
+import { Cron, CronExpression } from "@nestjs/schedule";
+import { PrismaService } from "../prisma/prisma.service";
+
+@Injectable()
+export class TasksTasks {
+	private readonly logger = new Logger(TasksTasks.name);
+	constructor(private readonly prisma: PrismaService) {}
+
+	/** 每天 03:10 把"已完成且超过 30 天"的软删记录真正删掉 */
+	@Cron("10 3 * * *")
+	async purgeDone() {
+		const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000);
+		const { count } = await this.prisma.task.deleteMany({
+			where: { status: "done", updatedAt: { lt: cutoff } },
+		});
+		if (count > 0) this.logger.log(`purged ${count} finished tasks`);
+	}
+}
+```
+
+### 2. 两类测试，各管一段
+
+```ts
+// src/tasks/tasks.service.spec.ts —— 单测：不碰数据库
+import { Test } from "@nestjs/testing";
+import { TasksService } from "./tasks.service";
+import { PrismaService } from "../prisma/prisma.service";
+
+describe("TasksService.list", () => {
+	it("把 page/limit 换算成 skip/take，并算出 hasNext", async () => {
+		const prisma = {
+			$transaction: jest.fn().mockResolvedValue([[{ id: "1" }], 12]),
+			task: { findMany: jest.fn(), count: jest.fn() },
+		};
+		const moduleRef = await Test.createTestingModule({
+			providers: [TasksService, { provide: PrismaService, useValue: prisma }],
+		}).compile();
+
+		const service = moduleRef.get(TasksService);
+		const res = await service.list({ page: 3, limit: 5, status: "all" } as never);
+
+		expect(prisma.task.findMany).toHaveBeenCalledWith(
+			expect.objectContaining({ skip: 10, take: 5 }),
+		);
+		expect(res.hasNext).toBe(false);
+	});
+});
+```
+
+```ts
+// test/tasks.e2e-spec.ts —— e2e：真起服务、真发 HTTP
+import { Test } from "@nestjs/testing";
+import { INestApplication, ValidationPipe } from "@nestjs/common";
+import request from "supertest";
+import { AppModule } from "../src/app.module";
+
+describe("tasks (e2e)", () => {
+	let app: INestApplication;
+	let token: string;
+
+	beforeAll(async () => {
+		const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+		app = moduleRef.createNestApplication();
+		app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+		await app.init();
+
+		const login = await request(app.getHttpServer())
+			.post("/auth/login")
+			.send({ username: "demo", password: "demo1234" });
+		token = login.body.accessToken;
+	});
+
+	afterAll(() => app.close());
+
+	it("未登录访问列表 → 401", async () => {
+		await request(app.getHttpServer()).get("/tasks").expect(401);
+	});
+
+	it("分页契约：返回 items/total/hasNext", async () => {
+		const res = await request(app.getHttpServer())
+			.get("/tasks?_page=1&_limit=5")
+			.set("Authorization", `Bearer ${token}`)
+			.expect(200);
+		expect(res.body.items.length).toBe(5);
+		expect(typeof res.body.total).toBe("number");
+		expect(res.body.hasNext).toBe(true);
+	});
+
+	it("校验失败返回字段级错误", async () => {
+		const res = await request(app.getHttpServer())
+			.post("/tasks")
+			.set("Authorization", `Bearer ${token}`)
+			.send({ title: "ab", assignee: "" })
+			.expect(422);
+		expect(res.body.errors).toHaveProperty("title");
+	});
+});
+```
+
+> e2e 用独立的测试库：`DATABASE_URL="file:./test.db"`，在 `beforeAll` 里跑一次 `prisma migrate deploy` + 种子，结束时删除文件。**别拿开发库跑 e2e**。
+
+### 3. 部署：pm2 或 Docker，二选一
+
+```js
+// ecosystem.config.cjs
+module.exports = {
+	apps: [
+		{
+			name: "task-api",
+			script: "dist/main.js",
+			instances: 1, // SQLite 单写 → 只能 1；换 MySQL 后可上 cluster
+			env: { NODE_ENV: "production", PORT: 3100 },
+			max_memory_restart: "400M",
+			out_file: "/root/ops/task-api.out.log",
+			error_file: "/root/ops/task-api.err.log",
+		},
+	],
+};
+```
+
+```bash
+npm ci
+npx prisma migrate deploy      # 生产只跑 deploy，不跑 dev
+npm run build
+pm2 start ecosystem.config.cjs && pm2 save
+curl -s localhost:3100/health
+```
+
+Docker 版关键点（多阶段 + 非 root）：
+
+```dockerfile
+FROM node:22-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npx prisma generate && npm run build
+
+FROM node:22-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/prisma ./prisma
+COPY package.json ./
+USER node
+CMD ["node", "dist/main.js"]
+```
+
+### 4. 用 curl 逐条验收契约（发版前必做）
+
+```bash
+BASE=http://localhost:3100
+TOKEN=$(curl -s -X POST $BASE/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"demo1234"}' | grep -o '"accessToken":"[^"]*' | cut -d'"' -f4)
+
+curl -s "$BASE/tasks?_page=1&_limit=5" -H "Authorization: Bearer $TOKEN" | head -c 200
+curl -s "$BASE/tasks?_page=1&_limit=5&status=doing" -H "Authorization: Bearer $TOKEN" | head -c 200
+curl -s "$BASE/tasks/不存在" -H "Authorization: Bearer $TOKEN" -o /dev/null -w '%{http_code}\n'   # 期望 404
+curl -s -X POST "$BASE/tasks" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"用 curl 建的任务","assignee":"test"}' | head -c 200
+```
+
+### ✅ 阶段 3 验收清单
+
+- [ ] `npm test`（单测）全绿；`npm run test:e2e` 全绿；两次跑之间不残留测试库。
+- [ ] 把 `title` 的最小长度从 4 改成 8 → **单测和 e2e 同时变红**（说明测试真的在守契约）。
+- [ ] 手动触发一次清理（把 cron 改成 `*/1 * * * *`）→ 日志出现 `purged N`，数据库里过期数据消失。
+- [ ] `GET /health` 返回 `{status:"ok"}`；把数据库文件改名后再请求 → 健康检查返回 503。
+- [ ] `pm2 logs task-api` 能按 `requestId` 串起一次请求。
+- [ ] 前端（React 那篇）把 `VITE_API_BASE` 指到 `http://localhost:3100`，登录后列表/新建/删除全部可用，**前端代码零改动**。
+- [ ] 关掉服务后，前端列表页显示"网络异常…"并可重试（错误分类真的生效了）。
+
+---
+
+## 常见坑
+
+1. **`@Query()` 里字符串没转数字**：`_page=2` 拿到的是 `"2"`，`(page-1)*limit` 变字符串拼接。用 `@Type(() => Number)` 或 `@Transform`。
+2. **`findMany` + `count` 分两次查**：中间有人插入时 `total` 和 `items` 对不上。用 `$transaction`。
+3. **物理删除**：误删无法恢复、审计无迹。默认软删，另配清理任务。
+4. **refresh token 放 localStorage**：等于给 XSS 送长期凭证。httpOnly + `path` 限定到刷新接口。
+5. **JWT 密钥写在代码里**：换密钥要改代码 + 重启；放环境变量，且 access/refresh 用**不同**密钥。
+6. **日志打印整个 `req`**：`authorization`、`cookie`、密码字段全进日志。用 redact 白名单。
+7. **`ValidationPipe` 没开 `whitelist`**：前端多传 `role: "admin"` 会被原样落到 `data`。
+8. **SQLite 开多实例**：写锁冲突直接 500。要么单实例，要么换 MySQL/Postgres。
+9. **e2e 连开发库**：跑一次测试把开发数据清空，是新人最常犯的事故。
+10. **`migrate dev` 上生产**：会尝试重置。生产只用 `migrate deploy`。
+
+---
+
+## 毕业自测：10 题
+
+1. `Module` / `Controller` / `Provider` 各解决什么问题？为什么 controller 里不该有 `prisma`？
+2. 为什么 `update` 之前要先 `findOne`？（Prisma 更新不存在的 id 会抛 P2025，但错误体不友好，且软删记录会被"复活"）
+3. `hasNext` 为什么不能用 `items.length === limit` 判断？（最后一页刚好满时误判；React 篇的 json-server 那样做是因为拿不到 total）
+4. JWT 过期后前端该怎么做？`401 → refresh → 重放原请求` 这段逻辑放哪一层？（请求拦截器，不要每个页面写一遍）
+5. `sameSite=lax` 与 `strict` 在这个场景下差在哪？（跨站直接打开链接时是否带 Cookie）
+6. 日志里没有 `requestId` 会怎样？（并发时无法把报错与请求对上）
+7. 单测和 e2e 各自"守"什么？（单测守逻辑分支，e2e 守协议与链路）
+8. 为什么 `migrate deploy` 与 `migrate dev` 不能混用？
+9. 软删后分页的 `total` 该怎么算？（必须带 `deletedAt: null` 条件，否则总数虚高）
+10. 现在要给这个 API 加"批量删除 + 权限校验"，改哪几层？（DTO/controller、service 事务、guard 里的角色判断、e2e 补两条用例）
+
+---
+
+## 做完之后
+
+- 你有了一个**能上线**的服务，而不是一堆"跑得起来"的示例。
+- 你体验了"契约先行 → 前后端并行 → 联调零改动"的完整循环。
+- 下一步：加缓存（Redis 缓存列表第一页）、加队列（导出大 CSV 走 `@nestjs/bull`）、换 Postgres 并开多实例、把日志接到 Loki/ELK。
+
+> 判断一个后端项目"能不能交付"，看的不是代码量，而是：**契约稳定、错误统一、有测试、能部署、能回滚**。这五条你都有了。
