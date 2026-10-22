@@ -1,0 +1,254 @@
+---
+title: '11 · 测试与工程质量'
+published: 2026-10-20T21:00:00+08:00
+description: 'Next.js 项目的测试体系：Vitest 单元测试、Testing Library 组件测试、Server Action 与 Route Handler 的集成测试、Playwright 关键链路 E2E、RSC 测试策略、环境变量校验与 CI 闸门。'
+tags: [Next.js, 测试, Vitest, Playwright, CI]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> Next.js 项目最容易出现的测试误区是「什么都要测」。页面结构天天变，快照测试只会制造噪音；真正该锁死的是**钱、权限、数据一致性和关键链路**。
+
+---
+
+## 测试分层
+
+| 层 | 工具 | 测什么 | 成本 |
+| --- | --- | --- | --- |
+| 单元 | Vitest | 纯函数、校验、金额计算、权限判断 | 低 |
+| 组件 | Testing Library | 表单交互、状态变化、可访问性 | 中 |
+| 集成 | Vitest + 测试数据库 | Server Action、Route Handler、Repository | 中 |
+| E2E | Playwright | 登录、下单、支付、关键后台流程 | 高 |
+
+建议比例：单元 + 组件占大头，集成覆盖写操作，E2E 只测 5–10 条核心链路。**不要用 E2E 覆盖所有边界情况**，慢且脆。
+
+---
+
+## 单元测试：从纯逻辑开始
+
+把业务规则从框架里抽出来，测试成本会断崖式下降：
+
+```ts
+// lib/pricing.ts
+export function calcTotal(items: CartItem[], coupon?: Coupon) {
+  const subtotal = items.reduce((sum, i) => sum + i.price * i.qty, 0);
+  if (!coupon) return subtotal;
+  if (coupon.type === "percent") {
+    return Math.max(0, subtotal - Math.round(subtotal * coupon.value));
+  }
+  return Math.max(0, subtotal - coupon.value);
+}
+```
+
+```ts
+// lib/pricing.test.ts
+import { describe, expect, it } from "vitest";
+import { calcTotal } from "./pricing";
+
+describe("calcTotal", () => {
+  it("按百分比折扣计算", () => {
+    expect(
+      calcTotal([{ price: 100, qty: 2 }], { type: "percent", value: 0.1 }),
+    ).toBe(180);
+  });
+
+  it("折扣不会把金额算成负数", () => {
+    expect(
+      calcTotal([{ price: 10, qty: 1 }], { type: "fixed", value: 50 }),
+    ).toBe(0);
+  });
+});
+```
+
+金额、税费、权限、状态机——这些地方出错的代价最高，测试收益最大。
+
+---
+
+## 组件测试
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { expect, it, vi } from "vitest";
+import { QuantityPicker } from "./quantity-picker";
+
+it("点击加号会增加数量", async () => {
+  const onChange = vi.fn();
+  render(<QuantityPicker value={1} onChange={onChange} />);
+
+  await userEvent.click(screen.getByRole("button", { name: "增加" }));
+  expect(onChange).toHaveBeenCalledWith(2);
+});
+```
+
+原则：
+
+- 用**角色 + 可访问名称**查询，别依赖 class 或 DOM 结构。
+- 测用户行为，不测内部 state。
+- 组件里如果有 `useRouter`、`useSearchParams`，需要 mock 或包一层测试 Provider。
+- 快照测试只用于稳定的展示型组件，别给整页做快照。
+
+---
+
+## RSC 怎么测
+
+Testing Library 不能直接渲染 async Server Component。务实的策略：
+
+1. **把数据获取和业务逻辑抽成普通函数**，单独做单元测试。
+2. **页面级行为交给 E2E**，因为 RSC 的最终产物就是 HTML。
+3. 需要集成验证时，直接测试它调用的 service / repository，而不是渲染整棵服务端树。
+
+不要为了「测 RSC」引入一堆实验性工具，最后维护成本高于收益。
+
+---
+
+## Server Action 集成测试
+
+Action 本质是一个普通 async 函数，可以直接调用：
+
+```ts
+// tests/create-order.test.ts
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createOrder } from "@/app/actions/orders";
+import { db } from "@/lib/db";
+
+vi.mock("@/lib/auth", () => ({
+  requireUser: vi.fn(async () => ({ id: "u1", tenantId: "t1" })),
+}));
+
+describe("createOrder", () => {
+  beforeEach(async () => {
+    await db.order.deleteMany();
+    await db.inventory.updateMany({ data: { stock: 10 } });
+  });
+
+  it("库存不足时返回业务错误", async () => {
+    const form = new FormData();
+    form.set("productId", "p1");
+    form.set("qty", "99");
+
+    const state = await createOrder({ ok: true }, form);
+
+    expect(state.ok).toBe(false);
+    expect(state.message).toContain("库存");
+  });
+});
+```
+
+要点：
+
+- **用真实数据库**（测试库 / Testcontainers），不要在核心写路径上 mock ORM。
+- 每个用例前清理数据，或用事务回滚。
+- 覆盖：正常路径、校验失败、权限不足、并发/库存边界。
+- `redirect()` 和 `revalidatePath()` 需要 mock 或在测试环境容错。
+
+---
+
+## Route Handler 测试
+
+直接构造 `Request` 调用导出的函数：
+
+```ts
+import { GET } from "@/app/api/orders/[id]/route";
+
+const response = await GET(new Request("http://localhost/api/orders/1"), {
+  params: Promise.resolve({ id: "1" }),
+});
+
+expect(response.status).toBe(200);
+```
+
+Web 标准的 `Request` / `Response` 让这类测试非常轻，不需要启动服务器。适合覆盖鉴权、404、错误码契约。
+
+---
+
+## E2E：只测关键链路
+
+```ts
+// e2e/checkout.spec.ts
+import { expect, test } from "@playwright/test";
+
+test("用户可以完成一次下单", async ({ page }) => {
+  await page.goto("/login");
+  await page.getByLabel("邮箱").fill("demo@example.com");
+  await page.getByLabel("密码").fill(process.env.E2E_PASSWORD!);
+  await page.getByRole("button", { name: "登录" }).click();
+
+  await page.goto("/products");
+  await page.getByRole("button", { name: "加入购物车" }).first().click();
+  await page.getByRole("link", { name: "去结算" }).click();
+  await page.getByRole("button", { name: "提交订单" }).click();
+
+  await expect(page.getByRole("heading", { name: "订单详情" })).toBeVisible();
+});
+```
+
+降低脆弱性：
+
+- 用 `storageState` 复用登录态，别每条用例都走登录。
+- 用角色选择器，不用 CSS 路径。
+- 每个用例自建数据、自清理，避免相互污染。
+- 不要 `waitForTimeout`，用 `expect(...).toBeVisible()` 自动等待。
+- CI 上跑无头模式，失败保留 trace / 截图 / video。
+
+E2E 覆盖建议：注册登录、核心交易、权限边界、支付回调、关键后台操作。**其余靠下层测试。**
+
+---
+
+## 工程质量闸门
+
+除了测试，至少还要这些：
+
+- **TypeScript strict**：`strict: true`，考虑开 `noUncheckedIndexedAccess`。
+- **ESLint**：`next/core-web-vitals` + 团队规则，CI 必须过。
+- **格式统一**：Prettier 或 Biome，pre-commit 自动格式化。
+- **环境变量校验**：启动时用 zod 校验，缺一个直接失败，别等运行时才炸。
+- **构建必须过**：`next build` 是最便宜的全量类型与路由检查。
+- **迁移检查**：CI 里跑一次 `migrate deploy` 到空库，确保迁移可重放。
+
+```ts
+// lib/env.ts
+import { z } from "zod";
+
+export const env = z
+  .object({
+    DATABASE_URL: z.string().url(),
+    SESSION_SECRET: z.string().min(32),
+    NODE_ENV: z.enum(["development", "test", "production"]),
+  })
+  .parse(process.env);
+```
+
+---
+
+## CI 流水线
+
+```yaml
+- run: npm ci
+- run: npm run typecheck
+- run: npm run lint
+- run: npm run test -- --run
+- run: npm run build
+- run: npx playwright test
+```
+
+顺序有讲究：类型和 lint 最快，先失败先止损；构建放 E2E 前，避免用坏产物跑端到端。
+
+---
+
+## 常见坑
+
+- **只测实现细节**：重构一次，测试全红。
+- **什么都不 mock**：单元测试连真实支付网关。
+- **什么都 mock**：测试全绿，线上迁移失败。
+- **没有权限测试**：普通用户能删别人数据，测试毫无察觉。
+- **E2E 相互依赖**：跑单条通过，全量失败。
+- **覆盖率当 KPI**：为了数字写无意义断言。
+- **CI 不跑 build**：类型错误拖到部署才暴露。
+
+---
+
+## 小结
+
+测试不是「证明代码对」，而是「防止未来改坏」。把测试预算花在高风险路径上，把工程闸门（类型、lint、构建、迁移）交给 CI，团队才敢持续重构。下一篇讲部署：从 `next build` 到生产环境稳定运行之间的所有坑。

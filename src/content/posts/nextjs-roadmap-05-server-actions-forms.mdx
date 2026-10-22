@@ -1,0 +1,235 @@
+---
+title: '05 · Server Actions 与表单'
+published: 2026-10-20T15:00:00+08:00
+description: 'Server Actions 实战：use server 的真实语义、表单渐进增强、useActionState 与 useFormStatus、乐观更新、输入校验与鉴权、redirect 陷阱，以及为什么它本质是一个公开的写接口。'
+tags: [Next.js, Server Actions, 表单, React 19, 安全]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> Server Action 最大的误导性在于「像调函数」。你在客户端 `await saveOrder(data)`，感觉是在本地调用；实际上它是一次 POST 请求，任何人都能构造同样的请求。**把它当公开 API 对待，安全模型才不会错。**
+
+---
+
+## 它到底是什么
+
+```ts
+// app/actions/orders.ts
+"use server";
+
+export async function createOrder(formData: FormData) {
+  const session = await requireUser();
+  const productId = String(formData.get("productId"));
+  await db.order.create({
+    data: { productId, userId: session.userId },
+  });
+}
+```
+
+`'use server'` 做了两件事：
+
+1. 把这个模块里的导出函数登记为**可被客户端调用的服务端函数**。
+2. 生成一个隐藏的 HTTP 端点，客户端调用时发送 POST，参数经序列化传输。
+
+所以它天然具备：
+
+- **渐进增强**：不写 `onSubmit`，直接用 `form action={createOrder}` 这种写法，JS 没加载完也能提交。
+- **类型安全**：端到端 TypeScript，参数类型在编译期检查。
+- **自动集成**：可以在 action 里 `cookies().set()`、`redirect()`、`revalidatePath()`。
+
+但它**不具备**：自动鉴权、自动校验、自动防重放。这些都得自己写。
+
+---
+
+## 表单的现代写法
+
+React 19 提供 `useActionState`，把「提交结果 + 错误 + pending」收进一个 Hook：
+
+```tsx
+"use client";
+
+import { useActionState } from "react";
+import { createOrder } from "@/app/actions/orders";
+
+export function OrderForm() {
+  const [state, action, pending] = useActionState(createOrder, {
+    ok: true,
+    errors: {},
+  });
+
+  return (
+    <form action={action}>
+      <input name="productId" />
+      {state.errors?.productId && <p>{state.errors.productId}</p>}
+
+      <input name="qty" type="number" defaultValue={1} />
+      {state.errors?.qty && <p>{state.errors.qty}</p>}
+
+      <button disabled={pending}>{pending ? "提交中…" : "下单"}</button>
+      {state.message && <p>{state.message}</p>}
+    </form>
+  );
+}
+```
+
+对应的 action 签名变成 `(prevState, formData)`：
+
+```ts
+"use server";
+
+type State = {
+  ok: boolean;
+  message?: string;
+  errors?: Record<string, string>;
+};
+
+export async function createOrder(
+  _prev: State,
+  formData: FormData,
+): Promise<State> {
+  const session = await requireUser();
+
+  const parsed = orderSchema.safeParse({
+    productId: formData.get("productId"),
+    qty: formData.get("qty"),
+  });
+
+  if (!parsed.success) {
+    return {
+      ok: false,
+      errors: parsed.error.flatten().fieldErrors,
+    };
+  }
+
+  await db.order.create({
+    data: { ...parsed.data, userId: session.userId },
+  });
+
+  revalidatePath("/orders");
+  redirect("/orders");
+}
+```
+
+配套的 `useFormStatus` 适合放在**表单的子组件**里读取 pending：
+
+```tsx
+"use client";
+import { useFormStatus } from "react-dom";
+
+export function SubmitButton() {
+  const { pending } = useFormStatus();
+  return <button disabled={pending}>保存</button>;
+}
+```
+
+注意：`useFormStatus` 必须在表单内部的子组件中使用，和 `form` 同级是拿不到的。
+
+---
+
+## 契约：返回值与错误
+
+给 action 定三条规矩：
+
+1. **预期内错误用返回值**（校验失败、库存不足），不要 throw。
+2. **预期外错误才 throw**，交给 `error.tsx` 兜底，但不要泄漏堆栈。
+3. **返回值必须可序列化**，只返回 UI 需要的字段。
+
+```ts
+if (stock < qty) {
+  return { ok: false, message: "库存不足" }; // 预期内
+}
+```
+
+`redirect()` 是靠抛异常实现的。**不要把它包在 `try/catch` 里**，否则会被吞掉：
+
+```ts
+try {
+  await db.order.create(...);
+  redirect("/orders"); // ❌ 被 catch 吃掉，页面不会跳
+} catch (e) {
+  return { ok: false };
+}
+```
+
+正确写法是先 try 数据库操作，再在 try 外 redirect。
+
+---
+
+## 安全：四道必须自己上的锁
+
+### 1. 鉴权与授权写在 action 里
+
+隐藏字段、前端禁用按钮都不算权限控制。**每个 action 的第一行都应该是身份校验**：
+
+```ts
+const session = await requireUser();
+if (order.userId !== session.userId) throw new Error("Forbidden");
+```
+
+### 2. 永远不信任客户端传值
+
+价格、用户 ID、角色、租户 ID 这类字段，能从会话推导的就不要从表单接收。必须接收的，用 zod 做类型、范围、枚举校验。
+
+### 3. 注意 CSRF 与反向代理
+
+Next.js 内置了 Origin/Host 校验。但如果前面有反向代理、CDN 或多域名，记得配置 `serverActions.allowedOrigins`，否则会出现「本地正常、线上 403」。
+
+### 4. 限流与幂等
+
+Action 是一个可以被脚本反复调用的 POST 端点：
+
+- 写操作加幂等键（如 `requestId` 唯一索引）。
+- 敏感操作加频率限制（Redis 计数器）。
+- 支付、下单这类操作，数据库层面再兜一层唯一约束。
+
+---
+
+## 乐观更新
+
+点赞、勾选、排序这类高频交互，等一个来回太慢，用 `useOptimistic`：
+
+```tsx
+"use client";
+
+const [optimisticDone, setDone] = useOptimistic(todo.done);
+
+async function toggle() {
+  setDone(!optimisticDone);
+  await toggleTodo(todo.id); // 失败时 React 会自动回滚
+}
+```
+
+原则：**乐观更新只用于「失败概率低、回滚无副作用」的操作**。支付、扣库存不要乐观。
+
+---
+
+## 文件上传
+
+用 `FormData` 接收，别忘记两件事：
+
+- 限制大小：`next.config.ts` 的 `experimental.serverActions.bodySizeLimit`，以及业务层的文件大小校验。
+- 校验类型与内容：不能只看扩展名，最好校验 magic number；上传后重命名、存对象存储，不要直接落本地磁盘。
+
+```ts
+const file = formData.get("avatar");
+if (!(file instanceof File)) return { ok: false };
+if (file.size > 2 * 1024 * 1024) return { ok: false, message: "超过 2MB" };
+```
+
+---
+
+## 常见坑
+
+- **在客户端 `useEffect` 里调用 action**：它是一次 POST，不是查询函数，容易重复写入。
+- **action 里返回 ORM 实体**：序列化失败或泄漏字段。
+- **忘记失效缓存**：写成功但页面不更新，用户重复提交。
+- **把 action 当读接口**：读数据请直接在 Server Component 里取，或者用 Route Handler。
+- **在 action 里做长任务**：请求会一直挂着；耗时任务应写队列，用 `after()` 做收尾。
+- **以为 `'use server'` 加了就安全**：它只标记执行位置，不做任何权限判断。
+
+---
+
+## 小结
+
+Server Action 把「表单提交」从手写 `fetch` + 状态机里解放出来，代价是把一个写接口暴露在了公网。**校验、鉴权、幂等、失效**这四件事一个都不能省。下一篇讲另一条写路径：Route Handlers，以及什么时候该用它而不是 Server Action。

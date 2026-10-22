@@ -47,6 +47,14 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 				chips: ["Hooks", "状态管理", "性能"],
 			},
 			{
+				title: "Next.js 全栈实战",
+				abbr: "Next",
+				desc: "从 App Router、RSC 到认证、数据库与生产部署，把 React 能力延伸到服务端",
+				url: "/nextjs-roadmap/",
+				category: "Next.js学习路线",
+				chips: ["App Router", "RSC", "Server Actions"],
+			},
+			{
 				title: "前端工程化",
 				abbr: "工",
 				desc: "构建原理、规范 lint、CI/CD、微前端与 Monorepo",

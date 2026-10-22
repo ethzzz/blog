@@ -1,0 +1,208 @@
+---
+title: '10 · 错误处理与可观测性'
+published: 2026-10-20T20:00:00+08:00
+description: 'Next.js 生产级错误处理：error.tsx / global-error / not-found 的边界语义、预期错误与异常的分层、Server Action 的 redirect 吞异常陷阱、结构化日志、instrumentation 上报、Sentry 与 SLO 告警。'
+tags: [Next.js, 错误处理, 可观测性, 日志, Sentry]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 「线上有问题但没人知道」比「线上有问题」可怕十倍。错误处理的目标不是消灭所有错误，而是：**该兜的兜住、该报的报上来、该查的查得到。**
+
+---
+
+## 错误边界的分层
+
+App Router 用文件约定划分错误边界：
+
+| 文件 | 作用 | 注意 |
+| --- | --- | --- |
+| `error.tsx` | 捕获该段及子段的渲染/数据错误 | 必须是 Client Component |
+| `global-error.tsx` | 捕获根布局错误 | 要自带 `html` / `body` |
+| `not-found.tsx` | 404 UI | 由 `notFound()` 触发 |
+| `loading.tsx` | 加载态 | 本质是 Suspense |
+
+`error.tsx` 拿到的 `error` 在生产环境**不包含原始错误信息**，只有一个 `digest`。这是故意的：避免把堆栈和内部细节发给浏览器。要定位问题，得靠服务端日志把 `digest` 和完整异常对上。
+
+```tsx
+"use client";
+
+import { useEffect } from "react";
+
+export default function Error({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  useEffect(() => {
+    // 上报到自己的端点或 Sentry，注意脱敏
+    reportClientError({
+      digest: error.digest,
+      message: error.message,
+      path: location.pathname,
+    });
+  }, [error]);
+
+  return (
+    <div role="alert">
+      <h2>页面出了点问题</h2>
+      <p>错误编号：{error.digest ?? "unknown"}</p>
+      <button onClick={reset}>重试</button>
+    </div>
+  );
+}
+```
+
+设计要点：
+
+- 错误页给用户**下一步动作**（重试、返回、联系支持），不要只显示「出错了」。
+- `reset()` 会重新渲染该段，适合临时性错误；数据本身有问题时重试也没用。
+- 错误边界**不能捕获事件处理器里的异常**，那需要 `try/catch` 或全局 `window.onerror`。
+- `error.tsx` 管不到同级的 `layout.tsx`，根布局的错误只能靠 `global-error.tsx`。
+
+---
+
+## 把错误分成三类
+
+| 类型 | 例子 | 处理方式 |
+| --- | --- | --- |
+| 预期内业务错误 | 库存不足、权限不够、校验失败 | 返回值 + 明确提示，不打 error 级日志 |
+| 可恢复系统错误 | 第三方超时、限流 | 重试/降级 + warn 日志 |
+| 不可恢复异常 | 空指针、数据库断连 | 抛出 + 上报 + 500 |
+
+最糟糕的写法是所有错误都 `catch` 后返回 `{ ok: false }`，日志里一片安静，用户只看到「操作失败」。** silently swallowed error 是运维的噩梦。**
+
+Server Action 里尤其要注意：
+
+```ts
+// ❌ redirect() 靠抛异常实现，会被 catch 吞掉
+try {
+  await db.order.create({ ... });
+  redirect("/orders");
+} catch (e) {
+  return { ok: false };
+}
+```
+
+要么把 `redirect` 放到 try 外，要么在 catch 里识别并重新抛出导航异常。
+
+---
+
+## 结构化日志
+
+不要在生产环境打散装 `console.log`。用 JSON 结构化日志，字段固定：
+
+```ts
+logger.info({
+  event: "order.created",
+  requestId,
+  userId,
+  tenantId,
+  orderId,
+  durationMs,
+});
+```
+
+至少包含：
+
+- `timestamp`、`level`、`event`
+- `requestId`（贯穿一次请求）
+- `userId` / `tenantId`（排查越权和串数据）
+- `route`、`method`
+- `durationMs`
+- 错误时的 `error.name`、`error.message`、`stack`（仅服务端）
+
+**永远不要记录**：密码、token、完整 Cookie、身份证/银行卡、请求体里的敏感字段。日志系统往往是权限最松的数据仓库。
+
+---
+
+## instrumentation：服务端的统一入口
+
+Next.js 支持 `instrumentation.ts`，在服务启动时注册一次，并统一接收请求错误：
+
+```ts
+// instrumentation.ts
+export async function register() {
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    await import("./instrumentation.node");
+  }
+}
+
+export async function onRequestError(
+  error: unknown,
+  request: { path: string; method: string },
+  context: { routePath: string; routeType: string },
+) {
+  const err = error instanceof Error ? error : new Error(String(error));
+  logger.error({
+    event: "request.error",
+    path: request.path,
+    method: request.method,
+    routePath: context.routePath,
+    routeType: context.routeType,
+    message: err.message,
+    stack: err.stack,
+  });
+}
+```
+
+这里适合做：
+
+- 初始化 OpenTelemetry / Sentry。
+- 统一错误上报与脱敏。
+- 注入 `requestId`。
+- 采集运行时信息（Node 版本、部署版本）。
+
+客户端侧可以用 `instrumentation-client.ts`，或在根布局挂一个上报组件。
+
+---
+
+## Sentry 之类工具怎么接
+
+- 用官方 SDK，按环境采样：生产 10%–20% 的 trace，错误 100%。
+- **上传 source map**，否则线上堆栈全是压缩后的变量名。
+- 配置 `beforeSend` 脱敏，过滤掉爬虫/已知噪音。
+- 设置 release 版本，把错误和部署版本关联。
+- 前后端用同一个 `traceId` 串起来，才能看清一次慢请求卡在哪一层。
+
+不要把所有 4xx 都报成 error，否则告警很快就会被忽略。
+
+---
+
+## 告警：按用户影响，不按单条错误
+
+好的告警规则：
+
+- 5xx 比例在 5 分钟内超过 1%。
+- P95 响应时间连续 10 分钟超过阈值。
+- 关键业务事件（下单、支付）成功率下降。
+- 队列积压、连接池耗尽、磁盘水位。
+
+坏的告警规则：
+
+- 「出现一条 error 就打电话」。
+- 没有 runbook 的告警。
+- 对已知爬虫噪音反复告警。
+
+告警要能回答三个问题：**影响谁、影响多大、现在该做什么。**
+
+---
+
+## 常见坑
+
+- **根级一个 `error.tsx` 包打天下**：所有错误都落到同一个页面，用户不知道发生了什么。
+- **把 `error.message` 直接展示给用户**：泄漏内部实现，甚至 SQL。
+- **不记录 `digest`**：线上报错编号对不上日志，排查全靠猜。
+- **在客户端日志里打 token**：把凭证送进第三方平台。
+- **只监控服务器，不监控客户端**：白屏、hydration 失败、chunk 加载失败全靠用户反馈。
+- **重试没有退避**：第三方故障时把对方和自己一起打挂。
+- **告警没有分级**：真正的 P0 淹没在噪音里。
+
+---
+
+## 小结
+
+可观测性由三根柱子组成：**日志（发生了什么）、指标（影响多大）、追踪（慢在哪一层）**。Next.js 的 `error.tsx` 负责用户体验，`instrumentation.ts` 负责统一上报，剩下的靠你把这些数据接到真正会有人看的系统里。下一篇讲测试与工程质量——怎么让这些问题在合并前暴露。

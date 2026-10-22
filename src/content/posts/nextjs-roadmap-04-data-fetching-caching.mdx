@@ -1,0 +1,199 @@
+---
+title: '04 · 数据获取、缓存与重验证'
+published: 2026-10-20T14:00:00+08:00
+description: 'Next.js 数据层完全指南：fetch 默认不缓存之后怎么设计缓存、use cache / cacheLife / cacheTag 显式缓存模型、React cache 请求内去重、revalidateTag 与 updateTag 失效策略、以及缓存串号与脏读的生产事故。'
+tags: [Next.js, 缓存, 数据获取, ISR, revalidate]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 缓存是 Next.js 生产事故的第一大来源。核心原因不是 API 难，而是**很多人还在用「框架会自动帮我缓存」的旧心智**。Next.js 15 之后，默认答案已经变成：不缓存，你自己声明。
+
+---
+
+## 先把三种「缓存」分开
+
+聊 Next.js 缓存，必须先分清三层，否则永远对不上号：
+
+| 层 | 存在哪 | 控制方式 |
+| --- | --- | --- |
+| 请求内去重 | 单次渲染 | React `cache()` |
+| 数据缓存 | 服务端持久层 | `fetch` 的 `next` 选项 / `use cache` |
+| 客户端路由缓存 | 浏览器内存 | 导航行为、`router.refresh()` |
+
+大部分「数据没更新」的抱怨，其实卡在第三层：服务端早就新了，浏览器还拿着上一次的 RSC Payload。
+
+---
+
+## fetch 默认不缓存
+
+Next.js 15 起：
+
+```ts
+// 默认：每次请求都取最新
+const res = await fetch("https://api.example.com/products");
+```
+
+要缓存就显式声明：
+
+```ts
+const res = await fetch("https://api.example.com/products", {
+  next: { revalidate: 60, tags: ["products"] },
+});
+```
+
+- `revalidate: 60`：60 秒内复用缓存，之后后台再生。
+- `tags: ["products"]`：给这份数据打标签，方便精确失效。
+- `cache: "no-store"`：明确不缓存（默认行为，写出来更清楚）。
+
+**同一渲染流程里的相同请求会自动去重**，所以不用担心在布局和页面里各取一次会打两次接口。但跨请求不会共享，除非你显式缓存。
+
+---
+
+## React `cache()`：请求内记忆化
+
+对于数据库查询这类不走 `fetch` 的逻辑，用 `cache()` 做请求内去重：
+
+```ts
+import { cache } from "react";
+
+export const getCurrentUser = cache(async () => {
+  const session = await auth();
+  if (!session) return null;
+  return db.user.findUnique({ where: { id: session.userId } });
+});
+```
+
+`cache()` 的生命周期是**一次服务端渲染**，不会跨请求。它解决的是「布局、页面、`generateMetadata` 都调用同一个函数」的重复查询，不解决数据新鲜度。
+
+---
+
+## `use cache`：把缓存粒度下沉
+
+Next.js 16 的 Cache Components 提供了函数级缓存：
+
+```ts
+// next.config.ts
+const nextConfig = { cacheComponents: true };
+```
+
+```ts
+import { cacheLife, cacheTag } from "next/cache";
+
+export async function getProducts(category: string) {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag(`products:${category}`);
+
+  return db.product.findMany({ where: { category } });
+}
+```
+
+`cacheLife` 常用的预置档位：
+
+| 档位 | 大致语义 | 适用 |
+| --- | --- | --- |
+| `seconds` | 秒级新鲜 | 库存、价格 |
+| `minutes` | 分钟级 | 商品列表、内容流 |
+| `hours` | 小时级 | 配置、字典 |
+| `days` / `weeks` | 长缓存 | 静态内容、文档 |
+| `max` | 尽可能久 | 永不变更的资源 |
+
+注意：`use cache` 的 key 由**函数参数 + 构建期闭包**决定。参数不同就是不同的缓存条目，这既是能力也是陷阱——下一节讲。
+
+---
+
+## 失效：三种武器，三种语义
+
+```ts
+import { revalidateTag, revalidatePath, updateTag } from "next/cache";
+
+revalidateTag("products:electronics"); // 标记失效，下次请求再生
+revalidatePath("/products");           // 按路径失效
+updateTag("cart:42");                  // 写后读一致（仅 Server Action）
+```
+
+怎么选：
+
+- **内容更新**：写库后 `revalidateTag()`，让下一次读取重新生成。
+- **不确定影响哪些标签**：`revalidatePath()` 兜底，但范围大、代价高。
+- **用户刚提交完、必须立刻看到自己的修改**：`updateTag()`，它在当前请求内同步更新缓存条目。
+- **只是想让当前页面的未缓存数据重取**：在客户端调用 `router.refresh()`。
+
+一个可靠的写操作模板：
+
+```ts
+"use server";
+
+export async function updateProduct(id: string, input: ProductInput) {
+  await requireAdmin();
+  const parsed = productSchema.parse(input);
+  await db.product.update({ where: { id }, data: parsed });
+
+  revalidateTag("products");
+  revalidateTag(`product:${id}`);
+}
+```
+
+写库和失效必须**成对出现**。只写不失效，就是在生产上制造「数据要等半小时才变」的工单。
+
+---
+
+## 缓存串号：最危险的一类事故
+
+只要缓存 key 里缺少「区分维度」，就会把 A 的数据发给 B：
+
+```ts
+// ❌ 缓存 key 只有 category，没有 tenant
+export async function getOrders(category: string) {
+  "use cache";
+  cacheLife("minutes");
+  return db.order.findMany({ where: { category } }); // 查询却按当前租户过滤
+}
+```
+
+如果查询依赖了 `cookies()` 里的当前用户/租户，但 key 里没有它，第二个租户就会命中第一个租户的结果。这类 bug 在测试环境几乎发现不了，上线后是数据泄漏级别的事故。
+
+规则：**凡是用户相关、租户相关的数据，要么不进缓存，要么把身份显式放进参数/标签。**
+
+```ts
+export async function getOrders(tenantId: string, category: string) {
+  "use cache";
+  cacheTag(`orders:${tenantId}`);
+  return db.order.findMany({ where: { tenantId, category } });
+}
+```
+
+---
+
+## 客户端路由缓存与「看起来没更新」
+
+服务端数据已经新了，页面却还是旧的，通常是客户端路由缓存：
+
+- 软导航会复用已缓存的 RSC Payload。
+- 布局和 `loading` 状态默认复用。
+- 动态页面在 Next.js 15 之后默认不再长时间缓存，但短时间内的重复导航仍可能命中。
+
+处理手段：
+
+- 写操作后 `revalidatePath` / `revalidateTag`，再配合 `router.refresh()`。
+- 对实时性要求高的页面，用 `connection()` 或读取 `cookies()` 明确动态化，别让它进静态壳。
+- 不要靠「刷新两次就好了」糊弄用户。
+
+---
+
+## 常见坑
+
+- **给个性化接口加了共享缓存**：串号、越权、隐私泄漏。
+- **`revalidate` 单位写成毫秒**：以为是 60 秒，实际是 60 毫秒的语义误解（Next.js 用秒）。
+- **只缓存页面、不缓存数据**：页面看着是静态的，但每次再生都打满数据库。
+- **在 `use cache` 函数里读 `cookies()`**：构建期或缓存命中时没有请求上下文，直接报错。
+- **用 `cache()` 当持久缓存**：它只活一次渲染，重启即失效。
+- **忘记 `revalidateTag` 的标签拼写**：失效没报错，但永远命中不到。
+
+---
+
+## 小结
+
+数据层设计就三个问题：**能不能旧、能旧多久、谁来让它变新**。答案写进代码（`cacheLife` + `cacheTag` + 写后失效），而不是留在脑子里。下一篇讲写操作：Server Actions 怎么用，以及为什么它不是一个「随便调的函数」。

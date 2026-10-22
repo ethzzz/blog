@@ -1,0 +1,139 @@
+---
+title: '01 · App Router 与渲染模型'
+published: 2026-10-20T11:00:00+08:00
+description: 'App Router 的渲染模型：RSC 与 SSR 的区别、静态/动态路由的判定规则、Streaming 与 PPR、一次请求的完整生命周期，以及动态污染、错误的 dynamic 配置等生产坑。'
+tags: [Next.js, App Router, RSC, SSR, 渲染]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这篇是整个系列的地基。如果你只记住一句话：**App Router 里「服务端渲染」不等于「服务端组件」**。前者是 HTML 生成方式，后者是组件执行位置。两者可以组合，但不是一个维度的事。
+
+---
+
+## 从 Pages Router 到 App Router
+
+Pages Router 的模型很好理解：每个 `pages/*.tsx` 是一个页面，`getServerSideProps` 在服务端取数，`getStaticProps` 在构建期取数，组件最终都会 hydrate 成客户端 React。
+
+App Router 换了三层结构：
+
+- **路由层**：目录即路由，`page.tsx` 是页面，`layout.tsx` 是持久布局。
+- **渲染层**：默认所有组件都是 Server Component，只在需要交互的文件顶部写 `'use client'`。
+- **传输层**：服务端不再只发 HTML，还发一份 **RSC Payload**（描述服务端组件树的序列化数据），客户端用它增量更新。
+
+所以一次导航可能发生三件事：服务端渲染 RSC Payload、客户端渲染 Client Component、必要时再补一次 HTML 流。
+
+---
+
+## 一次请求的完整生命周期
+
+以一个生产环境的动态页面为例：
+
+```
+浏览器请求 /orders/123
+  → nginx / CDN
+  → Next.js server
+      ├─ proxy.ts（原 middleware）做重写 / 鉴权预处理
+      ├─ 匹配 app/orders/[id]/page.tsx
+      ├─ 执行 layout → page 的 Server Components
+      │    ├─ await params
+      │    ├─ 读 cookies / headers（标记为动态）
+      │    └─ fetch / DB 查询
+      ├─ 生成 RSC Payload + HTML 流
+      └─ 按 Suspense 边界分块 flush
+  → 浏览器先渲染骨架，再 hydrate Client Components
+```
+
+注意两个细节：
+
+1. **`params` 和 `searchParams` 都是 Promise**（Next.js 15 起）。不 `await` 直接访问会拿到警告甚至错误。
+2. **HTTP 响应是流式的**。只要页面里有 `loading.tsx` 或 `Suspense`，服务端就可以先发壳、后发数据。这也是为什么反代必须关闭响应缓冲。
+
+```tsx
+// app/orders/[id]/page.tsx
+export default async function OrderPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  const order = await getOrder(id);
+  return <OrderDetail order={order} />;
+}
+```
+
+---
+
+## 五种渲染结果
+
+不要背名词，按「HTML 什么时候生成」来分：
+
+| 形态 | HTML 生成时机 | 数据新鲜度 | 典型场景 |
+| --- | --- | --- | --- |
+| 静态（SSG） | 构建期 | 随构建更新 | 官网、博客、文档 |
+| 增量静态（ISR） | 构建期 + 后台再生 | `revalidate` 秒级/按标签 | 商品详情、内容站 |
+| 服务端渲染（SSR） | 每次请求 | 实时 | 控制台、订单、个性化页面 |
+| 客户端渲染（CSR） | 浏览器 | 请求时 | 图表、编辑器、强交互模块 |
+| 流式 + PPR | 静态壳 + 动态洞 | 混合 | 首页、仪表盘 |
+
+**PPR（Partial Prerendering）** 是这套模型的终点：整页先按静态壳预渲染，动态部分用 Suspense 留洞，请求时只渲染洞里的内容。Next.js 16 里通过 `cacheComponents` 开启，仍属于要谨慎评估的选项——它会把「哪些部分能静态」这个问题暴露得非常彻底。
+
+---
+
+## 静态还是动态，谁说了算
+
+框架的判定规则可以粗暴概括为：**只要读取了请求相关的东西，这条路由就是动态的**。
+
+会触发动态的常见 API：
+
+- `cookies()`、`headers()`、`draftMode()`
+- `searchParams`（页面级）
+- `connection()`（显式声明「我需要请求上下文」）
+- 未缓存的 `fetch` 或数据库查询本身不会让路由变动态，但会让渲染变慢
+
+很多团队遇到「为什么全站都是动态渲染」，答案往往是在某个共享组件里读了一次 `cookies()`。这叫**动态污染**：一个叶子节点的需求，把整棵路由树拖下水。
+
+```tsx
+// ❌ 一个共享的 Header 读了 cookie，所有引用它的页面都变动态
+export async function Header() {
+  const theme = (await cookies()).get("theme")?.value ?? "light";
+  return <nav data-theme={theme} />;
+}
+```
+
+解法不是硬写 `export const dynamic = "force-static"`（那会让 `cookies()` 直接报错），而是把动态需求**下沉到 Suspense 洞里**，或者让客户端读取这类偏好。
+
+---
+
+## 段配置还有没有用
+
+`export const dynamic`、`revalidate`、`fetchCache` 这些路由段配置仍然有效，但它们更像是「兜底开关」：
+
+- `dynamic = "force-dynamic"`：明确要每次请求渲染，适合控制台。
+- `dynamic = "force-static"`：明确要静态，任何动态 API 都会报错，适合内容页。
+- `revalidate = 60`：段级默认再生时间。
+
+真正推荐的姿势是 **`use cache` + `cacheLife` + `cacheTag`**：把缓存粒度从「整页」下沉到「函数/组件」，再用标签精确失效。第 04 篇展开。
+
+---
+
+## 常见坑
+
+- **在 `layout.tsx` 里读 `cookies()` 做鉴权**：所有子路由全部动态，且布局不会随导航重新渲染，权限变化可能不生效。鉴权应在 `proxy.ts`（原 middleware）+ 页面/数据层双重校验。
+- **以为 `generateStaticParams` 一写就全静态**：页面里只要有 `searchParams` 或 `cookies()`，照样动态。
+- **把 `loading.tsx` 放在根布局**：整站导航都进同一个 loading，体验反而更差。放在需要等待的段上。
+- **`export const revalidate` 与 `fetch` 级缓存混用**：以为是 AND，实际是各管一层，调起来非常痛苦。
+- **用 `next start` 验证 standalone 产物**：两者目录结构不同，验证结论不可迁移。
+
+---
+
+## 小结
+
+记住三句话：
+
+1. **Server Component 决定代码在哪跑，SSR/SSG 决定 HTML 何时生成。**
+2. **动态 API 会沿着路由树向上污染**，动态需求要下沉到 Suspense 边界。
+3. **缓存默认关闭，显式声明才生效**，这是 Next.js 15 之后最大的行为变化。
+
+下一篇讲路由与文件约定，把 `layout`、`route group`、并行路由这些「目录即架构」的东西一次理清。

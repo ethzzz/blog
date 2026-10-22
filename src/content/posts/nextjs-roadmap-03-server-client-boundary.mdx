@@ -1,0 +1,181 @@
+---
+title: '03 · Server / Client 组件边界'
+published: 2026-10-20T13:00:00+08:00
+description: 'App Router 最核心的一课：RSC 与 Client Component 的能力差异、use client 的模块边界传播规则、序列化约束、children 组合模式、密钥与 hydration 安全，以及如何用边界思维控制客户端 bundle。'
+tags: [Next.js, RSC, Server Component, Client Component, 架构]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一篇值整个系列一半的价钱。边界划错，后面所有优化都是徒劳：要么把服务端能力打进浏览器，要么把整站退化成 SPA。
+
+---
+
+## 两种组件，两套能力
+
+| 能力 | Server Component | Client Component |
+| --- | --- | --- |
+| 直接查数据库 / 读文件 | ✅ | ❌ |
+| 读取密钥、服务端环境变量 | ✅ | ❌ |
+| `async` 组件 | ✅ | ❌ |
+| `useState` / `useEffect` | ❌ | ✅ |
+| 事件处理（onClick 等） | ❌ | ✅ |
+| 浏览器 API（window、localStorage） | ❌ | ✅ |
+| 进入客户端 bundle | ❌ | ✅ |
+| 首屏 HTML 中可见 | ✅ | ✅（SSR 预渲染） |
+
+关键认知：**Client Component 也会在服务端预渲染 HTML**。它只是在浏览器里 additionally hydrate 一次。所以「Client Component 等于没有 SSR」是错的；「Client Component 等于会进 bundle」才是对的。
+
+---
+
+## `'use client'` 是模块边界，不是组件标记
+
+这行指令的含义是：**从这个模块开始，它及其静态导入的所有模块，都属于客户端图**。
+
+```tsx
+// app/dashboard/page.tsx  （Server）
+import { Chart } from './Chart';        // Chart.tsx 顶部有 'use client'
+import { formatMoney } from '@/lib/money'; // 被 Chart 导入 → 进客户端
+
+export default async function Page() {
+  const data = await getStats();
+  return <Chart data={data} />;
+}
+```
+
+`formatMoney` 本身没写 `'use client'`，但因为它被客户端模块导入，就会被打进浏览器 bundle。这就是为什么**共享工具库要保持纯净**：不要在 `lib/` 里随手导入数据库客户端或 `fs`。
+
+反过来，客户端组件不能直接导入 Server Component：
+
+```tsx
+'use client';
+// ❌ ProductList 依赖数据库；这里导入后它会被当作客户端组件处理，直接报错
+import { ProductList } from './ProductList';
+```
+
+正确做法是**由服务端父级把服务端组件作为 `children` 传进去**。
+
+---
+
+## 组合模式：用 children 打洞
+
+客户端组件只负责交互外壳，内容由服务端填充：
+
+```tsx
+// app/products/page.tsx（Server）
+import { FilterBar } from './FilterBar';
+import { ProductList } from './ProductList';
+
+export default function Page({ searchParams }) {
+  return (
+    <FilterBar>
+      <ProductList searchParams={searchParams} />
+    </FilterBar>
+  );
+}
+```
+
+```tsx
+// app/products/FilterBar.tsx（Client）
+'use client';
+
+export function FilterBar({ children }: { children: React.ReactNode }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <section>
+      <button onClick={() => setOpen((v) => !v)}>筛选</button>
+      {open && <div className="filters">{/* 客户端筛选表单 */}</div>}
+      {children} {/* ProductList 仍由服务端渲染 */}
+    </section>
+  );
+}
+```
+
+`children` 是在服务端生成好的 RSC 节点，客户端只是把它放到某个位置。**这是跨边界组合唯一正确的姿势**，也是「客户端弹窗里放服务端内容」的标准解法。
+
+---
+
+## 序列化边界
+
+服务端传给客户端的 props 必须是可序列化的：
+
+- ✅ 原始值、数组、普通对象、`Date`、`Map`、`Set`、`BigInt`
+- ✅ Server Action（函数）
+- ❌ 类实例、DOM 节点、回调函数、Symbol、循环引用
+
+把 ORM 实体直接传给客户端是个常见错误：Prisma / Drizzle 返回的对象通常带原型方法，序列化会丢字段甚至报错。**在服务端显式映射成 DTO**，顺便避免把内部字段（如 `passwordHash`）泄漏到 RSC Payload 里。
+
+```tsx
+// ✅ 显式挑选字段
+const user = await db.user.findUnique({ where: { id } });
+return <ProfileCard user={{ id: user.id, name: user.name }} />;
+```
+
+---
+
+## 安全：三道容易被忽略的泄漏
+
+### 1. `NEXT_PUBLIC_` 不是「公开也没关系」的同义词
+
+任何以 `NEXT_PUBLIC_` 开头的变量都会**内联进客户端 bundle**。把 `NEXT_PUBLIC_API_SECRET` 写进去，等于把密钥发给全世界。
+
+### 2. 服务端模块要加 `server-only`
+
+```ts
+// lib/db.ts
+import 'server-only';
+```
+
+一旦某个客户端文件误导入它，构建会直接失败，而不是把数据库连接串打进浏览器。这个包值得每个项目都装。
+
+### 3. RSC Payload 也能被看到
+
+Server Component 传给客户端的 props 会出现在网络响应里。别把「用户不该看到的字段」寄希望于「反正没渲染出来」。
+
+---
+
+## Hydration 不匹配
+
+Client Component 会在服务端预渲染一次、浏览器再 hydrate 一次，两次输出必须一致。以下写法会导致闪烁或警告：
+
+```tsx
+// ❌ 服务端与浏览器结果不同
+const now = new Date().toLocaleString();
+const id = Math.random();
+const isMobile = window.innerWidth < 768;
+```
+
+解法：
+
+- 时间、随机数、`localStorage` 相关内容放到 `useEffect` 里，或使用 `suppressHydrationWarning`（仅限确实可接受差异的文本节点）。
+- 响应式布局优先用 CSS 媒体查询，不要用 JS 读宽度决定首屏结构。
+- 第三方库如果依赖 `window`，用 `next/dynamic` 关闭 SSR，但注意 `ssr: false` 只能在客户端组件里使用。
+
+---
+
+## 怎么划边界：一个决策流程
+
+1. **需要事件、状态、浏览器 API？** → Client。
+2. **需要数据库、文件系统、密钥？** → Server。
+3. **两者都不需要？** → 默认 Server，别加 `'use client'`。
+4. **一棵大树只有叶子需要交互？** → 只把叶子做成 Client，父级保持 Server。
+5. **需要跨层级共享状态？** → Provider 是 Client，但把 `children` 从 Server 传进去，避免整棵树客户端化。
+
+一个反例：把 `ThemeProvider`、`QueryClientProvider` 放在根布局，并把整个 `body` 包进去——这本身没错，但**Provider 的 children 必须是服务端传入的节点**，否则整站都会进客户端图。
+
+---
+
+## 常见坑
+
+- **根布局加 `'use client'`**：全站客户端化，Server Component 全部失效。
+- **把 `useSearchParams` 用在静态页面却不包 Suspense**：构建直接报错。
+- **在客户端组件里导入 `fs` / `pg`**：构建失败还算幸运，更糟的是被打包后在浏览器报错。
+- **为了「方便」把整个页面标成客户端**：然后疑惑为什么首屏数据要等接口。
+- **忽略 bundle 体积**：每次加 `'use client'` 都应该跑一次 bundle analyzer，看看新增了什么。
+
+---
+
+## 小结
+
+边界的判断标准只有一条：**这段代码需不需要在浏览器里「活着」**。需要，才进客户端；不需要，就留在服务端。`'use client'` 往下传播、`children` 往上打洞，掌握这一进一出，App Router 的组件模型就通了。下一篇讲数据：什么时候取、缓存多久、谁来失效。

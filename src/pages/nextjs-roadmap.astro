@@ -1,0 +1,126 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+const allPosts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === "Next.js学习路线" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = Number.parseInt(
+		a.slug.match(/nextjs-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	const numB = Number.parseInt(
+		b.slug.match(/nextjs-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	return numA - numB;
+});
+
+const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
+const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
+---
+
+<MainGridLayout title="Next.js 全栈实战">
+	<div class="onload-animation">
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">Next.js 全栈实战</h1>
+			<p class="text-75 text-lg">从 App Router 到多租户 SaaS，把 React 能力延伸到服务端 · 共 {sortedPosts.length} 篇</p>
+		</div>
+
+		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white font-bold text-xl">
+					N
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">Next.js - React 全栈框架</h2>
+					<p class="text-75 text-sm mb-2">Vercel 出品，App Router + RSC 把 React 从浏览器延伸到服务端；一套代码同时交付页面、接口与渲染策略</p>
+					<div class="flex flex-wrap gap-2 text-xs">
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">App Router</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">RSC</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Server Actions</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">认证</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">部署</span>
+					</div>
+				</div>
+				<a href="https://nextjs.org/" target="_blank" rel="noopener"
+				   class="flex-shrink-0 text-[var(--primary)] hover:opacity-75 transition-opacity">
+					<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M11.572 0c-.176 0-.31.001-.358.007a19.76 19.76 0 0 1-.364.033C7.443.346 4.25 2.185 2.228 5.012a11.875 11.875 0 0 0-2.119 5.243c-.096.659-.108.854-.108 1.747s.012 1.089.108 1.748c.652 4.506 3.86 8.292 8.209 9.695.779.251 1.6.422 2.534.525.363.04 1.935.04 2.299 0 1.611-.178 2.977-.577 4.323-1.264.207-.106.247-.134.219-.158-.02-.013-.9-1.193-1.955-2.62l-1.919-2.592-2.404-3.558a338.739 338.739 0 0 0-2.422-3.556c-.009-.002-.018 1.579-.023 3.51-.007 3.38-.01 3.515-.052 3.595a.426.426 0 0 1-.206.214c-.075.037-.14.044-.495.044H7.81l-.108-.068a.438.438 0 0 1-.157-.171l-.05-.106.006-4.703.007-4.705.072-.092a.645.645 0 0 1 .174-.143c.096-.047.134-.051.54-.051.478 0 .558.018.682.154.035.038 1.337 1.999 2.895 4.361a10760.433 10760.433 0 0 0 4.735 7.17l1.9 2.879.096-.063a12.317 12.317 0 0 0 2.466-2.163 11.944 11.944 0 0 0 2.824-6.134c.096-.66.108-.854.108-1.748 0-.893-.012-1.088-.108-1.747-.652-4.506-3.859-8.292-8.208-9.695a12.597 12.597 0 0 0-2.499-.523A33.119 33.119 0 0 0 11.573 0zm4.069 7.217c.347 0 .408.005.486.047a.473.473 0 0 1 .237.277c.018.06.023 1.365.018 4.304l-.006 4.218-.744-1.14-.746-1.14v-3.066c0-1.982.01-3.097.023-3.15a.478.478 0 0 1 .233-.296c.096-.05.13-.054.5-.054z"/></svg>
+				</a>
+			</div>
+		</div>
+
+		{overviewPost && (
+			<a href={getPostUrlBySlug(overviewPost.slug)}
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white">总览</span>
+							<span class="text-sm text-50">{overviewPost.data.published.toLocaleDateString("zh-CN")}</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">{overviewPost.data.title}</h2>
+						<p class="text-75 text-sm line-clamp-2">{overviewPost.data.description}</p>
+					</div>
+					<div class="ml-4 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<div class="space-y-4">
+			{stagePosts.map((post, index) => (
+				<a href={getPostUrlBySlug(post.slug)}
+				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+					<div class="flex items-start gap-4">
+						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white transition-colors">{index + 1}</div>
+						<div class="flex-1 min-w-0">
+							<div class="flex items-center gap-2 mb-1">
+								<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">{post.data.title}</h3>
+							</div>
+							<p class="text-75 text-sm mb-2 line-clamp-2">{post.data.description}</p>
+							<div class="flex items-center gap-3 text-xs text-50">
+								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+								{post.data.tags && post.data.tags.length > 0 && (
+									<span class="flex items-center gap-1">
+										{post.data.tags.slice(0, 3).map(tag => (<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">#{tag}</span>))}
+									</span>
+								)}
+							</div>
+						</div>
+						<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+						</div>
+					</div>
+				</a>
+			))}
+		</div>
+
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
+			<p class="font-medium mb-1">学习建议</p>
+			<p>Next.js 的学习曲线不在 API，而在「边界」：哪些代码跑在服务端、哪些跑在浏览器、缓存什么时候失效。先吃透 RSC 与渲染模型，再动 Server Actions 和缓存。别把 App Router 当 Pages Router 的升级版用，也别把所有组件都写成 "use client"——那等于白换框架。生产问题里，一半是缓存没失效，另一半是边界放错了地方。</p>
+		</div>
+
+		<div class="mt-4 flex flex-wrap gap-4 text-sm">
+			<a href="https://nextjs.org/docs" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+				Next.js 官方文档
+			</a>
+			<a href="https://nextjs.org/docs/app" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+				App Router 文档
+			</a>
+			<a href="https://github.com/vercel/next.js" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+				GitHub
+			</a>
+		</div>
+	</div>
+</MainGridLayout>

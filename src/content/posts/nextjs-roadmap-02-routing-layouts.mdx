@@ -1,0 +1,196 @@
+---
+title: '02 · 路由、布局与文件约定'
+published: 2026-10-20T12:00:00+08:00
+description: 'App Router 的文件约定：layout 与 template 的区别、路由组与多根布局、动态段与通配段、并行路由与拦截路由实现模态框、metadata 与 generateStaticParams，以及目录结构即架构的设计方法。'
+tags: [Next.js, App Router, 路由, Layout, 文件约定]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> App Router 的目录结构不是「文件放哪」的问题，而是**架构本身**。一个 `layout.tsx` 放在哪一层，决定了哪些状态能保留、哪些代码会重复执行、导航时哪些部分不重新渲染。
+
+---
+
+## 文件约定速查
+
+一个路由段的目录里，下面这些文件各有明确语义：
+
+| 文件 | 作用 | 关键行为 |
+| --- | --- | --- |
+| `page.tsx` | 页面入口 | 使该段成为可访问路由 |
+| `layout.tsx` | 持久布局 | 导航时不重新挂载，可嵌套 |
+| `template.tsx` | 模板 | 每次导航重新挂载，适合入场动画 |
+| `loading.tsx` | 加载态 | 自动包一层 Suspense |
+| `error.tsx` | 错误边界 | 必须是 Client Component |
+| `not-found.tsx` | 404 | 由 `notFound()` 触发 |
+| `route.ts` | HTTP 处理器 | 与 `page.tsx` 互斥 |
+| `default.tsx` | 并行路由兜底 | 硬导航时渲染 |
+
+目录名也有语义：
+
+- `(group)`：路由组，**不进 URL**，用来共享布局或按业务分域。
+- `[id]`：动态段。
+- `[...slug]`：通配段，必须匹配至少一段。
+- `[[...slug]]`：可选通配段，连根路径都能匹配。
+- `@modal`：插槽，配合并行路由。
+- `(.)`、`(..)`、`(...)`：拦截路由的相对层级。
+
+---
+
+## layout 与 template：一个常被忽略的差别
+
+`layout.tsx` 在客户端导航时**保持挂载**。这意味着：
+
+- 布局里的 Client Component 状态不会丢。
+- 布局里的 `fetch` 不会因为子路由切换而重跑。
+- 但布局**收不到子路由的 `params`**，也**不会因为 `searchParams` 变化而重渲染**。
+
+`template.tsx` 则相反：每次导航都重新挂载。需要「切换页面时重置表单/播放动画」时用它。
+
+```tsx
+// app/(dashboard)/template.tsx
+export default function Template({ children }: { children: React.ReactNode }) {
+  return <div className="animate-in">{children}</div>;
+}
+```
+
+> 经验：90% 的场景用 `layout`，剩下 10% 里有一半其实是「状态该提升到 URL」。真正需要 `template` 的场景很少。
+
+---
+
+## 路由组：把 URL 和代码结构解耦
+
+最常见的后台结构：
+
+```
+app/
+├── (auth)/
+│   ├── login/page.tsx        → /login
+│   └── register/page.tsx     → /register
+├── (dashboard)/
+│   ├── layout.tsx            → 带侧边栏的壳
+│   ├── orders/page.tsx       → /orders
+│   └── settings/page.tsx     → /settings
+└── layout.tsx                → 根布局
+```
+
+`(auth)` 和 `(dashboard)` 不出现在 URL 里，但各自可以有独立布局。更进一步，**多个根布局**也是允许的：让登录页和后台拥有完全不同的 `<html>` 结构。
+
+```
+app/
+├── (marketing)/layout.tsx   → 自带 <html><body>
+└── (app)/layout.tsx         → 自带 <html><body>
+```
+
+注意：一旦使用多个根布局，导航在两个根之间切换会**整页刷新**，这是预期行为。
+
+---
+
+## 动态段与类型安全
+
+Next.js 15 之后，页面收到的 `params` 是 Promise：
+
+```tsx
+type Props = { params: Promise<{ slug: string }> };
+
+export default async function PostPage({ params }: Props) {
+  const { slug } = await params;
+  const post = await getPost(slug);
+  if (!post) notFound();
+  return <Article post={post} />;
+}
+```
+
+`generateStaticParams` 决定构建期预渲染哪些值：
+
+```tsx
+export async function generateStaticParams() {
+  const posts = await listPublishedPosts();
+  return posts.map((p) => ({ slug: p.slug }));
+}
+
+export const dynamicParams = false; // 未列出的 slug 直接 404
+```
+
+`dynamicParams = false` 是个很有用的开关：内容站不希望搜索引擎抓到任意 slug 组合时，把它关掉。
+
+---
+
+## 并行路由 + 拦截路由：模态框的正确姿势
+
+这是 App Router 最容易被低估的能力。目标：列表页点详情，弹模态框；直接访问详情 URL，又是完整页面。
+
+```
+app/orders/
+├── layout.tsx
+├── page.tsx
+├── @modal/
+│   ├── default.tsx
+│   └── (..)orders/[id]/page.tsx   ← 拦截软导航
+└── [id]/page.tsx                  ← 硬导航/刷新时的完整页
+```
+
+- 软导航进入 `/orders/123` 时，`@modal` 插槽渲染拦截版本。
+- 刷新或直接打开时，`@modal` 用 `default.tsx` 兜底，完整页正常渲染。
+
+```tsx
+// app/orders/layout.tsx
+export default function Layout({
+  children,
+  modal,
+}: {
+  children: React.ReactNode;
+  modal: React.ReactNode;
+}) {
+  return (
+    <>
+      {children}
+      {modal}
+    </>
+  );
+}
+```
+
+坑在于：**拦截路由只对客户端软导航生效**。任何导致整页加载的操作（刷新、外链进入、`window.location`）都会走完整页。所以详情页必须能独立工作，模态框只是增强。
+
+---
+
+## metadata：别在客户端拼 SEO
+
+静态元数据直接导出对象，动态的用 `generateMetadata`：
+
+```tsx
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { slug } = await params;
+  const post = await getPost(slug);
+  if (!post) return {};
+  return {
+    title: post.title,
+    description: post.excerpt,
+    openGraph: { images: [post.cover] },
+  };
+}
+```
+
+要点：
+
+- 配置 `metadataBase`，否则 OG 图片会是相对路径，社交平台抓不到。
+- `generateMetadata` 与页面会**并行取数**，不要在里面做重复查询；用 React `cache()` 包一层请求函数。
+- 客户端组件里不能导出 metadata。需要动态标题时，把页面保持为 Server Component，只把交互区抽成客户端岛屿。
+
+---
+
+## 常见坑
+
+- **同一路径在两个路由组里重复定义**：构建报错，或行为取决于匹配顺序。
+- **在 `layout` 里读 `searchParams`**：布局根本拿不到，别白费劲。
+- **`loading.tsx` 放太高**：整个段都进同一个骨架，子路由之间的快速切换会闪烁。
+- **路由组命名带业务含义却指望它出现在 URL 里**：括号目录永远不进 URL。
+- **拦截路由当权限控制**：它只是导航行为，不构成任何安全边界。
+
+---
+
+## 小结
+
+路由文件约定本质是在回答三个问题：**哪些 UI 要持久（layout）、哪些要重挂（template）、哪些要并行（@slot）**。把这三点想清楚，目录结构自然就是架构图。下一篇进入最关键的一题：Server 与 Client 的边界到底怎么划。

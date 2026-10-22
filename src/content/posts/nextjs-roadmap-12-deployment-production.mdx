@@ -1,0 +1,237 @@
+---
+title: '12 · 部署与生产运维'
+published: 2026-10-20T22:00:00+08:00
+description: 'Next.js 生产部署完整指南：standalone 产物结构、环境变量的构建期与运行期、Docker 多阶段构建、nginx 反代与流式响应、多实例缓存一致性、零停机发布、健康检查、安全响应头与回滚策略。'
+tags: [Next.js, 部署, Docker, nginx, 运维]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 「本地 `npm run dev` 能跑」和「生产稳定运行」之间，隔着一整个运维体系。这一篇按上线顺序讲：构建产物 → 环境变量 → 容器/进程 → 反代 → 缓存 → 发布 → 回滚。
+
+---
+
+## 构建产物长什么样
+
+`next build` 之后，关键目录：
+
+```
+.next/
+├── server/          # 服务端代码与 RSC 运行时
+├── static/          # 带 hash 的 JS/CSS/chunk
+├── standalone/      # 开启 output: 'standalone' 后的最小运行包
+└── cache/           # 构建缓存（不要部署）
+public/              # 静态资源，原样提供
+```
+
+开启 standalone：
+
+```ts
+// next.config.ts
+const nextConfig = {
+  output: "standalone",
+};
+export default nextConfig;
+```
+
+⚠️ standalone **不会自动带上** `public/` 和 `.next/static/`，必须手动复制：
+
+```bash
+cp -r public .next/standalone/
+cp -r .next/static .next/standalone/.next/
+```
+
+漏掉任意一个，表现就是「页面能打开，但样式和图片全 404」。这是自托管最高频的翻车点。
+
+---
+
+## 环境变量：构建期 vs 运行期
+
+| 变量 | 何时读取 | 注意 |
+| --- | --- | --- |
+| `NEXT_PUBLIC_*` | 构建期内联进代码 | 改了必须重新构建；等于公开 |
+| 服务端变量 | 运行时读取 | 不要写进客户端代码路径 |
+| `NODE_ENV` | 构建 + 运行 | 生产必须是 `production` |
+
+常见事故：在 Docker 里构建时没传 `NEXT_PUBLIC_API_URL`，运行时再设已经晚了——值早已被写死进 bundle。
+
+建议在启动时校验服务端变量，缺失直接退出，而不是带病运行：
+
+```ts
+// instrumentation.ts
+export async function register() {
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    await import("./lib/env"); // zod 校验，失败抛错
+  }
+}
+```
+
+---
+
+## Docker：多阶段构建
+
+```dockerfile
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+要点：
+
+- `HOSTNAME=0.0.0.0`，否则容器外访问不到。
+- 生产镜像不要带 devDependencies 和源码。
+- 安装 `sharp`（图片优化在 standalone 下需要）。
+- 构建阶段给足内存。Next.js 大型项目构建 OOM 很常见，必要时 `NODE_OPTIONS=--max-old-space-size=4096`。
+
+---
+
+## nginx 反代
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3010;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # SSE / 流式渲染必须关缓冲
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 300s;
+
+    client_max_body_size 20m;
+}
+```
+
+几个细节：
+
+- `X-Forwarded-Proto` 不传，Next.js 可能认为请求是 HTTP，导致 Cookie `secure` 失效或跳转错乱。
+- 上传接口的 `client_max_body_size` 要和 Server Action / Route Handler 的限制对齐。
+- WebSocket（如果用了）需要 `Upgrade` / `Connection` 头。
+- 静态资源可以单独加长缓存：
+
+```nginx
+location /_next/static/ {
+    proxy_pass http://127.0.0.1:3010;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+}
+```
+
+---
+
+## 多实例与缓存一致性
+
+Next.js 默认的缓存（数据缓存、ISR）是**实例本地**的：
+
+- 两个实例各自持有一份缓存，A 失效了 B 不知道。
+- 负载均衡下，用户可能一会儿看到新数据、一会儿看到旧数据。
+
+解决方式：
+
+- 自定义 cacheHandler，把缓存放到 Redis 或共享存储。
+- 或者把强一致页面设为动态渲染，只缓存真正无状态的数据。
+- 写操作后通过发布/订阅通知所有实例失效。
+
+单实例自托管可以先不折腾，但**要把它写进架构决策记录**，别等到扩容时才发现。
+
+---
+
+## 零停机发布
+
+推荐顺序：
+
+1. 在独立环境构建产物（别在生产实例上 `npm run build`，会抢 CPU/内存导致 502）。
+2. 执行向前兼容的数据库迁移（expand 阶段）。
+3. 启动新实例，做健康检查（`/api/health` 返回 200）。
+4. 切换流量（nginx upstream / 负载均衡 / 软链）。
+5. 观察错误率与延迟，保留旧产物以便回滚。
+6. 确认稳定后再执行清理（contract 阶段）。
+
+用 PM2 的话，`pm2 reload` 是滚动重启；用 systemd 则配合 socket activation 或反代摘流。**不要 `kill -9` 后直接重启**，正在处理的请求会全断。
+
+健康检查区分：
+
+- **liveness**：进程活着吗（别查数据库，避免数据库抖动导致全量重启）。
+- **readiness**：能接流量吗（可以查数据库/依赖）。
+
+---
+
+## 安全响应头
+
+```ts
+// next.config.ts
+const nextConfig = {
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          {
+            key: "Permissions-Policy",
+            value: "camera=(), microphone=(), geolocation=()",
+          },
+        ],
+      },
+    ];
+  },
+};
+```
+
+CSP 建议先在 Report-Only 模式跑一段时间，收集违规再收紧；直接上严格 CSP 很容易把内联脚本和第三方统计打挂。
+
+---
+
+## 回滚
+
+上线前就必须写好回滚方案：
+
+- 保留上一个版本的构建产物（镜像 tag / 目录软链）。
+- 数据库迁移遵循 expand-contract，保证新旧代码都能跑。
+- 回滚脚本要演练过，不是「应该可以」。
+- 明确回滚判据：错误率、核心接口成功率、P95 延迟。
+
+---
+
+## 常见坑
+
+- **standalone 漏 `static` / `public`**：全站无样式。
+- **构建期环境变量没传**：前端请求打到 localhost。
+- **反代缓冲没关**：流式页面变成一次性输出。
+- **生产实例上构建**：构建期间服务不可用。
+- **多实例共享本地缓存**：数据新旧随机。
+- **只做 liveness 探活**：依赖挂了仍然接流量。
+- **迁移不可回滚**：一出问题只能硬着头皮往前。
+- **日志只写容器 stdout 不采集**：容器重启后现场全无。
+
+---
+
+## 小结
+
+部署的本质是「让产物、配置、流量、数据四件事按顺序安全地切换」。standalone 产物别漏文件，环境变量分清构建期和运行期，反代记得关缓冲，多实例提前想缓存一致性。下一篇讲大型项目怎么组织：目录、边界、协作与架构决策。

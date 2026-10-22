@@ -1,0 +1,240 @@
+---
+title: '06 · Route Handlers 与 API 设计'
+published: 2026-10-20T16:00:00+08:00
+description: 'Route Handlers 实战：与 Server Actions 的选型边界、GET/POST 处理器写法、SSE 流式响应、Webhook 签名校验与幂等、CORS、缓存默认值与运行时选择，以及反代缓冲导致流式失效的排查。'
+tags: [Next.js, Route Handlers, API, SSE, Webhook]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> App Router 里有三条「服务端入口」：Server Component（读）、Server Action（写）、Route Handler（对外接口）。选错不是不能跑，而是会在鉴权、缓存、错误语义上不断还债。
+
+---
+
+## 三者怎么选
+
+| 场景 | 选择 | 原因 |
+| --- | --- | --- |
+| 页面渲染前取数据 | Server Component 直接取 | 少一次网络跳转，能流式渲染 |
+| 表单提交、按钮触发的写操作 | Server Action | 类型安全、渐进增强、自动集成 |
+| 移动端 / 第三方调用 | Route Handler | 标准 HTTP 契约 |
+| Webhook 回调 | Route Handler | 需要原始请求体与签名头 |
+| 文件下载、SSE | Route Handler | 需要控制响应流与头 |
+| 内部定时任务触发 | Route Handler | 可被外部调度器调用 |
+
+一句话：**给「人」用的写操作走 Action，给「系统」用的接口走 Route Handler。**
+
+---
+
+## 基本写法
+
+```ts
+// app/api/orders/[id]/route.ts
+import { requireUser } from "@/lib/auth";
+
+export async function GET(
+  _request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const { id } = await params;
+  const session = await requireUser();
+
+  const order = await db.order.findFirst({
+    where: { id, userId: session.userId },
+  });
+
+  if (!order) {
+    return Response.json({ error: "NOT_FOUND" }, { status: 404 });
+  }
+
+  return Response.json({ data: order });
+}
+
+export async function DELETE(
+  _request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const { id } = await params;
+  const session = await requireUser();
+
+  const result = await db.order.deleteMany({
+    where: { id, userId: session.userId },
+  });
+
+  if (result.count === 0) {
+    return Response.json({ error: "NOT_FOUND" }, { status: 404 });
+  }
+
+  return new Response(null, { status: 204 });
+}
+```
+
+要点：
+
+- 导出函数名就是 HTTP 方法名，大小写必须一致。
+- 同一目录下 `route.ts` 和 `page.tsx` **不能共存**。
+- 参数用 Web 标准的 `Request` / `Response`，需要便捷方法时用 `NextRequest` / `NextResponse`。
+- 动态段参数同样要 `await`。
+
+---
+
+## 缓存：默认不缓存
+
+Next.js 15 起，GET Route Handler **默认不缓存**。这对接口是好事，但如果你确实想要静态响应，要显式声明：
+
+```ts
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export async function GET() {
+  return Response.json(await getPublicConfig());
+}
+```
+
+反过来，任何读取 `cookies()`、`headers()`、`request.url` 查询参数的处理逻辑都会让它动态化。别在「应该静态」的接口里读这些。
+
+---
+
+## SSE：把流式响应写对
+
+```ts
+// app/api/stream/route.ts
+export async function GET() {
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const timer = setInterval(() => {
+        const payload = JSON.stringify({ at: Date.now() });
+        controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+      }, 1000);
+
+      setTimeout(() => {
+        clearInterval(timer);
+        controller.close();
+      }, 30_000);
+
+      // 客户端断开时应清理定时器（生产代码务必处理 cancel）
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
+  });
+}
+```
+
+流式接口上线后「本地是逐字的、线上是一坨一坨的」，九成是反代缓冲：
+
+- nginx：`proxy_buffering off;`、`proxy_cache off;`、`X-Accel-Buffering: no`。
+- CDN / 网关：确认没有开启响应压缩缓冲或整体缓冲。
+- Next.js 自身的 `compress` 一般不是主因，但压缩会改变分块行为，排查时可以临时关掉对照。
+
+另外，Serverless 平台通常有执行时长上限，长连接不适合无脑放上去；自托管则要关注 node 进程的并发与内存。
+
+---
+
+## Webhook：先验签，再解析
+
+Webhook 是公网端点，必须假设「所有人都会打它」：
+
+```ts
+// app/api/webhooks/payment/route.ts
+import crypto from "node:crypto";
+
+export async function POST(request: Request) {
+  const raw = await request.text(); // 必须拿原始字符串
+  const signature = request.headers.get("x-signature") ?? "";
+  const secret = process.env.PAYMENT_WEBHOOK_SECRET!;
+
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(raw)
+    .digest("hex");
+
+  const ok =
+    signature.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+
+  if (!ok) {
+    return new Response("invalid signature", { status: 401 });
+  }
+
+  const event = JSON.parse(raw);
+
+  // 幂等：同一 event.id 只处理一次
+  const inserted = await db.webhookEvent.createMany({
+    data: [{ id: event.id, type: event.type }],
+    skipDuplicates: true,
+  });
+  if (inserted.count === 0) {
+    return Response.json({ received: true, duplicate: true });
+  }
+
+  await handlePaymentEvent(event);
+  return Response.json({ received: true });
+}
+```
+
+三个细节：
+
+1. **不要先 `request.json()` 再验签**——body 已被消费，签名必然对不上。
+2. 用 `timingSafeEqual`，不要用 `===` 比较签名。
+3. **入库幂等 + 快速返回**。支付方通常会重试，处理慢会被判定失败并重复推送。
+
+---
+
+## CORS 与预检
+
+如果接口要被别的域名直接调用：
+
+```ts
+const cors = {
+  "Access-Control-Allow-Origin": "https://app.example.com",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type,Authorization",
+};
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: cors });
+}
+```
+
+不要图省事写 `*`，尤其是带 Cookie 的接口——浏览器规范本来也不允许 `*` 与凭据共存。
+
+---
+
+## 错误契约
+
+接口的错误响应要稳定，前端才能统一处理：
+
+```json
+{ "error": "INVALID_INPUT", "message": "数量必须大于 0", "requestId": "..." }
+```
+
+- 4xx 表示调用方问题，5xx 表示服务端问题，别混用。
+- 不要在响应里返回堆栈。
+- 带上 `requestId`，方便把用户报障和日志对上。
+- 写操作返回 201/204 要有明确约定，别有时 200 有时 204。
+
+---
+
+## 常见坑
+
+- **在 GET 里写数据**：爬虫、预取、浏览器重试都会让它重复执行。
+- **忘记鉴权**：Route Handler 不会继承任何页面级保护，`proxy.ts` 的匹配范围也要覆盖 `/api`。
+- **Edge Runtime 里用 Node 内置模块**：`fs`、`crypto` 的部分 API、数据库驱动都可能不可用。
+- **长时间任务同步执行**：请求超时、平台杀进程；该用队列 + `after()`。
+- **用 Route Handler 替代 Server Component 取数**：多一跳网络，还失去流式渲染。
+- **反代没关缓冲**：SSE 变成「攒够一批才吐一次」。
+
+---
+
+## 小结
+
+Route Handler 是 Next.js 对外的「正规接口层」：契约清晰、可控缓存、能流式、能验签。把它和 Server Action 的职责分开，接口层就不会变成一锅粥。下一篇进入产品化的第一道门槛：认证、会话与权限。

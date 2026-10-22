@@ -1,0 +1,213 @@
+---
+title: '07 · 认证、会话与权限'
+published: 2026-10-20T17:00:00+08:00
+description: 'Next.js 认证与授权：JWT 与数据库会话的取舍、Cookie 安全属性、Auth.js 接入、proxy/middleware 的乐观校验与数据层强校验、RBAC 与租户隔离、会话撤销，以及中间件绕过漏洞的教训。'
+tags: [Next.js, 认证, 会话, RBAC, 安全]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 认证（你是谁）和授权（你能干什么）是两件事。生产事故里，前者通常做得还行，后者一塌糊涂：登录了就能看别人的订单，前端藏了按钮就以为后端安全了。
+
+---
+
+## 先选会话形态
+
+| 方案 | 优点 | 代价 |
+| --- | --- | --- |
+| JWT（无状态） | 不查库、易横向扩展 | 难撤销、权限变更滞后、体积大 |
+| 数据库会话（有状态） | 可随时撤销、权限实时 | 每次请求查一次（可加缓存） |
+| 混合（短 JWT + 刷新令牌） | 平衡体验与安全 | 实现复杂、要处理刷新竞态 |
+
+我的默认建议：**后台管理系统用数据库会话，面向公众的 C 端可以用短 JWT + 服务端会话表兜底**。除非你确实有跨服务无状态校验的硬需求，否则别一上来就 JWT。
+
+---
+
+## 数据库会话的最小实现
+
+```ts
+// lib/auth/session.ts
+import "server-only";
+import { cache } from "react";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+
+const COOKIE = "session";
+
+export const getSession = cache(async () => {
+  const token = (await cookies()).get(COOKIE)?.value;
+  if (!token) return null;
+
+  const session = await db.session.findUnique({
+    where: { tokenHash: sha256(token) },
+    include: { user: true },
+  });
+
+  if (!session || session.expiresAt <= new Date()) return null;
+  return session;
+});
+
+export async function requireUser() {
+  const session = await getSession();
+  if (!session) redirect("/login");
+  return session.user;
+}
+```
+
+关键点：
+
+- **Cookie 里放随机 token，库里存它的哈希**。数据库泄露时，攻击者不能直接拿来登录。
+- 过期时间在服务端判断，不要只依赖 Cookie 的 `max-age`。
+- 用 React `cache()` 包一层，保证同一次渲染里布局、页面、`generateMetadata` 只查一次。
+
+Cookie 属性别漏：
+
+```ts
+(await cookies()).set(COOKIE, token, {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax",
+  path: "/",
+  maxAge: 60 * 60 * 24 * 7,
+});
+```
+
+- `httpOnly`：禁止 JS 读取，防 XSS 窃取。
+- `secure`：只走 HTTPS。
+- `sameSite=lax`：挡住大部分跨站 POST；如果你的登录回调需要跨站，才考虑 `none`（必须配 `secure`）。
+- 登录成功后**轮换 session id**，防会话固定攻击。
+
+---
+
+## 密码与登录
+
+- 哈希用 **argon2id**（首选）或 bcrypt（cost ≥ 12），绝不自己写加密。
+- 登录失败提示统一为「账号或密码错误」，不要暴露账号是否存在。
+- 按 IP + 账号双维度限流，失败次数递增延迟。
+- 支持 TOTP 二次验证的后台，安全性会上一个台阶。
+- 密码重置 token 一次性、短时效、存哈希。
+
+---
+
+## Auth.js 值不值得用
+
+如果需求是「Google/GitHub 登录 + 邮箱魔法链接 + 标准会话」，Auth.js（原 NextAuth）能省掉大量样板：
+
+```ts
+// auth.ts
+import NextAuth from "next-auth";
+import GitHub from "next-auth/providers/github";
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  providers: [GitHub],
+});
+```
+
+```ts
+// app/api/auth/[...nextauth]/route.ts
+import { handlers } from "@/auth";
+export const { GET, POST } = handlers;
+```
+
+但要注意：
+
+- Adapter 决定会话存哪，默认的 JWT 策略同样存在「难撤销」问题。
+- 自定义 Credentials 登录时，密码校验、限流、审计仍要自己写。
+- 版本升级有过破坏性变更，锁版本、读迁移指南。
+
+**不要为了省事把认证完全交给一个不理解的库**。至少要知道：token 存哪、什么时候过期、怎么撤销。
+
+---
+
+## 中间件只做「乐观校验」
+
+Next.js 16 把 `middleware.ts` 更名为 `proxy.ts`（运行在 Node.js runtime），职责不变：在路由匹配前执行。
+
+```ts
+// proxy.ts
+import { NextResponse, type NextRequest } from "next/server";
+
+export function proxy(request: NextRequest) {
+  const hasSession = request.cookies.has("session");
+  const isApp = request.nextUrl.pathname.startsWith("/app");
+
+  if (isApp && !hasSession) {
+    const url = new URL("/login", request.url);
+    url.searchParams.set("next", request.nextUrl.pathname);
+    return NextResponse.redirect(url);
+  }
+}
+
+export const config = { matcher: ["/app/:path*"] };
+```
+
+它适合做：未登录跳转、 locale 重写、A/B 分流、简单限流。**不适合做唯一的安全边界**：
+
+- 它看不到数据库里的角色变化。
+- 历史上有过通过伪造内部请求头绕过中间件的漏洞（CVE-2025-29927）。框架已修复，但教训是：**安全不能只压在一层**。
+- Server Action 和 Route Handler 都可能不经过你预期的 matcher。
+
+正确姿势是**双层校验**：
+
+1. `proxy.ts`：没登录直接踢走，省一次渲染。
+2. 数据层 / Action / Route Handler：再次 `requireUser()` + 权限判断。
+
+---
+
+## RBAC 与租户隔离
+
+权限判断要收敛成少数几个函数，别散落在页面里：
+
+```ts
+// lib/auth/guard.ts
+export async function requirePermission(code: PermissionCode) {
+  const user = await requireUser();
+  const allowed = await hasPermission(user.id, code);
+  if (!allowed) throw new ForbiddenError(code);
+  return user;
+}
+```
+
+调用时：
+
+```ts
+const user = await requirePermission("order:read");
+const orders = await db.order.findMany({ where: { tenantId: user.tenantId } });
+```
+
+两条铁律：
+
+- **默认拒绝**：没有明确授予的权限就是没有。
+- **租户 ID 从会话取，不从请求参数取**。查询条件里永远带 `tenantId`，并且用数据库层面的组合索引/唯一约束兜底。
+
+对象级权限（这条订单是不是你的）必须查库确认，不能靠「URL 里有 id 就说明有权限」——这就是最典型的 IDOR。
+
+---
+
+## 会话撤销与权限变更
+
+JWT 方案下，用户被禁用后 token 仍然有效，这是真实存在的安全事故。解决方式：
+
+- 会话表记录 `userId` 与 `revokedAt`，敏感操作时校验。
+- JWT 里放 `sessionVersion`，用户改密码/被禁用时自增，旧 token 全部失效。
+- 权限变更后强制刷新会话，或把权限放进短 TTL 缓存并在变更时主动清除。
+
+「退出登录」也必须服务端删会话，不能只清浏览器 Cookie。
+
+---
+
+## 常见坑
+
+- **只在前端隐藏按钮**：接口裸奔，改个请求就能删数据。
+- **把 token 存 `localStorage`**：XSS 一把梭。
+- **JWT 有效期设成 30 天且不可撤销**：等于发了一张长期通行证。
+- **权限码硬编码在页面里**：改一次权限要改十个文件，必然漏。
+- **登录回跳不校验 `next` 参数**：开放重定向，钓鱼神器。
+- **多租户查询漏了 `tenantId`**：A 公司看到 B 公司数据。
+
+---
+
+## 小结
+
+认证解决「进门」，授权解决「能进哪个房间」。把会话做成可撤销的、把权限收敛成 `requirePermission`、把租户 ID 锁死在服务端会话里，这三件事做完，后台的安全底座才算立住。下一篇讲数据层：ORM、连接池、事务和 N+1。

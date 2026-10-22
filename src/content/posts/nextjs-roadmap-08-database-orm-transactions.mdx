@@ -1,0 +1,217 @@
+---
+title: '08 · 数据库、ORM 与事务'
+published: 2026-10-20T18:00:00+08:00
+description: 'Next.js 全栈的数据层工程：Prisma / Drizzle 选型、连接池与 serverless 陷阱、N+1 与分页、事务与隔离级别、条件更新防超卖、迁移的 expand-contract、索引设计与生产数据安全。'
+tags: [Next.js, 数据库, Prisma, 事务, 性能]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 在 Server Component 里直接查库很爽，但「能查」和「查得对、查得快、查得安全」是三件事。这一篇讲的是把前端工程师真正变成全栈工程师的那部分。
+
+---
+
+## 数据层放在哪
+
+```
+src/
+├── app/                 # 路由与页面
+├── lib/
+│   ├── db.ts            # 连接与客户端
+│   ├── auth/            # 会话与权限
+│   └── repositories/    # 查询与写入
+└── components/
+```
+
+规则：
+
+- `lib/db.ts` 第一行写 `import "server-only"`，从物理上阻止被客户端导入。
+- 页面和组件**不要直接拼 ORM 查询**，收敛到 repository / service。否则同一个查询会在五个页面里各写一遍，加索引时找不到全貌。
+- Repository 返回 DTO，不返回 ORM 实体。序列化边界和数据泄漏都在这里挡住。
+
+---
+
+## Prisma、Drizzle 还是手写 SQL
+
+| 方案 | 适合 | 注意 |
+| --- | --- | --- |
+| Prisma | 团队协作、schema 驱动、迁移完整 | 生成客户端体积、复杂 SQL 表达力有限 |
+| Drizzle | 喜欢 SQL、类型推导轻量 | 迁移与生态要自己补 |
+| Kysely | 类型安全的查询构建器 | 偏底层，样板略多 |
+| 手写 SQL | 复杂分析、极致性能 | 参数化、映射、维护成本 |
+
+没有银弹。**中后台 + 关系模型清晰，Prisma 很省心；分析型查询多、SQL 复杂，Drizzle 或手写更顺。**
+
+---
+
+## 连接池：本地和线上是两套问题
+
+长时间运行的 Node 服务（自托管、PM2、Docker）：
+
+```ts
+// lib/db.ts
+import "server-only";
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma?: PrismaClient;
+};
+
+export const db =
+  globalForPrisma.prisma ??
+  new PrismaClient({ log: ["warn", "error"] });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = db;
+}
+```
+
+`globalThis` 那一段是给开发环境热更新用的，不加会不断创建新连接直到数据库拒绝。
+
+Serverless / Edge 环境：
+
+- 每个函数实例都可能建连接，**必须用外部连接池**（如 PgBouncer、Supabase Pooler、Neon Proxy）。
+- PgBouncer 的 transaction 模式不支持所有会话级特性（prepared statements、advisory locks 等），Prisma 需要加 `pgbouncer=true` 参数。
+- 设置合理的 `connection_limit`，别让一个实例占满数据库。
+
+自托管最容易犯的错：**在每个请求里 `new PrismaClient()`**。连接数会随并发线性上涨，最后 `too many connections`。
+
+---
+
+## N+1：RSC 里更隐蔽
+
+```ts
+// ❌ 每个订单查一次用户
+const orders = await db.order.findMany({ where: { tenantId } });
+const rows = await Promise.all(
+  orders.map((o) => db.user.findUnique({ where: { id: o.userId } })),
+);
+```
+
+100 个订单就是 101 次查询。正确写法是一次带关联：
+
+```ts
+const orders = await db.order.findMany({
+  where: { tenantId },
+  include: { user: { select: { id: true, name: true } } },
+  orderBy: { createdAt: "desc" },
+  take: 20,
+});
+```
+
+在 Server Component 里，N+1 更危险：它发生在服务端，浏览器 Network 面板完全看不见，只表现为「页面慢」。**上线前一定要看数据库慢查询日志。**
+
+---
+
+## 分页：别用深 offset
+
+```ts
+// 深分页会越翻越慢：OFFSET 100000 仍要扫描前 10 万行
+await db.order.findMany({
+  where: { tenantId },
+  skip: page * 20,
+  take: 20,
+});
+```
+
+用游标分页：
+
+```ts
+const rows = await db.order.findMany({
+  where: { tenantId },
+  orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+  take: 21,
+  ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+});
+
+const hasNext = rows.length > 20;
+const items = hasNext ? rows.slice(0, 20) : rows;
+```
+
+配套索引：`(tenantId, createdAt desc, id desc)`。**多租户场景下，`tenantId` 永远放在联合索引第一列。**
+
+---
+
+## 事务：短、幂等、可重试
+
+```ts
+await db.$transaction(
+  async (tx) => {
+    const updated = await tx.inventory.updateMany({
+      where: { productId, stock: { gte: qty } },
+      data: { stock: { decrement: qty } },
+    });
+
+    if (updated.count === 0) throw new OutOfStockError();
+
+    await tx.order.create({
+      data: { productId, qty, userId, tenantId },
+    });
+  },
+  { isolationLevel: "Serializable", timeout: 5000 },
+);
+```
+
+要点：
+
+- **条件更新**（`stock >= qty`）比「先查再改」安全，天然防并发超卖。
+- 事务里**不要做 HTTP 调用、发消息、写文件**。外部系统超时会把数据库锁拖到天荒地老。
+- 事务要短。长事务会阻塞 DDL、放大死锁概率。
+- 死锁是正常现象，捕获后**有限次重试**；不要无限重试。
+- 跨服务一致性用 outbox 模式，不要在事务里直接调支付。
+
+---
+
+## 迁移：生产环境只有一条路
+
+开发环境可以 `migrate dev`，生产环境必须：
+
+```bash
+npx prisma migrate deploy
+```
+
+规则：
+
+- 迁移文件进 git，**只增不改**。
+- 上线前在备份库演练一遍，记录耗时。
+- 大表加索引用 `CREATE INDEX CONCURRENTLY`（PostgreSQL）或在线 DDL 工具，别锁表。
+- 破坏性变更走 **expand-contract**：先加新列（可空）→ 双写 → 回填 → 切读 → 删旧列。每一步都可回滚。
+- 任何 `DROP` / `DELETE` / 改结构之前，先备份。这条不是建议，是纪律。
+
+---
+
+## 索引与查询
+
+- 用 `EXPLAIN ANALYZE` 看真实执行计划，不要猜。
+- 联合索引注意列顺序：等值条件在前，范围/排序在后。
+- 区分度低的列（如状态）单独建索引意义不大，适合做联合索引的一部分。
+- 不要 `SELECT *`，尤其别把大文本/JSON 字段带进列表页。
+- 统计数量用近似值或缓存，别在列表页每次 `count(*)` 扫全表。
+
+---
+
+## 数据建模的几个底线
+
+- **金额用 `DECIMAL` / 整数分，不用浮点。**
+- **时间统一 UTC 存，展示层再转时区。**
+- 外键、唯一约束、检查约束尽量落到数据库，应用层校验会漏。
+- JSON 列适合「结构不固定、整体读写」的字段；需要按内部字段查询时，老老实实建表。
+- 软删除要统一：所有查询都带 `deletedAt IS NULL`，否则迟早漏。
+
+---
+
+## 常见坑
+
+- **把数据库客户端导出给客户端组件**：构建报错算幸运，配置泄漏是灾难。
+- **每个请求新建连接**：连接池耗尽。
+- **事务里调第三方接口**：锁等待、超时、雪崩。
+- **生产跑 `migrate dev`**：可能直接重置数据。
+- **多租户查询漏 `tenantId`**：越权 + 串数据。
+- **列表页 `count(*)` + 深分页**：数据库 CPU 打满。
+
+---
+
+## 小结
+
+数据层是全栈项目的地基：连接池决定稳定性，索引决定速度，事务决定一致性，迁移纪律决定你能不能睡好觉。下一篇讲性能——当页面、数据和 bundle 都开始变慢时，按什么顺序排查。

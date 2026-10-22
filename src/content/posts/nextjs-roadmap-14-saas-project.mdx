@@ -1,0 +1,299 @@
+---
+title: '14 · 综合实战：多租户 SaaS'
+published: 2026-10-20T23:59:00+08:00
+description: '用一个多租户 SaaS 串起全系列：租户与成员模型、租户解析、权限校验、邀请流程、订阅计费 Webhook、审计日志、租户隔离缓存、噪声邻居治理与上线检查清单。'
+tags: [Next.js, SaaS, 多租户, RBAC, 实战]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这是系列的收官。我们不再讲单个 API，而是把认证、数据、缓存、Action、部署串成一个能卖钱的产品：**多租户 SaaS**。核心只有一句话：**任何一次读写，都必须能回答「当前租户是谁、凭什么允许」。**
+
+---
+
+## 需求与边界
+
+一个最小可用的多租户 SaaS：
+
+- 用户可以属于多个组织（租户）。
+- 每个组织有成员、角色、订阅计划。
+- 支持邀请成员、角色变更、强制下线。
+- 按订阅计划限制席位与功能。
+- 关键操作有审计日志。
+- 数据严格隔离，A 租户永远看不到 B 租户。
+
+路由形态选择：
+
+| 方案 | 例子 | 取舍 |
+| --- | --- | --- |
+| 子域名 | `acme.app.com` | 隔离感强，Cookie/证书配置复杂 |
+| 路径前缀 | `app.com/acme/...` | 实现简单，分享链接直观 |
+| 会话内切换 | `app.com/dashboard` | 最灵活，但链接无法定位租户 |
+
+建议从路径前缀开始，`app/[tenant]/...`，等真有企业客户要求独立域名再升级。
+
+---
+
+## 数据模型
+
+```prisma
+model Tenant {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  plan      Plan     @default(FREE)
+  createdAt DateTime @default(now())
+  members   Membership[]
+}
+
+model Membership {
+  id       String @id @default(cuid())
+  userId   String
+  tenantId String
+  role     Role   @default(MEMBER)
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  user     User   @relation(fields: [userId], references: [id])
+
+  @@unique([userId, tenantId])
+  @@index([tenantId, role])
+}
+```
+
+几个关键约束：
+
+- `Membership` 的联合唯一键防止重复加入。
+- 所有业务表都带 `tenantId`，并且**以它作为联合索引第一列**。
+- 角色用枚举，不要在字符串里写 `"admin"`。
+- 删除租户用软删除 + 延迟清理，别级联删掉审计数据。
+
+---
+
+## 租户解析：只信服务端
+
+```ts
+// lib/tenant.ts
+import "server-only";
+import { cache } from "react";
+import { notFound } from "next/navigation";
+
+export const getTenantBySlug = cache(async (slug: string) => {
+  const tenant = await db.tenant.findUnique({ where: { slug } });
+  if (!tenant || tenant.deletedAt) notFound();
+  return tenant;
+});
+```
+
+页面里从路由参数拿 slug：
+
+```tsx
+// app/[tenant]/layout.tsx
+export default async function TenantLayout({
+  children,
+  params,
+}: {
+  children: React.ReactNode;
+  params: Promise<{ tenant: string }>;
+}) {
+  const { tenant: slug } = await params;
+  await requireMembership(slug, "tenant:view");
+  return <TenantShell>{children}</TenantShell>;
+}
+```
+
+**绝不允许**从请求头、查询参数或表单里直接取 `tenantId` 当权限依据。slug 只能用来定位租户，是否允许访问由会话 + membership 决定。
+
+---
+
+## 权限：一次校验，处处复用
+
+```ts
+// lib/auth/guard.ts
+export async function requireMembership(slug: string, permission: Permission) {
+  const user = await requireUser();
+  const tenant = await getTenantBySlug(slug);
+
+  const membership = await db.membership.findUnique({
+    where: {
+      userId_tenantId: { userId: user.id, tenantId: tenant.id },
+    },
+  });
+
+  if (!membership) forbidden();
+  if (!roleCan(membership.role, permission)) forbidden();
+
+  return { user, tenant, membership };
+}
+```
+
+调用点：
+
+```ts
+const { tenant, user } = await requireMembership(slug, "order:read");
+const orders = await db.order.findMany({
+  where: { tenantId: tenant.id },
+  take: 20,
+});
+```
+
+规则：
+
+- **每个 Server Action / Route Handler 都重新校验**，不能依赖布局已经检查过。
+- 权限判断用常量联合类型，避免拼写错误。
+- 对象级权限（这条订单属于当前租户）在查询条件里带上 `tenantId`，查不到就是 404，不要先查再判断。
+
+---
+
+## 邀请流程
+
+邀请是最容易做出漏洞的功能之一：
+
+1. 管理员输入邮箱，服务端校验席位余量。
+2. 生成**随机 token**，库里只存哈希，设置 24–72 小时过期。
+3. 邮件链接携带 token。
+4. 接受时校验：未过期、未使用、邮箱匹配、租户仍有席位。
+5. 在事务里创建 membership 并标记 token 已用。
+
+```ts
+await db.$transaction(async (tx) => {
+  const invite = await tx.invitation.findFirst({
+    where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
+  });
+  if (!invite) throw new InvalidInviteError();
+
+  await tx.membership.create({
+    data: { userId: user.id, tenantId: invite.tenantId, role: invite.role },
+  });
+
+  await tx.invitation.update({
+    where: { id: invite.id },
+    data: { usedAt: new Date() },
+  });
+});
+```
+
+席位并发要防：两个人同时接受最后一张邀请时，必须在事务里锁租户或做条件更新，否则会超卖。
+
+---
+
+## 订阅与计费
+
+支付平台的 Webhook 是订阅状态的**唯一真相源**，不是前端回调：
+
+```ts
+// app/api/webhooks/billing/route.ts
+export async function POST(request: Request) {
+  const raw = await request.text();
+  if (!verifySignature(raw, request.headers.get("x-signature"))) {
+    return new Response("invalid signature", { status: 401 });
+  }
+
+  const event = JSON.parse(raw);
+
+  const inserted = await db.billingEvent.createMany({
+    data: [{ id: event.id, type: event.type, payload: event }],
+    skipDuplicates: true,
+  });
+  if (inserted.count === 0) return Response.json({ ok: true });
+
+  await applySubscriptionEvent(event);
+  return Response.json({ ok: true });
+}
+```
+
+状态机要覆盖：
+
+- 试用、活跃、逾期、取消但未到期、已取消。
+- 支付失败后的宽限期。
+- 降级时超出限额的数据如何处理（只读、不可新建）。
+
+功能门禁放在服务端：
+
+```ts
+if (!planAllows(tenant.plan, "advanced-export")) {
+  throw new ForbiddenError("当前套餐不支持导出");
+}
+```
+
+前端的按钮隐藏只是体验优化，不构成限制。
+
+---
+
+## 审计日志
+
+关键操作与业务写入放在同一事务：
+
+```ts
+await db.$transaction(async (tx) => {
+  const order = await tx.order.create({ data: { ...input, tenantId } });
+
+  await tx.auditLog.create({
+    data: {
+      tenantId,
+      actorId: user.id,
+      action: "order.created",
+      targetId: order.id,
+      meta: { amount: order.amount },
+    },
+  });
+});
+```
+
+审计表只追加、不修改；查询按 `tenantId + createdAt` 建索引；敏感字段做脱敏。保留周期按合规要求定，别无限膨胀。
+
+---
+
+## 多租户缓存
+
+缓存 key 必须带租户：
+
+```ts
+export async function getDashboardStats(tenantId: string) {
+  "use cache";
+  cacheTag(`tenant:${tenantId}:dashboard`);
+  cacheLife("minutes");
+  return db.order.aggregate({ where: { tenantId }, ... });
+}
+```
+
+写操作后：
+
+```ts
+revalidateTag(`tenant:${tenantId}:dashboard`);
+```
+
+千万不能出现「只按资源 ID 缓存」而查询又依赖当前租户的写法——那是跨租户数据泄漏。
+
+---
+
+## 噪声邻居与配额
+
+多租户系统最怕一个大客户拖垮所有人：
+
+- 按租户做 API 限流（Redis 令牌桶）。
+- 重任务进队列，按租户配额调度。
+- 大导出、报表生成异步化，提供任务状态页。
+- 数据库慢查询按租户维度监控。
+
+---
+
+## 上线检查清单
+
+- [ ] 所有业务查询都带 `tenantId`，并有联合索引。
+- [ ] 每个 Action / Route Handler 都做身份与权限校验。
+- [ ] 邀请 token 只存哈希、一次性、有有效期。
+- [ ] Webhook 验签 + 幂等 + 快速返回。
+- [ ] 订阅状态以服务端 Webhook 为准。
+- [ ] 缓存 key 含租户，失效按租户标签。
+- [ ] 审计日志覆盖关键写操作。
+- [ ] 越权测试：A 租户用户访问 B 租户资源必须 404/403。
+- [ ] 限流、配额、异步任务已配置。
+- [ ] 备份、迁移回滚、监控告警已就绪。
+
+---
+
+## 小结
+
+多租户 SaaS 把前面 13 篇全部用上了：渲染模型决定页面怎么出，组件边界决定代码在哪跑，缓存决定数据新不新，认证与权限决定谁能看，数据库与事务决定数据对不对，部署与可观测性决定它能不能活。
+
+真正的分水岭不是「会不会用 Next.js」，而是**每一次读写都能说清租户、身份、权限和失效策略**。做到这一点，框架换不换，你都是那个能对生产负责的工程师。

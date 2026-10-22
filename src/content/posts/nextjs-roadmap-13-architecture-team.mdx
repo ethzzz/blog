@@ -1,0 +1,248 @@
+---
+title: '13 · 大型项目架构与团队协作'
+published: 2026-10-20T23:00:00+08:00
+description: 'Next.js 大型项目架构：按业务域组织目录、feature 公共出口与依赖边界、Server/Client 与数据层隔离、Monorepo 拆分、契约与权限单一来源、代码评审与 ADR，以及避免过早抽象的判断标准。'
+tags: [Next.js, 架构, Monorepo, 团队协作, 工程化]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 小项目的目录结构是「放文件」，大项目的目录结构是「划边界」。判断标准很简单：**半年后另一个人，能不能只看结构就知道改哪里、不会误伤别的模块。**
+
+---
+
+## 按业务域组织，而不是按文件类型
+
+```ts
+// ❌ 技术分层：所有组件挤在一起，改一个功能要跳五个目录
+src/
+├── components/
+├── hooks/
+├── services/
+├── types/
+└── utils/
+
+// ✅ 业务域优先
+src/
+├── app/                  # 只放路由与页面组装
+│   ├── (marketing)/
+│   ├── (app)/
+│   └── api/
+├── features/
+│   ├── orders/
+│   │   ├── components/
+│   │   ├── actions.ts
+│   │   ├── queries.ts
+│   │   ├── schema.ts
+│   │   └── index.ts
+│   └── billing/
+├── components/ui/        # 无业务语义的设计系统
+├── lib/                  # 跨域基础设施
+└── styles/
+```
+
+原则：
+
+- `app/` 只做**路由和数据编排**，不写业务细节。
+- 一个 feature 内部的组件、查询、Action、校验、测试放在一起。
+- 跨 feature 复用的东西才上提到 `components/ui` 或 `lib`。
+- 没有业务语义的组件（Button、Dialog、Table）才是「通用组件」。
+
+---
+
+## Feature 要有公共出口
+
+每个 feature 只暴露一个 `index.ts`，外部不许深引用：
+
+```ts
+// features/orders/index.ts
+export { OrderList } from "./components/order-list";
+export { createOrder } from "./actions";
+export type { OrderDTO } from "./schema";
+```
+
+配合 ESLint 禁止深层导入：
+
+```js
+// eslint.config.mjs
+"no-restricted-imports": [
+  "error",
+  {
+    patterns: [
+      {
+        group: ["@/features/*/components/*", "@/features/*/queries"],
+        message: "请从 feature 的公共出口导入",
+      },
+    ],
+  },
+],
+```
+
+好处：
+
+- 重构内部文件不影响调用方。
+- 依赖方向清晰，能看到谁用了什么。
+- 减少 barrel file 导致的 bundle 意外膨胀——**公共出口要显式导出，不要 `export *`**。
+
+---
+
+## 三条边界必须物理隔离
+
+1. **Server / Client**：服务端模块加 `import "server-only"`。
+2. **数据访问 / UI**：页面不直接查库，走 feature 的 query/service。
+3. **Feature / Feature**：不允许互相深引用，跨域协作走事件、共享 DTO 或上层编排。
+
+```
+app/page.tsx
+   ↓ 只调用
+features/orders/index.ts
+   ↓
+features/orders/queries.ts（server-only）
+   ↓
+lib/db.ts
+```
+
+一旦出现 `features/orders` 直接 import `features/billing` 的内部实现，两个域就开始耦合，最终会变成「改 A 必坏 B」。
+
+---
+
+## 契约单一来源
+
+大型项目里最容易失控的是「同一个概念有五种写法」：
+
+- 权限码散落在页面、Action、菜单配置里。
+- 请求/响应的类型前后端各写一份。
+- 状态枚举在数据库、后端、前端各有一套。
+
+收敛方式：
+
+```ts
+// features/orders/schema.ts
+import { z } from "zod";
+
+export const orderStatus = z.enum([
+  "pending",
+  "paid",
+  "shipped",
+  "cancelled",
+]);
+
+export const createOrderSchema = z.object({
+  productId: z.string().uuid(),
+  qty: z.number().int().min(1).max(99),
+});
+
+export type OrderStatus = z.infer<typeof orderStatus>;
+export type CreateOrderInput = z.infer<typeof createOrderSchema>;
+```
+
+同一份 schema 用于：
+
+- Server Action 的输入校验。
+- 表单的客户端校验。
+- 测试数据工厂。
+- 必要时生成 API 文档。
+
+权限码同理，定义成常量联合类型，菜单、路由、Action 全部引用同一份。
+
+---
+
+## Monorepo：什么时候值得
+
+出现下面两个信号再拆：
+
+- 有多个 Next.js 应用（C 端、后台、运营端）共享大量代码。
+- 数据库 schema、UI 组件、鉴权逻辑需要在应用间同步演进。
+
+典型结构：
+
+```
+apps/
+├── web/          # 面向用户
+├── admin/        # 内部后台
+└── docs/
+packages/
+├── ui/           # 设计系统
+├── db/           # schema 与 client
+├── auth/         # 会话与权限
+└── config/       # eslint / tsconfig / tailwind
+```
+
+要点：
+
+- 每个 package 有明确的 `exports`，不暴露内部路径。
+- 共享包不读应用专属环境变量。
+- 用 Turborepo / Nx 管理任务依赖与缓存。
+- 版本策略先 internal package（不发布），别一上来搞独立发版。
+
+**代价**：构建复杂度、依赖管理、CI 时间都会上升。单应用团队不要为了「显得专业」上 Monorepo。
+
+---
+
+## 团队协作的工程约定
+
+### 小 PR，单一目的
+
+- 一个 PR 只做一件事，控制在几百行以内。
+- 重构与功能分开提交，否则 review 无法聚焦。
+- 提交信息写清「为什么」，而不只是「改了什么」。
+
+### 架构决策记录（ADR）
+
+不可逆或高成本的选择，写一页 ADR：
+
+```
+# ADR-003 会话方案选择数据库会话
+
+## 背景
+需要支持管理员强制下线与权限即时生效。
+
+## 决策
+使用数据库会话，Cookie 存随机 token，库内存哈希。
+
+## 代价
+每次请求多一次查询，通过 React cache + Redis 缓解。
+
+## 替代方案
+JWT：无法即时撤销，放弃。
+```
+
+半年后新人会感谢这份记录，而不是对着一堆代码猜。
+
+### 预览环境
+
+每个 PR 部署一个 preview，产品和设计能在合并前点一遍。Next.js 的部署平台大多原生支持；自托管可以用 Docker + 动态域名。
+
+### 所有权
+
+用 CODEOWNERS 或文档明确每个 feature 的负责人。没有 owner 的模块，最后一定变成垃圾场。
+
+---
+
+## 避免过度设计
+
+三条克制原则：
+
+1. **Rule of Three**：第三次重复才抽象，前两次允许复制。
+2. **不为假想需求留钩子**：没有第二个调用方的「通用层」就是负债。
+3. **先解决问题，再提炼模式**：架构是复盘出来的，不是预判出来的。
+
+一个典型反例：项目初期就设计插件系统、事件总线、微前端，结果业务还没跑通，团队先被基础设施拖死。
+
+---
+
+## 常见坑
+
+- **`lib/utils.ts` 变成垃圾桶**：什么函数都往里塞，最后没人敢删。
+- **`export *` 的 barrel file**：打包体积失控，循环依赖难查。
+- **根布局被所有人修改**：每次合并都冲突；布局应保持稳定，业务逻辑下沉。
+- **共享包依赖应用代码**：依赖方向倒挂，Monorepo 变成一团。
+- **没有边界检查**：只能靠 review 里的「记得别这么写」。
+- **文档缺失**：架构只存在于某个人脑子里。
+
+---
+
+## 小结
+
+大型项目的架构不是「更复杂的目录」，而是**更清晰的依赖方向**：app 编排、feature 内聚、lib 提供基础设施、跨域走公共出口。把边界写进 lint、把决策写进 ADR、把所有权写进 CODEOWNERS，团队规模上来后才不会互相踩踏。最后一篇，我们把这些能力串成一个真实的多租户 SaaS。

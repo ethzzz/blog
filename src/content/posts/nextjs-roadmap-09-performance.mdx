@@ -1,0 +1,215 @@
+---
+title: '09 · 性能工程'
+published: 2026-10-20T19:00:00+08:00
+description: 'Next.js 性能优化实战：Core Web Vitals 与真实用户监控、RSC 减少 bundle、Suspense 流式渲染、图片与字体优化、并行取数消除瀑布、INP 交互优化、bundle 分析与性能预算。'
+tags: [Next.js, 性能优化, Core Web Vitals, 流式渲染, 图片]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 性能优化只有一条正确顺序：**先度量，再定位，最后才优化**。上来就加 `memo`、把图片全设 `priority`、给所有路由加 `dynamic`，大概率是在制造新问题。
+
+---
+
+## 度量：实验室数据和真实用户是两回事
+
+- **实验室**：Lighthouse、PageSpeed Insights，可复现，适合定位。
+- **真实用户（RUM）**：LCP、INP、CLS 的 P75，才是业务真正体验到的。
+- **服务端**：TTFB、数据库查询耗时、缓存命中率。
+
+Next.js 自带的 `useReportWebVitals` 可以把指标打到自己的分析端点：
+
+```tsx
+// app/_components/web-vitals.tsx
+"use client";
+
+import { useReportWebVitals } from "next/web-vitals";
+
+export function WebVitals() {
+  useReportWebVitals((metric) => {
+    navigator.sendBeacon(
+      "/api/vitals",
+      JSON.stringify({
+        name: metric.name,
+        value: metric.value,
+        id: metric.id,
+        path: location.pathname,
+      }),
+    );
+  });
+  return null;
+}
+```
+
+先在真实流量上拿到基线，再谈优化目标。没有基线的「优化」都是自我感觉。
+
+---
+
+## 最大的杠杆：少发 JS
+
+Next.js 最大的性能优势不是 SSR，而是 **Server Component 默认不进客户端 bundle**。
+
+- 页面能留在服务端就留在服务端。
+- `'use client'` 只加在真正需要交互的叶子。
+- 大依赖（图表、编辑器、地图）用 `next/dynamic` 懒加载。
+- 定期跑 bundle analyzer，看有没有意外被拖进客户端的库。
+
+```tsx
+import dynamic from "next/dynamic";
+
+const Editor = dynamic(() => import("@/components/editor"), {
+  loading: () => <EditorSkeleton />,
+});
+```
+
+一个常见的体积杀手是 barrel file：`import { Button } from "@/components"` 可能把整个组件库的导入图都带进来。按路径精确导入，或者配置 `modularizeImports` / `optimizePackageImports`。
+
+---
+
+## 流式渲染：先给壳，再给数据
+
+```tsx
+// app/dashboard/page.tsx
+import { Suspense } from "react";
+
+export default function Dashboard() {
+  return (
+    <main>
+      <Header />
+      <Suspense fallback={<StatsSkeleton />}>
+        <Stats />
+      </Suspense>
+      <Suspense fallback={<TableSkeleton />}>
+        <RecentOrders />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+`Stats`、`RecentOrders` 是 async Server Component，各自取数、各自流式返回。注意：
+
+- **两个 Suspense 边界是并行渲染的**，不要把它们串行 `await` 在一个父组件里。
+- 骨架要和真实内容尺寸接近，否则 CLS 飙升。
+- 流式响应经过反代时，关闭 `proxy_buffering`。
+
+### 消除请求瀑布
+
+```ts
+// ❌ 串行：三步各 200ms，总共 600ms
+const user = await getUser(id);
+const orders = await getOrders(user.id);
+const stats = await getStats(user.id);
+
+// ✅ 无依赖的并行
+const [user, stats] = await Promise.all([getUser(id), getStats(id)]);
+const orders = await getOrders(user.id);
+```
+
+RSC 里一个很容易忽视的点：**同一个 `await` 链上的兄弟组件也是串行的**。独立数据源拆到独立组件、独立 Suspense 边界里。
+
+---
+
+## 图片：LCP 的主战场
+
+```tsx
+import Image from "next/image";
+
+<Image
+  src={cover}
+  alt={title}
+  width={1200}
+  height={630}
+  sizes="(max-width: 768px) 100vw, 800px"
+  priority={isAboveTheFold}
+/>
+```
+
+规则：
+
+- **首屏主图加 `priority`**，其余图片不要加，否则会抢带宽。
+- 永远提供 `width` / `height` 或 `fill` + 容器尺寸，避免 CLS。
+- `sizes` 写对，否则会下载过大的图。
+- 图片走 CDN/对象存储，别让 Next 进程代理大文件。
+- 动图优先视频（`<video>`）或压缩后的 WebP/AVIF。
+
+---
+
+## 字体：别让文字等字体
+
+```ts
+// app/layout.tsx
+import { Noto_Sans_SC } from "next/font/google";
+
+const sans = Noto_Sans_SC({
+  subsets: ["latin"],
+  weight: ["400", "500", "700"],
+  display: "swap",
+});
+```
+
+- 用 `next/font` 自托管，避免第三方字体域名的额外连接。
+- 只加载需要的字重和子集，中文字体尤其要控制。
+- `display: "swap"` 先显示系统字体，避免 FOIT。
+- 变量字体优先，减少文件数量。
+
+---
+
+## 交互性能：INP 比加载更常被忽略
+
+页面加载快了，点击还是卡，问题通常在主线程：
+
+- 大列表渲染：虚拟化（`@tanstack/react-virtual`）。
+- 输入联想：`useDeferredValue` 把重渲染降级。
+- 大量状态更新：`startTransition` 标记非紧急更新。
+- 长任务：拆分为多个 `requestIdleCallback` / `scheduler` 任务。
+- 动画用 CSS transform/opacity，别在 JS 里逐帧改布局属性。
+
+```tsx
+const [query, setQuery] = useState("");
+const deferredQuery = useDeferredValue(query);
+const results = useMemo(() => search(deferredQuery), [deferredQuery]);
+```
+
+---
+
+## 缓存也是性能
+
+- 静态资源加长缓存 + 内容哈希（Next 构建产物自带）。
+- 页面级缓存用 `use cache` / ISR，别每次请求都打数据库。
+- 接口层加 Redis 缓存时，记得设计失效，别制造「数据永远旧」的新问题。
+- CDN 缓存 HTML 要谨慎：带用户信息的页面绝不能进公共缓存。
+
+---
+
+## 性能预算
+
+给团队定可执行的数字，而不是喊口号：
+
+| 指标 | 建议目标 |
+| --- | --- |
+| LCP（P75） | 小于 2.5s |
+| INP（P75） | 小于 200ms |
+| CLS（P75） | 小于 0.1 |
+| 首屏 JS（gzip） | 控制在 200KB 以内 |
+| 单页数据请求 | 关键路径不超过 3 跳 |
+
+把预算写进 CI：Lighthouse CI 或自建脚本，超过阈值就报警。性能是**守出来的**，不是某次专项优化出来的。
+
+---
+
+## 常见坑
+
+- **无脑 `priority`**：首屏图片互相抢带宽，LCP 反而更差。
+- **把所有组件标成客户端**：JS 体积翻倍，流式渲染失效。
+- **只看 Lighthouse 分数**：实验室 100 分，真实用户依然卡。
+- **在客户端传巨大数组**：RSC Payload 几百 KB，序列化和 hydrate 都慢。
+- **滥用 `useMemo` / `memo`**：比较成本大于收益。
+- **忽略第三方脚本**：统计、客服、A/B 脚本经常是 INP 罪魁祸首，用 `next/script` 的 `lazyOnload` / `afterInteractive` 管好。
+
+---
+
+## 小结
+
+性能优化是「减少要做的事」：少发 JS、少等一次网络、少渲染一帧。Next.js 提供了流式渲染、RSC、图片与字体优化这些工具，但用不用、用在哪，取决于你有没有度量。下一篇讲另一件决定项目能不能长期运行的事：错误处理与可观测性。
