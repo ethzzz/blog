@@ -51,7 +51,7 @@ const articleCount = groupData.reduce(
 					{group.modules.map((m) => (
 						<a href={url(m.url)}
 						   class="card-base card-shadow p-5 flex items-start gap-4 hover:shadow-lg transition-all group">
-							<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-base group-hover:bg-[var(--primary)] group-hover:text-white transition-colors">
+							<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-base group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
 								{m.abbr}
 							</div>
 							<div class="flex-1 min-w-0">

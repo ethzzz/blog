@@ -40,7 +40,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 		<!-- 项目信息卡片 -->
 		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
 			<div class="flex items-start gap-4">
-				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white font-bold text-xl">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white dark:text-black/70 font-bold text-xl">
 					H
 				</div>
 				<div class="flex-1">
@@ -70,7 +70,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 				<div class="flex items-start justify-between">
 					<div class="flex-1">
 						<div class="flex items-center gap-2 mb-2">
-							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white dark:text-black/70">
 								总览
 							</span>
 							<span class="text-sm text-50">
@@ -100,7 +100,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
 					<div class="flex items-start gap-4">
 						<!-- 阶段编号 -->
-						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white transition-colors">
+						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
 							{index + 1}
 						</div>
 						
