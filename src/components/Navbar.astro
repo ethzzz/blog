@@ -337,6 +337,11 @@ function initNavDropdowns() {
 		"#nav-links-scroll .nav-dropdown-wrap",
 	);
 	if (!scroller || !host || !wraps.length) return;
+	// 导航栏跨页共享（swup 只换主内容，但会重跑本脚本）：
+	// 面板首次已搬到 host 下，再跑一遍 wrap.querySelector 只会拿到 null。
+	// 与 initNavLinksScroll 同一套幂等约定，监听器也只注册一次。
+	if (scroller.dataset.dropdownInit === "1") return;
+	scroller.dataset.dropdownInit = "1";
 	let openWrap: HTMLElement | null = null;
 	let closeTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 	// 面板被搬运到 host 下后不再是 wrap 的后代，必须持引用查找
