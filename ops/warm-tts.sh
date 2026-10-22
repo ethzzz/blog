@@ -16,14 +16,19 @@
 #   bash /root/blog-src/ops/warm-tts.sh --verbose    # 打印耗时
 #
 # 定时（root crontab，与本机其它 ops 任务一致走 cron）：
-#   */5 * * * * /bin/bash /root/blog-src/ops/warm-tts.sh >> /root/ops/tts-warm.log 2>&1
+#   * * * * * /bin/bash /root/blog-src/ops/warm-tts.sh >> /root/ops/tts-warm.log 2>&1
 #
-# 频率的依据（2026-10-23 实测衰减曲线，见日志 /tmp/tts-decay.log）：
-#   ~2 秒（刚合成过）→ 空闲 3/6/12/20/30 分钟后逐点探测，取「明显变慢之前」的间隔；
-#   5 分钟既能压住换出，又只占 2 核里约 1% 的空闲 CPU（一次 1 字合成 ≈ 2 秒）。
+# 频率依据（2026-10-23 01:00 实测衰减曲线，脚本 /tmp/tts-decay*.sh）：
+#   空闲 0s   -> 1.57s
+#   空闲 60s  -> 1.56s   ← 仍在热窗口内
+#   空闲 180s -> 6.2s / 19.2s（两次同条件，取决于当时的内存压力）
+#   空闲 ~1h  -> 74s（线上真实出现过的首块耗时）
+#   拐点在 60s~180s 之间，所以取 **1 分钟** 一次：始终待在实测过的热窗口里。
+#   代价：一次 1 字合成 ≈1.5 秒 CPU，2 核机器上约 1.25%；且下面有活跃跳过，
+#   真有人朗读时不会跟它抢串行队列。
 #
-# ⚠️ kokoro 服务端是**全局串行**的：预热请求会排进同一个队列。
-#   所以 TEXT 只取 1 个字（≈2 秒），不跟正在朗读的用户抢太多时间。
+# ⚠️ 跳过窗口必须 **小于** cron 间隔，否则上一分钟的预热会把自己下一次拦住。
+#   这里 interval=60s，IDLE_WINDOW 默认 50s。
 set -uo pipefail
 
 CONTAINER=${CONTAINER:-kokoro}
@@ -52,7 +57,8 @@ fi
 
 # 刚有人朗读过就跳过：模型已经是热的，这时再插一次请求只会占串行队列
 # （kokoro 服务端全局串行），对正在听的人纯属添堵。
-IDLE_WINDOW=${IDLE_WINDOW:-120}
+# 必须小于 cron 间隔（60s），否则会把下一次预热自己拦掉。
+IDLE_WINDOW=${IDLE_WINDOW:-50}
 if docker logs --since "${IDLE_WINDOW}s" "$CONTAINER" 2>&1 | grep -q 'Synthesizing'; then
 	[ -n "$VERBOSE" ] && echo "$(ts) [skip] ${IDLE_WINDOW}s 内已有合成请求，无需预热"
 	exit 0
