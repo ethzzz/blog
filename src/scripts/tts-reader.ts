@@ -180,6 +180,16 @@ function setBusy(refs: UiRefs, busy: boolean): void {
 	refs.button.setAttribute("aria-busy", busy ? "true" : "false");
 }
 
+/**
+ * 视觉状态：loading（转圈 + 合成中）/ playing（可停止）/ idle。
+ * 只打 data-tts-phase，转圈与图标切换由 CSS 负责（见 styles/main.css）。
+ * 必须区分 loading 与 playing：kokoro 冷启动首块可能要几十秒，
+ * 这期间若显示「停止 N/M」，用户会以为已经在播却没声音。
+ */
+function setPhase(refs: UiRefs, phase: "idle" | "loading" | "playing"): void {
+	refs.button.dataset.ttsPhase = phase;
+}
+
 function stopPlayback(refs?: UiRefs): void {
 	stopRequested = true;
 	if (audioEl) audioEl.pause();
@@ -191,6 +201,7 @@ function stopPlayback(refs?: UiRefs): void {
 	if (refs) {
 		isPlaying = false;
 		setBusy(refs, false);
+		setPhase(refs, "idle");
 		setLabel(refs, "阅读");
 	}
 }
@@ -205,7 +216,8 @@ async function startPlayback(refs: UiRefs): Promise<void> {
 	stopRequested = false;
 	isPlaying = true;
 	setBusy(refs, true);
-	setLabel(refs, "准备中…");
+	setPhase(refs, "loading");
+	setLabel(refs, "合成中…");
 
 	const tasks = new Map<number, Promise<Blob>>();
 	const ensure = (i: number): Promise<Blob> | null => {
@@ -225,23 +237,34 @@ async function startPlayback(refs: UiRefs): Promise<void> {
 			// 预取后续若干块：合成慢于播放，靠提前排队填补等待
 			for (let d = 1; d <= PREFETCH_DEPTH; d++) ensure(i + d);
 
-			setLabel(refs, `停止 ${i + 1}/${chunks.length}`);
 			const task = ensure(i);
 			if (!task) break;
+
+			// 等合成时是 loading；等到了、真正要开播时才切成可停止的 playing
+			setPhase(refs, "loading");
+			setLabel(
+				refs,
+				chunks.length > 1 ? `合成中 ${i + 1}/${chunks.length}` : "合成中…",
+			);
+
 			const blob = await task;
 			if (stopRequested) break;
 
+			setPhase(refs, "playing");
+			setLabel(refs, `停止 ${i + 1}/${chunks.length}`);
 			await playBlob(blob);
 			tasks.delete(i);
 		}
 	} catch (err) {
 		console.error("[tts-reader]", err);
+		setPhase(refs, "idle");
 		setLabel(refs, "朗读失败");
 		window.setTimeout(() => setLabel(refs, "阅读"), 2500);
 		return;
 	} finally {
 		isPlaying = false;
 		setBusy(refs, false);
+		setPhase(refs, "idle");
 	}
 
 	if (!stopRequested) setLabel(refs, "阅读");

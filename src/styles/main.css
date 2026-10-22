@@ -161,3 +161,33 @@
     }
   }
 }
+
+/* 朗读按钮的「合成中」转圈：由 data-tts-phase 驱动（见 src/scripts/tts-reader.ts），
+   状态值 loading / playing / idle。kokoro 冷启动时首块可长达几十秒，
+   没有这个视觉反馈用户会以为点了没反应。 */
+#tts-read-btn .tts-spinner {
+    display: none;
+    width: 0.875rem;
+    height: 0.875rem;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: tts-spin 0.7s linear infinite;
+}
+#tts-read-btn[data-tts-phase="loading"] .tts-icon {
+    display: none;
+}
+#tts-read-btn[data-tts-phase="loading"] .tts-spinner {
+    display: block;
+}
+@keyframes tts-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+/* 尊重系统的「减少动态效果」：转圈降速，文案本身仍然说明状态 */
+@media (prefers-reduced-motion: reduce) {
+    #tts-read-btn .tts-spinner {
+        animation-duration: 2.4s;
+    }
+}

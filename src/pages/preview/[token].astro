@@ -141,7 +141,9 @@ const EMBED_CSS = `
                 <button id="tts-read-btn" type="button" aria-label="朗读全文" aria-busy="false"
                         class="flex flex-row items-center cursor-pointer transition active:scale-95 hover:text-[var(--primary)]">
                     <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
-                        <Icon name="material-symbols:text-to-speech"></Icon>
+                        <Icon class="tts-icon" name="material-symbols:text-to-speech"></Icon>
+                        {/* 与文章页一致：合成中显示转圈 */}
+                        <span class="tts-spinner" aria-hidden="true"></span>
                     </div>
                     <span id="tts-read-label" class="text-sm">阅读</span>
                 </button>
@@ -192,7 +194,7 @@ const EMBED_CSS = `
   embed 模式：接收后台发来的新正文，**只替换正文**，不刷新整页。
   刷新整页会白屏 + 丢滚动位置，而打字时每次停顿都会更新一次，那样根本没法用。
 
-  ⚠️ 必须是 `is:inline`：普通 <script> 会被 Astro 打包并**提升**到模块里，
+  ⚠️ 必须是 `is:inline`：普通 script 标签会被 Astro 打包并**提升**到模块里，
      外层 {embed && ...} 的条件包裹随之失效（等于所有访客都加载这段）。
 */}
 <script is:inline define:vars={{ embed }}>

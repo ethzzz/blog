@@ -71,7 +71,9 @@ const jsonLd = {
                 <button id="tts-read-btn" type="button" aria-label="朗读全文" aria-busy="false"
                         class="flex flex-row items-center cursor-pointer transition active:scale-95 hover:text-[var(--primary)]">
                     <div class="transition h-6 w-6 rounded-md bg-black/5 dark:bg-white/10 text-black/50 dark:text-white/50 flex items-center justify-center mr-2">
-                        <Icon name="material-symbols:text-to-speech"></Icon>
+                        <Icon class="tts-icon" name="material-symbols:text-to-speech"></Icon>
+                        {/* 合成中（尤其是冷启动首块）用转圈替代图标，由 data-tts-phase 驱动 */}
+                        <span class="tts-spinner" aria-hidden="true"></span>
                     </div>
                     <span id="tts-read-label" class="text-sm">阅读</span>
                 </button>
