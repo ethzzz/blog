@@ -145,7 +145,5 @@ const jsonLd = {
 
 </MainGridLayout>
 
-<script>
-	// 朗读功能：只在文章详情页加载，通过 /blog/tts/ 反代调用服务端语音合成
-	import "../../scripts/tts-reader";
-</script>
+<!-- 朗读功能的脚本挂在 Layout.astro（站点级），此处不再引入：
+     页面级 <script> 在 swup 客户端路由时不会执行，会导致从首页点进文章后按钮失效 -->

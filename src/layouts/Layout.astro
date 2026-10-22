@@ -603,6 +603,13 @@ window.onresize = () => {
 import PhotoSwipeLightbox from "photoswipe/lightbox"
 import "photoswipe/style.css"
 
+/* 朗读全文：必须挂在站点级脚本里，不能放在文章页的 <script> 中。
+   原因：swup 只替换 main/#toc 并用 innerHTML 更新 <head>，
+   页面级 <script type="module" src> 在客户端路由时不会执行
+   ——从首页点进文章后按钮就成了死的（点击无任何反应）；
+   而模块在站点级脚本里已随首屏加载，page:view 钩子会自动重新 bind。 */
+import "../scripts/tts-reader"
+
 let lightbox: PhotoSwipeLightbox
 let pswp = import("photoswipe")
 

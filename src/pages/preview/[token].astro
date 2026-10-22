@@ -185,10 +185,8 @@ const EMBED_CSS = `
 
 </MainGridLayout>
 
-<script>
-	// 与文章详情页同一个朗读脚本（预览页的正文 DOM 结构与它一致）
-	import "../../scripts/tts-reader";
-</script>
+<!-- 朗读脚本挂在 Layout.astro（站点级）：预览页正文 DOM 与文章页一致，
+     按钮 id 相同，站点级脚本里的 page:view → bind() 会一并接管 -->
 
 {/*
   embed 模式：接收后台发来的新正文，**只替换正文**，不刷新整页。
