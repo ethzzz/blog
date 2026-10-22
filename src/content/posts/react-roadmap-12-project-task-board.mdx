@@ -1,0 +1,1074 @@
+---
+title: '12 · 毕业项目：从零做一个任务中后台（分 3 阶段交付）'
+published: 2026-10-23T01:30:00+08:00
+description: '前 11 篇是零件，这篇是把零件装成一台能跑的机器：用 Vite + React Router + TanStack Query 从零做一个「任务中后台」，分 3 个阶段交付，每个阶段都带可勾选的验收清单。做完你能独立完成一个带路由、请求、CRUD、乐观更新、错误处理与键盘可达性的真实页面。'
+tags: [React, 项目实战, React Router, TanStack Query, 验收清单]
+category: React学习路线
+draft: false
+---
+
+> [!NOTE]
+> **这篇的定位**：前 11 篇讲的是零件（JSX、Hooks、状态、性能、路由、坑），但**看懂零件不等于会装机**。
+> 这篇是一个完整的、能跑起来的项目，分 3 个阶段交付，每阶段都有"做完自己就能验"的清单。
+>
+> **怎么用**：每个阶段先自己写，卡住再看这里的参考实现。**别先读代码再抄**——抄一遍不会长能力。
+
+---
+
+## 先定"做到什么算过"
+
+一个新手跟完这个项目，应该能独立做到下面 8 件事。做不到的，就是没毕业：
+
+1. 给你一张需求（列表 + 筛选 + 分页 + CRUD），你能**独立拆出路由、页面、数据层**，不再是一把梭写在一个文件里。
+2. 请求层有统一的错误类型，`4xx/5xx/断网` 三种情况 UI 表现不同、都有出路（重试 / 回列表 / 提示）。
+3. **URL 就是筛选与分页状态**：刷新、分享、后退都不丢。
+4. 增删改之后列表**自动一致**（不手动 `refetch` 拍脑袋）。
+5. 乐观更新失败能**回滚**，不会出现"界面成功了但服务器没有"。
+6. 表单校验有字段级错误 + 焦点自动落到第一个错误字段。
+7. 全程可以只用键盘操作完（Tab 能走到每个控件，焦点环可见）。
+8. 能说出这个项目里**哪些地方故意没加** `memo/useMemo`，以及为什么。
+
+> 这 8 条对应的是"能独立干活"，不是"能背 API"。第 3、5、7 条是绝大多数教程会跳过、但真实工作每天都要用的部分。
+
+---
+
+## 技术选型（以及为什么只选这几个）
+
+| 选择 | 理由 | 不选什么 |
+|---|---|---|
+| Vite + React 18 + TS | 启动快、类型能兜住一半低级错误 | 不上 CRA（已停更） |
+| React Router 6（data router） | 路由即页面骨架，`errorElement` 兜渲染错误 | 不上手写 switch |
+| TanStack Query v5 | 服务端状态（缓存、失效、重试、乐观更新）不用自己写 | 不自己造 `useFetch` |
+| json-server 0.17 | 10 秒得到一个真 REST 后端，能增删改查、分页、模糊搜索 | 不先写 Node 后端（会跑偏） |
+| 手写 CSS | 不引入 UI 库，注意力留在数据流 | 不上 AntD（会变成学组件库） |
+
+**刻意不引入**：Redux/Zustand（这个规模的页面不需要，见 [状态管理那篇](/blog/posts/react-roadmap-08-state-management/)）、表单库（手写一遍才知道受控组件难在哪）。
+
+---
+
+## 阶段 0：15 分钟把骨架跑起来
+
+### 1. 建项目、装依赖
+
+```bash
+npm create vite@latest task-board -- --template react-ts
+cd task-board
+npm i
+npm i @tanstack/react-query react-router-dom
+npm i -D json-server@0.17.4
+```
+
+> 固定 `json-server@0.17.4`：0.17 用 `_page/_limit` 分页，1.x 换成了 `_per_page` 且返回结构变了。版本漂移是新手最常见的"教程跑不通"原因。
+
+### 2. 造一个真后端：`db.json`
+
+```json
+{
+  "tasks": [
+    { "id": "t-01", "title": "修复登录页在 Safari 上的样式错位", "status": "todo", "priority": "high", "assignee": "皓", "desc": "只在 16.x 上出现，怀疑是 flex + gap 的兼容问题", "createdAt": "2026-10-01T01:00:00.000Z" },
+    { "id": "t-02", "title": "任务列表支持按状态筛选", "status": "doing", "priority": "mid", "assignee": "小林", "desc": "筛选条件要写进 URL", "createdAt": "2026-10-02T02:00:00.000Z" },
+    { "id": "t-03", "title": "导出 CSV 增加 BOM 头", "status": "done", "priority": "low", "assignee": "阿哲", "desc": "不然 Excel 打开是乱码", "createdAt": "2026-10-03T03:00:00.000Z" },
+    { "id": "t-04", "title": "详情页补充操作日志", "status": "todo", "priority": "mid", "assignee": "皓", "desc": "谁在什么时候改了什么", "createdAt": "2026-10-04T04:00:00.000Z" },
+    { "id": "t-05", "title": "列表空态文案改成引导式", "status": "todo", "priority": "low", "assignee": "小林", "desc": "\"没有数据\"对用户没有帮助", "createdAt": "2026-10-05T05:00:00.000Z" },
+    { "id": "t-06", "title": "移动端表格改为卡片流", "status": "doing", "priority": "high", "assignee": "阿哲", "desc": "小屏横向滚动体验太差", "createdAt": "2026-10-06T06:00:00.000Z" },
+    { "id": "t-07", "title": "删除操作加二次确认", "status": "done", "priority": "mid", "assignee": "皓", "desc": "误删过两次", "createdAt": "2026-10-07T07:00:00.000Z" },
+    { "id": "t-08", "title": "接口超时统一提示", "status": "todo", "priority": "high", "assignee": "小林", "desc": "超过 10s 给用户一个明确的出路", "createdAt": "2026-10-08T08:00:00.000Z" },
+    { "id": "t-09", "title": "负责人下拉支持搜索", "status": "todo", "priority": "low", "assignee": "阿哲", "desc": "人多了以后下拉太长", "createdAt": "2026-10-09T09:00:00.000Z" },
+    { "id": "t-10", "title": "悲观更新改乐观更新", "status": "doing", "priority": "mid", "assignee": "皓", "desc": "切换状态要等 300ms 才有反应", "createdAt": "2026-10-10T10:00:00.000Z" },
+    { "id": "t-11", "title": "埋点：列表到详情的转化", "status": "done", "priority": "low", "assignee": "小林", "desc": "先埋事件，再谈优化", "createdAt": "2026-10-11T11:00:00.000Z" },
+    { "id": "t-12", "title": "权限：普通成员只能改自己的", "status": "todo", "priority": "high", "assignee": "阿哲", "desc": "后端也要拦，不能只靠前端", "createdAt": "2026-10-12T12:00:00.000Z" }
+  ]
+}
+```
+
+启动它：
+
+```bash
+npx json-server --watch db.json --port 4000
+# GET  http://localhost:4000/tasks?_page=1&_limit=5
+# POST http://localhost:4000/tasks
+```
+
+### 3. 目录结构（先想清楚再写文件）
+
+```
+src/
+├─ main.tsx                 # 挂载 + QueryClient + Router
+├─ router.tsx               # 路由表（唯一的路由真相）
+├─ styles.css
+├─ api/
+│  ├─ client.ts             # fetch 封装 + ApiError
+│  └─ tasks.ts              # 领域接口：list/get/create/update/remove
+├─ components/
+│  ├─ Layout.tsx            # 顶栏 + <Outlet/>
+│  ├─ StatusBadge.tsx
+│  ├─ ErrorBox.tsx
+│  ├─ RouteError.tsx        # 路由级兜底
+│  └─ Toast.tsx             # Context + 全局提示
+└─ features/tasks/
+   ├─ useTasks.ts           # queryKey 工厂 + 查询/变更 hooks
+   ├─ useTaskForm.ts        # 表单状态 + 校验
+   ├─ TaskForm.tsx          # 新建/编辑共用的表单
+   ├─ TaskListPage.tsx
+   ├─ TaskDetailPage.tsx
+   └─ TaskFormPage.tsx
+```
+
+**为什么这么分**：`api/` 只认 HTTP，`features/` 只认业务，`components/` 只认 UI。这样换后端只动 `api/`，换 UI 只动 `components/`——这就是"能独立维护"和"能跑起来"的区别。
+
+---
+
+## 阶段 1：列表页（路由 + 请求 + 三态）
+
+**目标**：打开 `/tasks` 能看到列表；筛选、分页、搜索都写进 URL；加载/错误/空三种状态各有出路。
+
+### 1. `api/client.ts`：统一出口 + 统一错误
+
+```ts
+const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:4000";
+
+export class ApiError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+		readonly detail?: unknown,
+	) {
+		super(message);
+		this.name = "ApiError";
+	}
+}
+
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+	let res: Response;
+	try {
+		res = await fetch(`${BASE}${path}`, {
+			...init,
+			headers: { "Content-Type": "application/json", ...init?.headers },
+		});
+	} catch {
+		// fetch 只在网络层失败时 reject —— 这是"断网/后端没起"
+		throw new ApiError(0, "网络异常，请检查后端是否在运行");
+	}
+
+	if (!res.ok) {
+		let detail: unknown = null;
+		try {
+			detail = await res.json();
+		} catch {
+			detail = await res.text();
+		}
+		throw new ApiError(res.status, statusText(res.status), detail);
+	}
+
+	if (res.status === 204) return undefined as T;
+	return (await res.json()) as T;
+}
+
+function statusText(status: number): string {
+	if (status === 404) return "资源不存在（可能已被别人删除）";
+	if (status === 422) return "提交的数据不合法";
+	if (status >= 500) return "服务端出错了，稍后重试";
+	return `请求失败（${status}）`;
+}
+```
+
+**要点**：把"网络失败"和"业务失败"分开。前者是 `fetch` reject（`status: 0`），后者是 `res.ok === false`。分开之后 UI 才能给出不同出路。
+
+### 2. `api/tasks.ts`：领域接口
+
+```ts
+import { request } from "./client";
+
+export type TaskStatus = "todo" | "doing" | "done";
+export type TaskPriority = "low" | "mid" | "high";
+
+export interface Task {
+	id: string;
+	title: string;
+	status: TaskStatus;
+	priority: TaskPriority;
+	assignee: string;
+	desc: string;
+	createdAt: string;
+}
+
+export interface TaskQuery {
+	page: number;
+	limit: number;
+	status: TaskStatus | "all";
+	keyword: string;
+}
+
+export interface TaskPage {
+	items: Task[];
+	hasNext: boolean;
+}
+
+export async function listTasks(q: TaskQuery): Promise<TaskPage> {
+	const params = new URLSearchParams({
+		_page: String(q.page),
+		_limit: String(q.limit),
+	});
+	if (q.status !== "all") params.set("status", q.status);
+	if (q.keyword.trim()) params.set("q", q.keyword.trim());
+
+	const items = await request<Task[]>(`/tasks?${params.toString()}`);
+	// json-server 0.17 的 total 在响应头里，浏览器读不到（CORS 未暴露），
+	// 这里用"本页是否取满"判断有没有下一页。真实后端请返回 total。
+	return { items, hasNext: items.length === q.limit };
+}
+
+export const getTask = (id: string) => request<Task>(`/tasks/${id}`);
+
+export type TaskInput = Pick<Task, "title" | "status" | "priority" | "assignee" | "desc">;
+
+export const createTask = (input: TaskInput) =>
+	request<Task>("/tasks", {
+		method: "POST",
+		body: JSON.stringify({ ...input, createdAt: new Date().toISOString() }),
+	});
+
+export const updateTask = (id: string, patch: Partial<TaskInput>) =>
+	request<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+
+export const removeTask = (id: string) =>
+	request<void>(`/tasks/${id}`, { method: "DELETE" });
+```
+
+### 3. `features/tasks/useTasks.ts`：queryKey 工厂 + 四个 hook
+
+```ts
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import * as api from "../../api/tasks";
+
+/** queryKey 统一在这里生成：手写字符串数组早晚会拼错，导致缓存命中不了 */
+export const taskKeys = {
+	all: ["tasks"] as const,
+	list: (q: api.TaskQuery) => ["tasks", "list", q] as const,
+	detail: (id: string) => ["tasks", "detail", id] as const,
+};
+
+export function useTaskList(q: api.TaskQuery) {
+	return useQuery({
+		queryKey: taskKeys.list(q),
+		queryFn: () => api.listTasks(q),
+		placeholderData: (prev) => prev, // 翻页时保留上一页，不闪白
+		staleTime: 15_000,
+	});
+}
+
+export function useTask(id: string | undefined) {
+	return useQuery({
+		queryKey: taskKeys.detail(id ?? ""),
+		queryFn: () => api.getTask(id as string),
+		enabled: Boolean(id),
+	});
+}
+
+export function useCreateTask() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.createTask,
+		onSuccess: () => {
+			// 注意：不要精确匹配 ["tasks","list",某个查询对象]，
+			// 用前缀 ["tasks"] 让所有列表查询一起失效
+			void qc.invalidateQueries({ queryKey: taskKeys.all });
+		},
+	});
+}
+
+export function useUpdateTask(id: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (patch: Partial<api.TaskInput>) => api.updateTask(id, patch),
+		// 乐观更新：先改缓存，失败再回滚
+		onMutate: async (patch) => {
+			await qc.cancelQueries({ queryKey: taskKeys.detail(id) });
+			const previous = qc.getQueryData<api.Task>(taskKeys.detail(id));
+			if (previous) {
+				qc.setQueryData<api.Task>(taskKeys.detail(id), { ...previous, ...patch });
+			}
+			return { previous };
+		},
+		onError: (_err, _patch, ctx) => {
+			if (ctx?.previous) qc.setQueryData(taskKeys.detail(id), ctx.previous);
+		},
+		onSettled: () => {
+			void qc.invalidateQueries({ queryKey: taskKeys.all });
+		},
+	});
+}
+
+export function useDeleteTask() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.removeTask,
+		onSuccess: () => {
+			void qc.invalidateQueries({ queryKey: taskKeys.all });
+		},
+	});
+}
+```
+
+### 4. `router.tsx`：唯一的路由真相
+
+```tsx
+import { createBrowserRouter, Navigate } from "react-router-dom";
+import { Layout } from "./components/Layout";
+import { RouteError } from "./components/RouteError";
+import TaskListPage from "./features/tasks/TaskListPage";
+import TaskDetailPage from "./features/tasks/TaskDetailPage";
+import TaskFormPage from "./features/tasks/TaskFormPage";
+
+export const router = createBrowserRouter([
+	{
+		path: "/",
+		element: <Layout />,
+		errorElement: <RouteError />,
+		children: [
+			{ index: true, element: <Navigate to="/tasks" replace /> },
+			{ path: "tasks", element: <TaskListPage /> },
+			{ path: "tasks/new", element: <TaskFormPage /> },
+			{ path: "tasks/:id", element: <TaskDetailPage /> },
+			{ path: "tasks/:id/edit", element: <TaskFormPage /> },
+		],
+	},
+]);
+```
+
+### 5. `main.tsx`
+
+```tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { RouterProvider } from "react-router-dom";
+import { router } from "./router";
+import "./styles.css";
+
+const queryClient = new QueryClient({
+	defaultOptions: {
+		queries: {
+			retry: 1, // 断网时不要连打 3 次
+			refetchOnWindowFocus: false, // 中后台切窗口回来别乱刷新
+		},
+	},
+});
+
+createRoot(document.getElementById("root") as HTMLElement).render(
+	<StrictMode>
+		<QueryClientProvider client={queryClient}>
+			<RouterProvider router={router} />
+		</QueryClientProvider>
+	</StrictMode>,
+);
+```
+
+### 6. `components/Layout.tsx` + `StatusBadge.tsx`
+
+```tsx
+import { NavLink, Outlet } from "react-router-dom";
+
+export function Layout() {
+	return (
+		<div className="app">
+			<header className="topbar">
+				<strong>Task Board</strong>
+				<nav>
+					<NavLink to="/tasks" className={({ isActive }) => (isActive ? "active" : "")}>
+						任务
+					</NavLink>
+				</nav>
+			</header>
+			<main className="page">
+				<Outlet />
+			</main>
+		</div>
+	);
+}
+```
+
+```tsx
+import type { TaskStatus } from "../../api/tasks";
+
+const LABEL: Record<TaskStatus, string> = { todo: "待办", doing: "进行中", done: "已完成" };
+
+export function StatusBadge({ status }: { status: TaskStatus }) {
+	return <span className={`badge ${status}`}>{LABEL[status]}</span>;
+}
+```
+
+### 7. `features/tasks/TaskListPage.tsx`：URL 即状态
+
+```tsx
+import { Link, useSearchParams } from "react-router-dom";
+import type { TaskStatus } from "../../api/tasks";
+import { StatusBadge } from "../../components/StatusBadge";
+import { useTaskList } from "./useTasks";
+
+const PAGE_SIZE = 5;
+
+export default function TaskListPage() {
+	const [searchParams, setSearchParams] = useSearchParams();
+
+	// URL 是唯一真相：刷新、分享链接、浏览器后退都不会丢筛选
+	const page = Math.max(1, Number(searchParams.get("page") ?? "1") || 1);
+	const status = (searchParams.get("status") ?? "all") as TaskStatus | "all";
+	const keyword = searchParams.get("q") ?? "";
+
+	const { data, isPending, isError, error, refetch, isFetching } = useTaskList({
+		page,
+		limit: PAGE_SIZE,
+		status,
+		keyword,
+	});
+
+	const patchParams = (patch: Record<string, string | undefined>) => {
+		const next = new URLSearchParams(searchParams);
+		for (const [key, value] of Object.entries(patch)) {
+			if (!value) next.delete(key);
+			else next.set(key, value);
+		}
+		// replace: true —— 连续的输入/翻页不该塞满历史记录
+		setSearchParams(next, { replace: true });
+	};
+
+	return (
+		<section>
+			<div className="toolbar">
+				<input
+					className="search"
+					placeholder="搜索标题…"
+					defaultValue={keyword}
+					onChange={(e) => patchParams({ q: e.target.value, page: undefined })}
+				/>
+				<select
+					value={status}
+					onChange={(e) => patchParams({ status: e.target.value, page: undefined })}
+				>
+					<option value="all">全部状态</option>
+					<option value="todo">待办</option>
+					<option value="doing">进行中</option>
+					<option value="done">已完成</option>
+				</select>
+				<Link className="btn primary" to="/tasks/new">
+					新建任务
+				</Link>
+			</div>
+
+			{isPending ? (
+				<p className="hint">加载中…</p>
+			) : isError ? (
+				<div className="error" role="alert">
+					<p>{error.message}</p>
+					<button type="button" onClick={() => refetch()}>
+						重试
+					</button>
+				</div>
+			) : data.items.length === 0 ? (
+				<p className="hint">没有符合条件的任务。换个关键词，或清空筛选。</p>
+			) : (
+				<ul className="list">
+					{data.items.map((task) => (
+						<li key={task.id}>
+							<Link to={`/tasks/${task.id}`} className="row">
+								<span className="title">{task.title}</span>
+								<StatusBadge status={task.status} />
+								<span className="assignee">{task.assignee}</span>
+							</Link>
+						</li>
+					))}
+				</ul>
+			)}
+
+			<div className="pager">
+				<button type="button" disabled={page <= 1} onClick={() => patchParams({ page: String(page - 1) })}>
+					上一页
+				</button>
+				<span>
+					第 {page} 页{isFetching ? "（刷新中…）" : ""}
+				</span>
+				<button
+					type="button"
+					disabled={!data?.hasNext}
+					onClick={() => patchParams({ page: String(page + 1) })}
+				>
+					下一页
+				</button>
+			</div>
+		</section>
+	);
+}
+```
+
+### ✅ 阶段 1 验收清单
+
+- [ ] 打开 `/tasks` 显示 5 条；点「下一页」URL 变成 `?page=2`，**刷新后仍停在第 2 页**。
+- [ ] 选「进行中」→ URL 出现 `status=doing`，列表只剩 2 条；**浏览器后退**能回到"全部"。
+- [ ] 搜索框输入"删" → URL 出现 `q=删`；清空后回到全量。
+- [ ] 复制当前 URL 到新标签页 → 筛选与页码完全一致（这就是"URL 即状态"）。
+- [ ] 关掉 json-server 再刷新 → 出现"网络异常…"和**重试**按钮；重启后端后点重试能恢复。
+- [ ] 搜索一个不存在的词 → 出现引导式空态，而不是空白页。
+- [ ] DevTools Network：翻页时**不会整页闪白**（`placeholderData` 生效），只有"（刷新中…）"提示。
+- [ ] 双击"下一页"快速翻 → 不会出现页码和列表错位（URL 是唯一来源）。
+
+---
+
+## 阶段 2：CRUD + 表单 + 乐观更新
+
+**目标**：能新建、编辑、删除；表单有字段级校验和焦点管理；状态切换是乐观更新且能回滚。
+
+### 1. `useTaskForm.ts`：受控表单 + 校验 + 焦点
+
+```ts
+import { useState } from "react";
+import type { TaskInput, TaskPriority, TaskStatus } from "../../api/tasks";
+
+export interface TaskFormValues {
+	title: string;
+	status: TaskStatus;
+	priority: TaskPriority;
+	assignee: string;
+	desc: string;
+}
+
+export type FieldErrors = Partial<Record<keyof TaskFormValues, string>>;
+
+export const EMPTY_FORM: TaskFormValues = {
+	title: "",
+	status: "todo",
+	priority: "mid",
+	assignee: "",
+	desc: "",
+};
+
+/** 纯函数：方便单测，也方便复用（提交前和失焦时都可以调） */
+export function validate(values: TaskFormValues): FieldErrors {
+	const errors: FieldErrors = {};
+	const title = values.title.trim();
+	if (!title) errors.title = "标题不能为空";
+	else if (title.length < 4) errors.title = "标题至少 4 个字";
+	else if (title.length > 60) errors.title = "标题不要超过 60 个字";
+	if (!values.assignee.trim()) errors.assignee = "请填写负责人";
+	if (values.desc.length > 500) errors.desc = "描述不要超过 500 字";
+	return errors;
+}
+
+export function useTaskForm(
+	initial: TaskFormValues,
+	onSubmit: (values: TaskFormValues) => Promise<void>,
+) {
+	const [values, setValues] = useState<TaskFormValues>(initial);
+	const [errors, setErrors] = useState<FieldErrors>({});
+	const [submitting, setSubmitting] = useState(false);
+	const [formError, setFormError] = useState<string | null>(null);
+
+	const setField = <K extends keyof TaskFormValues>(key: K, value: TaskFormValues[K]) => {
+		setValues((prev) => ({ ...prev, [key]: value }));
+		// 边输边清掉这个字段的旧错误，避免"改好了红字还在"
+		setErrors((prev) => ({ ...prev, [key]: undefined }));
+		setFormError(null);
+	};
+
+	const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+		event.preventDefault();
+		const found = validate(values);
+		setErrors(found);
+
+		const firstInvalid = (Object.keys(found) as (keyof TaskFormValues)[])[0];
+		if (firstInvalid) {
+			// 把焦点送到第一个出错的字段：键盘/读屏用户不用自己找
+			document.getElementById(`field-${firstInvalid}`)?.focus();
+			return;
+		}
+
+		setSubmitting(true);
+		try {
+			await onSubmit(values);
+		} catch (err) {
+			setFormError(err instanceof Error ? err.message : "提交失败，请重试");
+		} finally {
+			setSubmitting(false);
+		}
+	};
+
+	return { values, errors, submitting, formError, setField, handleSubmit };
+}
+
+export function toFormValues(task: TaskInput): TaskFormValues {
+	return {
+		title: task.title,
+		status: task.status,
+		priority: task.priority,
+		assignee: task.assignee,
+		desc: task.desc,
+	};
+}
+```
+
+### 2. `TaskForm.tsx`：新建 / 编辑共用一个表单
+
+```tsx
+import type { TaskFormValues } from "./useTaskForm";
+import { useTaskForm } from "./useTaskForm";
+
+interface Props {
+	initial: TaskFormValues;
+	submitting: boolean;
+	submitText: string;
+	onSubmit: (values: TaskFormValues) => Promise<void>;
+	onCancel: () => void;
+}
+
+export function TaskForm({ initial, submitting, submitText, onSubmit, onCancel }: Props) {
+	// key 由父组件控制：编辑页数据加载完再挂载，避免"先渲染空表单再填值"
+	const form = useTaskForm(initial, onSubmit);
+	const { values, errors, formError } = form;
+
+	return (
+		<form className="form" onSubmit={form.handleSubmit} noValidate>
+			<div className="field">
+				<label htmlFor="field-title">标题</label>
+				<input
+					id="field-title"
+					value={values.title}
+					onChange={(e) => form.setField("title", e.target.value)}
+					aria-invalid={Boolean(errors.title)}
+					aria-describedby={errors.title ? "err-title" : undefined}
+					placeholder="一句话说清要做什么"
+				/>
+				{errors.title && (
+					<p id="err-title" className="err">
+						{errors.title}
+					</p>
+				)}
+			</div>
+
+			<div className="grid2">
+				<div className="field">
+					<label htmlFor="field-status">状态</label>
+					<select
+						id="field-status"
+						value={values.status}
+						onChange={(e) => form.setField("status", e.target.value as TaskFormValues["status"])}
+					>
+						<option value="todo">待办</option>
+						<option value="doing">进行中</option>
+						<option value="done">已完成</option>
+					</select>
+				</div>
+				<div className="field">
+					<label htmlFor="field-priority">优先级</label>
+					<select
+						id="field-priority"
+						value={values.priority}
+						onChange={(e) =>
+							form.setField("priority", e.target.value as TaskFormValues["priority"])
+						}
+					>
+						<option value="low">低</option>
+						<option value="mid">中</option>
+						<option value="high">高</option>
+					</select>
+				</div>
+			</div>
+
+			<div className="field">
+				<label htmlFor="field-assignee">负责人</label>
+				<input
+					id="field-assignee"
+					value={values.assignee}
+					onChange={(e) => form.setField("assignee", e.target.value)}
+					aria-invalid={Boolean(errors.assignee)}
+					aria-describedby={errors.assignee ? "err-assignee" : undefined}
+				/>
+				{errors.assignee && (
+					<p id="err-assignee" className="err">
+						{errors.assignee}
+					</p>
+				)}
+			</div>
+
+			<div className="field">
+				<label htmlFor="field-desc">描述</label>
+				<textarea
+					id="field-desc"
+					rows={4}
+					value={values.desc}
+					onChange={(e) => form.setField("desc", e.target.value)}
+					aria-invalid={Boolean(errors.desc)}
+					aria-describedby={errors.desc ? "err-desc" : undefined}
+				/>
+				<p className="hint">{values.desc.length}/500</p>
+				{errors.desc && (
+					<p id="err-desc" className="err">
+						{errors.desc}
+					</p>
+				)}
+			</div>
+
+			{formError && (
+				<p className="err" role="alert">
+					{formError}
+				</p>
+			)}
+
+			<div className="actions">
+				<button className="btn primary" type="submit" disabled={submitting || undefined}>
+					{submitting ? "保存中…" : submitText}
+				</button>
+				<button className="btn" type="button" onClick={onCancel}>
+					取消
+				</button>
+			</div>
+		</form>
+	);
+}
+```
+
+> 注意 `disabled={submitting || undefined}` 这种写法没必要——直接 `disabled={submitting}` 就行。故意留这句是为了提醒你：**看到可疑写法先怀疑，别当模板抄**。
+
+### 3. `TaskFormPage.tsx`：新建 / 编辑复用
+
+```tsx
+import { useNavigate, useParams } from "react-router-dom";
+import { ErrorBox } from "../../components/ErrorBox";
+import { useToast } from "../../components/Toast";
+import { useCreateTask, useTask, useUpdateTask } from "./useTasks";
+import { TaskForm } from "./TaskForm";
+import { EMPTY_FORM, toFormValues, type TaskFormValues } from "./useTaskForm";
+
+export default function TaskFormPage() {
+	const { id } = useParams();
+	const isEdit = Boolean(id);
+	const navigate = useNavigate();
+	const toast = useToast();
+
+	const { data: task, isPending, isError, error, refetch } = useTask(id);
+	const createTask = useCreateTask();
+	const updateTask = useUpdateTask(id ?? "");
+
+	if (isEdit) {
+		if (isPending) return <p className="hint">加载中…</p>;
+		if (isError) return <ErrorBox message={error.message} onRetry={() => refetch()} />;
+		if (!task) return <p className="hint">任务不存在</p>;
+	}
+
+	const initial: TaskFormValues = task ? toFormValues(task) : EMPTY_FORM;
+	const submitting = createTask.isPending || updateTask.isPending;
+
+	const handleSubmit = async (values: TaskFormValues) => {
+		if (isEdit && id) {
+			await updateTask.mutateAsync(values);
+			toast("已保存");
+			navigate(`/tasks/${id}`);
+			return;
+		}
+		const created = await createTask.mutateAsync(values);
+		toast("已创建");
+		navigate(`/tasks/${created.id}`, { replace: true });
+	};
+
+	return (
+		<section>
+			<h2>{isEdit ? "编辑任务" : "新建任务"}</h2>
+			<TaskForm
+				key={task?.id ?? "new"}
+				initial={initial}
+				submitting={submitting}
+				submitText={isEdit ? "保存修改" : "创建"}
+				onSubmit={handleSubmit}
+				onCancel={() => navigate(-1)}
+			/>
+		</section>
+	);
+}
+```
+
+### 4. `TaskDetailPage.tsx`：详情 + 乐观切换 + 删除
+
+```tsx
+import { useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import type { TaskStatus } from "../../api/tasks";
+import { ErrorBox } from "../../components/ErrorBox";
+import { StatusBadge } from "../../components/StatusBadge";
+import { useToast } from "../../components/Toast";
+import { useDeleteTask, useTask, useUpdateTask } from "./useTasks";
+
+const NEXT_STATUS: Record<TaskStatus, TaskStatus> = {
+	todo: "doing",
+	doing: "done",
+	done: "todo",
+};
+
+export default function TaskDetailPage() {
+	const { id = "" } = useParams();
+	const navigate = useNavigate();
+	const toast = useToast();
+	const [confirming, setConfirming] = useState(false);
+
+	const { data: task, isPending, isError, error, refetch } = useTask(id);
+	const updateTask = useUpdateTask(id);
+	const deleteTask = useDeleteTask();
+
+	if (isPending) return <p className="hint">加载中…</p>;
+	if (isError) return <ErrorBox message={error.message} onRetry={() => refetch()} />;
+	if (!task) return <p className="hint">任务不存在（可能已被删除）</p>;
+
+	const handleNextStatus = () => {
+		// 乐观更新：UI 立刻变；失败时 onError 会把缓存回滚
+		updateTask.mutate({ status: NEXT_STATUS[task.status] });
+	};
+
+	const handleDelete = async () => {
+		setConfirming(false);
+		try {
+			await deleteTask.mutateAsync(task.id);
+			toast("已删除");
+			// 回列表后把焦点交给列表容器，键盘用户不会"失焦"
+			navigate("/tasks", { replace: true });
+		} catch (err) {
+			toast(err instanceof Error ? err.message : "删除失败");
+		}
+	};
+
+	return (
+		<section>
+			<div className="detail-head">
+				<h2>{task.title}</h2>
+				<StatusBadge status={task.status} />
+			</div>
+			<p className="meta">
+				负责人：{task.assignee} ｜ 创建于 {new Date(task.createdAt).toLocaleString("zh-CN")}
+			</p>
+			<p className="desc">{task.desc || "（没有描述）"}</p>
+
+			<div className="actions">
+				<button className="btn" type="button" onClick={handleNextStatus}>
+					切换到「{NEXT_STATUS[task.status]}」
+				</button>
+				<Link className="btn" to={`/tasks/${task.id}/edit`}>
+					编辑
+				</Link>
+				{confirming ? (
+					<span className="confirm">
+						确定删除？
+						<button className="btn danger" type="button" onClick={handleDelete}>
+							删除
+						</button>
+						<button className="btn" type="button" onClick={() => setConfirming(false)}>
+							取消
+						</button>
+					</span>
+				) : (
+					<button className="btn danger" type="button" onClick={() => setConfirming(true)}>
+						删除
+					</button>
+				)}
+			</div>
+		</section>
+	);
+}
+```
+
+### 5. `components/Toast.tsx`：Context 的正当用途
+
+```tsx
+import { createContext, useCallback, useContext, useEffect, useState } from "react";
+
+const ToastContext = createContext<(message: string) => void>(() => {});
+
+export function ToastProvider({ children }: { children: React.ReactNode }) {
+	const [message, setMessage] = useState<string | null>(null);
+
+	const show = useCallback((text: string) => setMessage(text), []);
+
+	useEffect(() => {
+		if (!message) return;
+		const timer = setTimeout(() => setMessage(null), 2200);
+		return () => clearTimeout(timer);
+	}, [message]);
+
+	return (
+		<ToastContext.Provider value={show}>
+			{children}
+			{message && (
+				<div className="toast" role="status" aria-live="polite">
+					{message}
+				</div>
+			)}
+		</ToastContext.Provider>
+	);
+}
+
+export function useToast() {
+	return useContext(ToastContext);
+}
+```
+
+> 这就是 Context 的合适场景：**低频、全局、只有一个值**（一个函数）。别把列表数据塞 Context——那会让所有消费者一起重渲染（见[状态管理那篇](/blog/posts/react-roadmap-08-state-management/)）。
+>
+> 用之前记得在 `main.tsx` 里包一层 `ToastProvider`。
+
+### ✅ 阶段 2 验收清单
+
+- [ ] `/tasks/new` 表单留空直接点创建 → 标题下方红字 + **焦点自动跳到标题输入框**。
+- [ ] 标题输 2 个字 → 提示"至少 4 个字"；改成 6 个字 → 红字消失。
+- [ ] 创建成功后跳到详情页，**返回列表能看到新任务**（不手动刷新）。
+- [ ] 编辑保存 → 详情页立即显示新值；列表里也是新值。
+- [ ] 详情页点「切换状态」→ **界面立刻变**（不用等网络），Network 里能看到 PATCH。
+- [ ] 关掉 json-server 再点「切换状态」→ 状态**自动回滚**，并有错误提示（toast）。
+- [ ] 删除要二次确认；删除后回到列表，被删的任务消失。
+- [ ] 提交时按钮变「保存中…」且不可点（连点不会产生两条记录）。
+- [ ] 表单校验失败时，`aria-invalid` 为 `true`（DevTools 里看元素的属性）。
+
+---
+
+## 阶段 3：体验与工程化（把它变成"能给别人用"）
+
+**目标**：出错不白屏、首屏不背全量代码、键盘可用、搜索不抖。
+
+### 1. 路由级兜底：`components/RouteError.tsx`
+
+```tsx
+import { Link, useRouteError } from "react-router-dom";
+
+export function RouteError() {
+	const error = useRouteError();
+	const message = error instanceof Error ? error.message : "页面出错了";
+
+	return (
+		<section className="error" role="alert">
+			<h2>这个页面崩了</h2>
+			<p>{message}</p>
+			<Link className="btn" to="/tasks">
+				回到任务列表
+			</Link>
+		</section>
+	);
+}
+```
+
+> `errorElement` 接住的是**渲染期/loader 期**抛出的错误（包括 `undefined.map` 这种低级错）。它接不住事件回调里的错误——那类错误要自己 try/catch 或上 Sentry。
+
+### 2. 路由级代码分割（只给编辑页分包）
+
+```tsx
+import { lazy, Suspense } from "react";
+
+const TaskFormPage = lazy(() => import("./features/tasks/TaskFormPage"));
+
+// 路由表里：
+{ path: "tasks/new", element: <Suspense fallback={<p className="hint">加载中…</p>}><TaskFormPage /></Suspense> }
+```
+
+**为什么只拆表单页**：它包含最多的表单/校验代码，但用户 80% 的时间在列表页。把最大、最少用的那块先拆出去，收益最高。**别一上来全站 lazy**——过度分割会让每次跳转都多一次请求。
+
+### 3. 搜索防抖：`useDebouncedValue`
+
+```ts
+import { useEffect, useState } from "react";
+
+export function useDebouncedValue<T>(value: T, delay = 300): T {
+	const [debounced, setDebounced] = useState(value);
+	useEffect(() => {
+		const timer = setTimeout(() => setDebounced(value), delay);
+		return () => clearTimeout(timer); // 每次输入都会取消上一个 timer
+	}, [value, delay]);
+	return debounced;
+}
+```
+
+在列表页把 `keyword` 换成"输入先落本地 state，防抖后再写 URL"：每敲一个字不发请求，`?q=` 也不会被中间态污染。
+
+### 4. 键盘可用性三件事
+
+1. 所有可点元素用 `button` / `a`，不要给 `div` 加 `onClick`。
+2. 焦点环别用 `outline: none` 干掉；若要自定义，用 `:focus-visible` 只给键盘用户画。
+3. 操作后焦点要有落点：删除后回列表，把焦点移到列表标题或第一条。
+
+```css
+:focus-visible {
+	outline: 2px solid #2563eb;
+	outline-offset: 2px;
+	border-radius: 6px;
+}
+```
+
+### 5. 性能：哪些地方故意不加 memo
+
+- 列表行 `TaskRow` 没加 `React.memo`：父组件每次翻页都**整体换数据**，memo 只会增加比较成本。
+- `useTaskList` 的 `queryFn` 是箭头函数、每次渲染都新建：TanStack Query 只依赖 `queryKey`，不需要 `useCallback`。
+- **什么时候才加**：DevTools Profiler 里看到某个子组件在父组件无关更新时反复重渲染，且它渲染成本高（长列表、图表）。先度量，再优化——见[性能那篇](/blog/posts/react-roadmap-09-performance/)。
+
+### 6. 一条命令验收后端契约
+
+```bash
+# 列表 + 分页 + 筛选
+curl -s "http://localhost:4000/tasks?_page=2&_limit=5" | head -c 200
+curl -s "http://localhost:4000/tasks?status=doing&_limit=5" | head -c 200
+
+# 创建 → 改 → 删（自己把 id 换成上一步返回的）
+curl -s -X POST http://localhost:4000/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"用 curl 建的任务","status":"todo","priority":"low","assignee":"test","desc":"","createdAt":"2026-10-23T00:00:00.000Z"}'
+```
+
+### ✅ 阶段 3 验收清单
+
+- [ ] 在详情页把 `task.desc` 改成 `task.descxxxx.foo`（故意写错）→ 页面显示兜底页 + 「回到任务列表」，**不是白屏**。
+- [ ] DevTools Network 里 `/tasks/new` 的 JS 是**独立 chunk**，进列表页时不会下载它。
+- [ ] 快速连打 5 个字搜索 → Network 里只有 1 次请求（防抖生效）。
+- [ ] 全程只用 Tab / Shift+Tab / Enter 能完成：进列表 → 打开详情 → 编辑 → 保存 → 回列表。
+- [ ] 每个可聚焦元素都有可见焦点环（不是浏览器默认的黑色细环也行，但必须有）。
+- [ ] 删除后焦点没有掉到 `body` 上（按 Tab 能继续走，不会从头开始）。
+- [ ] 手机宽度（375px）下列表可用、不横向溢出。
+
+---
+
+## 常见坑（这个项目里我踩过的）
+
+1. **queryKey 手写字符串**：`["tasks", {page,status}]` 和 `["tasks", {status,page}]` 是两个缓存。用 `taskKeys` 工厂函数统一生成。
+2. **`invalidateQueries` 只传精确 key**：想失效所有列表查询，用前缀 `["tasks"]`，不要传整个查询对象。
+3. **乐观更新忘了回滚**：`onMutate` 里存了 `previous`，`onError` 一定要 `setQueryData` 回去，否则界面在骗人。
+4. **`useEffect` 里请求数据**：这是最容易把代码写乱的起点。服务端状态交给 TanStack Query，`useEffect` 只留给"同步外部系统"。
+5. **编辑页先渲染空表单再填值**：会出现"用户刚输入就被覆盖"。用 `key={task.id}` 挂载，或加载完再渲染表单。
+6. **受控组件 `value={undefined}`**：从 `undefined` 变成字符串会把组件从非受控切成受控，React 直接警告。初始值一律给空字符串。
+7. **json-server 的 `id` 是字符串**：别用 `Number(id)` 比较，`t-01` 转数字是 `NaN`。
+8. **`disabled` 当"防止重复提交"**：点了之后到状态更新之间仍有间隙，真正稳的是 `mutation.isPending` 判断 + 后端幂等。
+
+---
+
+## 毕业自测：10 个问题
+
+答不上来的，回去补对应阶段（括号里是答案落在哪一节）：
+
+1. 为什么把 `page/status/q` 放 URL，而不是 `useState`？（阶段 1 第 7 步）
+2. 翻页时为什么不闪白？（`placeholderData`）
+3. `staleTime` 和 `cacheTime` 分别控制什么？这个项目为什么设 15s？
+4. 增删改之后为什么不用手动 `refetch`？（`invalidateQueries` 前缀失效）
+5. 乐观更新的三个回调分别负责什么？（`onMutate/onError/onSettled`）
+6. 断网和服务端 500，在 UI 上要怎么区分？（`ApiError.status`）
+7. 表单提交失败为什么要 `catch` → `formError`，而不是 `alert`？
+8. `errorElement` 接不住哪类错误？（事件回调里的）
+9. 这个项目里为什么没引全局状态库？（数据都在 URL 与 Query 缓存里）
+10. 如果现在要加"批量选中删除"，你会改哪几个文件？（`api/tasks.ts` 加批量接口、`useTasks.ts` 加 mutation、列表页加选中态、`useSearchParams` 或本地 state）
+
+---
+
+## 做完这个项目，你能独立做什么
+
+- 接到"列表 + 筛选 + 分页 + CRUD"这类中后台需求，你能**独立从零搭出骨架**，而不是找模板改。
+- 能判断"这个状态该放 URL、放 Query 缓存、放本地 state、还是放全局库"。
+- 能解释每一个网络请求的失败路径，并给出用户出路。
+- 能把同一套结构平移到 Vue/Next：换的是语法，不是架构。
+
+**下一步建议**（按顺序）：
+
+1. 用这套结构重写一遍**你自己的真实小需求**（比再做一遍 demo 有用十倍）。
+2. 加测试：`api/tasks.ts` 是纯函数层，最适合先写；组件层用 Testing Library 测"提交空表单→出现红字"。
+3. 换后端：把 json-server 换成 [Node + NestJS 那一套](/blog/posts/node-roadmap-03-http-server-express-koa/)，体会"前端只依赖契约"。
+4. 迁到 Next.js：同样的页面用 Server Components + Server Actions 写一遍，对照 [Next.js 全栈路线](/blog/posts/nextjs-roadmap-05-server-actions-forms/)。
+
+> 如果你把 3 个阶段的清单都勾完了，恭喜——你已经在"能独立编程"这一档了。剩下的不是学更多 API，而是**多做几个真实需求**。
