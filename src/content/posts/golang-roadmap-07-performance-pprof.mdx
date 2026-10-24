@@ -1,0 +1,240 @@
+---
+title: '07 · 内存与性能：先有数字，再谈优化'
+published: 2026-10-24T20:54:00+08:00
+description: 'Go 的性能优化路径很固定：benchmark 拿到 ns/op 与 allocs/op，pprof 找到热点，改一处，再测一次。这篇讲逃逸分析怎么读、GC 会影响什么、pprof 的三种 profile 怎么看，以及最容易见效的几类优化。'
+tags: [Go, 性能优化, pprof, benchmark, GC]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这篇最容易写成"优化技巧大全"，但那没用。**真正的顺序是：测量 → 定位 → 只改一处 → 再测**。
+> 没有 benchmark 数字的优化，等于给自己加了个不确定的风险。
+
+---
+
+## 1. 先会写 benchmark
+
+```go
+func BenchmarkConcatWithPlus(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		s := ""
+		for j := 0; j < 100; j++ {
+			s += "x"
+		}
+		_ = s
+	}
+}
+
+func BenchmarkConcatWithBuilder(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var sb strings.Builder
+		sb.Grow(100)
+		for j := 0; j < 100; j++ {
+			sb.WriteString("x")
+		}
+		_ = sb.String()
+	}
+}
+```
+
+```bash
+go test -bench . -benchmem -count 3
+```
+
+输出关键三列：
+
+```
+BenchmarkConcatWithPlus-8      20000    61234 ns/op    3120 B/op    99 allocs/op
+BenchmarkConcatWithBuilder-8  500000     2341 ns/op      112 B/op     1 allocs/op
+```
+
+- `ns/op`：每次操作耗时。
+- `B/op`：每次操作分配的字节数。
+- `allocs/op`：每次操作的分配次数（**最该盯的指标**——分配少了，GC 压力自然小）。
+
+> 注意：如果编译器发现结果没被使用，会把整个调用优化掉，测出 0.3ns 的假数据。所以**一定要把结果赋值给包级变量或用 `_ = x` 之后再引用**。
+
+---
+
+## 2. 逃逸分析：谁把变量搬到了堆上
+
+```bash
+go build -gcflags="-m -m" ./...
+```
+
+看到 `escapes to heap` 就说明这个变量被分配到堆（需要 GC 回收）；没逃逸的在栈上（函数返回即释放，零成本）。
+
+常见逃逸原因：
+
+| 写法 | 为什么逃逸 | 怎么改 |
+|---|---|---|
+| 返回局部变量的指针 | 调用方还要用 | 尽量返回值（小对象） |
+| 把局部变量存进 interface | 接口背后是堆对象 | 避免无谓的 `any` |
+| 闭包捕获局部变量 | 生命周期超出函数 | 传参而非捕获 |
+| 切片/字符串转 `[]byte` | 转换会分配 | 用 `unsafe` 前先证明是热点 |
+| 大结构体按值传参 | 可能触发拷贝与逃逸 | 超过几十字节用指针 |
+
+⚠️ **不要为省一次分配写可读性很差的代码**。逃逸分析是"知道就行"，不是"必须消除"。
+
+---
+
+## 3. GC 在 Go 里意味着什么
+
+- Go 用**并发三色标记 + 混合写屏障**，STW（Stop The World）通常在**亚毫秒级**，所以对大多数服务不是问题。
+- GC 触发频率由 `GOGC` 控制：默认 100，表示"堆增长到上次存活量的 2 倍就触发一次"。调大 → GC 少但内存高；调小 → 反之。
+- **降低 GC 开销的正道是减少分配**（少 B/op），不是调 GOGC。
+- 想看 GC 行为：
+
+```bash
+GODEBUG=gctrace=1 ./server
+# gc 12 @3.4s 2%: 0.021+1.2+0.003 ms clock, ...
+# 分别对应：GC 次数、时间、CPU 占比、各阶段耗时
+```
+
+---
+
+## 4. pprof：定位热点的唯一正确工具
+
+### 起一个 pprof 端点（服务里）
+
+```go
+import _ "net/http/pprof" // 匿名导入即注册 /debug/pprof/*
+
+func main() {
+	go func() {
+		// 单独端口，别和业务端口混在一起
+		_ = http.ListenAndServe("127.0.0.1:6060", nil)
+	}()
+	// ... 业务
+}
+```
+
+⚠️ 生产上**只监听 127.0.0.1**（或用独立的内网端口 + 鉴权），别把 `/debug/pprof` 暴露到公网——它能看到源码路径、goroutine 栈、甚至内存内容。
+
+### 三种 profile 的用途
+
+| Profile | 采集命令 | 回答什么问题 |
+|---|---|---|
+| CPU | `go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30` | 时间花在哪个函数 |
+| Heap | `go tool pprof http://127.0.0.1:6060/debug/pprof/heap` | 内存是谁占的 |
+| Goroutine | `go tool pprof http://127.0.0.1:6060/debug/pprof/goroutine` | 有没有泄漏、卡在哪 |
+
+进去之后最常用的四个命令：
+
+```
+(pprof) top10        # 最耗资源的前 10 个函数
+(pprof) list 函数名   # 逐行看热点代码
+(pprof) web          # 生成调用图（需要 graphviz）
+(pprof) trace 函数名  # 看调用链
+```
+
+离线分析：
+
+```bash
+go tool pprof -http=:8080 cpu.out   # 浏览器里看火焰图，比 web 命令方便
+```
+
+---
+
+## 5. 最容易见效的四类优化
+
+**① 预分配**
+
+```go
+// 差：反复扩容（每次扩容都要拷贝）
+var out []int
+for _, v := range in {
+	out = append(out, v*2)
+}
+
+// 好：一次分配到位
+out := make([]int, 0, len(in))
+```
+
+**② 复用缓冲**
+
+```go
+var bufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+func encode(v any) []byte {
+	b := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		b.Reset()
+		bufPool.Put(b)
+	}()
+	_ = json.NewEncoder(b).Encode(v)
+	return b.Bytes() // ⚠️ 注意：Bytes() 返回的底层数组随后可能被复用，需要拷贝
+}
+```
+
+> `sync.Pool` 只适合"生命周期短、创建成本高"的对象；且取出后**必须假设内容脏**。上面那个 `Bytes()` 的坑很真实：要么拷贝一份，要么别把底层数组交给调用方。
+
+**③ 减少字符串/字节转换**
+
+```go
+// 差：每次都转
+for _, s := range items {
+	w.Write([]byte(s))
+}
+
+// 好：直接写字符串
+for _, s := range items {
+	io.WriteString(w, s)
+}
+```
+
+**④ 别在热路径用 `fmt.Sprintf`**
+
+```go
+// 差：反射 + 多次分配
+log.Println(fmt.Sprintf("user=%s id=%d", name, id))
+
+// 好：结构化日志（slog 会延迟格式化，级别不够就不花钱）
+slog.Info("user loaded", "name", name, "id", id)
+```
+
+---
+
+## 6. 优化的边界：什么时候该停
+
+- `ns/op` 已经低于业务要求（比如一次请求 200µs，优化到 150µs 对用户无感）→ 停。
+- 优化后代码可读性明显下降 → 加注释说明原因，或者换个更简单的方案。
+- 瓶颈不在你的代码（DB、网络、锁等待）→ 先去查那些，PPROF 的 CPU profile 会告诉你。
+
+---
+
+## 常见坑速查
+
+| 坑 | 症状 | 做法 |
+|---|---|---|
+| benchmark 结果被优化掉 | 0.x ns/op 的假数据 | 结果赋给包级变量 |
+| 只看 ns/op 不看 allocs | 优化后 GC 更频繁 | 一起看 `-benchmem` |
+| pprof 端点暴露公网 | 信息泄露 | 只听 127.0.0.1 或加鉴权 |
+| 用 GOGC 调优代替减分配 | 内存飙高 | 先降 allocs/op |
+| `sync.Pool` 里存大对象 | 内存不释放 | Pool 只放小的、可复用的 |
+| 过早优化 | 代码复杂但没收益 | 先测，再改，再测 |
+
+---
+
+## 小结
+
+- 流程固定：benchmark → pprof → 改一处 → 再 benchmark。
+- 三个数字：`ns/op`、`B/op`、`allocs/op`；**allocs 最值得盯**。
+- 逃逸分析帮你理解"为什么这里分配了"，但不必追求零逃逸。
+- GC 不是敌人；减分配才是根本。
+- pprof 三种 profile 各答一个问题：CPU 花哪、内存谁占、goroutine 卡哪。
+
+---
+
+## 练习
+
+1. 给"字符串拼接"写两个 benchmark（`+=` 与 `strings.Builder`），用 `-benchmem -count 3` 出数字，写一句结论。
+2. 用一个让变量逃逸的函数与一个不逃逸的版本，分别 `go build -gcflags="-m -m"` 看报告。
+3. 给一个小服务挂上 `net/http/pprof`，用 `go tool pprof -http=:8080` 看火焰图，找出最热的函数。
+4. 把某个返回 `[]byte` 的函数改成用 `sync.Pool` 复用缓冲，对比 `allocs/op`（注意处理好 `Bytes()` 的复用陷阱）。
+5. 用 `GODEBUG=gctrace=1` 跑你的服务，观察 GC 频率；再把一个热路径里的 `fmt.Sprintf` 换成 `slog`，看 GC 次数变化。

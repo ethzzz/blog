@@ -1,0 +1,254 @@
+---
+title: '10 · 数据层：database/sql 的正确姿势（连接池、事务、迁移）'
+published: 2026-10-24T21:00:00+08:00
+description: 'database/sql 是接口层，不是驱动。这篇讲清连接池三个参数为什么必须调、context 怎么传下去、事务里 defer Rollback 的固定写法、NULL 值怎么扫、分页与总数怎么一次拿到，以及迁移脚本的最小做法。'
+tags: [Go, database/sql, 事务, 连接池, 迁移]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> `database/sql` 不实现数据库，它是一层**连接池 + 接口抽象**，具体驱动由 `github.com/lib/pq`、`github.com/go-sql-driver/mysql`、`modernc.org/sqlite` 之类提供。
+> 所以这一篇的每个知识点，换成任何数据库都成立。
+
+---
+
+## 1. 打开 ≠ 连接
+
+```go
+import (
+	"database/sql"
+	_ "modernc.org/sqlite" // 纯 Go 版 SQLite 驱动（免 CGO）
+)
+
+func open(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", dsn) // 只校验 DSN，不建立连接
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil { // 这里才真正连
+		return nil, err
+	}
+	return db, nil
+}
+```
+
+`sql.DB` 是**连接池**，不是单个连接。它是长期对象，**整个进程共用一个**，不要每次请求 Open。
+
+---
+
+## 2. 连接池三参数：不调会出事故
+
+```go
+db.SetMaxOpenConns(25)                  // 同时最多 25 条连接
+db.SetMaxIdleConns(25)                  // 空闲保留 25 条（避免频繁建连）
+db.SetConnMaxLifetime(5 * time.Minute)  // 连接最多活 5 分钟
+db.SetConnMaxIdleTime(2 * time.Minute)  // 空闲超过 2 分钟就回收
+```
+
+| 参数 | 不设的后果 |
+|---|---|
+| MaxOpenConns | 默认不限 → 突发流量把数据库连接打满 |
+| MaxIdleConns | 默认 2 → 高峰期反复建连（TCP + TLS + 认证开销） |
+| ConnMaxLifetime | 连接不重建 → 遇到中间件/数据库的空闲断连，报 `connection reset` |
+| ConnMaxIdleTime | 长期空闲连接占着资源 |
+
+经验值：**MaxOpenConns 取"数据库最大连接数 ÷ 实例数"的 70%**，Lifetime 比云厂商的空闲断连时间短（常见 5 分钟）。
+
+---
+
+## 3. 查询：把 ctx 一路传下去
+
+```go
+func (s *Store) List(ctx context.Context, page, limit int, status string) ([]Task, int, error) {
+	where := "where deleted_at is null"
+	args := []any{}
+	if status != "" && status != "all" {
+		where += " and status = ?"
+		args = append(args, status)
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx,
+		"select count(*) from tasks "+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		"select id, title, status, assignee, created_at from tasks "+where+
+			" order by created_at desc limit ? offset ?",
+		append(args, limit, (page-1)*limit)...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close() // ⚠️ 必须关，否则连接不还回池子
+
+	var out []Task
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.ID, &t.Title, &t.Status, &t.Assignee, &t.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil { // ⚠️ 遍历完必须检查
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+```
+
+三条硬规则：**`defer rows.Close()`、遍历后查 `rows.Err()`、SQL 参数用占位符**（不要拼字符串，防注入）。
+
+---
+
+## 4. NULL 与"没查到"
+
+```go
+type Task struct {
+	Desc      string         // 表里可能是 NULL
+	DeletedAt sql.NullTime   //
+}
+
+var desc sql.NullString
+err := db.QueryRowContext(ctx, "select desc from tasks where id = ?", id).Scan(&desc)
+if errors.Is(err, sql.ErrNoRows) {
+	return nil, ErrNotFound // 一定是判 ErrNoRows，不要靠 nil 判断
+}
+if err != nil {
+	return nil, err
+}
+if desc.Valid {
+	t.Desc = desc.String
+}
+```
+
+- `sql.ErrNoRows`：单行查询没结果，**这是正常业务分支**，不是异常。
+- `sql.NullString` / `NullInt64` / `NullTime`：带 `Valid` 标记，扫 NULL 不会报错。
+- 也可以直接扫进 `*string`（nil 表示 NULL），看团队习惯，选一种统一。
+
+---
+
+## 5. 事务：固定写法，不要自由发挥
+
+```go
+func (s *Store) Transfer(ctx context.Context, from, to string, amount int) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return err
+	}
+	// 固定套路：失败就回滚；成功时 Commit 之后 Rollback 是无害的
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "update accounts set balance = balance - ? where id = ?", amount, from); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "update accounts set balance = balance + ? where id = ?", amount, to); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+```
+
+四个要点：
+
+1. `defer Rollback()` 放在 Commit 之前——**Commit 成功后 Rollback 返回 ErrTxDone，忽略即可**。
+2. 事务内**必须用 `tx.` 而不是 `db.`**，否则那条语句不在事务里（最隐蔽的 bug）。
+3. 事务尽量短：不要在里面调外部 HTTP 接口。
+4. 序列化隔离会更容易冲突，按业务选默认（多数是 ReadCommitted / RepeatableRead）。
+
+---
+
+## 6. 迁移：最小可用方案
+
+不用框架也能做：一个 `migrations/` 目录 + `go:embed` + 版本表。
+
+```go
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+func migrate(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `create table if not exists schema_version (
+		version integer primary key, applied_at timestamp default current_timestamp)`); err != nil {
+		return err
+	}
+
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	for _, e := range entries {
+		version := parseVersion(e.Name()) // 001_init.sql -> 1
+		var exists int
+		_ = db.QueryRowContext(ctx, "select count(*) from schema_version where version = ?", version).Scan(&exists)
+		if exists > 0 {
+			continue
+		}
+		body, _ := fs.ReadFile(migrationsFS, "migrations/"+e.Name())
+		if _, err := db.ExecContext(ctx, string(body)); err != nil {
+			return fmt.Errorf("apply %s: %w", e.Name(), err)
+		}
+		if _, err := db.ExecContext(ctx, "insert into schema_version(version) values(?)", version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+团队项目建议直接用现成的：`pressly/goose`、`golang-migrate/migrate`、`atlas`。**核心原则不变**：迁移脚本入库、只前进、不手改线上表。
+
+---
+
+## 7. N+1：先看查询次数，再谈优化
+
+```go
+// 差：1 次列表 + N 次查详情
+for _, t := range tasks {
+	_ = db.QueryRow("select assignee from users where id = ?", t.AssigneeID)
+}
+
+// 好：一次 IN 查询批量拿
+rows, _ := db.QueryContext(ctx, "select id, name from users where id in (?,?,?)", ids...)
+```
+
+排查手段：在驱动的日志里打印每条 SQL（或用 `sqlmock` 断言调用次数）；上线后看数据库的"每秒查询数"是否随列表页 QPS 线性放大。
+
+---
+
+## 常见坑速查
+
+| 坑 | 症状 | 做法 |
+|---|---|---|
+| 忘了 `rows.Close()` | 连接池耗尽，请求排队 | 紧跟 `defer rows.Close()` |
+| 只判 `err != nil` 不判 `ErrNoRows` | 404 变成 500 | `errors.Is(err, sql.ErrNoRows)` |
+| 事务里混用 `db.` | 部分语句不在事务内 | 一律用 `tx.` |
+| 拼 SQL 字符串 | 注入 + 无法复用预编译 | 占位符 + 参数 |
+| `sql.Open` 后不 Ping | 首次请求才暴露连不上 | 启动时 Ping |
+| 连接不设 Lifetime | 空闲断连报错 | 5 分钟重建 |
+| 在事务里调外部 API | 事务变长、锁等待 | 事务外做 IO |
+
+---
+
+## 小结
+
+- `sql.DB` 是池；三参数（MaxOpen/MaxIdle/Lifetime）必须显式设。
+- 全链路传 ctx：`QueryContext` / `ExecContext` / `BeginTx(ctx, ...)`。
+- `rows.Close` + `rows.Err` 是标配；`ErrNoRows` 是正常分支。
+- 事务用固定模板：`BeginTx` → `defer Rollback` → `Commit`，且只用 `tx.`。
+- 迁移脚本入库、只前进；N+1 先量化再优化。
+
+---
+
+## 练习
+
+1. 用 SQLite 建 `tasks` 表并插入 20 条，实现分页查询（`_page/_limit`），返回 `items/total/hasNext`。
+2. 故意不 `defer rows.Close()`，用 100 并发请求把连接池打满，观察 `context deadline exceeded`；修复后复测。
+3. 写一个转账事务（两个 update），在中途人为返回错误，验证两边的余额都没变。
+4. 给 `desc` 字段（可能为 NULL）用 `sql.NullString` 扫，写两个测试：有值 / 为 NULL。
+5. 写一个最小的 `go:embed` 迁移器，跑两次，验证第二次跳过（版本表里只有一行）。

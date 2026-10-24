@@ -1,0 +1,198 @@
+---
+title: '02 · 类型系统与值语义：Go 真正让人栽跟头的地方'
+published: 2026-10-24T20:44:00+08:00
+description: 'Go 的零值可用、值传递、slice 共享底层数组、nil map 写入 panic——这些不是语法细节，而是"你以为在改副本，其实改的是同一块内存"。这篇用可复现的例子把值语义讲透。'
+tags: [Go, 值语义, slice, map, 指针]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 从 JS/Java 过来的人，第一周最容易写出的 bug 不是并发，而是**"改了一个副本"**和**"以为 slice 是数组"**。
+> 这篇的每个例子都能直接跑，跑完你对"Go 里什么在共享内存"就有直觉了。
+
+---
+
+## 1. 零值可用：不写就是合法值
+
+```go
+var (
+	n int        // 0
+	s string     // ""
+	b bool       // false
+	p *User      // nil
+	sl []int     // nil（长度 0，容量 0）
+	m  map[string]int // nil
+	ch chan int  // nil
+)
+```
+
+Go 不允许未初始化的变量，所有变量都有零值。这带来一个重要的设计习惯：**让你的类型"零值即可用"**。
+
+```go
+// 好：零值可用，不需要构造函数
+var buf bytes.Buffer
+buf.WriteString("hi")
+
+// 差：零值不可用，必须 New 一下
+type BadCounter struct{ m map[string]int }
+func (c *BadCounter) Inc(k string) { c.m[k]++ } // 零值 c.m == nil → panic
+```
+
+**但有两个零值是"不可用"的**：nil map 只能读不能写；nil channel 永远阻塞。
+
+```go
+var m map[string]int
+fmt.Println(m["x"]) // 0 —— 读 nil map 是安全的
+m["x"] = 1          // panic: assignment to entry in nil map
+
+var ch chan int
+<-ch                // 永久阻塞（不是 panic，更难查）
+```
+
+---
+
+## 2. 值传递：函数拿到的一定是副本
+
+```go
+type User struct {
+	Name string
+	Tags []string
+}
+
+func rename(u User) { u.Name = "别人" }        // 改副本，外面不变
+func renamePtr(u *User) { u.Name = "别人" }    // 改原对象
+
+func main() {
+	u := User{Name: "皓"}
+	rename(u)
+	fmt.Println(u.Name) // 皓
+	renamePtr(&u)
+	fmt.Println(u.Name) // 别人
+}
+```
+
+**但是注意**：`User` 里的 `Tags` 是 slice，复制 struct 只复制了 slice 头（指针 + len + cap），**底层数组还是同一块**：
+
+```go
+func addTag(u User) { u.Tags[0] = "被改了" }
+
+u := User{Name: "皓", Tags: []string{"a", "b"}}
+addTag(u)
+fmt.Println(u.Tags[0]) // 被改了 —— 因为底层数组共享
+```
+
+结论：**"值传递"保护的是被复制的字段本身，不保护字段指向的东西**。这叫浅拷贝。
+
+---
+
+## 3. slice 三件套：长度、容量、底层数组
+
+```go
+s := make([]int, 2, 4) // len=2 cap=4 [0 0]
+t := s[:1]             // len=1 cap=4，和 s 共享数组
+t[0] = 9
+fmt.Println(s[0])      // 9
+
+t = append(t, 5)       // 没超过 cap，仍是同一数组
+fmt.Println(s[1])      // 5 —— s 看到了
+
+t = append(t, 6, 7, 8) // 超过 cap → 分配新数组，从此分家
+t[0] = 100
+fmt.Println(s[0])      // 9 —— 不再共享
+```
+
+三个必记事实：
+
+1. `append` 在容量够时**原地追加**，不够才扩容（约 2 倍，大 slice 会更保守）。
+2. 从大 slice 上切一小段并长期持有，会**把整个底层数组钉在内存里**。要脱离就用 `slices.Clone`（Go 1.21+）或 `append([]T(nil), s...)`。
+3. 传 slice 给函数，函数里的 `append` 可能让调用方看不见（因为 slice 头被复制了）。
+
+```go
+func addOne(s []int) []int { return append(s, 1) } // 必须返回，调用方要接
+```
+
+---
+
+## 4. map：无序、并发不安全、key 要可比较
+
+```go
+m := map[string]int{"b": 2, "a": 1}
+for k := range m { fmt.Println(k) } // 顺序随机，别依赖
+
+// 并发写会直接 fatal（不是 panic，recover 抓不住）
+go func() { m["x"] = 1 }()
+go func() { m["y"] = 2 }()
+```
+
+需要并发读写时：用 `sync.RWMutex` 包一层，或者用 `sync.Map`（只适合"读多写少、key 集合稳定"的场景，不要当默认选择）。
+
+**key 必须可比较**：slice、map、func 不能作 key；struct 只要字段都可比较就能作 key。
+
+```go
+type Point struct{ X, Y int }
+ok := map[Point]string{{1, 2}: "A"} // 可以
+// bad := map[[]int]string{}        // 编译错误
+```
+
+---
+
+## 5. string 与 []byte：转换有拷贝
+
+```go
+s := "你好"
+b := []byte(s)   // 拷贝一次
+s2 := string(b)  // 再拷贝一次
+```
+
+高频路径（比如拼 JSON、写日志）要注意这个成本：
+
+```go
+// 差：每次都拷贝
+for i := 0; i < 1000; i++ {
+	_ = string([]byte("x"))
+}
+
+// 好：预分配
+var sb strings.Builder
+sb.Grow(1000)
+for i := 0; i < 1000; i++ {
+	sb.WriteString("x")
+}
+out := sb.String()
+```
+
+`strings.Builder` 内部用 `[]byte` 累积，最后一次性转 string，避免中间拷贝。
+
+---
+
+## 6. 常见坑速查
+
+| 坑 | 症状 | 正确做法 |
+|---|---|---|
+| nil map 写入 | `assignment to entry in nil map` | `make(map[string]int)` 后再写 |
+| nil channel 读写 | 永久阻塞，goroutine 泄漏 | 只声明不用的 channel 要有明确理由 |
+| slice 共享底层数组 | 改了 A 影响 B | 需要独立就 `slices.Clone` |
+| 在大 slice 上切小段 | 内存不释放 | clone 一份再用 |
+| `for range` 取地址 | 所有指针指向最后一个元素 | Go 1.22 起循环变量每轮新建，老版本要 `v := v` |
+| map 并发写 | `fatal error: concurrent map writes` | 加锁或用 `sync.Map` |
+| 依赖 map 遍历顺序 | 测试偶发失败 | 先取 key 排序再遍历 |
+
+---
+
+## 小结
+
+- 零值可用是设计目标，但 nil map / nil channel 是两个例外。
+- "值传递"只保证副本，不保证深拷贝；slice/map/指针字段仍然共享。
+- slice 的 len/cap/底层数组三件套决定了 append 之后是否还共享。
+- map 无序、并发不安全、key 必须可比较。
+
+---
+
+## 练习
+
+1. 写一个函数 `AppendBad(s []int) []int`，在内部 append 但不返回，验证调用方拿不到新元素；再改成返回版本。
+2. 复现"在大 slice 上切小段导致内存不释放"：造一个 100MB 的 `[]byte`，切出前 10 字节传给一个长期持有的变量，用 `runtime.ReadMemStats` 观察（或用 pprof 看 heap）。
+3. 用 `sync.RWMutex` 把 map 包成并发安全的 `Store`，写一个 `go test -race` 能过的测试。
+4. 用 `strings.Builder` 与 `+=` 各拼接 10 万次字符串，用 `testing.Benchmark` 比较 `ns/op`。
+5. 解释：为什么 `for _, v := range users { ptrs = append(ptrs, &v) }` 在 Go 1.21 及以前是个经典 bug？（提示：循环变量复用）

@@ -1,0 +1,170 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+// 获取所有 Go 学习路线文章
+const allPosts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === "Go学习路线" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+
+// 按 slug 中的阶段编号排序
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = Number.parseInt(
+		a.slug.match(/golang-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	const numB = Number.parseInt(
+		b.slug.match(/golang-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	return numA - numB;
+});
+
+// 分离总览和阶段文章
+const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
+const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
+---
+
+<MainGridLayout title="Go 学习路线">
+	<div class="onload-animation">
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">Go 学习路线</h1>
+			<p class="text-75 text-lg">标准库就能写出能上线的服务 · 含毕业项目 · 共 {sortedPosts.length} 篇</p>
+		</div>
+
+		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white dark:text-black/70 font-bold text-xl">
+					Go
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">Go - 简单、明确、能并发</h2>
+					<p class="text-75 text-sm mb-2">编译成单个静态二进制 · 并发是语言能力 · 标准库够写服务；云原生的事实标准语言</p>
+					<div class="flex flex-wrap gap-2 text-xs">
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">goroutine</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">channel</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">net/http</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">database/sql</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">pprof</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">部署</span>
+					</div>
+				</div>
+				<a href="https://go.dev/doc/" target="_blank" rel="noopener" aria-label="Go 官方文档"
+				   class="flex-shrink-0 text-[var(--primary)] hover:opacity-75 transition-opacity">
+					<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+						<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+						<polyline points="14 2 14 8 20 8"/>
+						<line x1="16" y1="13" x2="8" y2="13"/>
+						<line x1="16" y1="17" x2="8" y2="17"/>
+					</svg>
+				</a>
+			</div>
+		</div>
+
+		{overviewPost && (
+			<a href={getPostUrlBySlug(overviewPost.slug)}
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white dark:text-black/70">
+								总览
+							</span>
+							<span class="text-sm text-50">
+								{overviewPost.data.published.toLocaleDateString("zh-CN")}
+							</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">
+							{overviewPost.data.title}
+						</h2>
+						<p class="text-75 text-sm line-clamp-2">
+							{overviewPost.data.description}
+						</p>
+					</div>
+					<div class="ml-4 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M5 12h14M12 5l7 7-7 7"/>
+						</svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<div class="space-y-4">
+			{stagePosts.map((post, index) => (
+				<a href={getPostUrlBySlug(post.slug)}
+				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+					<div class="flex items-start gap-4">
+						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+							{index + 1}
+						</div>
+
+						<div class="flex-1 min-w-0">
+							<div class="flex items-center gap-2 mb-1">
+								<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
+									{post.data.title}
+								</h3>
+							</div>
+							<p class="text-75 text-sm mb-2 line-clamp-2">
+								{post.data.description}
+							</p>
+							<div class="flex items-center gap-3 text-xs text-50">
+								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+								{post.data.tags && post.data.tags.length > 0 && (
+									<span class="flex items-center gap-1">
+										{post.data.tags.slice(0, 3).map(tag => (
+											<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+												#{tag}
+											</span>
+										))}
+									</span>
+								)}
+							</div>
+						</div>
+
+						<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<path d="M5 12h14M12 5l7 7-7 7"/>
+							</svg>
+						</div>
+					</div>
+				</a>
+			))}
+		</div>
+
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
+			<p class="font-medium mb-1">💡 学习建议</p>
+			<p>01–04 是地基，务必动手：Go 的坑集中在值语义与接口，光看会以为懂了。05–06 是分水岭，并发写不对不会立刻报错，必须用 <code>go test -race</code> 跑。07 别提前看，等有 benchmark 数字再回来。最后的 12 是毕业项目，用标准库写一个能上线的任务 API——它的接口契约与 React、Node 两篇完全一致，做完你能横向对比三种语言写同一个服务。</p>
+		</div>
+
+		<div class="mt-4 flex flex-wrap gap-4 text-sm">
+			<a href="https://go.dev/tour/" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+					<path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+				</svg>
+				Tour of Go（官方交互教程）
+			</a>
+			<a href="https://go.dev/doc/effective_go" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+					<polyline points="14 2 14 8 20 8"/>
+					<line x1="16" y1="13" x2="8" y2="13"/>
+					<line x1="16" y1="17" x2="8" y2="17"/>
+				</svg>
+				Effective Go（写地道的 Go）
+			</a>
+			<a href="https://pkg.go.dev/" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<circle cx="11" cy="11" r="8"/>
+					<line x1="21" y1="21" x2="16.65" y2="16.65"/>
+				</svg>
+				标准库与包文档
+			</a>
+		</div>
+	</div>
+</MainGridLayout>

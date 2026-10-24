@@ -1,0 +1,261 @@
+---
+title: '08 · 标准库实战：net/http、encoding/json、log/slog、flag'
+published: 2026-10-24T20:56:00+08:00
+description: 'Go 的标准库就是"够用"的典范：一个 Handler 接口撑起整个 HTTP；encoding/json 靠 struct tag 控协议；log/slog 做结构化日志；flag + 环境变量管配置。这篇把这四样用到熟，后面写服务就不用先装框架。'
+tags: [Go, 标准库, net/http, json, slog]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 很多人上手 Go 就先装 Gin。其实**标准库能覆盖 80% 的服务需求**，而且升级不用等框架适配。
+> 这篇把四个最常用的包讲透：`net/http`、`encoding/json`、`log/slog`、`flag`。
+
+---
+
+## 1. net/http：一个接口撑起全部
+
+```go
+type Handler interface {
+	ServeHTTP(w http.ResponseWriter, r *http.Request)
+}
+```
+
+任何实现了这一个方法的类型，都能当 handler。`http.HandlerFunc` 是它的函数适配器：
+
+```go
+func hello(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintln(w, "hello")
+}
+
+http.HandleFunc("/hello", hello)      // 注册到 DefaultServeMux
+http.ListenAndServe(":8080", nil)
+```
+
+### 中间件的本质就是"包一层"
+
+```go
+type Middleware func(http.Handler) http.Handler
+
+func withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		slog.Info("request", "method", r.Method, "path", r.URL.Path, "cost", time.Since(start))
+	})
+}
+```
+
+链式串联（从外到内）：
+
+```go
+var h http.Handler = http.HandlerFunc(hello)
+h = withLogging(h)
+h = withRecover(h)
+```
+
+### 路由：Go 1.22 起 ServeMux 支持方法与路径参数
+
+```go
+mux := http.NewServeMux()
+mux.HandleFunc("GET /tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id") // 直接取路径参数，不用第三方路由
+	// ...
+})
+mux.HandleFunc("POST /tasks", createTask)
+```
+
+不需要 `gin` 也能有 `GET /tasks/{id}` 这种语义。复杂匹配（正则、通配）才考虑 chi。
+
+### 写响应：三种常见形态
+
+```go
+// JSON
+w.Header().Set("Content-Type", "application/json; charset=utf-8")
+w.WriteHeader(http.StatusCreated)
+_ = json.NewEncoder(w).Encode(task)
+
+// 纯文本 + 状态码
+http.Error(w, "not found", http.StatusNotFound)
+
+// 空响应
+w.WriteHeader(http.StatusNoContent)
+```
+
+⚠️ **`WriteHeader` 只能调一次**，之后再写 header 无效；`json.NewEncoder(w)` 会隐式写 200，所以要先 `WriteHeader` 再 Encode。
+
+---
+
+## 2. encoding/json：协议就是 tag
+
+```go
+type Task struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Status    string    `json:"status,omitempty"` // 零值时不输出
+	CreatedAt time.Time `json:"createdAt"`
+	Internal  string    `json:"-"` // 永不输出
+}
+```
+
+几个关键点：
+
+| 需求 | 写法 |
+|---|---|
+| 改字段名 | `json:"camelCase"` |
+| 零值省略 | `json:"x,omitempty"` |
+| 不输出 | `json:"-"` |
+| 字符串数字 | `json:"n,string"` |
+| 时间格式 | 默认 RFC3339；要别的格式得自定义类型 |
+
+自定义时间格式（前端要 `yyyy-MM-dd HH:mm:ss` 时很常见）：
+
+```go
+type LocalTime time.Time
+
+func (t LocalTime) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + time.Time(t).Format("2006-01-02 15:04:05") + `"`), nil
+}
+
+func (t *LocalTime) UnmarshalJSON(data []byte) error {
+	parsed, err := time.Parse(`"2006-01-02 15:04:05"`, string(data))
+	if err != nil {
+		return err
+	}
+	*t = LocalTime(parsed)
+	return nil
+}
+```
+
+**解码要注意的三件事**：
+
+1. `json.Unmarshal` 不认识多余字段（默认忽略）；要严格就 `dec.DisallowUnknownFields()`。
+2. 传指针：`json.Unmarshal(data, &v)`，传值会改副本。
+3. 大响应别用 `Unmarshal`，用 `json.Decoder` 流式解码省内存。
+
+```go
+dec := json.NewDecoder(r.Body)
+dec.DisallowUnknownFields() // 前端多传字段直接报错（配合白名单防越权字段）
+if err := dec.Decode(&input); err != nil {
+	// 返回 400
+}
+```
+
+---
+
+## 3. log/slog：结构化日志（Go 1.21+）
+
+```go
+slog.Info("user login",
+	"userID", u.ID,
+	"ip", r.RemoteAddr,
+	"cost", time.Since(start),
+)
+```
+
+输出（默认 TextHandler）：
+
+```
+time=2026-10-24T21:00:00.000+08:00 level=INFO msg="user login" userID=u-1 ip=1.2.3.4 cost=12ms
+```
+
+切 JSON（生产推荐，便于采集）：
+
+```go
+handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+log := slog.New(handler)
+slog.SetDefault(log)
+```
+
+几个实用能力：
+
+```go
+// 带固定字段的子 logger（一次设置，处处携带）
+reqLog := slog.With("requestID", rid, "path", r.URL.Path)
+reqLog.Info("start")
+reqLog.Warn("slow query", "cost", cost)
+
+// 分组
+slog.Info("db", "query", slog.Group("sql", "table", "tasks", "rows", 12))
+
+// 错误
+slog.Error("create task failed", "err", err)
+```
+
+**脱敏**：`slog` 没有内置 redact，得自己控制——**不要**在日志里打 `Authorization`、`Cookie`、密码、完整手机号。
+
+---
+
+## 4. flag + 环境变量：配置的两层来源
+
+```go
+var (
+	addr = flag.String("addr", ":8080", "监听地址")
+	dsn  = flag.String("dsn", os.Getenv("DATABASE_URL"), "数据库连接串（也可用环境变量）")
+)
+
+func main() {
+	flag.Parse()
+	if *dsn == "" {
+		slog.Error("缺少 DATABASE_URL")
+		os.Exit(1)
+	}
+	// ...
+}
+```
+
+约定：
+
+- **环境相关（端口、DSN、密钥）走环境变量**，方便容器部署；
+- **临时开关（调试、迁移）走 flag**，命令行试；
+- 默认值要能让本地"零配置跑起来"（比如 `:8080` + 本地 sqlite）。
+
+---
+
+## 5. 其它常被忽略但很有用的包
+
+| 包 | 用途 | 一句话示例 |
+|---|---|---|
+| `io` | 通用读写接口 | `io.Copy(dst, src)` |
+| `bufio` | 带缓冲读写 | `w := bufio.NewWriter(f)`，最后 `w.Flush()` |
+| `context` | 取消与超时 | 见第 06 篇 |
+| `errors` | 错误包装与判等 | 见第 04 篇 |
+| `path/filepath` | 跨平台路径 | `filepath.Join("a", "b")` |
+| `time` | 时间与定时 | `time.Now().UTC()` |
+| `sort` / `slices` | 排序 | `slices.Sort(nums)`（1.21+） |
+| `maps` | map 工具 | `maps.Keys(m)`、`maps.Clone(m)` |
+
+---
+
+## 常见坑速查
+
+| 坑 | 症状 | 做法 |
+|---|---|---|
+| `WriteHeader` 调两次 | 日志警告 `superfluous WriteHeader` | 只写一次，注意 Encoder 隐式 200 |
+| 忘了 `Content-Type` | 浏览器/前端按文本解析 | 显式设置 |
+| `json.Unmarshal` 传值 | 解码无效 | 传 `&v` |
+| `omitempty` 对数字 0 生效 | 想输出 0 却丢了 | 用指针字段或用自定义 Marshal |
+| 日志里打了 token | 安全事故 | 白名单字段，敏感字段脱敏 |
+| `flag` 在库代码里用 | 与使用方的 flag 冲突 | 只在 main 里解析 |
+| `bufio.Writer` 忘 Flush | 输出丢一半 | defer Flush |
+
+---
+
+## 小结
+
+- `net/http` 的核心就一个 `Handler` 接口，中间件就是"包一层"。
+- Go 1.22 的 `ServeMux` 已支持 `GET /tasks/{id}`，多数项目不需要路由库。
+- `encoding/json` 用 tag 控协议；解码传指针；大响应用 `Decoder`。
+- `log/slog` 是结构化日志的标准答案，生产切 JSON handler。
+- 配置：环境变量为主，flag 为临时开关。
+
+---
+
+## 练习
+
+1. 用标准库起一个服务，提供 `GET /hello`（返回 JSON）与 `GET /users/{id}`（用 `PathValue` 取参），用 `curl` 验证。
+2. 写一个日志中间件：记录方法、路径、状态码、耗时；状态码要靠自己包一层 `ResponseWriter` 才能拿到（提示：实现 `WriteHeader` 并记录）。
+3. 给 `Task` 写自定义时间格式（`2006-01-02 15:04:05`），验证序列化与反序列化都对。
+4. 用 `DisallowUnknownFields` 让"多传一个 `role` 字段"的请求返回 400。
+5. 把日志从 `TextHandler` 换成 `JSONHandler`，用 `jq` 过滤出 `level=ERROR` 的行。

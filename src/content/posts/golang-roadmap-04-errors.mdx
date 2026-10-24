@@ -1,0 +1,237 @@
+---
+title: '04 · 错误处理：error 是值，不是异常'
+published: 2026-10-24T20:48:00+08:00
+description: 'Go 不抛异常，错误是普通返回值。这篇讲清：什么时候该包装（%w）、什么时候该判等（errors.Is）、自定义错误类型怎么配合 errors.As、为什么 panic 只该用于"不可恢复"，以及错误信息怎么写得能定位问题。'
+tags: [Go, 错误处理, errors, panic]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 从 JS 来的人第一反应是"这么多 `if err != nil` 好啰嗦"。但换个角度：
+> **异常把控制流藏起来了**，你读代码时不知道哪一行会跳走；而 `if err != nil` 把每条失败路径都摆在明面上。
+> 代价是行数，收益是"能一眼看完所有分支"。
+
+---
+
+## 1. 基本形态：返回值里带 error
+
+```go
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+```
+
+三条约定：
+
+1. `error` 永远是**最后一个返回值**；
+2. 有错误时，其它返回值给零值（`nil`、`0`、`""`），别返回"半个结果"；
+3. 错误要**往上抛就抛**，别静默吞掉（`_ = doSomething()` 是事故伏笔）。
+
+---
+
+## 2. 包装：加"上下文"但不丢原始错误
+
+```go
+// 差：原始错误丢了，只剩一句话
+if err != nil {
+	return fmt.Errorf("加载配置失败")
+}
+
+// 好：%w 把原始错误包进去，链条可追溯
+if err != nil {
+	return fmt.Errorf("加载配置 %s: %w", path, err)
+}
+```
+
+`%w` 与 `%v` 的区别：`%w` 会保留可 unwrap 的链，`%v` 只是拼字符串。
+
+```go
+err := fmt.Errorf("读取配置: %w", os.ErrNotExist)
+fmt.Println(errors.Is(err, os.ErrNotExist)) // true —— 用 %v 就会是 false
+```
+
+**包装的规范**：每层只加"这一层知道的信息"，不要重复。比如底层说 "no such file"，上层加 "读取配置 app.yaml"，最终信息就是：
+
+```
+加载配置 app.yaml: open app.yaml: no such file or directory
+```
+
+信息量刚好，不啰嗦。
+
+---
+
+## 3. 判等用 errors.Is，取类型用 errors.As
+
+```go
+var (
+	ErrNotFound  = errors.New("资源不存在")
+	ErrConflict  = errors.New("资源冲突")
+)
+
+// 判等：穿透整条包装链
+if errors.Is(err, ErrNotFound) {
+	// 映射成 404
+}
+```
+
+自定义错误类型 + `errors.As`：
+
+```go
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e *ValidationError) Error() string {
+	return e.Field + ": " + e.Message
+}
+
+func parseAge(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, &ValidationError{Field: "age", Message: "必须是数字"}
+	}
+	if n < 0 {
+		return 0, &ValidationError{Field: "age", Message: "不能为负"}
+	}
+	return n, nil
+}
+
+func main() {
+	_, err := parseAge("-1")
+	var ve *ValidationError
+	if errors.As(err, &ve) { // 注意：传的是 &ve（指针的指针）
+		fmt.Println("字段:", ve.Field, ve.Message)
+	}
+}
+```
+
+> 记忆：**判"是不是那个错误"用 Is；取"错误里的字段"用 As**。两者都能穿透 `%w` 的包装链。
+
+---
+
+## 4. 哨兵错误 vs 自定义类型：怎么选
+
+| 场景 | 用法 | 例子 |
+|---|---|---|
+| 只需要区分"是哪一类失败" | 包级 `var ErrXxx = errors.New(...)` + `errors.Is` | `sql.ErrNoRows` |
+| 需要带结构化信息 | 自定义 struct + `errors.As` | 校验错误（字段、原因） |
+| 需要 HTTP 状态码映射 | 自定义类型实现 `StatusCode() int` | 业务错误 |
+
+给 Web 层用的写法：
+
+```go
+type AppError struct {
+	Status  int
+	Code    string
+	Message string
+	Err     error
+}
+
+func (e *AppError) Error() string { return e.Message }
+func (e *AppError) Unwrap() error { return e.Err } // 支持 errors.Is/As 穿透
+
+func NotFound(msg string) error {
+	return &AppError{Status: 404, Code: "NOT_FOUND", Message: msg}
+}
+```
+
+有了 `Unwrap`，上层既可以用 `errors.As` 取 `*AppError` 拿状态码，又能用 `errors.Is` 穿透到内部的哨兵错误。
+
+---
+
+## 5. panic 与 recover：只在边界用
+
+**该用 panic 的场景**（很少）：
+
+- 程序启动时的配置错误（没法继续跑，早点崩）；
+- 不可能发生的不变量被破坏（`default:` 分支里 `panic("unreachable")`）；
+- 库的初始化失败（如 `regexp.MustCompile`）。
+
+**不该用 panic 的场景**：参数校验、依赖调用失败、业务规则不满足——这些一律返回 error。
+
+`recover` 只该出现在"进程边界"：
+
+```go
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic: %v\n%s", rec, debug.Stack())
+				http.Error(w, "服务器内部错误", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+⚠️ 注意两点：
+1. `recover` 只能接住**同一个 goroutine** 里的 panic。子 goroutine 崩了照样带崩进程——子 goroutine 里要自己 defer recover。
+2. `recover` 之后不要在中间件里继续"假装成功"，必须返回 500。
+
+---
+
+## 6. 错误信息的写法（影响排障速度）
+
+```
+❌ "error"
+❌ "失败了"
+❌ "user error"            // 不知道哪个 user、什么错
+✅ "创建用户 alice: email 已存在"   // 谁 + 做什么 + 为什么
+```
+
+规则：**小写开头、不要句号、不要重复上层已经说过的词**。
+
+```go
+// 底层（store 包）
+return fmt.Errorf("insert user: %w", err)
+
+// 中层（service 包）
+return fmt.Errorf("register %s: %w", email, err)
+
+// 输出
+// register alice@example.com: insert user: duplicate key value ...
+```
+
+---
+
+## 7. 常见坑速查
+
+| 坑 | 后果 | 做法 |
+|---|---|---|
+| `_ = f()` 吞掉错误 | 静默失败，最难查 | 至少 log |
+| 用 `%v` 包装 | `errors.Is` 失效 | 用 `%w` |
+| 每层都重复上下文 | 日志变成"加载配置失败: 加载配置失败: ..." | 每层只加自己的信息 |
+| 用错误字符串做判断 | 改文案就崩 | 用哨兵错误或类型 |
+| 在 defer 里 recover 但没返回错误 | 调用方以为成功 | recover 后设置 named return 或返回 500 |
+| 自定义错误用值接收者 | `errors.As` 匹配失败 | 用指针接收者 |
+
+---
+
+## 小结
+
+- error 是值：返回、传递、包装，都不特殊。
+- 加上下文用 `%w`；判等用 `errors.Is`；取类型用 `errors.As`。
+- 需要状态码等结构化信息时，自定义类型 + `Unwrap`。
+- panic 只用于"不可恢复"，`recover` 只放在进程/请求边界，子 goroutine 自己兜。
+- 错误信息要能回答"谁、做什么、为什么失败"。
+
+---
+
+## 练习
+
+1. 写 `LoadConfig(path)`，对"文件不存在"与"JSON 非法"返回可区分的错误，并在 `main` 里用 `errors.Is` 分别处理。
+2. 定义一个 `ValidationError`（字段 + 原因），包两层 `%w` 后用 `errors.As` 取出来，验证能穿透。
+3. 实现 `AppError`（Status/Code/Message/Unwrap），写一个把任意 error 映射成 HTTP 状态码的函数，覆盖 404/409/422/500。
+4. 写一个中间件：捕获 handler 里的 panic，记录堆栈并返回 500；再写一个**没有** recover 的子 goroutine 触发 panic，观察进程行为。
+5. 对比 `fmt.Errorf("x: %v", err)` 与 `%w` 的差别：各写一行，用 `errors.Is` 验证。

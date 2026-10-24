@@ -1,0 +1,244 @@
+---
+title: '03 · 接口与组合：没有 implements，面向对象换了个样子'
+published: 2026-10-24T20:46:00+08:00
+description: 'Go 的接口是隐式实现的：不写 implements，方法签名对上就算。这篇讲清小接口为什么是惯例、接口 nil 陷阱为什么会骗过判空、嵌入怎么替代继承，以及接口该定义在调用方还是实现方。'
+tags: [Go, 接口, 组合, 类型断言]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 从 Java/C# 过来的人，找 `implements` 会找不到；从 JS 过来的人，会怀疑"这算不算类型安全"。
+> Go 的答案：**接口是"事后归纳"出来的**——先写类型，发现几个类型长得一样，再抽个接口。
+> 这个顺序反过来，就会抽出又大又没人用的接口。
+
+---
+
+## 1. 隐式实现：方法对上就算
+
+```go
+type Speaker interface {
+	Speak() string
+}
+
+type Dog struct{ Name string }
+
+func (d Dog) Speak() string { return d.Name + ": 汪" }
+
+type Robot struct{}
+
+func (r Robot) Speak() string { return "beep" }
+
+func main() {
+	speakers := []Speaker{Dog{Name: "旺财"}, Robot{}}
+	for _, s := range speakers {
+		fmt.Println(s.Speak())
+	}
+}
+```
+
+`Dog` 和 `Robot` 都没有声明"我实现了 Speaker"，但都可以塞进 `[]Speaker`。**这就是鸭子类型 + 编译期检查**。
+
+好处：实现方不需要 import 接口所在的包（减少耦合）；坏处：光看类型定义看不出它实现了哪些接口——靠工具（`go doc`、IDE）或约定。
+
+---
+
+## 2. 小接口是惯例，不是风格洁癖
+
+标准库里最强的两个接口各自只有一个方法：
+
+```go
+type Reader interface{ Read(p []byte) (n int, err error) }
+type Writer interface{ Write(p []byte) (n int, err error) }
+```
+
+于是 `os.File`、`bytes.Buffer`、`net.Conn`、`gzip.Reader`、`http.Response.Body` 全都能互换——**因为它们各自只需要一个方法**。
+
+对比一下"大接口"的代价：
+
+```go
+// 差：要测试一个函数，你得实现 6 个方法
+type UserRepo interface {
+	Get(id string) (*User, error)
+	List() ([]*User, error)
+	Create(u *User) error
+	Update(u *User) error
+	Delete(id string) error
+	Count() (int, error)
+}
+
+// 好：按调用方需要拆开，测试时只实现用到的那一个
+type UserGetter interface{ Get(id string) (*User, error) }
+```
+
+> 经验法则：**接口方法数 ≤ 3**。超过就该想想是不是把"数据访问"整个包成接口了。
+
+---
+
+## 3. 接口定义在使用方（这是最反直觉的一条）
+
+Java 的习惯是"先定义接口，再写实现"。Go 反过来：**谁要用，谁定义接口**。
+
+```go
+// internal/notify/notify.go（使用方）
+package notify
+
+// 只需要"能发消息"这一件事，不关心对方是邮件还是短信
+type Sender interface {
+	Send(to, body string) error
+}
+
+type Service struct {
+	sender Sender
+}
+
+func New(s Sender) *Service { return &Service{sender: s} }
+
+func (s *Service) NotifyUser(email string) error {
+	return s.sender.Send(email, "你的任务已完成")
+}
+```
+
+实现方（`internal/mail`）**完全不知道 `notify.Sender` 的存在**，只提供 `Send` 方法即可。测试时给一个假实现：
+
+```go
+type fakeSender struct{ sent []string }
+
+func (f *fakeSender) Send(to, body string) error {
+	f.sent = append(f.sent, to)
+	return nil
+}
+```
+
+---
+
+## 4. 接口 nil 陷阱：判空会骗你
+
+```go
+type MyErr struct{}
+func (e *MyErr) Error() string { return "boom" }
+
+func do() error {
+	var e *MyErr = nil
+	return e // 注意：返回的 error 不是 nil！
+}
+
+func main() {
+	err := do()
+	if err != nil {
+		fmt.Println("有错误:", err) // 会打印，而且打印的是 nil 指针
+	}
+}
+```
+
+原因：接口是"类型 + 值"两元组。`e` 是 `(*MyErr)(nil)`，装进 `error` 后类型部分是 `*MyErr`，所以整个接口不为 nil。
+
+**解法**：函数返回具体指针时，用 nil 判断后再返回 nil：
+
+```go
+func do() error {
+	var e *MyErr
+	if e == nil {
+		return nil // 明确返回无类型的 nil
+	}
+	return e
+}
+```
+
+这条坑在实际项目里非常常见，尤其是"包装错误"的时候。
+
+---
+
+## 5. 嵌入：用组合替代继承
+
+```go
+type Base struct{ ID string }
+
+func (b Base) Describe() string { return "id=" + b.ID }
+
+type Task struct {
+	Base          // 嵌入：Task 自动获得 Describe 方法
+	Title string
+}
+
+func main() {
+	t := Task{Base: Base{ID: "t-1"}, Title: "写代码"}
+	fmt.Println(t.Describe()) // 像继承一样调用
+	fmt.Println(t.ID)         // 字段也被提升
+}
+```
+
+和继承的区别：**没有多态覆盖**。如果 `Task` 也定义了 `Describe`，那 `Base` 内部的调用仍然走 `Base` 的版本（不像虚函数）。
+
+嵌入接口也是同样的用法，用来"复用方法集"：
+
+```go
+type ReadWriteCloser interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}
+```
+
+---
+
+## 6. 类型断言与 type switch
+
+```go
+var v any = 42
+
+// 单值形式：不是这个类型会 panic
+n := v.(int)
+
+// 双值形式：安全，常用
+if n, ok := v.(int); ok {
+	fmt.Println("是 int", n)
+}
+
+// type switch：多种类型分支
+switch x := v.(type) {
+case int:
+	fmt.Println("int", x)
+case string:
+	fmt.Println("string", x)
+case error:
+	fmt.Println("error", x.Error())
+default:
+	fmt.Printf("其他 %T\n", x)
+}
+```
+
+`any`（即 `interface{}`）要尽量少用：它把类型检查推迟到运行时，一旦断言错就 panic。**能定义接口就别用 any**。
+
+---
+
+## 7. 常见坑速查
+
+| 坑 | 症状 | 做法 |
+|---|---|---|
+| typed nil 装进接口 | `err != nil` 恒为真 | 返回前显式判 nil |
+| 接口定义在实现方 | 实现方 import 使用方，循环依赖 | 接口放使用方包里 |
+| 大接口 | 测试要写一堆空方法 | 拆成小接口 |
+| 用 any 传参 | 运行时 panic 才知道类型不对 | 用具体类型或小接口 |
+| 指针接收者 vs 值接收者混用 | 方法集不一致，接口实现失败 | 同一类型的方法接收者保持一致 |
+| 嵌入 + 同名方法 | 调用的是哪一个？ | 避免同名；必要时显式调用 `t.Base.Describe()` |
+
+---
+
+## 小结
+
+- 接口隐式实现：方法签名对上就行，不需要声明。
+- 小接口（1–3 个方法）是 Go 的核心惯例，它让标准库能互相拼接。
+- 接口定义在使用方，实现方不需要知道接口存在。
+- 接口 nil 陷阱：类型 + 值两元组，typed nil 不等于 nil。
+- 组合（嵌入）替代继承，但没有虚函数覆盖。
+
+---
+
+## 练习
+
+1. 定义 `Speaker` 接口，让 `Dog`（值接收者）与 `Robot`（指针接收者）都实现它，验证两者都能放进同一个 slice。
+2. 复现接口 nil 陷阱：写一个返回 `*MyErr`（值为 nil）的函数，声明返回类型为 `error`，验证 `err != nil` 为真，然后修好它。
+3. 给一个 `UserGetter` 小接口写两个实现（真实 DB 版 + 内存 map 版），并用后者写测试。
+4. 用嵌入把 `Base` 的方法"继承"给 `Task`，再让 `Task` 定义同名方法，观察谁被调用。
+5. 写一个 `Describe(v any)`，用 type switch 支持 int/string/error/slice，其他类型打印 `%T`。

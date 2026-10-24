@@ -1,0 +1,298 @@
+---
+title: '11 · 测试与工程质量：table-driven、httptest、-race 与 CI'
+published: 2026-10-24T21:02:00+08:00
+description: 'Go 自带测试框架，但"能写测试"和"测试有用"是两件事。这篇讲 table-driven 的组织方式、httptest 怎么测 handler、用接口 + 手写 fake 代替 mock 库、临时目录与环境变量怎么隔离，以及 CI 里该跑哪些命令。'
+tags: [Go, 测试, httptest, 竞态检测, CI]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> Go 的测试哲学很朴素：**标准库给框架，你自己写断言**（`if got != want`）。
+> 没有 `expect`、没有 `describe`，但换来的是"测试代码就是普通代码"，读起来没有魔法。
+
+---
+
+## 1. 基础形态
+
+```go
+func Add(a, b int) int { return a + b }
+
+func TestAdd(t *testing.T) {
+	if got := Add(1, 2); got != 3 {
+		t.Errorf("Add(1,2) = %d, want 3", got) // Errorf 继续跑；Fatalf 立刻中止
+	}
+}
+```
+
+约定：测试文件与被测文件同包同目录，命名 `xxx_test.go`；`go test ./...` 跑全部。
+
+---
+
+## 2. table-driven：Go 里最标准的写法
+
+```go
+func TestParsePaging(t *testing.T) {
+	tests := []struct {
+		name      string
+		query     string
+		wantPage  int
+		wantLimit int
+	}{
+		{name: "默认值", query: "", wantPage: 1, wantLimit: 10},
+		{name: "正常翻页", query: "_page=3&_limit=5", wantPage: 3, wantLimit: 5},
+		{name: "非法页码回落", query: "_page=-1", wantPage: 1, wantLimit: 10},
+		{name: "超上限截断", query: "_limit=9999", wantPage: 1, wantLimit: 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/api/tasks?"+tt.query, nil)
+			page, limit := parsePaging(r)
+			if page != tt.wantPage || limit != tt.wantLimit {
+				t.Fatalf("got (%d,%d), want (%d,%d)", page, limit, tt.wantPage, tt.wantLimit)
+			}
+		})
+	}
+}
+```
+
+好处：**新增一个用例只加一行**，失败信息自带用例名（`t.Run` 的 name）。
+
+`t.Helper()` 让辅助函数的报错行号指向调用处：
+
+```go
+func assertEqual(t *testing.T, got, want any) {
+	t.Helper() // 没有这行，报错会指向 assertEqual 内部，很难定位
+	if got != want {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+```
+
+---
+
+## 3. httptest：测 handler 不用起端口
+
+```go
+func TestTaskList(t *testing.T) {
+	h := NewHandler(NewService(NewMemoryStore()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks?_page=1&_limit=2", nil)
+	rec := httptest.NewRecorder()
+	h.list(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Items   []Task `json:"items"`
+		Total   int    `json:"total"`
+		HasNext bool   `json:"hasNext"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(body.Items) != 2 {
+		t.Errorf("items = %d, want 2", len(body.Items))
+	}
+}
+```
+
+要测**中间件链 + 路由**一起（更接近真实），用 `httptest.NewServer`：
+
+```go
+func TestWithMiddleware(t *testing.T) {
+	srv := httptest.NewServer(withTestMiddleware(mux()))
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/api/tasks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", res.StatusCode)
+	}
+}
+```
+
+---
+
+## 4. 替身：用接口 + 手写 fake，而不是 mock 库
+
+```go
+// 被测代码依赖小接口（第 03 篇讲的）
+type Repo interface {
+	List(ctx context.Context, page, limit int) ([]Task, int, error)
+}
+
+// 测试里手写一个假实现，20 行就够
+type fakeRepo struct {
+	tasks []Task
+	err   error
+	calls int
+}
+
+func (f *fakeRepo) List(ctx context.Context, page, limit int) ([]Task, int, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, 0, f.err
+	}
+	return f.tasks, len(f.tasks), nil
+}
+```
+
+三个好处：没有代码生成、能断言"被调用几次"、行为完全可控（想让它返回什么错就返回什么错）。
+
+> 什么时候该上 `gomock`/`mockery`：接口很大、方法多、要精确断言参数。**小接口手写 fake 更快**。
+
+---
+
+## 5. 隔离：临时目录、环境变量、清理
+
+```go
+func TestMigrate(t *testing.T) {
+	dir := t.TempDir() // 测试结束自动删除
+	dsn := filepath.Join(dir, "test.db")
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() }) // 注册清理，比 defer 更适合跨函数
+
+	if err := migrate(t.Context(), db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+}
+
+func TestConfigFromEnv(t *testing.T) {
+	t.Setenv("APP_PORT", "9090") // 自动恢复原值
+	if got := loadConfig().Port; got != 9090 {
+		t.Errorf("port = %d, want 9090", got)
+	}
+}
+```
+
+⚠️ **永远不要用生产/开发库跑测试**。SQLite 用临时文件，Postgres/MySQL 用独立 schema 或 testcontainers。
+
+---
+
+## 6. 并发与竞态
+
+```go
+func TestStoreConcurrent(t *testing.T) {
+	s := NewStore()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			s.Set(fmt.Sprintf("k%d", n), "v")
+		}(i)
+	}
+	wg.Wait()
+	if got := s.Len(); got != 100 {
+		t.Errorf("len = %d, want 100", got)
+	}
+}
+```
+
+```bash
+go test -race ./...   # 必须跑：竞态只在并发下暴露
+```
+
+`t.Parallel()` 可以让子测试并行，加快慢测试套件；但共享状态的测试千万别加。
+
+---
+
+## 7. 覆盖率与常用参数
+
+```bash
+go test ./... -cover                       # 概览
+go test ./... -coverprofile=cover.out      # 生成明细
+go tool cover -html=cover.out              # 浏览器里看哪些行没覆盖
+go test ./internal/task -run TestList -v   # 只跑一个
+go test ./... -count=1                     # 禁用缓存（怀疑结果不对时用）
+```
+
+覆盖率目标：**核心业务逻辑 70%+ 就够**，别为了数字去测 getter/setter。比覆盖率更重要的是：**错误分支有没有测**（404/500/校验失败）。
+
+---
+
+## 8. CI：三条命令 + 一个 lint
+
+```yaml
+# .github/workflows/go.yml
+name: Go
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.22", "1.23"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - run: go vet ./...
+      - run: go test ./... -race -coverprofile=cover.out -count=1
+      - run: go build -trimpath -o bin/app ./cmd/api
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+```
+
+顺序讲究：**vet 最快先跑**（语法/可疑代码），再 test（含 -race），再 build，最后 lint（最慢）。
+
+---
+
+## 9. 测试的边界：测行为，不测实现
+
+| 该测 | 不该测 |
+|---|---|
+| 输入 → 输出的映射 | 私有函数内部调用了几次 |
+| 错误类型/状态码 | 具体日志文案 |
+| 并发下结果正确（-race） | 某个字段恰好是第几层嵌套 |
+| 边界（空、超长、负数、不存在） | 数据库驱动自己的行为 |
+
+一句话：**改内部实现时测试不该红**。如果重构就大面积红，说明测试绑在实现细节上了。
+
+---
+
+## 常见坑速查
+
+| 坑 | 症状 | 做法 |
+|---|---|---|
+| 只测 happy path | 上线后 4xx/5xx 分支全是 bug | 覆盖错误分支 |
+| 测试连开发库 | 数据被清空 | 临时库/schema |
+| 忘 `t.Cleanup` | 端口/文件泄漏，后续测试失败 | 注册清理 |
+| 用 `Fatalf` 在 goroutine 里 | 测试不会中止，还会 panic | goroutine 里用 `t.Errorf` 或 channel 回传 |
+| 测试有顺序依赖 | 单独跑能过、全跑挂 | 每个测试自己准备数据 |
+| 不跑 `-race` | 竞态到线上才爆 | CI 必跑 |
+| 断言写成"字符串包含" | 文案一改就红 | 断言结构与字段 |
+
+---
+
+## 小结
+
+- table-driven + `t.Run` 是 Go 的标准测试形态。
+- `httptest.NewRecorder` 测 handler，`NewServer` 测中间件 + 路由。
+- 小接口 + 手写 fake 比 mock 库更直接。
+- `t.TempDir` / `t.Setenv` / `t.Cleanup` 保证隔离。
+- CI 顺序：vet → test（-race）→ build → lint。
+
+---
+
+## 练习
+
+1. 给 `parsePaging` 写 table-driven 测试，至少 5 个用例（含负数、超上限、非数字）。
+2. 给 `GET /api/tasks/{id}` 写测试：存在的 id 返回 200，不存在返回 404 且 body 是统一错误结构。
+3. 用 fakeRepo 测 service：分别模拟"仓储返回错误"与"返回空列表"，断言错误被正确上抛/返回空态。
+4. 写一个并发测试（100 goroutine 写同一个 Store），用 `-race` 验证；再去掉锁，确认 `-race` 会报错。
+5. 生成覆盖率报告，找出 `internal/task` 里未覆盖的分支，补 2 个用例把错误分支覆盖上。

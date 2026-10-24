@@ -113,6 +113,14 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 				chips: ["OOP", "集合", "线程"],
 			},
 			{
+				title: "Go 从零到能写服务",
+				abbr: "Go",
+				desc: "标准库就能写出能上线的服务：值语义、并发模型、pprof 与部署，含毕业项目",
+				url: "/golang-roadmap/",
+				category: "Go学习路线",
+				chips: ["goroutine", "net/http", "标准库"],
+			},
+			{
 				title: "RuoYi 实战",
 				abbr: "RuoYi",
 				desc: "跑通经典后台管理系统：权限、字典、定时任务、代码生成",

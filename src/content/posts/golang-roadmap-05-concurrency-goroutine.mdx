@@ -1,0 +1,290 @@
+---
+title: '05 · 并发（上）：goroutine 与 channel，先学会不泄漏'
+published: 2026-10-24T20:50:00+08:00
+description: 'goroutine 几 KB 就能起一个，所以"随手 go 一下"很容易泄漏。这篇讲清 goroutine 的生命周期、channel 的缓冲语义与关闭规则、select 的超时与非阻塞写法，以及超时后 goroutine 为什么还在跑。'
+tags: [Go, 并发, goroutine, channel, select]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 并发在 Go 里便宜到危险：`go f()` 一写就多一个执行体，**没有任何人负责回收它**。
+> 所以这一篇的重点不是"怎么起 goroutine"，而是**"怎么保证它一定会结束"**。
+
+---
+
+## 1. goroutine 是什么
+
+```go
+go func() {
+	fmt.Println("我在另一个执行体里")
+}()
+```
+
+- 它不是操作系统线程，是运行时的**用户态协程**，初始栈只有几 KB（线程通常是 MB 级）。
+- 由 Go runtime 调度到多个线程上（M:N 模型），所以你起十万个也不夸张。
+- **主 goroutine（main）结束，整个进程就退出**，其它 goroutine 直接被掐死——不会等它们。
+
+```go
+func main() {
+	go fmt.Println("你可能看不到这句")
+	// 主函数返回 → 进程退出 → 上面那行可能没来得及执行
+}
+```
+
+---
+
+## 2. 怎么等它结束：WaitGroup 或 channel
+
+```go
+var wg sync.WaitGroup
+for i := 0; i < 3; i++ {
+	wg.Add(1) // ⚠️ 必须在启动 goroutine 之前 Add
+	go func(id int) {
+		defer wg.Done()
+		fmt.Println("worker", id)
+	}(i) // ⚠️ 把 i 作为参数传进去，别在闭包里直接引用
+}
+wg.Wait()
+```
+
+或者用 channel 收结果：
+
+```go
+done := make(chan string)
+go func() { done <- doWork() }()
+fmt.Println(<-done) // 阻塞直到有值
+```
+
+`WaitGroup` 的三个坑：`Add` 写在 goroutine 里（可能在 `Wait` 之后才加，导致提前返回）、`wg` 按值传递（副本计数不共享）、忘了 `Done`（`Wait` 永久阻塞）。
+
+---
+
+## 3. 泄漏：没结束的 goroutine 会一直占内存
+
+```go
+// 泄漏：没人读这个 channel，sending goroutine 永久阻塞
+func leak() {
+	ch := make(chan int)
+	go func() { ch <- 42 }() // 永远卡在这里
+}
+
+// 泄漏：循环里没有退出条件
+func leakLoop() {
+	for i := 0; ; i++ {
+		go func() {
+			time.Sleep(time.Hour)
+		}()
+	}
+}
+```
+
+**怎么发现**：
+
+```go
+// 测试里断言 goroutine 数量回到基线
+before := runtime.NumGoroutine()
+callMaybeLeaky()
+time.Sleep(50 * time.Millisecond)
+if after := runtime.NumGoroutine(); after > before {
+	t.Errorf("goroutine 泄漏: %d -> %d", before, after)
+}
+```
+
+线上用 `net/http/pprof` 的 `/debug/pprof/goroutine?debug=1` 直接看堆栈——**这是排查泄漏最快的手段**。
+
+---
+
+## 4. channel：无缓冲是"交接"，有缓冲是"信箱"
+
+```go
+unbuffered := make(chan int)      // 发送与接收必须同时就绪
+buffered := make(chan int, 3)     // 缓冲没满就能发，没空就能收
+```
+
+| 类型 | 发送行为 | 典型用途 |
+|---|---|---|
+| 无缓冲 | 阻塞到有人接收 | 交接（握手）、严格同步 |
+| 有缓冲 | 满了才阻塞 | 解耦生产者/消费者、削峰 |
+
+方向类型让意图更清晰：
+
+```go
+func produce(out chan<- int) { out <- 1 }   // 只能发
+func consume(in <-chan int) int { return <-in } // 只能收
+```
+
+---
+
+## 5. 关闭规则：只由发送方关，且只关一次
+
+```go
+ch := make(chan int, 3)
+go func() {
+	defer close(ch) // ✅ 发送方负责关
+	for i := 0; i < 3; i++ {
+		ch <- i
+	}
+}()
+
+for v := range ch { // ✅ 关闭后自动结束循环
+	fmt.Println(v)
+}
+```
+
+四条铁律：
+
+1. **只由发送方关闭**（接收方不知道还有没有人要发）；
+2. **不要重复关闭**（panic: close of closed channel）；
+3. **关闭后不能再发**（panic: send on closed channel）；
+4. 关闭后接收**不会 panic**，会立刻拿到零值与 `ok=false`：
+
+```go
+v, ok := <-ch
+if !ok {
+	// 已关闭且无缓冲数据
+}
+```
+
+**广播**（关闭即广播）是常用技巧：
+
+```go
+quit := make(chan struct{})
+for i := 0; i < 3; i++ {
+	go func() {
+		<-quit // 一旦 close，所有等待者同时被唤醒
+		fmt.Println("收到退出信号")
+	}()
+}
+close(quit) // 一次性通知所有人
+```
+
+---
+
+## 6. select：多路等待 + 超时 + 非阻塞
+
+```go
+select {
+case v := <-ch:
+	fmt.Println("收到", v)
+case <-time.After(2 * time.Second):
+	fmt.Println("超时")
+case <-ctx.Done():
+	fmt.Println("被取消:", ctx.Err())
+}
+```
+
+`default` 让操作变成非阻塞：
+
+```go
+select {
+case v := <-ch:
+	// 有数据
+default:
+	// 没数据，立刻走这里（常用于"尽力而为"的度量上报）
+}
+```
+
+⚠️ **`time.After` 在循环里会累积定时器**：
+
+```go
+// 差：每轮都新建一个 Timer，循环很久会攒一堆
+for {
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+	}
+}
+
+// 好：复用一个 Timer
+ticker := time.NewTicker(time.Second)
+defer ticker.Stop()
+for {
+	select {
+	case <-ch:
+	case <-ticker.C:
+	}
+}
+```
+
+---
+
+## 7. Worker Pool：最常用的并发骨架
+
+```go
+func Process(ctx context.Context, items []Item, workers int) []Result {
+	jobs := make(chan Item)
+	results := make(chan Result, len(items))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range jobs {
+				select {
+				case <-ctx.Done():
+					return // ctx 取消时立刻退出，不再处理新任务
+				default:
+				}
+				results <- handle(item)
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs) // 生产者关 channel（发送方关）
+		for _, it := range items {
+			select {
+			case jobs <- it:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(results)
+	out := make([]Result, 0, len(items))
+	for r := range results {
+		out = append(out, r)
+	}
+	return out
+}
+```
+
+要点：`jobs` 由生产者关闭；worker 用 `range jobs` 自动退出；**每个阻塞点都带 `ctx.Done()`**，否则取消后 worker 还在等。
+
+---
+
+## 8. 常见坑速查
+
+| 坑 | 症状 | 做法 |
+|---|---|---|
+| 主函数不等 goroutine | 输出时有时无 | WaitGroup / 收 channel |
+| goroutine 无退出路径 | 内存涨、NumGoroutine 只增不减 | 每个 goroutine 都要有明确结束条件 |
+| 忘记 `wg.Add` 在启动前 | `Wait` 提前返回 | Add 在 `go` 之前 |
+| 接收方关 channel | 发送方 panic | 只由发送方关 |
+| 循环里 `time.After` | 定时器堆积 | 复用 `Ticker` 或 `Timer` |
+| 闭包直接引用循环变量 | 所有 goroutine 用同一个值 | 传参（Go 1.22 起已修，但显式传更清楚） |
+| 用无缓冲 channel 当队列 | 生产者被消费速度拖住 | 加缓冲或加中间层 |
+
+---
+
+## 小结
+
+- goroutine 很轻，但没人替你回收；**每一个都要有结束条件**。
+- 无缓冲 = 交接，有缓冲 = 信箱；方向类型写清楚意图。
+- 关闭只由发送方做；关闭是"广播"。
+- `select` 处理多路与超时；循环里别用 `time.After`。
+- Worker Pool 是所有并发处理的母版：生产者关 jobs、worker range、处处响应 ctx。
+
+---
+
+## 练习
+
+1. 用 `WaitGroup` 并发抓 5 个 URL（可用 `http.Get`），汇总每个的状态码；再故意把 `wg.Add(1)` 写进 goroutine 里，观察行为异常。
+2. 制造一个 goroutine 泄漏（发送方写无缓冲 channel 且无人收），用 `runtime.NumGoroutine()` 断言它真的泄漏了，然后修好。
+3. 用 `select` + `time.After` 给一个慢操作加 2 秒超时；再把它改到循环里，用 pprof 或 `runtime.NumGoroutine` 观察差异。
+4. 实现 `Process(ctx, items, workers)`，要求取消时 100ms 内全部 worker 退出（用一个计数器验证）。
+5. 用 close 实现广播：3 个 goroutine 等同一个 `quit`，`close(quit)` 后全部打印退出。

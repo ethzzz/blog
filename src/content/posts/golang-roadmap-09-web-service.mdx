@@ -1,0 +1,410 @@
+---
+title: '09 · 写一个 Web 服务：路由、中间件、统一错误、优雅关闭'
+published: 2026-10-24T20:58:00+08:00
+description: '把前八篇拼成一个能上线的 HTTP 服务：用标准库 ServeMux 做路由、中间件链处理日志与恢复、统一错误体映射状态码、请求体大小与超时限制、然后优雅关闭。全程不引框架，但结构上留好了换框架的缝。'
+tags: [Go, Web服务, 中间件, 优雅关闭, 路由]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一篇不教你"怎么用框架"，而是把**一个服务的骨架**搭出来：
+> 请求进来 → 中间件（requestID / 日志 / 恢复）→ 路由 → handler → 统一错误体 → 响应。
+> 换成 Gin/Echo/chi，改的只是路由与中间件签名，**分层与错误策略完全不变**。
+
+---
+
+## 1. 目录结构
+
+```
+task-api/
+├── cmd/api/main.go           # 只做装配：读配置、建依赖、起服务、等信号
+├── internal/
+│   ├── config/config.go      # 环境变量 + flag
+│   ├── httpx/                # HTTP 通用件：JSON、错误映射、中间件
+│   │   ├── respond.go
+│   │   ├── middleware.go
+│   │   └── apperror.go
+│   └── task/                 # 业务：model / service / http handler
+│       ├── model.go
+│       ├── service.go
+│       └── handler.go
+└── go.mod
+```
+
+`cmd/api/main.go` 里**不写业务**——它只负责"把东西接起来"，这样业务逻辑才能在测试里单独跑。
+
+---
+
+## 2. 统一响应与统一错误
+
+```go
+// internal/httpx/respond.go
+package httpx
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+)
+
+type ErrorBody struct {
+	StatusCode int               `json:"statusCode"`
+	Message    string            `json:"message"`
+	Errors     map[string]string `json:"errors,omitempty"`
+	RequestID  string            `json:"requestId,omitempty"`
+}
+
+func JSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if v == nil {
+		return
+	}
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Error("write response failed", "err", err)
+	}
+}
+```
+
+```go
+// internal/httpx/apperror.go
+package httpx
+
+import (
+	"errors"
+	"net/http"
+)
+
+type AppError struct {
+	Status  int
+	Message string
+	Fields  map[string]string
+	Err     error
+}
+
+func (e *AppError) Error() string { return e.Message }
+func (e *AppError) Unwrap() error { return e.Err }
+
+func BadRequest(msg string, fields map[string]string) error {
+	return &AppError{Status: http.StatusUnprocessableEntity, Message: msg, Fields: fields}
+}
+
+func NotFound(msg string) error {
+	return &AppError{Status: http.StatusNotFound, Message: msg}
+}
+
+// 把任意 error 翻译成响应：业务错误用它的状态码，其余一律 500 且不泄露细节
+func WriteError(w http.ResponseWriter, r *http.Request, err error) {
+	var appErr *AppError
+	if errors.As(err, &appErr) {
+		JSON(w, appErr.Status, ErrorBody{
+			StatusCode: appErr.Status,
+			Message:    appErr.Message,
+			Errors:     appErr.Fields,
+			RequestID:  RequestIDFrom(r.Context()),
+		})
+		return
+	}
+	slog.Error("unhandled error", "err", err, "requestID", RequestIDFrom(r.Context()))
+	JSON(w, http.StatusInternalServerError, ErrorBody{
+		StatusCode: http.StatusInternalServerError,
+		Message:    "服务端出错了",
+		RequestID:  RequestIDFrom(r.Context()),
+	})
+}
+```
+
+**关键点**：handler 里**只返回 error**，状态码映射集中在 `WriteError` 一处。这样"哪些错误对应 4xx、哪些该 500"就只有一份定义。
+
+---
+
+## 3. 中间件：requestID、日志、恢复
+
+```go
+// internal/httpx/middleware.go
+package httpx
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+	"net/http"
+	"runtime/debug"
+	"time"
+)
+
+type ctxKey string
+
+const requestIDKey ctxKey = "requestID"
+
+func RequestIDFrom(ctx context.Context) string {
+	v, _ := ctx.Value(requestIDKey).(string)
+	return v
+}
+
+func WithRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-Id")
+		if id == "" {
+			b := make([]byte, 8)
+			_, _ = rand.Read(b)
+			id = hex.EncodeToString(b)
+		}
+		ctx := context.WithValue(r.Context(), requestIDKey, id)
+		w.Header().Set("X-Request-Id", id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// 包一层 ResponseWriter，才能拿到真实状态码
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func WithLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		slog.Info("http",
+			"requestID", RequestIDFrom(r.Context()),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sw.status,
+			"cost", time.Since(start).String(),
+		)
+	})
+}
+
+func WithRecover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("panic",
+					"requestID", RequestIDFrom(r.Context()),
+					"panic", rec,
+					"stack", string(debug.Stack()),
+				)
+				JSON(w, http.StatusInternalServerError, ErrorBody{
+					StatusCode: http.StatusInternalServerError,
+					Message:    "服务端出错了",
+					RequestID:  RequestIDFrom(r.Context()),
+				})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+组合顺序（外层先执行）：
+
+```go
+h := router
+h = WithRecover(h)   // 最外层：接住所有 panic
+h = WithRequestID(h) // 先有 ID
+h = WithLogging(h)   // 再记日志（要 ID 与状态码）
+```
+
+---
+
+## 4. Handler：只做协议转换
+
+```go
+// internal/task/handler.go
+package task
+
+import (
+	"errors"
+	"net/http"
+
+	"example.com/task-api/internal/httpx"
+)
+
+type Handler struct {
+	svc *Service
+}
+
+func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+
+func (h *Handler) Routes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/tasks", h.list)
+	mux.HandleFunc("POST /api/tasks", h.create)
+	mux.HandleFunc("GET /api/tasks/{id}", h.get)
+	mux.HandleFunc("DELETE /api/tasks/{id}", h.remove)
+}
+
+func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
+	page, limit := parsePaging(r)
+	items, total, err := h.svc.List(r.Context(), page, limit, r.URL.Query().Get("status"))
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"items":   items,
+		"total":   total,
+		"hasNext": page*limit < total,
+	})
+}
+
+func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	t, err := h.svc.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			httpx.WriteError(w, r, httpx.NotFound("任务不存在"))
+			return
+		}
+		httpx.WriteError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, t)
+}
+```
+
+`parsePaging` 顺手做边界保护：
+
+```go
+func parsePaging(r *http.Request) (page, limit int) {
+	page = 1
+	limit = 10
+	if v := r.URL.Query().Get("_page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if v := r.URL.Query().Get("_limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+	return page, limit
+}
+```
+
+---
+
+## 5. main：装配 + 优雅关闭
+
+```go
+// cmd/api/main.go
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"example.com/task-api/internal/httpx"
+	"example.com/task-api/internal/task"
+)
+
+func main() {
+	// ① 信号驱动的根 ctx：Ctrl+C 或 kill 时取消
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// ② 依赖装配
+	svc := task.NewService(task.NewMemoryStore())
+	h := task.NewHandler(svc)
+
+	mux := http.NewServeMux()
+	h.Routes(mux)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	var handler http.Handler = mux
+	handler = httpx.WithLogging(handler)
+	handler = httpx.WithRequestID(handler)
+	handler = httpx.WithRecover(handler)
+
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,  // 防慢连接攻击
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// ③ 后台起服务，主 goroutine 等信号
+	go func() {
+		slog.Info("listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server failed", "err", err)
+			stop() // 让主流程退出
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("shutting down")
+
+	// ④ 给在途请求 10 秒收尾
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("graceful shutdown failed", "err", err)
+	}
+	slog.Info("bye")
+}
+```
+
+### Server 的四个超时为什么都要设
+
+| 字段 | 不设的后果 |
+|---|---|
+| `ReadHeaderTimeout` | 慢连接一直占着，资源被耗尽（Slowloris） |
+| `ReadTimeout` | 请求体慢慢传，worker 一直等 |
+| `WriteTimeout` | 客户端不读响应，服务端挂着 |
+| `IdleTimeout` | keep-alive 连接长期不释放 |
+
+⚠️ `Shutdown` 会**停止接受新连接**并等待在途请求完成；等待超过 ctx 超时就强制返回。这就是"优雅关闭"的全部含义。
+
+---
+
+## 6. 常见坑速查
+
+| 坑 | 症状 | 做法 |
+|---|---|---|
+| handler 里直接返回 HTML 错误 | 前端解析失败 | 统一 JSON 错误体 |
+| 每个 handler 自己映射状态码 | 规则不一致 | 集中 `WriteError` |
+| 中间件顺序搞反 | recover 抓不到日志里的 ID | 由外到内：recover → requestID → logging |
+| 忘了 `ReadHeaderTimeout` | 被慢连接拖死 | 四个超时都设 |
+| `Shutdown` 用 Background ctx | 进程可能挂住不退 | 带 10s 超时的 ctx |
+| 业务错误返回 500 | 前端无法区分"参数错"与"服务挂" | 4xx/5xx 分清 |
+| 健康检查里查一堆依赖 | 依赖抖动导致误杀 | `healthz` 只报自身存活，另设 `readyz` |
+
+---
+
+## 小结
+
+- `main` 只做装配；业务在 `internal/`，HTTP 细节在 `httpx/`。
+- 错误映射集中一处：handler 返回 error，`WriteError` 决定状态码。
+- 中间件由外到内：recover → requestID → logging。
+- 四个超时必须设；优雅关闭 = `signal.NotifyContext` + `Shutdown(timeout)`。
+- 不用框架也能写出结构清晰的服务；换框架只改路由与中间件签名。
+
+---
+
+## 练习
+
+1. 把上面的骨架跑起来，用 `curl -i` 看响应头里的 `X-Request-Id`，再用同一个 ID 在日志里搜到这次请求。
+2. 在 handler 里故意 `panic("boom")`，验证：日志有堆栈、客户端收到 500 JSON（而不是连接被重置）。
+3. 给 `/slow` 加一个 3 秒 sleep 的 handler，然后发请求的同时按 Ctrl+C，观察日志里"shutting down"与请求是否被等完。
+4. 去掉 `ReadHeaderTimeout`，用 `nc` 手动发一个不完备的请求头，观察连接占用情况（再恢复配置）。
+5. 加一个 `GET /api/tasks/{id}` 的 404 分支，确认返回体是统一的 JSON 错误结构。

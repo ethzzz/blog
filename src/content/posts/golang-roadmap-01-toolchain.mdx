@@ -1,0 +1,209 @@
+---
+title: '01 · 环境与工具链：从 go mod 开始就走在队形里'
+published: 2026-10-24T20:42:00+08:00
+description: 'Go 的工具链是"官方给全套"：go mod 管依赖、gofmt 定格式、go vet 抓可疑代码、go test 自带框架。这篇把项目和项目之间的差异抹平——目录怎么分、Makefile 怎么写、什么该进 git。'
+tags: [Go, 工具链, go mod, 工程化]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> Go 最省心的地方是：**格式、依赖、测试、编译，官方全给了**。
+> 所以团队里几乎没有"用 prettier 还是 eslint --fix""用 yarn 还是 pnpm"这类无休止的争论。
+> 这一篇要做的就是把这个"队形"用起来。
+
+---
+
+## 心智地图
+
+```text
+一个 Go 项目的骨架
+├── go.mod / go.sum        依赖与模块身份
+├── main.go                入口（package main + func main）
+├── internal/              只能被本模块引用的代码（编译器强制）
+├── pkg/                   可以被外部引用的代码（可选，别滥用）
+├── cmd/<bin>/main.go      多个可执行文件时的入口
+├── api/                   接口定义（proto/openapi）
+├── migrations/            数据库迁移
+└── Makefile               把常用命令固定下来
+```
+
+---
+
+## 1. 先建一个模块
+
+```bash
+mkdir hello && cd hello
+go mod init example.com/hello   # 模块名，通常用代码仓库路径
+```
+
+`go.mod` 长这样：
+
+```
+module example.com/hello
+
+go 1.23
+```
+
+**模块名不是随便起**：它决定 import 路径。如果你会发布，用真实仓库地址（`github.com/you/repo`）；只是本地练手，用 `example.com/xxx` 就行。
+
+依赖不需要手写，直接 import 然后：
+
+```bash
+go mod tidy    # 补齐缺失、删掉没用的，并更新 go.sum
+```
+
+> `go.sum` 是依赖内容的校验和，**必须进 git**。它不是锁文件的替代品——Go 的 `go.mod` 本身就钉了版本。
+
+---
+
+## 2. 目录结构：internal 是你的朋友
+
+```
+hello/
+├── go.mod
+├── cmd/
+│   └── hello/
+│       └── main.go
+└── internal/
+    ├── greet/
+    │   └── greet.go
+    └── store/
+        └── store.go
+```
+
+`internal/` 下的包**只能被同一模块内的代码引用**，外部模块 import 会编译失败。这就是 Go 版的"私有包"，编译器帮你守边界，不需要约定。
+
+```go
+// internal/greet/greet.go
+package greet
+
+import "fmt"
+
+// Greet 返回问候语。首字母大写的标识符才是导出的。
+func Greet(name string) string {
+	if name == "" {
+		name = "世界"
+	}
+	return fmt.Sprintf("你好，%s", name)
+}
+```
+
+```go
+// cmd/hello/main.go
+package main
+
+import (
+	"flag"
+	"fmt"
+
+	"example.com/hello/internal/greet"
+)
+
+func main() {
+	name := flag.String("name", "", "要问候的人")
+	flag.Parse()
+	fmt.Println(greet.Greet(*name))
+}
+```
+
+```bash
+go run ./cmd/hello -name=皓
+go build -o bin/hello ./cmd/hello
+```
+
+---
+
+## 3. 格式与静态检查：不要讨论风格
+
+```bash
+gofmt -l .          # 列出格式不对的文件
+gofmt -w .          # 直接改（多数编辑器保存时自动跑）
+go vet ./...        # 官方"可疑代码"检查：格式化串参数不对、锁被复制等
+```
+
+`go vet` 抓的是**编译能过但几乎肯定是 bug** 的写法，比如：
+
+```go
+// vet 会报：fmt.Sprintf format %d has arg s of wrong type string
+fmt.Printf("%d\n", "abc")
+
+// vet 会报：copylocks
+var mu sync.Mutex
+mu2 := mu
+```
+
+生产项目再加一个 `golangci-lint`（聚合了几十种 linter）：
+
+```bash
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+golangci-lint run ./...
+```
+
+`golangci-lint` 里建议至少开：`errcheck`（漏检查 error）、`govet`、`staticcheck`、`ineffassign`、`unused`。
+
+---
+
+## 4. Makefile：把命令固定下来
+
+```makefile
+.PHONY: run build test lint fmt vet
+
+run:
+	go run ./cmd/hello
+
+build:
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/hello ./cmd/hello
+
+test:
+	go test ./... -race -cover
+
+lint:
+	golangci-lint run ./...
+
+vet:
+	go vet ./...
+
+fmt:
+	gofmt -w .
+```
+
+三个编译参数值得记住：
+
+| 参数 | 作用 |
+|---|---|
+| `CGO_ENABLED=0` | 纯静态二进制，扔到任何 Linux 都能跑 |
+| `-trimpath` | 去掉构建机的绝对路径（可复现 + 不泄露目录） |
+| `-ldflags="-s -w"` | 去掉符号表与调试信息，体积通常减 25% 左右 |
+
+---
+
+## 5. 常见坑
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| 忘了 `go mod tidy` | CI 上 `missing go.sum entry` | 提交前跑一次，`go.sum` 一起提交 |
+| 用相对 import | `local import "./foo" in non-local package` | 一律用模块路径 `example.com/hello/internal/foo` |
+| 包名与目录名不一致 | 读代码时找不到 | 约定：目录名 = 包名（`internal/store` → `package store`） |
+| 导出的东西没注释 | lint 报 `exported ... should have comment` | 导出标识符写一句以名字开头的注释 |
+| 把 `bin/`、`.idea/` 提交了 | 仓库越来越脏 | `.gitignore` 加 `bin/`、`*.test`、`.DS_Store` |
+| 在 `main` 里写业务 | 无法测试 | 逻辑放 `internal/`，`main` 只负责装配 |
+
+---
+
+## 小结
+
+- `go mod init` 定身份，`go mod tidy` 管依赖，`go.sum` 入库。
+- `internal/` 用编译器强制边界，比"约定"可靠。
+- `gofmt` + `go vet` + `golangci-lint` 是硬门禁，别靠 review 抓格式。
+- Makefile 把"怎么跑、怎么测、怎么构建"写死，新人不问人也能干活。
+
+---
+
+## 练习
+
+1. 建一个模块 `example.com/demo`，分 `cmd/demo` 与 `internal/mathx`，实现一个 `Add(a, b int) int` 并 `go run` 出来。
+2. 故意在 `internal/` 里写一个函数、在**另一个模块**里 import 它，确认编译报错（体会 internal 的边界）。
+3. 写一个含 `fmt.Printf("%d", "x")` 与复制 `sync.Mutex` 的文件，跑 `go vet ./...` 看两条报告。
+4. 用 `-ldflags="-s -w"` 与不带参数各构建一次，比较二进制大小（`ls -lh`）。
+5. 给项目加 Makefile 与 `.gitignore`，确认 `make build` 后 `git status` 是干净的。
