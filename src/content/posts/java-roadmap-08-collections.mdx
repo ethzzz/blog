@@ -584,6 +584,15 @@ public class LibraryService {
 - `Optional` 表示可能不存在的结果
 - `Stream` 做过滤、映射、聚合（阶段十详细讲）
 
+## 练习
+
+1. 用 `merge(key, 1, Integer::sum)` 统计词频，再按次数降序、单词字典序输出；分别用 `HashMap` 和 `TreeMap` 各写一版。
+2. 在 `ArrayList` 和 `LinkedList` 的头部各插入 10 万个元素并计时，解释结果与直觉可能不一致的原因。
+3. 把一个没有重写 `equals/hashCode` 的自定义对象放进 `HashSet`，再放入两个「内容相同」的实例，观察 `size()`。
+4. 复现 `ConcurrentModificationException`：遍历 `ArrayList` 时直接 `remove`；再用 `Iterator.remove`、`removeIf`、先收集后删除三种方式修复。
+5. 用可变对象（如 `List<String>`）作为 `HashMap` 的 key，放入后修改它，再尝试 `get`，解释为什么查不到。
+6. 对比 `List.of("a", null)` 与 `Collections.unmodifiableList` 对 null 和修改操作的行为差异。
+
 ## 复习卡片
 
 ```java

@@ -523,6 +523,14 @@ public class PaymentDemo {
 
 这个设计的扩展性：**新增一种支付方式**（微信、银联）只需要写一个新类实现 `PaymentMethod`，业务代码不用改。这就是"面向接口编程"的威力。
 
+## 练习
+
+1. 定义 `PayChannel` 接口（`pay` 抽象方法 + `fee()` 默认方法），实现 `Alipay`、`WechatPay`，用接口数组遍历调用，验证默认方法可被覆写。
+2. 用抽象类和接口分别实现同一个「支付渠道」需求，写出两种版本的差异，并说明你选哪个、为什么。
+3. 用 Lambda 实现 `Comparator<Book>`：先按价格降序，价格相同按书名升序。
+4. 定义 `sealed interface Shape permits Circle, Rectangle`，再用 `switch` 模式匹配写面积计算，确认漏掉分支时编译器的提示。
+5. 写一个成员内部类和一个静态内部类，分别访问外部类的实例字段和静态字段，说明为什么优先选静态内部类。
+
 ## 复习卡片
 
 ```java

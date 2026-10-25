@@ -1,0 +1,612 @@
+---
+title: '15 · 毕业项目：写一个类型安全的 API SDK（契约、校验、类型推导与发布）'
+published: 2026-10-25T10:00:00+08:00
+description: '前 14 篇是零件，这篇把它们装成一台能交付的机器：从一份任务 API 契约出发，用 Zod 做运行时校验、用泛型与条件类型从契约推导出调用方类型、用声明文件与 package exports 发布 SDK，最后在消费端验证「改错字段编译期必报错、传错数据运行期必拦住」。'
+tags: [TypeScript, 项目实战, Zod, 类型体操, SDK, 验收清单]
+category: TypeScript学习路线
+draft: false
+---
+
+> [!NOTE]
+> **为什么 TS 的毕业项目是"写 SDK"而不是"写页面"**：
+> 页面练的是组件组织，SDK 练的是**契约设计**——同一份定义要同时约束编译期和运行期，
+> 还要让调用方在不知道实现细节的情况下获得准确的参数提示和错误分支。
+>
+> **这个项目全程可验证**：每个阶段都有能跑的断言，最后用 `npm pack` 装进一个消费端项目，
+> 故意改错字段，看编译器是否真的拦你。
+
+---
+
+## 1. 做到什么算过
+
+项目结束时，你要能拿出一个 `task-sdk` 包，并逐条演示：
+
+- [ ] 调用 `client.get("/tasks/:id", { params: { id: 1 } })` 时，`id` 只能是 `number`；传 `"1"` 编译失败。
+- [ ] 响应的类型由路由契约自动推导，不需要手写 `as Task`。
+- [ ] 后端返回缺字段 / 多字段 / 类型错误的数据时，SDK 在**运行期**抛出可读错误，而不是把脏数据交给业务。
+- [ ] 非 2xx 响应被收敛成可辨识联合，`switch` 处理错误分支时漏掉一种，编译器报 `never` 错误。
+- [ ] `npm pack` 后装进一个独立的 consumer 项目，`import` 有完整类型提示，`tsc --noEmit` 通过。
+- [ ] 修改契约字段（如 `title` → `name`）后，consumer 未同步修改的地方**全部编译失败**。
+- [ ] `strict: true` 全程开启，代码里没有 `any` 和裸 `as`（`unknown` + 守卫除外）。
+
+这份清单就是验收标准。做不到就回去补，不要用 `as any` 蒙混过去——那等于把这个项目唯一的价值扔掉。
+
+---
+
+## 2. 技术选型（以及为什么只选这些）
+
+| 选择 | 理由 | 不选什么 |
+| --- | --- | --- |
+| TypeScript 5.x，`strict: true` | 本项目就是练类型系统，关掉 strict 等于没做 | `noImplicitAny: false` |
+| Zod | 一份 schema 同时产出运行时校验和 `z.infer` 类型，避免类型与校验两套定义漂移 | 手写两个版本（一定漂移） |
+| Vitest | 跑得快，`expectTypeOf` 能做编译期断言 | Jest + ts-jest（配置更重） |
+| tsup 或 `tsc` | 前者打包省事，后者只用标准能力；两版都给 | 复杂 bundler 配置 |
+| `npm pack` + 本地安装 | 真实验证 `exports` / `types` 字段，而不是只在自己仓库里自嗨 | 只在 monorepo 内相对引用 |
+
+**不引入**：OpenAPI 代码生成器、请求库（fetch 就够）、状态管理。这个项目要看清每一层，不要被生成代码遮住。
+
+---
+
+## 3. 契约先行
+
+先定接口，再写实现。这份契约和 React / Node / Go 三条路线的毕业项目保持同一形状，方便你横向对照：
+
+```ts
+// 任务资源
+type Task = {
+  id: number;
+  title: string;
+  status: "todo" | "doing" | "done";
+  createdAt: string; // ISO 8601
+};
+
+// 路由表：key 是「方法 + 路径」，value 描述入参与响应
+type Routes = {
+  "GET /tasks": {
+    query?: { status?: Task["status"] };
+    response: Task[];
+  };
+  "GET /tasks/:id": {
+    params: { id: number };
+    response: Task;
+  };
+  "POST /tasks": {
+    body: { title: string; status?: Task["status"] };
+    response: Task;
+  };
+  "PATCH /tasks/:id": {
+    params: { id: number };
+    body: { title?: string; status?: Task["status"] };
+    response: Task;
+  };
+  "DELETE /tasks/:id": {
+    params: { id: number };
+    response: { ok: true };
+  };
+};
+```
+
+这份 `Routes` 是整个 SDK 的**唯一真相源**：调用签名、参数校验、响应类型、错误分支都从它派生。后面任何一处手写重复，都是缺陷。
+
+约定两条边界：
+
+- 路径参数一律用 `:name` 表示，由 SDK 负责替换与编码。
+- 响应只描述成功体；非 2xx 统一收敛为 `ApiError`，不混进 `response`。
+
+---
+
+## 4. 阶段 0：把骨架跑起来
+
+```bash
+mkdir task-sdk && cd task-sdk
+npm init -y
+npm i zod
+npm i -D typescript vitest @types/node
+npx tsc --init
+```
+
+`tsconfig.json` 只留必要项，但 strict 族一个都不能少：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist",
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+目录按职责切，不要让一个文件同时做校验、推导和请求：
+
+```
+src/
+├── contract.ts     # Routes 类型 + Zod schema
+├── errors.ts       # ApiError 可辨识联合
+├── request.ts      # 泛型请求函数（唯一发请求的地方）
+├── client.ts       # 对外的 createClient()
+└── index.ts        # 公共出口
+tests/
+├── contract.test.ts
+├── request.test.ts
+└── types.test-d.ts  # 只做类型断言，不产出运行时用例
+```
+
+✅ **阶段 0 验收**：`npx tsc --noEmit` 通过；`npx vitest run` 能跑（哪怕只有一个空用例）。
+
+---
+
+## 5. 阶段 1：运行时校验（Zod 做边界）
+
+类型只在编译期存在。后端返回的 JSON 是 `unknown`，在进入业务之前必须过一道运行时检查。
+
+```ts
+// src/contract.ts
+import { z } from "zod";
+
+export const TaskStatusSchema = z.enum(["todo", "doing", "done"]);
+
+export const TaskSchema = z.object({
+  id: z.number().int().positive(),
+  title: z.string().min(1).max(80),
+  status: TaskStatusSchema,
+  createdAt: z.string().datetime(),
+});
+
+export type Task = z.infer<typeof TaskSchema>;
+
+export const TaskListSchema = z.array(TaskSchema);
+```
+
+关键点：**类型从 schema 推导，不要反过来手写一份再让 schema 去对齐**。两份定义迟早漂移，而漂移发生在运行时边界上，最难发现。
+
+### 5.1 把校验失败变成可读错误
+
+直接抛 Zod 的原始错误，业务侧拿到的是一坨 issue 数组。包一层，保留字段路径：
+
+```ts
+// src/errors.ts
+export type ApiError =
+  | { kind: "http"; status: number; message: string }
+  | { kind: "network"; message: string }
+  | { kind: "parse"; path: string; message: string };
+
+export function toParseError(error: unknown): ApiError {
+  if (error instanceof z.ZodError) {
+    const first = error.issues[0];
+    return {
+      kind: "parse",
+      path: first?.path.join(".") ?? "(root)",
+      message: first?.message ?? "响应格式不合法",
+    };
+  }
+  return { kind: "parse", path: "(root)", message: String(error) };
+}
+```
+
+### 5.2 测试要覆盖"脏数据"
+
+```ts
+// tests/contract.test.ts
+import { describe, expect, it } from "vitest";
+import { TaskSchema } from "../src/contract";
+
+describe("TaskSchema", () => {
+  it("接受合法数据", () => {
+    expect(() =>
+      TaskSchema.parse({
+        id: 1,
+        title: "写文档",
+        status: "todo",
+        createdAt: "2026-10-25T02:00:00.000Z",
+      }),
+    ).not.toThrow();
+  });
+
+  it("拒绝缺失字段并指出路径", () => {
+    const result = TaskSchema.safeParse({ id: 1, status: "todo" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.path.join("."))).toContain("title");
+    }
+  });
+
+  it("拒绝非法枚举值", () => {
+    expect(
+      TaskSchema.safeParse({
+        id: 1,
+        title: "x",
+        status: "archived",
+        createdAt: "2026-10-25T02:00:00.000Z",
+      }).success,
+    ).toBe(false);
+  });
+});
+```
+
+✅ **阶段 1 验收**：三种脏数据（缺字段 / 类型错 / 枚举越界）都能被拦住，且错误里带字段路径。
+
+---
+
+## 6. 阶段 2：让类型自己推导
+
+这一阶段是本项目的核心，把前面 06-09 篇的泛型、条件类型、模板字面量、类型守卫全部用上。
+
+### 6.1 从路由 key 拆出方法与路径
+
+```ts
+type RouteKey = keyof Routes;
+
+type MethodOf<K extends RouteKey> =
+  K extends `${infer M} ${string}` ? M : never;
+
+type PathOf<K extends RouteKey> =
+  K extends `${string} ${infer P}` ? P : never;
+```
+
+### 6.2 递归提取路径参数
+
+```ts
+type ExtractParams<P extends string> =
+  P extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param]: string } & ExtractParams<`/${Rest}`>
+    : P extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+// 自测：这两个类型分别是什么？
+type A = ExtractParams<"/tasks/:id">;
+// { id: string }
+type B = ExtractParams<"/orgs/:orgId/tasks/:id">;
+// { orgId: string } & { id: string }
+```
+
+`ExtractParams` 只负责"有哪些参数"，参数类型（`id: number`）仍以 `Routes` 里的 `params` 为准。两者在调用签名处合并。
+
+### 6.3 推导调用入参
+
+规则很简单：有 `body` 就必须传 body，有 `params` 就必须传 params，只有 `query` 时可省略。
+
+```ts
+type RouteInput<K extends RouteKey> =
+  Routes[K] extends { body: infer B }
+    ? { body: B } & (Routes[K] extends { params: infer P } ? { params: P } : {})
+    : Routes[K] extends { params: infer P }
+      ? { params: P }
+      : Routes[K] extends { query?: infer Q }
+        ? { query?: Q }
+        : Record<string, never>;
+
+type RouteResponse<K extends RouteKey> =
+  Routes[K] extends { response: infer R } ? R : never;
+```
+
+### 6.4 唯一的请求出口
+
+```ts
+// src/request.ts
+import { z } from "zod";
+import type { Routes } from "./contract";
+import type { ApiError } from "./errors";
+import { toParseError } from "./errors";
+
+type RouteKey = keyof Routes;
+type RouteInput<K extends RouteKey> = /* 同上 */;
+type RouteResponse<K extends RouteKey> = /* 同上 */;
+
+export type ApiResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: ApiError };
+
+export type ClientOptions = {
+  baseUrl: string;
+  fetch?: typeof fetch;
+  headers?: Record<string, string>;
+};
+
+export function createRequest(options: ClientOptions) {
+  const doFetch = options.fetch ?? fetch;
+
+  return async function request<K extends RouteKey>(
+    key: K,
+    input: RouteInput<K>,
+  ): Promise<ApiResult<RouteResponse<K>>> {
+    const [method, rawPath] = key.split(" ") as [string, string];
+    const { path, query } = buildPath(rawPath, input);
+    const url = new URL(path, options.baseUrl);
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined) url.searchParams.set(k, String(v));
+      }
+    }
+
+    let response: Response;
+    try {
+      response = await doFetch(url, {
+        method,
+        headers: {
+          "content-type": "application/json",
+          ...options.headers,
+        },
+        body: "body" in input ? JSON.stringify(input.body) : undefined,
+      });
+    } catch (cause) {
+      return { ok: false, error: { kind: "network", message: String(cause) } };
+    }
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: {
+          kind: "http",
+          status: response.status,
+          message: await response.text().catch(() => response.statusText),
+        },
+      };
+    }
+
+    const json: unknown = await response.json().catch(() => undefined);
+    return { ok: true, data: json as RouteResponse<K> };
+  };
+}
+```
+
+注意两处**故意保留的断言**：`json as RouteResponse<K>` 和 `key.split(" ") as [...]`。它们不是偷懒，而是把 `unknown` 收窄到泛型的必要接缝；真正的运行期安全由下一步的 schema 校验补上。
+
+### 6.5 把校验挂到调用上
+
+为每个路由配一个响应 schema，请求函数在返回前校验：
+
+```ts
+// src/client.ts
+import { z } from "zod";
+import { TaskListSchema, TaskSchema } from "./contract";
+import { createRequest } from "./request";
+
+const responseSchemas = {
+  "GET /tasks": TaskListSchema,
+  "GET /tasks/:id": TaskSchema,
+  "POST /tasks": TaskSchema,
+  "PATCH /tasks/:id": TaskSchema,
+  "DELETE /tasks/:id": z.object({ ok: z.literal(true) }),
+} satisfies { [K in keyof Routes]: z.ZodType<Routes[K]["response"]> };
+```
+
+`satisfies` 这一行是双保险：schema 与契约任何一方漂移，这里编译失败。
+
+在 `request` 末尾接上：
+
+```ts
+const schema = responseSchemas[key];
+const parsed = schema.safeParse(json);
+if (!parsed.success) {
+  return { ok: false, error: toParseError(parsed.error) };
+}
+return { ok: true, data: parsed.data };
+```
+
+`parsed.data` 的类型是 `z.infer<typeof schema>`。当 schema 用 `satisfies` 绑定到 `Routes` 后，它与 `RouteResponse<K>` 对齐——**编译期和运行期第一次真正握上了手**。
+
+### 6.6 错误分支必须穷尽
+
+```ts
+function describe(error: ApiError): string {
+  switch (error.kind) {
+    case "http":
+      return `HTTP ${error.status}: ${error.message}`;
+    case "network":
+      return `网络错误: ${error.message}`;
+    case "parse":
+      return `响应不合法（${error.path}）: ${error.message}`;
+    default: {
+      const never: never = error;
+      return never;
+    }
+  }
+}
+```
+
+以后给 `ApiError` 加一种 `kind`，所有 `switch` 都会在编译期报错，逼你处理新分支。
+
+✅ **阶段 2 验收**：
+
+- `client.get("/tasks/:id", { params: { id: 1 } })` 返回 `ApiResult<Task>`。
+- `params: { id: "1" }` 编译失败。
+- 缺 `body` 调用 `POST /tasks` 编译失败。
+- 后端返回 `{ id: 1 }` 时得到 `parse` 错误，路径指向 `title`。
+
+---
+
+## 7. 阶段 3：声明文件、打包与消费端验证
+
+### 7.1 只做类型断言的测试
+
+运行时测试测不出"类型是否精确"。用 `expectTypeOf` 把类型钉住：
+
+```ts
+// tests/types.test-d.ts
+import { describe, expectTypeOf, it } from "vitest";
+import type { ApiResult } from "../src/request";
+import type { Task } from "../src/contract";
+
+describe("类型契约", () => {
+  it("响应类型可推导", () => {
+    type R = ApiResult<Task[]>;
+    expectTypeOf<R>().toEqualTypeOf<
+      | { ok: true; data: Task[] }
+      | {
+          ok: false;
+          error:
+            | { kind: "http"; status: number; message: string }
+            | { kind: "network"; message: string }
+            | { kind: "parse"; path: string; message: string };
+        }
+    >();
+  });
+});
+```
+
+### 7.2 打包与 exports
+
+`package.json` 必须写对三个字段，少一个消费端就会拿不到类型：
+
+```json
+{
+  "name": "task-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"]
+}
+```
+
+用 `tsc` 构建：
+
+```bash
+npx tsc -p tsconfig.json
+ls dist
+# index.js  index.d.ts  index.d.ts.map ...
+```
+
+`declaration: true` 生成的 `.d.ts` 就是消费端看到的全部世界。打开它检查一遍：如果里面出现了不该公开的内部类型，说明 `index.ts` 的出口没收干净。
+
+### 7.3 消费端验证
+
+```bash
+npm pack                 # 产出 task-sdk-0.1.0.tgz
+mkdir ../consumer && cd ../consumer
+npm init -y
+npm i ../task-sdk/task-sdk-0.1.0.tgz
+```
+
+```ts
+// consumer/index.ts
+import { createClient } from "task-sdk";
+
+const client = createClient({ baseUrl: "http://127.0.0.1:8001" });
+
+const list = await client.get("/tasks", { query: { status: "todo" } });
+if (list.ok) {
+  for (const task of list.data) {
+    console.log(task.title.toUpperCase()); // 有补全、有类型
+  }
+}
+
+const one = await client.get("/tasks/:id", { params: { id: 1 } });
+if (!one.ok) {
+  console.log(one.error.kind); // "http" | "network" | "parse"
+}
+```
+
+```bash
+npx tsc --noEmit   # 必须通过
+```
+
+### 7.4 故意改错，证明类型真的在工作
+
+把契约里的 `title` 改成 `name`，重新构建 SDK，再回到 consumer 执行 `tsc --noEmit`：
+
+预期结果：**`task.title` 那一行编译失败**，而不是运行时才 `undefined`。
+
+再试三种错误，确认都被编译期拦住：
+
+```ts
+client.get("/tasks/:id", { params: { id: "1" } });      // id 类型错
+client.post("/tasks", {});                              // 缺 body
+client.get("/tasks", { query: { status: "archived" } }); // 枚举越界
+```
+
+最后把后端改成返回 `{ id: 1, name: "x" }`（旧契约），运行期应得到 `parse` 错误而不是崩溃。
+
+✅ **阶段 3 验收**：`npm pack` 安装可用、类型提示完整、改字段 consumer 必报错、脏响应必被拦住。
+
+---
+
+## 8. 验收清单（总）
+
+```
+[ ] tsc --noEmit 通过（SDK 与 consumer 两边）
+[ ] vitest 全部通过，含脏数据用例
+[ ] 类型断言测试覆盖响应与错误联合
+[ ] 路由参数、body、query 缺一不可 / 多一不行
+[ ] 运行期校验错误带字段路径
+[ ] switch 错误分支穷尽检查生效
+[ ] npm pack 后 consumer 可 import 且类型完整
+[ ] 改契约字段后 consumer 编译失败
+[ ] 代码中无 any、无裸 as（必要接缝除外并写明原因）
+```
+
+---
+
+## 9. 常见坑
+
+**坑 1：类型和 schema 各写一份。**
+手写 `type Task` 再写 `TaskSchema`，第一周就开始漂移。永远 `z.infer`。
+
+**坑 2：把校验放在业务层。**
+校验必须在 SDK 边界完成。让业务代码自己 `TaskSchema.parse`，等于每个调用方都要记住这件事，迟早漏。
+
+**坑 3：`satisfies` 写成 `as`。**
+`as` 会强行压掉不匹配，`satisfies` 才会在漂移时报错。这里不是风格问题，是正确性问题。
+
+**坑 4：`exactOptionalPropertyTypes` 没开。**
+`{ status?: Task["status"] }` 在默认配置下允许 `status: undefined`，PATCH 语义会变得含糊。开了才会逼你明确"不传"和"传 undefined"的区别。
+
+**坑 5：`exports` 只写 `main`。**
+`moduleResolution: Bundler` 的消费端可能拿不到 `types`，表现为"能 import 但全是 any"。三个字段一起写。
+
+**坑 6：`npm pack` 前忘了清 `dist`。**
+旧产物混进 tarball，消费端看到的是上一版类型。构建脚本里先 `rm -rf dist`。
+
+**坑 7：用 `any` 消灭报错。**
+每写一个 `any`，就少一次编译器替你抓 bug 的机会。用 `unknown` + 守卫，或把问题暴露在类型层解决。
+
+---
+
+## 10. 毕业自测：10 个问题
+
+1. 为什么响应类型要从 `z.infer` 推导，而不是手写一份 `type`？
+2. `ExtractParams<"/orgs/:orgId/tasks/:id">` 的结果是什么？递归在哪一步停止？
+3. `satisfies` 和 `as` 在这个项目里分别会造成什么后果？
+4. `RouteInput<K>` 为什么用条件类型而不是把所有字段都设成可选？
+5. `json as RouteResponse<K>` 这个断言为什么可以接受？运行期安全由谁保证？
+6. `ApiError` 加一个 `kind: "timeout"` 后，哪些地方会编译失败？这说明了什么？
+7. `declaration: true` 生成的 `.d.ts` 里如果出现内部类型，问题通常出在哪？
+8. `exactOptionalPropertyTypes` 对 PATCH 语义有什么影响？
+9. 消费端"能 import 但类型全是 any"，优先检查哪三个字段？
+10. 如果后端契约频繁变化，你会继续手写 `Routes`，还是引入 OpenAPI 生成？各自的代价是什么？
+
+---
+
+## 11. 做完这个项目，你能独立做什么
+
+- 为团队内部服务写一个有类型、有运行时校验的 SDK，而不是散落的 `fetch` 调用。
+- 判断一个"类型安全"方案是真安全，还是只把 `any` 藏得更深。
+- 在契约变更时，用编译器列出所有受影响的调用点，而不是靠搜索和记忆。
+- 读懂 `openapi-typescript`、`ts-rest`、`zodios` 这类工具在解决什么问题，以及什么时候不该用它们。
+
+类型系统的价值不在于写多复杂的类型，而在于**让错误发生在它最便宜的时候**。这个项目练的就是这件事。
+
+---
+
+> [!TIP]
+> 做完别删仓库——把它当自己的第一个可发布工具，后续接入真实后端时只改 `schema.ts` 与 `Routes`，其余调用点由编译器带你迁移。
+>
+> 🎉 **至此 TypeScript 学习路线 16 篇全部完成。**
+>
+> 返回 [TypeScript 学习路线总览](/blog/posts/typescript-roadmap-00-overview/) | [合集页](/blog/typescript-roadmap/) | 上一篇：[14 框架集成实战](/blog/posts/typescript-roadmap-14-framework-integration/)

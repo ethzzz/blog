@@ -1,0 +1,585 @@
+---
+title: '15 · 毕业项目：把一条业务链路接进网关（路由 → 鉴权 → 限流 → 可观测 → 灰度 → 回滚）'
+published: 2026-10-25T11:00:00+08:00
+description: '前面 14 篇讲的是零件，这篇把它们装成一条能交付的链路：在本地 K8s 里起两个版本的任务 API，用 Higress 完成域名路由、JWT 鉴权、限流、超时重试熔断、可观测、按权重灰度与一键回滚。每个阶段都有 curl 验收命令和预期结果，不做"配完看着像成功"。'
+tags: [Higress, 项目实战, 灰度发布, JWT, 可观测, 验收清单]
+category: Higress学习路线
+draft: false
+---
+
+> [!NOTE]
+> **为什么毕业项目选"接一条业务链路"而不是"再讲一个插件"**：
+> 网关的价值不在单个功能，而在**顺序**——先有路由，才谈得上鉴权；先能观测，才敢灰度；
+> 先验证回滚，才敢放量。真实事故几乎都出在"功能都配了，但顺序和边界没想清楚"。
+>
+> **这个项目全程可验收**：每个阶段都用 `curl` 打真实请求，看状态码、响应体和响应头，
+> 不靠"控制台显示绿色"判断成功。
+
+---
+
+## 1. 做到什么算过
+
+项目结束时，你要能在一个本地 K8s 集群里演示：
+
+- [ ] `tasks.example.com/api/tasks` 能路由到 `tasks-v1`，未匹配的 Host 返回 404。
+- [ ] 不带 JWT 访问受保护路径返回 401；带合法 JWT 返回 200，并能读到透传的用户头。
+- [ ] `/api/health` 在白名单内，无需 JWT 即可访问。
+- [ ] 同一 IP 超过限流阈值后返回 429，并带 `Retry-After`。
+- [ ] 后端连续 5xx 时触发熔断，网关快速返回 503，而不是把请求继续压给故障实例。
+- [ ] Prometheus 能抓到网关指标；访问日志里能看到请求 ID、状态码、上游耗时。
+- [ ] 把灰度权重从 10 调到 50、100，响应体中 `v1` / `v2` 的比例随之变化。
+- [ ] 灰度出问题时，把权重调回 0 或删掉 canary Ingress，流量在秒级回到稳定版。
+
+这份清单就是验收标准。只配通一半不算完成。
+
+---
+
+## 2. 项目拓扑
+
+```
+                       ┌────────────────────────────┐
+   curl / 浏览器 ─────▶ │  Higress Gateway :8080     │
+   Host: tasks.example  │  路由 / JWT / 限流 / 熔断   │
+                       └────────────┬───────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+            Service tasks-v1                 Service tasks-v2
+            Deployment tasks-v1              Deployment tasks-v2
+            （稳定版，权重 90）              （灰度版，权重 10）
+```
+
+三个原则先记住：
+
+- **网关只做横切关注点**：路由、鉴权、限流、观测、灰度。业务逻辑不要塞进 Wasm 插件。
+- **版本用两个 Service 隔离**：不要在一个 Service 里混两个版本，灰度权重无法精确控制。
+- **所有变更都可回滚**：Ingress 是声明式的，改 YAML、`kubectl apply`、再改回来，就是回滚。
+
+---
+
+## 3. 阶段 0：环境与两个版本的服务
+
+本项目走 **Kubernetes + Helm** 路径。原因是路由注解、ConfigMap、灰度都需要 K8s 资源语义；Docker Compose standalone 适合体验 Console，不适合练这套配置。集群用 kind 或 minikube 都行，安装步骤见 [01 · 环境搭建](/blog/posts/higress-roadmap-01-env-setup/)。
+
+```bash
+# 示例：kind
+kind create cluster --name higress-lab
+
+# 安装 Higress
+helm repo add higress.io https://higress.io/helm-charts
+helm repo update
+helm install higress higress.io/higress \
+  -n higress-system --create-namespace
+
+kubectl get pods -n higress-system
+# higress-console / higress-controller / higress-gateway 全部 Running 再继续
+```
+
+### 3.1 两个版本的后端
+
+为了把注意力放在网关，后端用官方 `http-echo` 镜像：两个 Deployment 只差一个启动参数，响应体分别是 `v1` 和 `v2`。
+
+```yaml
+# tasks-app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasks-v1
+  labels: { app: tasks, version: v1 }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: tasks, version: v1 }
+  template:
+    metadata:
+      labels: { app: tasks, version: v1 }
+    spec:
+      containers:
+        - name: app
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:8080", "-text=v1"]
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasks-v1
+spec:
+  selector: { app: tasks, version: v1 }
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasks-v2
+  labels: { app: tasks, version: v2 }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: tasks, version: v2 }
+  template:
+    metadata:
+      labels: { app: tasks, version: v2 }
+    spec:
+      containers:
+        - name: app
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:8080", "-text=v2"]
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasks-v2
+spec:
+  selector: { app: tasks, version: v2 }
+  ports:
+    - port: 8080
+      targetPort: 8080
+```
+
+```bash
+kubectl apply -f tasks-app.yaml
+kubectl rollout status deploy/tasks-v1
+kubectl rollout status deploy/tasks-v2
+
+# 集群内先验证 Service 本身是通的
+kubectl run curl --rm -it --image=curlimages/curl --restart=Never -- \
+  curl -s http://tasks-v1:8080
+# v1
+```
+
+> 想换成真实业务服务也可以：把镜像换掉、端口保持 8080，后续所有网关配置一行都不用改。这正是"网关与业务解耦"的意思。
+
+✅ **阶段 0 验收**：两个 Deployment 各 2 个 Pod 全部 Ready；集群内访问 `tasks-v1:8080` / `tasks-v2:8080` 分别返回 `v1` / `v2`。
+
+---
+
+## 4. 阶段 1：路由与服务发现
+
+### 4.1 最小可用路由
+
+```yaml
+# tasks-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tasks-stable
+  annotations:
+    higress.io/destination: "tasks-v1.default.svc.cluster.local:8080"
+spec:
+  ingressClassName: higress
+  rules:
+    - host: tasks.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: tasks-v1
+                port:
+                  number: 8080
+```
+
+```bash
+kubectl apply -f tasks-ingress.yaml
+
+# 本地打通 80 端口（kind 没有云负载均衡）
+kubectl port-forward -n higress-system svc/higress-gateway 8080:80
+```
+
+另开一个终端验收：
+
+```bash
+# 正常路由
+curl -s -H "Host: tasks.example.com" http://127.0.0.1:8080/api
+# v1
+
+# Host 不匹配 → 404
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Host: unknown.example.com" http://127.0.0.1:8080/api
+# 404
+```
+
+### 4.2 路径重写
+
+真实后端通常没有 `/api` 前缀，网关负责剥掉：
+
+```yaml
+metadata:
+  annotations:
+    higress.io/use-regex: "true"
+    higress.io/rewrite-target: /$1
+spec:
+  rules:
+    - host: tasks.example.com
+      http:
+        paths:
+          - path: /api/(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: tasks-v1
+                port: { number: 8080 }
+```
+
+```bash
+curl -s -H "Host: tasks.example.com" http://127.0.0.1:8080/api/tasks/42
+# v1（上游收到的是 /tasks/42）
+```
+
+### 4.3 两个最容易踩的边界
+
+- `pathType: Prefix` 的 `/api` 会匹配 `/apiary` 吗？按 K8s 规范，前缀匹配以路径段为界，`/api` 不匹配 `/apiary`；但如果你写的是正则，边界要自己加。
+- `higress.io/destination` 与 `backend.service` 同时写时，前者优先。排障时先 `kubectl get ingress -o yaml` 看最终生效的是哪个。
+
+✅ **阶段 1 验收**：正确 Host 返回 `v1`；错误 Host 返回 404；`/api/tasks/42` 被改写到 `/tasks/42`。
+
+---
+
+## 5. 阶段 2：鉴权与流量治理
+
+这一步的顺序很重要：**先鉴权，再限流**。否则未认证的请求也能消耗限流配额，等于给攻击者一个廉价的打满入口。
+
+### 5.1 JWT 鉴权
+
+本地实验用 HS256 静态密钥，生产请换成 JWKS（见 [06 · 安全认证](/blog/posts/higress-roadmap-06-security/)）：
+
+```yaml
+metadata:
+  annotations:
+    higress.io/auth-type: "jwt"
+    higress.io/auth-jwt-secret: "lab-secret-change-me-32-bytes-long"
+    higress.io/auth-jwt-algorithm: "HS256"
+    higress.io/auth-jwt-from: "header"
+    higress.io/auth-jwt-header: "Authorization"
+    higress.io/auth-jwt-prefix: "Bearer "
+    higress.io/auth-jwt-forward-claims: "sub,roles"
+    higress.io/auth-jwt-forward-header-prefix: "X-JWT-"
+    higress.io/auth-white-list: "/api/health"
+```
+
+生成一个测试 token（Node 内置 `crypto`，不装依赖）：
+
+```js
+// gen-jwt.mjs
+import { createHmac } from "node:crypto";
+
+const secret = "lab-secret-change-me-32-bytes-long";
+const b64 = (obj) =>
+  Buffer.from(JSON.stringify(obj)).toString("base64url");
+
+const now = Math.floor(Date.now() / 1000);
+const head = b64({ alg: "HS256", typ: "JWT" });
+const body = b64({ sub: "u1", roles: ["admin"], iat: now, exp: now + 3600 });
+const sig = createHmac("sha256", secret)
+  .update(`${head}.${body}`)
+  .digest("base64url");
+
+console.log(`${head}.${body}.${sig}`);
+```
+
+```bash
+TOKEN=$(node gen-jwt.mjs)
+
+# 无 token → 401
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Host: tasks.example.com" http://127.0.0.1:8080/api
+# 401
+
+# 合法 token → 200
+curl -s -H "Host: tasks.example.com" \
+  -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api
+# v1
+
+# 篡改签名 → 401
+curl -s -o /dev/null -w "%{http_code}\n" -H "Host: tasks.example.com" \
+  -H "Authorization: Bearer ${TOKEN}x" http://127.0.0.1:8080/api
+# 401
+```
+
+### 5.2 验证 claims 真的透传了
+
+把后端临时换成一个能回显请求头的服务，确认 `X-JWT-Sub` 到达上游：
+
+```bash
+kubectl run echo --rm -it --image=mccutchen/go-httpbin --restart=Never -- \
+  go-httpbin -port 8080
+```
+
+或在真实后端里打印一次 `X-JWT-Sub`。**如果 claims 没透传，下游的权限判断就只能再解一次 token，等于鉴权做了两遍且可能不一致。**
+
+### 5.3 限流
+
+```yaml
+metadata:
+  annotations:
+    higress.io/limit-rps: "10"
+    higress.io/limit-burst-multiplier: "2"
+    higress.io/limit-by-ip: "true"
+    higress.io/limit-rejected-code: "429"
+    higress.io/limit-rejected-body: '{"error":"Too Many Requests"}'
+    higress.io/limit-rejected-header: "Retry-After:1"
+```
+
+```bash
+# 连续打 30 次，统计状态码
+for i in $(seq 1 30); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    -H "Host: tasks.example.com" \
+    -H "Authorization: Bearer $TOKEN" \
+    http://127.0.0.1:8080/api
+done | sort | uniq -c
+# 预期出现 200 与 429，且 429 占比与 rps 阈值相符
+```
+
+限流是**按网关实例**计数的。多副本部署时每副本各有一份计数器，实际阈值会放大；需要全局精确限流时，接 Redis（见 05 篇的 `rateLimit` ConfigMap）。
+
+### 5.4 超时、重试、熔断
+
+```yaml
+metadata:
+  annotations:
+    higress.io/connect-timeout: "2s"
+    higress.io/request-timeout: "5s"
+    higress.io/retry-count: "2"
+    higress.io/retry-on: "5xx,reset,connect-failure"
+    higress.io/retry-back-off-base-interval-ms: "100"
+    higress.io/circuit-breaker-consecutive-5xx: "5"
+    higress.io/circuit-breaker-sleep-window: "30s"
+    higress.io/circuit-breaker-fallback-code: "503"
+```
+
+验证熔断：把 `tasks-v1` 的镜像临时改成一个启动即失败或返回 500 的版本，连续请求 6 次后，网关应在 `sleep-window` 内直接返回 503，而不是继续等待上游超时。
+
+```bash
+kubectl set image deploy/tasks-v1 app=hashicorp/http-echo:1.0 --dry-run=client -o yaml
+# 更直接：kubectl scale deploy/tasks-v1 --replicas=0（模拟全挂）
+kubectl scale deploy/tasks-v1 --replicas=0
+
+for i in $(seq 1 8); do
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
+    -H "Host: tasks.example.com" \
+    -H "Authorization: Bearer $TOKEN" \
+    http://127.0.0.1:8080/api
+done
+# 前面几次慢（连接失败/超时），达到阈值后应快速返回 503
+
+kubectl scale deploy/tasks-v1 --replicas=2
+```
+
+✅ **阶段 2 验收**：无 token 401、合法 token 200、篡改 token 401；超阈值 429 且带 `Retry-After`；上游全挂时熔断返回 503 且响应时间明显下降。
+
+---
+
+## 6. 阶段 3：可观测、灰度与回滚
+
+### 6.1 打开指标与访问日志
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: higress-config
+  namespace: higress-system
+data:
+  higress: |
+    o11y:
+      metrics:
+        enabled: true
+        port: 15020
+    accessLog:
+      enabled: true
+      format: |
+        {"time":"%START_TIME%","method":"%REQ(:METHOD)%","path":"%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%","status":%RESPONSE_CODE%,"duration_ms":%DURATION%,"upstream_ms":%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%,"request_id":"%REQ(X-REQUEST-ID)%","upstream":"%UPSTREAM_HOST%"}
+```
+
+```bash
+kubectl apply -f higress-config.yaml
+kubectl rollout restart deploy/higress-gateway -n higress-system
+
+# 抓指标（本地验证）
+kubectl port-forward -n higress-system deploy/higress-gateway 15020:15020
+curl -s http://127.0.0.1:15020/stats/prometheus | head
+# envoy_http_downstream_rq_total{...} 等指标应出现
+```
+
+访问日志直接看 Pod 输出：
+
+```bash
+kubectl logs -n higress-system deploy/higress-gateway --tail=20
+```
+
+要看的四个字段：`status`（是否非 2xx）、`duration_ms`（端到端）、`upstream_ms`（后端耗时）、`upstream`（打到了哪个版本）。**没有 `upstream` 字段，灰度期间你根本不知道请求去了 v1 还是 v2。**
+
+### 6.2 灰度：10% → 50% → 100%
+
+稳定版 Ingress 保持不动，新增 canary Ingress：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tasks-canary
+  annotations:
+    higress.io/canary: "true"
+    higress.io/canary-weight: "10"
+spec:
+  ingressClassName: higress
+  rules:
+    - host: tasks.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: tasks-v2
+                port:
+                  number: 8080
+```
+
+```bash
+kubectl apply -f tasks-canary.yaml
+
+# 打 100 次，统计两个版本的占比
+for i in $(seq 1 100); do
+  curl -s -H "Host: tasks.example.com" \
+    -H "Authorization: Bearer $TOKEN" \
+    http://127.0.0.1:8080/api
+  echo
+done | sort | uniq -c
+# 约 90 个 v1、10 个 v2（样本小会有波动）
+```
+
+按 10 → 50 → 100 逐步调权重，每次观察三件事：错误率、P95 延迟、日志里 v2 的异常。三者任一明显劣化就停止放量。
+
+```bash
+kubectl annotate ingress tasks-canary \
+  higress.io/canary-weight=50 --overwrite
+# 观察一段时间后再调到 100
+```
+
+### 6.3 定向灰度（更安全的做法）
+
+按权重灰度是"随机抽用户"，出问题时 10% 的用户会受影响。更稳的是先按 Header 或 Cookie 定向：
+
+```yaml
+metadata:
+  annotations:
+    higress.io/canary: "true"
+    higress.io/canary-by-header: "X-Env"
+    higress.io/canary-by-header-value: "canary"
+```
+
+```bash
+# 只有带这个 Header 的请求进入 v2
+curl -s -H "Host: tasks.example.com" -H "X-Env: canary" \
+  -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api
+# v2
+```
+
+先让内部同学用 Header 验证，再切权重放量——这是生产中更常见的顺序。
+
+### 6.4 回滚
+
+回滚有三个粒度，按事故严重程度选：
+
+```bash
+# 1. 停止灰度（最快，秒级）
+kubectl annotate ingress tasks-canary \
+  higress.io/canary-weight=0 --overwrite
+
+# 2. 删除 canary（彻底）
+kubectl delete ingress tasks-canary
+
+# 3. 后端版本本身有问题（Ingress 没问题）
+kubectl rollout undo deploy/tasks-v2
+```
+
+回滚后立刻复验：
+
+```bash
+for i in $(seq 1 20); do
+  curl -s -H "Host: tasks.example.com" \
+    -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api
+  echo
+done | sort | uniq -c
+# 应全部是 v1
+```
+
+✅ **阶段 3 验收**：指标可抓取；日志含状态码/上游/耗时；权重 10/50/100 时比例变化；权重归零后 20 次请求全部回到 v1。
+
+---
+
+## 7. 常见坑
+
+**坑 1：`curl` 忘了带 `Host` 头。**
+直接打 `127.0.0.1:8080` 会命中默认路由或 404。域名路由必须带 `Host: tasks.example.com`。
+
+**坑 2：`pathType` 写错。**
+`/api` 配 `Exact` 只匹配 `/api` 本身，`/api/tasks` 会 404。需要前缀就用 `Prefix`，需要正则就用 `ImplementationSpecific` + `use-regex`。
+
+**坑 3：鉴权和限流的顺序反了。**
+先限流后鉴权，未认证流量会先消耗配额。把鉴权注解放在同一 Ingress 上，Higress 会按内置顺序执行，但跨 Ingress 的规则不要拆散。
+
+**坑 4：JWT 白名单写成前缀。**
+`/api/health` 是精确路径；要放行一组路径用正则 `"/api/public/.*"`，不要写成 `"/api"`——那会把整个 API 都放出去。
+
+**坑 5：限流阈值按全局理解。**
+单实例限流在多副本下会被放大 N 倍。要全局精确限流必须接 Redis。
+
+**坑 6：灰度只看权重，不看日志。**
+10% 的流量出错，如果日志没有 `upstream` 字段，你无法确认是 v2 的问题还是 v1 本来就错。
+
+**坑 7：熔断阈值设得太敏感。**
+`consecutive-5xx: 2` 在正常抖动下就会打开熔断，把健康实例也摘掉。先用 5 起步，观察真实错误率再调。
+
+**坑 8：改完 YAML 没等生效就验收。**
+Ingress 变更到数据面生效有秒级延迟。`kubectl apply` 后等 2-3 秒再打请求，或看 controller 日志确认已下发。
+
+---
+
+## 8. 毕业自测：10 个问题
+
+1. 为什么用两个 Service 做灰度，而不是一个 Service 选两个 Deployment？
+2. `higress.io/destination` 和 `backend.service` 冲突时谁生效？排障时先看什么？
+3. JWT 鉴权放在限流之前的原因是什么？反过来会有什么后果？
+4. `auth-white-list` 写 `/api` 和写 `/api/health` 的安全影响有什么差别？
+5. 单实例限流在多副本下为什么阈值会放大？要全局限流需要引入什么？
+6. 熔断的 `consecutive-5xx` 和 `error-percent` 分别适合什么场景？
+7. 灰度日志里没有 `upstream` 字段，会给你带来什么盲区？
+8. 按权重灰度和按 Header 灰度，各自的适用场景与风险是什么？
+9. 回滚的三个粒度分别对应什么故障？为什么"权重归零"通常比"删 Ingress"更快？
+10. 如果网关配置全部正确，但业务仍然偶发 502，你会按什么顺序排查（网关 → Service → Pod → 应用）？
+
+---
+
+## 9. 做完这个项目，你能独立做什么
+
+- 给一个新服务接上网关：路由、鉴权、限流、超时重试、观测，一次配齐。
+- 设计一次可回滚的灰度发布，而不是"全量上线后出问题再回滚"。
+- 用状态码、响应头、日志、指标四类证据定位问题，而不是猜。
+- 判断哪些能力该放网关（横切）、哪些该放业务（领域），避免把网关做成第二个业务系统。
+
+网关是流量的第一道门，也是事故的第一现场。**能把这条链路完整走一遍、并且每一步都能回滚，才算真正会用 Higress。**
+
+---
+
+> [!TIP]
+> 建议把这个实验环境保留下来当"网关靶场"：以后每学一个新的插件或流量策略，都先在这里加一条规则、跑一轮压测、验证一次回滚，再往生产搬。
+>
+> 🎉 **至此 Higress 学习路线 16 篇全部完成。**
+>
+> 返回 [Higress 学习路线总览](/blog/posts/higress-roadmap-00-overview/) | [合集页](/blog/higress-roadmap/) | 上一篇：[14 生产最佳实践](/blog/posts/higress-roadmap-14-best-practices/)

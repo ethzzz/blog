@@ -725,6 +725,15 @@ String name = nameResult.orElse("Anonymous");
 - **函数式接口**：`map` 接受 `Function<T, R>`
 - **PECS 原则**：`Function<T, R>` 中 T 是生产者（读），R 是消费者（写）
 
+## 练习
+
+1. 写一个受检异常 `InsufficientBalanceException`，在 `withdraw` 方法中抛出；调用方分别用 `try/catch` 和 `throws` 两种方式处理。
+2. 实现一个 `AutoCloseable` 资源，在 `close()` 里也抛异常；用 try-with-resources 打开两个资源，打印关闭顺序并读取 `getSuppressed()`。
+3. 写一个在 `finally` 里 `return` 的方法，调用后观察返回值被覆盖；再写一个在 `finally` 里吞掉异常的方法，说明为什么这是反模式。
+4. 实现泛型方法 `static <T extends Comparable<T>> T max(List<T> list)`，分别传 `List<Integer>` 和 `List<String>` 验证。
+5. 验证类型擦除：`new ArrayList<String>().getClass() == new ArrayList<Integer>().getClass()`；再尝试 `new T[]`，记录编译错误。
+6. 用 PECS 写两个方法：一个只读的 `sum(List<? extends Number>)`，一个只写的 `fill(List<? super Integer>)`，各制造一次非法调用。
+
 ## 复习卡片
 
 ```java

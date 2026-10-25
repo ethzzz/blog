@@ -150,3 +150,10 @@ npx tsx src/server.ts   # 免编译直接跑
 2. 用 Vue `<script setup lang="ts">` 写计数器：`ref<number>` + `defineProps` + `defineEmits`。
 3. 用 Express + TS 写 `/api/users` 返回 `User[]`，给 `res.json` 传类型化数据。
 4. 审查你现有项目，找出三处可用 `unknown`+守卫替换 `any` 的地方。
+
+---
+
+> [!TIP]
+> 下一篇：[15 毕业项目：写一个类型安全的 API SDK](/blog/posts/typescript-roadmap-15-project-type-safe-sdk/) 会把这一路学到的接口、泛型、条件类型、声明文件与工程化配置拼成一个可发布的 SDK，并用"故意改字段 → 消费端编译失败"来验收。
+>
+> 返回 [TypeScript 学习路线总览](/blog/posts/typescript-roadmap-00-overview/) | [合集页](/blog/typescript-roadmap/)

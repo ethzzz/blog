@@ -803,6 +803,16 @@ public class ConcurrentDownloader {
 - **`AtomicInteger`** 无锁计数器
 - **优雅关闭**：`shutdown` + `awaitTermination` + `shutdownNow` 三段式
 
+## 练习
+
+1. 复现竞态：10 个线程各对同一个 `int` 自增 10 万次，打印最终值；分别用 `synchronized` 和 `AtomicInteger` 修复到 100 万。
+2. 用「继承 Thread」「实现 Runnable」「实现 Callable + 线程池」三种方式各起一个任务，打印线程名并拿到返回值。
+3. 创建固定 4 线程的线程池提交 10 个任务，用 `shutdown()` + `awaitTermination()` 等待全部完成，统计耗时。
+4. 用 `CompletableFuture.supplyAsync` 并行执行两个任务，`thenCombine` 合并结果；再让其中一个抛异常，用 `exceptionally` 兜底。
+5. 复现死锁：两个线程以相反顺序获取两把锁；用 `jstack <pid>` 找到死锁报告，再改成 `tryLock(timeout)` 解决。
+6. 在线程池里用 `ThreadLocal` 存用户上下文，连续提交两个任务观察脏数据，最后用 `remove()` 修复。
+7. 如果本机是 JDK 21+，用虚拟线程执行 1 万个阻塞任务，和固定线程池对比总耗时与线程数。
+
 ## 复习卡片
 
 ```java

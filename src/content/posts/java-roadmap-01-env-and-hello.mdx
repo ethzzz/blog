@@ -174,6 +174,14 @@ java Sum
 - `new Scanner(System.in)` 创建对象，Java 里除了基本类型都要用 `new`。
 - `"a + b = " + (a + b)`：`+` 遇到字符串会做拼接，所以要用括号保证先算加法。**注意优先级**，写成 `"a + b = " + a + b` 会变成 `"a + b = 35"`（拼接）。
 
+## 练习
+
+1. 不查资料，说出 `java`、`javac`、`jar` 分别属于 JDK / JRE / JVM 的哪一层，然后各执行一次版本命令验证（`jar` 用 `jar --version`）。
+2. 用单文件源码模式（`java Hello.java`）和先编译再运行（`javac Hello.java` + `java Hello`）各跑一遍，对比目录里 `.class` 文件的有无，并解释单文件模式为什么不在当前目录留下字节码。
+3. 故意制造三个编译错误，记下报错首行：文件名与 `public class` 不一致、语句末尾漏分号、`main` 写成 `public static void main()`。
+4. 把类编译到独立目录：`javac -d out Hello.java`，再分别执行 `java -cp out Hello` 和 `java out/Hello`，解释后者为什么找不到类。
+5. 写一个接收两个命令行参数并输出和的小程序；分别传入 `3 5`、只传 `3`、传 `3 x`，让后两种情况给出可读提示而不是直接抛异常。
+
 ## 复习卡片
 
 一分钟回想整个阶段的关键点：

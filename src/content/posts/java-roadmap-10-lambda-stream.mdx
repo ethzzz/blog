@@ -688,6 +688,15 @@ class OrderAnalytics {
 
 Java 版本看起来更"结构化"，JS 版本更"随手"，但表达力是一样的。
 
+## 练习
+
+1. 把一段「for 循环 + if 过滤 + 新列表」改写成 Stream 链（`filter` / `map` / `sorted` / `collect`），保持输出顺序一致。
+2. 分别写出方法引用的四种形式：静态方法、实例方法、特定对象的实例方法、构造器引用，各配一个可运行示例。
+3. 在 Lambda 中尝试修改局部变量，记录编译错误；改用 `AtomicInteger` 实现后再说明为什么这种写法通常不推荐。
+4. 给定订单列表（客户、金额），用 `groupingBy` + `summingInt` 统计每个客户的总金额，再取金额最高的前 3 名。
+5. 用 `Optional` 改写一段三层嵌套的 null 判断（`map` / `filter` / `orElseThrow`），并避免调用 `get()`。
+6. 用 `parallelStream` 向普通 `ArrayList` 添加元素，观察结果是否稳定；再换成 `collect` 或并发集合对比。
+
 ## 复习卡片
 
 ```java

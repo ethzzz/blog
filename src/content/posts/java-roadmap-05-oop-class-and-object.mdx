@@ -557,6 +557,14 @@ public class LibraryDemo {
 }
 ```
 
+## 练习
+
+1. 写一个 `Book` 类：`private` 字段、全参构造器、getter/setter、`toString()`；再用 `record Book(String title, double price)` 重写一遍，列出两种写法各自适合的场景。
+2. 定义 `print(int)`、`print(Integer)`、`print(Object)` 三个重载，分别传 `int`、`Integer`、`null`，观察编译器选了哪个并解释原因。
+3. 用 `static` 计数器统计 `new User(...)` 创建了多少个实例；再尝试在静态方法里访问 `this`，确认编译错误。
+4. 写 `swap(int a, int b)` 和 `swap(int[] arr)` 两个方法，验证只有数组版本能交换成功，说明 Java 的传递方式。
+5. 给 `Book` 手写 `equals` 和 `hashCode`，让两本「书名和价格都相同」的书相等；再故意只重写 `equals`，观察放进 `HashSet` 后的结果。
+
 ## 复习卡片
 
 ```java

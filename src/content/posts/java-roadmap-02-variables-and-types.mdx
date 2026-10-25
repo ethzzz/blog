@@ -357,6 +357,15 @@ nums[0] = 10;     // 索引访问
 
 数组长度**固定不变**，想要动态数组用 `ArrayList`（阶段八讲）。
 
+## 练习
+
+1. 让 `int` 溢出：`int max = Integer.MAX_VALUE; System.out.println(max + 1);`，再用 `Math.addExact(max, 1)` 对比，说明为什么金额计算不能用 `int`。
+2. 预测并验证：`Integer a = 127, b = 127; a == b` 与 `Integer c = 128, d = 128; c == d` 的结果，解释 Integer 缓存范围。
+3. 验证 `0.1 + 0.2 == 0.3` 的结果，并用 `BigDecimal` 写一个正确的比较方法（注意使用字符串构造器）。
+4. 分别执行 `(int) 3.9`、`(byte) 200`、`(char) 65`，写出结果并解释每种转换发生了什么。
+5. 用 `var` 声明 `var list = new ArrayList<>();` 和 `var n = 1;`，在 IDE 里查看推断出的类型；再试 `var` 修饰成员变量和方法参数，确认是否合法。
+6. 对比 `new String("hi") == "hi"` 与 `new String("hi").equals("hi")`，再用 `intern()` 让前者的比较结果为 `true`。
+
 ## 复习卡片
 
 一分钟回忆本阶段所有关键点：
