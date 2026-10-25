@@ -118,6 +118,16 @@ const jsonLd = {
                 <Content />
             </Markdown>
 
+            <!-- 社区讨论入口：走 /community/link 中转（有讨论帖进详情，没有则进发帖页并预填标题）。
+                 key 必须是文章路径（与 RSS 的 pathname 同源），否则会和后台种子帖对不上。 -->
+            <div class="flex justify-end mb-3 onload-animation">
+                <a href={`/community/link?type=blog&key=${encodeURIComponent(getPostUrlBySlug(entry.slug))}&title=${encodeURIComponent(entry.data.title)}`}
+                   class="btn-card rounded-2xl h-10 px-4 gap-2 text-sm text-black/75 dark:text-white/75 active:scale-95">
+                    <Icon name="material-symbols:forum-outline-rounded" class="text-[1.25rem] text-[var(--primary)]"></Icon>
+                    参与讨论
+                </a>
+            </div>
+
             {licenseConfig.enable && <License title={entry.data.title} slug={entry.slug} pubDate={entry.data.published} class="mb-6 rounded-xl license-container onload-animation"></License>}
 
         </div>
