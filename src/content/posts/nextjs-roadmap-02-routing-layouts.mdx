@@ -191,6 +191,26 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 ---
 
+## 练习（带自检）
+
+1. **判断**：给出目录 `app/(marketing)/pricing/page.tsx`、`app/(shop)/cart/page.tsx`、`app/blog/[slug]/page.tsx`。哪些 URL 会冲突？路由组为什么能共存？如果两个组里都有 `layout.tsx`，哪个生效？
+2. **改错**：从 `/blog/a` 跳到 `/blog/b` 时，页面里的 `useState` 没有重置，导致 b 页显示 a 页的展开状态。解释原因，并给出两种修法。
+3. **做出**：用并行路由做"列表 + 详情"同屏布局（`@list` / `@detail`），要求直接刷新详情 URL 时两个槽都有内容，且没有 `default.tsx` 时报错能被你解释。
+4. **量数据**：同一条慢路由，分别在有 `loading.tsx` 和无 `loading.tsx` 的情况下，用 `curl -w "%{time_starttransfer}"` 记录首字节时间，说明流式到底省了什么。
+5. **故意搞坏**：用拦截路由 `(.)photo/[id]` 做弹窗预览，然后直接在新标签页打开该 URL——观察全页版本与弹窗版本各走哪套文件，并说明为什么会这样。
+
+**自检标准**：第 2 题能说出"同层级同类型组件被复用，state 不会重置"，修法是 `key` 或 `layout` 分层；第 4 题能说出"流式提前送出的是 HTML 外壳，不是数据"。
+
+## 验收清单
+
+- [ ] 能画出自己项目的路由树，标出每个 `layout` 的作用范围
+- [ ] 路由组用过一次，且能解释"不改变 URL"这一点
+- [ ] 详情页切换时状态会正确重置（`key` 或结构分层）
+- [ ] 慢页面有 `loading.tsx`，且浏览器里能看到流式填充
+- [ ] 并行路由的两个槽都有 `default.tsx`，硬刷新不 404
+- [ ] 知道 `not-found.tsx` 放在哪一层只影响哪一层
+- [ ] 动态段参数做了校验（非法 slug 直接 404，而不是把脏参数透传到查询）
+
 ## 小结
 
 路由文件约定本质是在回答三个问题：**哪些 UI 要持久（layout）、哪些要重挂（template）、哪些要并行（@slot）**。把这三点想清楚，目录结构自然就是架构图。下一篇进入最关键的一题：Server 与 Client 的边界到底怎么划。

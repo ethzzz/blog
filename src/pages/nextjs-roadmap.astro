@@ -105,7 +105,8 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 
 		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
 			<p class="font-medium mb-1">学习建议</p>
-			<p>Next.js 的学习曲线不在 API，而在「边界」：哪些代码跑在服务端、哪些跑在浏览器、缓存什么时候失效。先吃透 RSC 与渲染模型，再动 Server Actions 和缓存。别把 App Router 当 Pages Router 的升级版用，也别把所有组件都写成 "use client"——那等于白换框架。生产问题里，一半是缓存没失效，另一半是边界放错了地方。</p>
+			<p>Next.js 的学习曲线不在 API，而在「边界」：哪些代码跑在服务端、哪些跑在浏览器、缓存什么时候失效。按三层读：<strong>L1（01–03）</strong> 渲染模型、路由与组件边界，必须先读通；<strong>L2（04–08、14）</strong> 数据读写、鉴权、数据库与 SEO，是产品化的主体；<strong>L3（09–13）</strong> 性能、可观测、测试、部署与架构，决定能不能长期跑。别把 App Router 当 Pages Router 的升级版用，也别把所有组件都写成 "use client"——那等于白换框架。生产问题里，一半是缓存没失效，另一半是边界放错了地方。</p>
+			<p class="mt-2">每篇末尾都有<strong>带自检的练习</strong>与<strong>验收清单</strong>：先把正文读完，合上文章动手做，卡住再翻回去。直接看答案的收益接近于零。</p>
 		</div>
 
 		<div class="mt-4 flex flex-wrap gap-4 text-sm">

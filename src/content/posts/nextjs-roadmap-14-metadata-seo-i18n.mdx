@@ -1,0 +1,276 @@
+---
+title: '14 · Metadata、SEO 与国际化'
+published: 2026-10-20T22:00:00+08:00
+description: 'Metadata API 的继承与覆盖规则、generateMetadata 的取数方式、动态 OG 图、sitemap 与 robots、canonical 与 hreflang、JSON-LD 结构化数据，以及基于路由段的国际化方案与多语言下的缓存陷阱。'
+tags: [Next.js, SEO, Metadata, 国际化, OpenGraph]
+category: Next.js学习路线
+draft: false
+---
+
+前 13 篇讲的是"能不能跑"，这一篇讲"能不能被找到"。对内容站、SaaS 官网、电商来说，**SEO 是功能需求，不是运营需求**——它决定了你的页面在搜索结果里长什么样、能不能被抓到、多语言版本会不会互相打架。
+
+Next.js 的 Metadata API 把这堆东西收进了框架：不用手写 `<head>`，但**继承规则和优先级必须搞清楚**，否则会出现"明明写了 description，线上却是另一段"。
+
+## 两套写法，一条继承链
+
+```tsx
+// 静态：值在构建期确定
+import type { Metadata } from "next";
+
+export const metadata: Metadata = {
+	title: "任务管理 · NoteLab",
+	description: "把任务、筛选与协作放在一个页面里。",
+};
+
+// 动态：需要读 params / 外部数据
+export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
+	const { id } = await params;
+	const task = await getTask(id);
+	if (!task) return { title: "任务不存在" };
+	return {
+		title: task.title,
+		description: task.summary.slice(0, 120),
+		openGraph: { images: [`/api/og/task/${id}`] },
+	};
+}
+```
+
+两条硬规则：
+
+- **同一个文件里不能同时导出 `metadata` 和 `generateMetadata`**，会直接报错。
+- **子段覆盖父段，但是"浅合并"**：子段写了 `openGraph`，不会丢父段的 `openGraph.title`，但**数组会被整体替换**（比如 `keywords`）。
+
+```tsx
+// 根布局：给全站兜底 + 标题模板
+export const metadata: Metadata = {
+	metadataBase: new URL("https://haolo.cloud"),
+	title: { default: "NoteLab", template: "%s · NoteLab" },   // 子页只写 title，自动拼后缀
+	description: "笔记、任务与协作工具。",
+	openGraph: { type: "website", siteName: "NoteLab" },
+};
+```
+
+**`metadataBase` 必须设**。不设的话，相对 URL（OG 图、canonical）在构建时只能猜，产物里会出现 `http://localhost:3000/...`——这条在预发环境测不出来，上线后才被社交平台抓出一堆坏图。
+
+## 页面级的七个必写项
+
+```tsx
+export const metadata: Metadata = {
+	title: "定价",
+	description: "按席位计费，随时升降级。",
+	alternates: { canonical: "/pricing" },          // 1) 归一化，防重复内容
+	openGraph: {
+		title: "定价 · NoteLab",
+		description: "按席位计费，随时升降级。",
+		url: "/pricing",
+		images: [{ url: "/og/pricing.png", width: 1200, height: 630 }],   // 2) 1200×630
+	},
+	twitter: { card: "summary_large_image" },        // 3) 大图卡片
+	robots: { index: true, follow: true },           // 4) 明确允许
+};
+```
+
+五项容易被漏掉的：
+
+1. **`canonical`**：同一个内容有多个 URL（带参数、带尾斜杠、www 与非 www）时，告诉搜索引擎哪个是正主。不做的话权重会被摊薄。
+2. **OG 图尺寸 1200×630**：别的尺寸在多数平台会被裁切。
+3. **`twitter.card`**：不写就只有一条纯文本链接。
+4. **`robots`**：后台、草稿、搜索结果页应该 `noindex`——**靠 `robots.txt` 拦不住，必须用 meta**（`robots.txt` 只阻止抓取，页面仍可能被索引）。
+5. **`title` 长度**：中文建议 20 字内，超出在结果页会被截断成省略号。
+
+## 动态 OG 图：一行代码出图
+
+```tsx
+// app/og/route.tsx
+import { ImageResponse } from "next/og";
+
+export const runtime = "nodejs";
+
+export async function GET(req: Request) {
+	const title = new URL(req.url).searchParams.get("title") ?? "NoteLab";
+
+	return new ImageResponse(
+		(
+			<div style={{ display: "flex", flexDirection: "column", justifyContent: "space-between", width: "100%", height: "100%", padding: 64, background: "#0b0b0c", color: "#fff" }}>
+				<div style={{ fontSize: 28, opacity: 0.7 }}>haolo.cloud</div>
+				<div style={{ fontSize: 64, lineHeight: 1.2 }}>{title}</div>
+				<div style={{ fontSize: 24, opacity: 0.6 }}>前端 · 全栈 · 工程化</div>
+			</div>
+		),
+		{ width: 1200, height: 630 },
+	);
+}
+```
+
+三个注意点：
+
+- `ImageResponse` 里的 JSX **只支持 flex 布局**（内部用的是 satori），写 `grid` 会静默失效；
+- **它是运行时渲染**，每次请求都算一遍，所以要缓存（`Cache-Control` 或 CDN），否则社交平台抓取会拖慢你的服务；
+- 字体要显式加载（`fonts` 选项），默认字体不支持中文——**中文 OG 图必须传字体文件**，否则全是方块。
+
+## sitemap、robots 与结构化数据
+
+```ts
+// app/sitemap.ts
+import type { MetadataRoute } from "next";
+
+export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
+	const posts = await listPublishedPosts();
+	return [
+		{ url: "https://haolo.cloud/", changeFrequency: "weekly", priority: 1 },
+		...posts.map(p => ({
+			url: `https://haolo.cloud/posts/${p.slug}`,
+			lastModified: p.updatedAt,
+			changeFrequency: "monthly" as const,
+			priority: 0.7,
+		})),
+	];
+}
+```
+
+```ts
+// app/robots.ts
+import type { MetadataRoute } from "next";
+
+export default function robots(): MetadataRoute.Robots {
+	return {
+		rules: [{ userAgent: "*", allow: "/", disallow: ["/admin", "/api", "/preview"] }],
+		sitemap: "https://haolo.cloud/sitemap.xml",
+	};
+}
+```
+
+**结构化数据**（JSON-LD）是让搜索结果出现富媒体摘要的唯一途径：
+
+```tsx
+export default async function PostPage({ params }: { params: Promise<{ slug: string }> }) {
+	const { slug } = await params;
+	const post = await getPost(slug);
+	const jsonLd = {
+		"@context": "https://schema.org",
+		"@type": "Article",
+		headline: post.title,
+		datePublished: post.publishedAt,
+		author: { "@type": "Person", name: "Ethan" },
+	};
+
+	return (
+		<article>
+			<script
+				type="application/ld+json"
+				// JSON-LD 必须序列化后注入，不能直接塞对象
+				dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+			/>
+			<h1>{post.title}</h1>
+		</article>
+	);
+}
+```
+
+`@type` 要和页面内容一致（文章用 `Article`，商品用 `Product`，FAQ 用 `FAQPage`）。**乱标会被判为垃圾结构化数据**，比不标更糟。
+
+## 国际化：路由段是唯一可靠的方案
+
+```text
+app/
+├── [locale]/
+│   ├── layout.tsx            # <html lang={locale}> + 语言切换
+│   ├── page.tsx
+│   └── pricing/page.tsx
+└── api/
+```
+
+```tsx
+// app/[locale]/layout.tsx
+export function generateStaticParams() {
+	return [{ locale: "zh" }, { locale: "en" }];   // 静态生成两套
+}
+
+export default async function LocaleLayout({ children, params }: {
+	children: React.ReactNode;
+	params: Promise<{ locale: string }>;
+}) {
+	const { locale } = await params;
+	if (!["zh", "en"].includes(locale)) notFound();   // 关键：白名单
+	return (
+		<html lang={locale} dir={locale === "ar" ? "rtl" : "ltr"}>
+			<body>{children}</body>
+		</html>
+	);
+}
+```
+
+**为什么用 `/en/...` 而不是 cookie 或 `Accept-Language` 自动跳转**：
+
+- 每个语言有**独立可分享的 URL**，能分别被索引（SEO 的唯一正确做法）；
+- CDN 能分别缓存；
+- 用户能手动固定语言，不会被"猜错"反复跳走。
+
+自动跳转（读 `Accept-Language` 再 302）是常见错误：**搜索引擎抓到的永远是默认语言**，其它版本等于不存在。
+
+### hreflang：告诉搜索引擎"这些是同一页的不同语言"
+
+```tsx
+export const metadata: Metadata = {
+	alternates: {
+		canonical: "/zh/pricing",
+		languages: {
+			zh: "/zh/pricing",
+			en: "/en/pricing",
+			"x-default": "/en/pricing",   // 兜底版本
+		},
+	},
+};
+```
+
+漏了这一步，多语言站点会出现"两个语言版本互相竞争同一批关键词"。
+
+### 多语言下的缓存陷阱
+
+```tsx
+// ❌ 用 cookie 决定语言 → 整条路由动态化，CDN 缓存全失效
+const locale = (await cookies()).get("locale")?.value ?? "zh";
+```
+
+语言从**路由段**取（`params.locale`），不从 cookie 取。cookie 只用于"记住用户上次选的"，用来做**首次重定向**，不参与渲染。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 线上 description 不是自己写的 | 父子段浅合并 + 数组整体替换 | 在产生该页面的那一层显式覆盖 |
+| OG 图是 `localhost:3000` | 没设 `metadataBase` | 在根布局设置 |
+| 社交平台抓不到图 | 相对路径 / 尺寸不对 / 需要鉴权 | 用绝对路径 + 1200×630 + 公开可访问 |
+| 中文 OG 图全是方块 | 没加载中文字体 | `ImageResponse` 传 `fonts` |
+| 后台页面被搜到 | 只做了 `robots.txt` | 加 `robots: { index: false }` |
+| 多语言互相抢排名 | 没有 hreflang / canonical 指错 | 每个语言页都写 `alternates.languages` |
+| 切换到英文后还是中文 | 文案写死在组件里，没走字典 | 统一 `messages` 读取 |
+| 语言切换后 404 | `params` 是 Promise，没 await | `const { locale } = await params` |
+
+## 练习（带自检）
+
+1. **判断**：根布局写了 `title.template: "%s · NoteLab"`，某个子页写了 `title: "定价 · NoteLab"`。线上标题会变成什么？为什么？
+2. **改错**：线上分享卡片没有图，代码里 `openGraph.images` 写的是 `"/og/home.png"`。列出三个可能原因并逐一说明怎么验。
+3. **做出**：给文章页做动态 OG 图，要求中文正常显示、尺寸 1200×630、响应带缓存头。
+4. **量数据**：用 `curl` 抓页面 HTML，检查 `canonical`、`og:image`、`hreflang` 三处是否都是绝对 URL 且正确。
+5. **故意搞坏**：把语言从路由段改成读 cookie，观察构建符号（是否变 `ƒ`）与两套语言是否还能各自被 CDN 缓存。
+
+**自检标准**：第 1 题能说出"模板会再拼一次后缀，变成'定价 · NoteLab · NoteLab'"；第 5 题能说出"用 cookie 决定语言会让整条路由动态化，且 CDN 无法按语言分缓存"。
+
+## 验收清单
+
+- [ ] 根布局设了 `metadataBase` 与 `title.template`
+- [ ] 每个可索引页面都有唯一的 `title`、`description`、`canonical`
+- [ ] OG 图是绝对 URL、1200×630、公开可访问
+- [ ] 后台/草稿/预览页有 `robots: { index: false }`
+- [ ] `sitemap.ts` 只收录已发布内容，且 `lastModified` 是真实更新时间
+- [ ] `robots.ts` 指向 sitemap，且没把全站 disallow
+- [ ] 文章页有 JSON-LD，`@type` 与内容一致
+- [ ] 多语言用路由段，每页都有 `alternates.languages` 含 `x-default`
+- [ ] `<html lang>` 随语言变化，切换语言后 URL 与内容都变
+
+## 小结
+
+SEO 在 Next.js 里不是"加几个 meta 标签"，而是**让每一层都输出正确、可被索引的东西**：URL 唯一（canonical）、语言分明（hreflang）、分享可读（OG）、结构可解析（JSON-LD）。这些一旦漏掉，内容写得再好也没人点进来。
+
+下一篇是整条路线的收口：用一个多租户 SaaS 把边界、缓存、鉴权、部署全部串起来。

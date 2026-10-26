@@ -194,6 +194,26 @@ export async function getOrders(tenantId: string, category: string) {
 
 ---
 
+## 练习（带自检）
+
+1. **判断**：给出一段 `fetch(url, { next: { revalidate: 60 } })` 加一处 `revalidateTag("tasks")` 的代码。写出：什么时候会看到旧数据、什么时候一定看到新数据、以及"后台改了数据但前台还是旧的"的可能原因。
+2. **改错**：后台更新了任务，前台列表半小时不刷新，最后靠重启解决。给出三种修法（`revalidatePath` / `revalidateTag` / 客户端重新拉取），并说明各自的适用面与副作用。
+3. **做出**：用 `cacheTag` 给"列表"和"详情"分别打标签，写入后只失效相关标签。用日志证明没有出现全站失效。
+4. **量数据**：对同一路由连续请求两次，用响应头（`x-nextjs-cache` 或 CDN 的 `x-cache`）证明第一次 MISS、第二次 HIT。
+5. **故意搞坏**：把某处 `fetch` 改成 `cache: "no-store"`，观察构建符号从静态变动态，并记录 TTFB 的变化幅度。
+
+**自检标准**：第 2 题能说出"写入不失效是设计缺失，不是 bug"；第 5 题能说出"一个 `no-store` 只影响它所在的路由，但会让整条路由失去静态能力"。
+
+## 验收清单
+
+- [ ] 项目里每一处 `fetch` 都能回答"这份数据能旧多久"
+- [ ] 所有写操作（action / route handler）都配了对应的失效调用
+- [ ] 失效粒度到 tag，而不是"一把 `revalidatePath('/')`"
+- [ ] 能说出 `revalidatePath` 与 `revalidateTag` 的区别，并各用过一次
+- [ ] 页面不会因为某个叶子组件读 `cookies` 而整条变动态（已把该读取下移）
+- [ ] 用 `curl` 或 DevTools 验证过一次 HIT/MISS
+- [ ] 知道客户端组件里的 `fetch` 不走服务端缓存，说明白这一点
+
 ## 小结
 
 数据层设计就三个问题：**能不能旧、能旧多久、谁来让它变新**。答案写进代码（`cacheLife` + `cacheTag` + 写后失效），而不是留在脑子里。下一篇讲写操作：Server Actions 怎么用，以及为什么它不是一个「随便调的函数」。

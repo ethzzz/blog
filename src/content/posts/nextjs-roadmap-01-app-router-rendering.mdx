@@ -128,6 +128,26 @@ export async function Header() {
 
 ---
 
+## 练习（带自检）
+
+1. **判断**：一个页面里有 `cookies()`、一个 `'use client'` 子组件、和一个不传 `cache` 的 `fetch`。`next build` 会给这条路由打什么符号？写出你的判定链路。
+2. **改错**：整个站本来可以静态化，但构建日志里全是 `ƒ`。列出三种最常见的"偷偷引入动态"的写法（提示：请求期 API、动态段配置、第三方库读 `window`），并给出各自的替代方案。
+3. **做出**：给同一份内容做两条路由——一条纯静态，一条读 `searchParams`。用 `next build` 的输出对照两行的符号，并对比两者的首屏 HTML 字节数。
+4. **量数据**：用 `curl -sI` 分别请求两条路由，记录 `cache-control` 与 `x-nextjs-cache`，说明哪个能被 CDN 缓存、为什么。
+5. **故意搞坏**：在根布局加 `export const dynamic = "force-dynamic"`，记录哪些路由从 `○` 变成 `ƒ`，并用 `curl -w "%{time_starttransfer}"` 对比 TTFB 变化。
+
+**自检标准**：第 1 题能说出"用了 `cookies`/`headers`/`searchParams` 就进 Dynamic"；第 5 题能说明"段配置会向下继承，一行配置能毁掉整站静态化"。
+
+## 验收清单
+
+- [ ] 能看着一段页面代码，说出它在构建期、请求期还是浏览器执行
+- [ ] 能解释 `○`、`●`、`ƒ` 三个符号的差别，并在自己项目里找出各一处
+- [ ] 本地 `next build` 的输出里，首页是静态、详情页是动态，且理由说得通
+- [ ] 静态路由的响应头里有可被 CDN 复用的 `cache-control`
+- [ ] 知道"读 `cookies()` 会让整条路由变动态"，并能给出下移到客户端组件的改法
+- [ ] 能说出 `export const dynamic` 与 `export const revalidate` 的区别与优先级
+- [ ] 流式路由在浏览器里能看到"先出现骨架、后填充内容"
+
 ## 小结
 
 记住三句话：

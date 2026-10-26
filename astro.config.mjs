@@ -45,6 +45,8 @@ export default defineConfig({
 			"/blog/posts/react-roadmap-16-engineering-pitfalls/",
 		"/posts/react-roadmap-12-project-task-board/":
 			"/blog/posts/react-roadmap-17-project-task-board/",
+		// Next.js（2026-10-26）：新增 Metadata/SEO 篇为 14，SaaS 实战后移到 15
+		"/posts/nextjs-roadmap-14-saas-project/": "/blog/posts/nextjs-roadmap-15-saas-project/",
 	},
 	// 混合渲染（hybrid）：整站仍是静态产物（默认 prerender=true），
 	// 只有 src/pages/solutions/ 下的两个页面显式 `export const prerender = false`。
