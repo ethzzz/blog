@@ -1,157 +1,215 @@
 ---
 title: '08 · 联合、交叉与类型守卫'
-published: 2026-09-27T18:00:00+08:00
-description: 'TypeScript 类型收窄机制全解：联合类型与字面量联合、typeof/instanceof/in 收窄、可辨识联合（discriminated union）、自定义类型守卫 is、断言 as 与非空断言 ! 的安全边界。'
-tags: [TypeScript, 联合类型, 类型守卫, 可辨识联合, 类型收窄]
+published: 2026-09-30T13:00:00+08:00
+description: '判别联合 + never 穷尽检查是 TS 里性价比最高的模式：它让"新增一个分支忘了处理"变成编译错误。附四类类型守卫的正确写法、断言函数的边界，以及联合类型最常踩的三个坑。'
+tags: [TypeScript, 联合类型, 类型守卫, 判别联合, never]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> JS 运行时值是动态的，TS 靠"类型收窄"在代码流里逐步把宽泛类型变精确。本篇讲清所有收窄手段，尤其是可辨识联合这一实战神器。
+## 判别联合：把"非法状态"变成不可表达
 
----
-
-## 1. 联合类型
-
-一个值可以是多种类型之一：
+反面教材（真实见得多）：
 
 ```ts
-let id: number | string;
-id = 1;
-id = "a1";
-```
-
-联合让 API 更灵活（如 `id` 既接受数字也接受字符串）。但访问联合的**共有成员**才安全，专有成员需先收窄。
-
----
-
-## 2. 字面量联合
-
-```ts
-type Status = "idle" | "loading" | "success" | "error";
-let s: Status = "loading";
-s = "done"; // ❌ 不在联合内
-```
-
-字面量联合是最常用的"枚举替代"，零运行时开销。
-
----
-
-## 3. 类型收窄 narrowing
-
-TS 在 `if`/三元等控制流里会**自动收窄**联合：
-
-```ts
-function format(value: number | string): string {
-  if (typeof value === "string") {
-    return value.trim(); // 这里 value 被收窄为 string
-  }
-  return value.toFixed(2); // 这里收窄为 number
+interface State {
+  loading: boolean;
+  data?: User;
+  error?: string;
 }
 ```
 
----
+这四个字段的组合有 2³ = 8 种，其中 5 种是非法的：`loading: false` 且既没 `data` 也没 `error`；`loading: true` 且同时有 `data`……但类型系统一个都不拦。
 
-## 4. 收窄手段一览
-
-| 手段 | 适用 |
-| --- | --- |
-| `typeof x === "string"` | 原始类型 |
-| `x instanceof Foo` | 类实例 |
-| `key in x` | 对象是否含某键 |
-| `x === 字面量` | 字面量联合 |
-| 自定义守卫 `is` | 任意复杂判断 |
-| 可辨识联合的 `switch` | 带 `kind` 的联合 |
-
-`in` 示例：
+正例：
 
 ```ts
-type A = { a: number };
-type B = { b: string };
-function f(x: A | B): void {
-  if ("a" in x) x.a; // A
-  else x.b;          // B
-}
+type State =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; data: User }
+  | { status: 'error'; error: string };
 ```
 
----
-
-## 5. 可辨识联合 discriminated union
-
-给联合每个成员加一个**共同的字面量字段**（`kind`/`type`），即可用 `switch` 安全分派：
+现在：
 
 ```ts
-type Shape =
-  | { kind: "circle"; r: number }
-  | { kind: "rect"; w: number; h: number };
-
-function area(s: Shape): number {
-  switch (s.kind) {
-    case "circle": return Math.PI * s.r ** 2; // s 收窄为 circle
-    case "rect":   return s.w * s.h;          // s 收窄为 rect
+function render(s: State) {
+  switch (s.status) {
+    case 'idle':     return '未开始';
+    case 'loading':  return '加载中';
+    case 'success':  return s.data.name;   // ✅ 这里一定有 data
+    case 'error':    return s.error;       // ✅ 这里一定有 error
     default:
-      // 穷尽性检查：若漏 case，这里 s 是 never，会编译报错
-      const _exhaustive: never = s;
+      const _exhaustive: never = s;        // ✅ 新增分支忘了处理，这里报错
       return _exhaustive;
   }
 }
 ```
 
-`never` 穷尽检查是**杀手锏**：以后新增 `kind`，忘了加 `case`，编译期立刻报错，不会漏处理。
+**`never` 穷尽检查是整个 TS 里投入产出比最高的一招**：以后有人给 `State` 加了 `{ status: 'empty' }`，所有没处理的 switch 立刻编译报错，而不是线上显示空白。
+
+> 团队实践：给这类 switch 加一条 ESLint 规则或 code review 检查项——"带 `default` 的 switch 必须做穷尽断言"。
 
 ---
 
-## 6. 自定义类型守卫 is
-
-判断逻辑复杂时，用 `is` 抽成守卫函数：
+## 联合上的操作必须先收窄
 
 ```ts
-function isFish(x: Fish | Bird): x is Fish {
-  return (x as Fish).swim !== undefined;
-}
-function move(x: Fish | Bird): void {
-  if (isFish(x)) x.swim(); // 收窄为 Fish
-  else x.fly();
+type Shape = { kind: 'circle'; r: number } | { kind: 'rect'; w: number; h: number };
+
+function area(s: Shape) {
+  // s.r;                        // ❌ circle 有，rect 没有
+  if (s.kind === 'circle') return Math.PI * s.r ** 2;   // ✅ 收窄
+  return s.w * s.h;                                      // ✅ 剩下的只能是 rect
 }
 ```
 
-`x is Fish` 告诉 TS："这个函数返回 true 时，x 就是 Fish"，从而在调用处自动收窄。
+三个常被误解的点：
+
+1. **联合类型的"公共字段"才能直接访问**：`s.kind` 能访问（都存在），`s.r` 不行。
+2. **收窄是靠控制流分析**：`if`、`switch`、`&&`、`??`、`throw` 都会影响；函数调用一般不会（除非是断言函数/类型守卫）。
+3. **`|` 是"或"，`&` 是"且"**：`A | B` 的变量只能是其中一种形状；`A & B` 必须同时满足两者（见 03 篇"不可能的交叉"）。
 
 ---
 
-## 7. 断言 as 与非空 !
+## 四类类型守卫
 
-⚠️ 这两是"我比编译器更懂"的逃生舱，**慎用**：
+### 1. `typeof`（原始类型）
 
 ```ts
-const el = document.getElementById("app") as HTMLDivElement; // 断言类型
-const len = (el as any).length;                              // 双断言链，危险
+if (typeof v === 'string') v.toUpperCase();
+if (typeof v === 'function') v();
+```
 
-function f(x: string | null): number {
-  return x!.length; // 非空断言：你保证 x 非 null，否则运行时炸
+注意 `typeof null === 'object'`——判断对象时一定要加 `v !== null`。
+
+### 2. `instanceof`（类实例）
+
+```ts
+if (err instanceof TypeError) err.message;
+```
+
+跨 iframe / 跨 realm 会失效（`Array` 构造函数不是同一个），此时用 `Array.isArray`。
+
+### 3. `in`（字段存在性，适合判别联合的变体）
+
+```ts
+type Result = { data: User } | { error: string };
+if ('data' in result) result.data.name;
+```
+
+### 4. 自定义守卫（返回 `x is T`）
+
+```ts
+function isUser(v: unknown): v is User {
+  return typeof v === 'object' && v !== null && 'id' in v && typeof (v as User).id === 'string';
+}
+
+if (isUser(payload)) payload.name;    // ✅ 收窄成功
+```
+
+⚠️ **守卫是"你向编译器保证"**，它不做运行时校验的额外检查。写错一个条件，类型就是假的：
+
+```ts
+// ❌ 危险：只查了 id 是 string，但 User 还有必填的 name
+function isUser(v: unknown): v is User { ... }
+```
+
+所以：**外部数据不要手写守卫，用 schema 库**（11 篇），它同时产出类型和校验。
+
+---
+
+## 断言函数：让"调用即收窄"
+
+```ts
+function assertIsUser(v: unknown): asserts v is User {
+  if (!isUser(v)) throw new TypeError('不是合法 User');
+}
+
+function handle(payload: unknown) {
+  assertIsUser(payload);
+  payload.name;          // ✅ 之后都是 User（因为不合法就抛了）
 }
 ```
 
-规则：
-- 优先用收窄，别用 `as`。
-- 必须断言时，用 `as` 一步到位，避免 `as any as X`。
-- `!` 只在你**确定**非空时用，否则把运行时错误藏起来。
+与守卫的取舍：
+
+| | 类型守卫 `v is T` | 断言函数 `asserts v is T` |
+| --- | --- | --- |
+| 返回值 | `boolean` | `void`（不合法就抛） |
+| 用法 | 必须写在 `if` 里 | 直接调用，后续自动收窄 |
+| 适合 | 可失败的判断 | 合约式前置条件（"这里必须满足"） |
 
 ---
 
-## 小结
+## 联合的几个坑
 
-- 联合 `A | B` 与字面量联合是灵活 API 的基础。
-- 收窄手段：`typeof`/`instanceof`/`in`/`===`/自定义 `is`/可辨识联合。
-- 可辨识联合 + `never` 穷尽检查 = 漏 case 编译期报错。
-- `as`/`!` 是逃生舱，能收窄就别断言。
+### 坑 1：可选属性 vs 联合
+
+```ts
+// A：字段可选 —— 允许"既没有 a 也没有 b"的非法状态
+type A = { a?: string; b?: number };
+
+// B：联合 —— 只能是其中一种
+type B = { a: string } | { b: number };
+```
+
+能用 B 就用 B。A 那种写法最后一定会在某处写 `a!` 或 `a ?? ''`。
+
+### 坑 2：`Object.keys` 丢失键类型
+
+```ts
+const obj = { a: 1, b: 2 };
+Object.keys(obj).forEach((k) => obj[k]);   // ❌ k 是 string，不是 'a' | 'b'
+```
+
+内置签名返回 `string[]`（因为运行时可能有多余键）。要精确键，写：
+
+```ts
+function keysOf<T extends object>(o: T): (keyof T)[] {
+  return Object.keys(o) as (keyof T)[];
+}
+```
+
+### 坑 3：`Exclude` 不等于"删字段"
+
+```ts
+type T = Exclude<'a' | 'b' | 'c', 'a'>;   // 'b' | 'c'（删的是联合成员）
+type O = Omit<User, 'age'>;                // 删的是对象字段
+```
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| switch 加了新分支但老代码不报错 | 没有 `never` 穷尽检查 | `default: const _x: never = s` |
+| `s.status` 判了还是报错 | 只判了 `if (s.status === 'x')` 的一部分 | 用 `switch` 或提前 `return` 收窄 |
+| 自定义守卫写错导致线上崩 | 守卫是"声明"不是"校验" | 外部数据用 schema（11 篇） |
+| `typeof v === 'object'` 后访问属性报错 | `null` 也是 object | 加 `v !== null &&` |
+| 联合类型上调用方法报"没有共同签名" | 方法签名不一致 | 先判别联合再调用 |
+| `Object.keys` 遍历取值报错 | 键被推成 `string` | 用 `keysOf` 泛型包装或 `as` 局部断言 |
+
+---
+
+## 验收清单
+
+- [ ] 状态类类型用判别联合，而不是"多个布尔字段"
+- [ ] 所有对联合的 `switch` 都有 `never` 穷尽断言
+- [ ] 没有 `a?: X` + `b?: Y` 这种"半可选"的组合（除非业务真的允许）
+- [ ] 外部数据的收窄靠 schema，而不是手写 `v is T`
+- [ ] 能说清守卫（返回 boolean）与断言函数（抛错）的使用边界
+- [ ] 知道 `Exclude`（删联合成员）与 `Omit`（删对象字段）的区别
 
 ---
 
 ## 练习
 
-1. 定义可辨识联合 `type Resp = { ok: true; data: string } | { ok: false; error: string }`，写 `handle(r: Resp)` 用 `switch`。
-2. 给上题加 `never` 穷尽检查，然后新增一个 `ok` 变体看是否报错。
-3. 写 `isString(x: unknown): x is string` 守卫函数，并在 `format` 里用它收窄。
-4. 解释 `as any` 为什么危险，什么场景才该用 `as`。
+1. **给一个真实组件加穷尽检查**：把 `if/else` 状态渲染改成 `switch` + `never`，然后给联合加一个新成员，确认编译报错。  
+   *自检*：报错位置应精确指向 `const _x: never = s`，而不是运行时报错。
+2. **手写一个守卫并故意写错**：`isUser` 只检查 `id`，传入 `{ id: 'x' }` 通过守卫，然后在 `payload.name.toUpperCase()` 处崩。  
+   *自检*：能说明"守卫是编译期假设，不是运行时保证"。
+3. **对比两种状态建模**：用"三个可选字段"和"判别联合"各写一个 loading 组件，统计需要 `?.` 和 `!` 的次数。  
+   *自检*：联合版本的非空断言次数应该是 0。

@@ -1,153 +1,200 @@
 ---
 title: '06 · 泛型基础'
-published: 2026-09-27T16:00:00+08:00
-description: 'TypeScript 泛型入门：为什么需要泛型、泛型函数 identity、泛型约束 extends、泛型默认值、泛型接口与泛型类、多个类型参数。用泛型写出可复用且类型安全的代码。'
-tags: [TypeScript, 泛型, generics, 类型约束, 类型安全]
+published: 2026-09-30T12:00:00+08:00
+description: '泛型解决的是"类型之间的关系丢失"，不是"让代码更通用"：什么时候真的需要泛型、约束 extends 怎么写、默认值与推断时机，以及最常见的误用（T 只出现一次）。'
+tags: [TypeScript, 泛型, 类型推断, 约束]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> 泛型 = "参数化的类型"。它让函数/类/接口在**保持类型安全**的同时适配多种类型。本篇打基础，第 7 篇讲进阶玩法。
+## 泛型的本质：把"类型之间的关系"表达出来
 
----
-
-## 1. 为什么需要泛型
-
-没有泛型时，想写一个"返回传入值"的函数只能退化成 `any`：
+不用泛型时，你只能二选一：
 
 ```ts
-function identity(arg: any): any {
-  return arg;
-}
-const x = identity(10); // x 是 any，丢了 number 信息
+function firstAny(arr: any[]): any {}        // 关系丢了：进去是 string，出来是 any
+function firstStr(arr: string[]): string {}  // 关系保住了，但只能处理 string
 ```
 
-用泛型保留类型信息：
+泛型是把这层关系**参数化**：
 
 ```ts
-function identity<T>(arg: T): T {
-  return arg;
-}
-const x = identity(10);   // x: number
-const s = identity("hi"); // s: string
-```
-
-`T` 是**类型参数**，调用时由实参推断。返回值类型和入参类型被"绑定"在一起。
-
----
-
-## 2. 泛型函数
-
-```ts
-function first<T>(arr: T[]): T | undefined {
+function first<T>(arr: T[]): T {             // 进来 T，出去还是 T
   return arr[0];
 }
-first([1, 2, 3]);     // number | undefined
-first(["a", "b"]);    // string | undefined
+const a = first([1, 2]);      // number
+const b = first(['x']);       // string
 ```
 
-多个类型参数：
+关键认知：**泛型的价值不是"通用"，而是"关系不丢"**。如果一个类型参数在签名里只出现一次，它就没在表达关系，等于 `any`。
 
 ```ts
-function pair<K, V>(key: K, value: V): [K, V] {
-  return [key, value];
-}
+// ❌ T 只出现一次：没有任何约束作用，调用方随便传
+function log<T>(value: T): void { console.log(value); }
+
+// ✅ 正确写法：不需要泛型
+function log(value: unknown): void { console.log(value); }
 ```
+
+这条判断标准能干掉一半"为了显得高级"的泛型。
 
 ---
 
-## 3. 泛型约束 extends
-
-有时你想限制 `T` "至少长什么样"。用 `extends` 约束：
+## 基本形态
 
 ```ts
-interface HasLength {
-  length: number;
-}
-function longest<T extends HasLength>(a: T, b: T): T {
-  return a.length >= b.length ? a : b;
-}
-longest("abc", "de");   // ✅ string 有 length
-longest([1, 2], [3]);   // ✅ 数组有 length
-// longest(10, 20);     // ❌ number 没有 length
-```
+// 函数
+function identity<T>(x: T): T { return x; }
 
-约束让 `T` 既保留具体类型，又能安全访问 `length`。
+// 接口
+interface Box<T> { value: T }
 
----
+// 类型别名
+type Pair<A, B> = { first: A; second: B };
 
-## 4. 泛型默认值
-
-类型参数也能给默认：
-
-```ts
-interface ApiResponse<T = unknown> {
-  code: number;
-  data: T;
-}
-const r1: ApiResponse = { code: 0, data: null };      // data: unknown
-const r2: ApiResponse<string> = { code: 0, data: "ok" }; // data: string
-```
-
-默认值让可选泛型更友好，常见于库的类型定义。
-
----
-
-## 5. 泛型接口
-
-```ts
-interface Result<T> {
-  ok: boolean;
-  value: T;
-}
-function ok<T>(value: T): Result<T> {
-  return { ok: true, value };
-}
-```
-
----
-
-## 6. 泛型类
-
-```ts
+// 类
 class Stack<T> {
   private items: T[] = [];
-  push(item: T): void { this.items.push(item); }
+  push(item: T) { this.items.push(item); }
   pop(): T | undefined { return this.items.pop(); }
 }
-const s = new Stack<number>();
-s.push(1);
 ```
 
-实例化时指定 `T`，类内所有用到 `T` 的地方都锁定为该类型。
-
----
-
-## 7. 泛型与箭头函数
-
-给箭头函数加泛型要小心语法——`<T>` 易被解析为 JSX：
+在 React / Vue 里也随处可见：
 
 ```ts
-const identity = <T,>(arg: T): T => arg; // 加逗号 <T,> 避免歧义
+const [state, setState] = useState<User | null>(null);   // 显式指定
+const ref = useRef<HTMLDivElement>(null);                // 元素类型约束
 ```
-
-在 `.tsx` 文件里这个逗号**必需**。
 
 ---
 
-## 小结
+## 约束 `extends`：把"能做什么"写进类型
 
-- 泛型 `<T>` 把"类型"当参数，保留类型信息又复用逻辑。
-- `extends` 约束 `T` 的形态；默认值让泛型可选。
-- 泛型可用于函数、接口、类，多个类型参数用 `<K, V>`。
-- `.tsx` 中写 `<T,>` 防止被当成 JSX。
+不约束的泛型什么都不能干：
+
+```ts
+function longest<T>(a: T, b: T): T {
+  return a.length >= b.length ? a : b;   // ❌ T 上没有 length
+}
+```
+
+加约束：
+
+```ts
+function longest<T extends { length: number }>(a: T, b: T): T {
+  return a.length >= b.length ? a : b;   // ✅
+}
+longest('abc', 'de');        // string
+longest([1, 2], [3]);        // number[]
+longest(1, 2);               // ❌ number 没有 length
+```
+
+`extends` 在泛型里是**"可赋值给"**的意思，不是继承。常用形态：
+
+| 约束 | 含义 | 场景 |
+| --- | --- | --- |
+| `T extends object` | 非原始类型 | 只接受对象 |
+| `T extends string` | 字符串（含字面量） | 模板字面量类型 |
+| `K extends keyof T` | T 的键 | `get(obj, key)` |
+| `T extends (...args: any) => any` | 是函数 | 提取返回值 |
+| `T extends unknown[]` | 是数组 | 处理列表 |
+
+---
+
+## 默认值：给"最常用"的类型参数一个兜底
+
+```ts
+type ApiResponse<T = unknown, E = Error> =
+  | { ok: true; data: T }
+  | { ok: false; error: E };
+
+type UserResp = ApiResponse<User>;        // E 默认 Error
+type RawResp = ApiResponse;               // T = unknown, E = Error
+```
+
+默认值让调用方只在"需要精确"时才写类型参数——**这是让 API 用起来不啰嗦的关键**。
+
+---
+
+## 推断时机：为什么有时能省、有时必须写
+
+```ts
+first([1, 2]);                    // ✅ 从参数推断 T = number
+new Stack();                      // ❌ 推断不出 T（没参数），默认 T = unknown
+new Stack<number>();              // ✅ 显式给
+
+// 泛型默认值能救这种场景
+class Stack<T = unknown> {}
+```
+
+三条规律：
+
+1. **从参数位置推断**：最可靠；
+2. **从返回值推断**：TS 不做（不做"逆向推断"），必须显式写；
+3. **推断不出来时**：落到默认值，没默认值就是 `unknown`。
+
+---
+
+## 泛型 + 约束的实战：一个类型安全的事件总线
+
+```ts
+type Events = {
+  'user:login': { userId: string };
+  'cart:add': { sku: string; qty: number };
+};
+
+class Bus<E extends Record<string, unknown>> {
+  private handlers: { [K in keyof E]?: Array<(p: E[K]) => void> } = {};
+
+  on<K extends keyof E>(event: K, handler: (payload: E[K]) => void) {
+    (this.handlers[event] ??= []).push(handler);
+  }
+
+  emit<K extends keyof E>(event: K, payload: E[K]) {
+    this.handlers[event]?.forEach((h) => h(payload));
+  }
+}
+
+const bus = new Bus<Events>();
+bus.emit('cart:add', { sku: 'a', qty: 1 });   // ✅
+bus.emit('cart:add', { sku: 'a' });           // ❌ 少 qty
+bus.emit('nope', {});                         // ❌ 事件名不存在
+```
+
+这段代码把"事件名 → 载荷形状"的关系完整编码进类型，**新增事件只改 `Events` 一处**。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 泛型参数推不出来，全变 `unknown` | 没有从参数位置提供信息 | 显式写 `<T>`，或加默认值 |
+| `T` 上访问属性报"不存在" | 没加约束 | `T extends { id: string }` |
+| 泛型函数里 `return null` 报错 | 返回类型被推断成 `T`，不接受 null | 返回类型写 `T \| null` |
+| 一个函数 4 个泛型参数 | 想一次解决所有问题 | 拆函数，或用 `satisfies` 约束字面量 |
+| 泛型类实例化后类型全 `any` | 用了 `new Stack<any>()` | 去掉 `any`，让推断或默认值生效 |
+| 约束写成 `T extends string[]` 却传了元组 | 元组不能赋值给可变数组 | 用 `readonly string[]` 或 `unknown[]` |
+
+---
+
+## 验收清单
+
+- [ ] 项目里的泛型参数**至少出现两次**（否则删掉换具体类型）
+- [ ] 有约束的泛型（`extends`）而不是"裸 T + `as any` 访问属性"
+- [ ] 公共 API 的类型参数有合理默认值（调用方不必每次都写）
+- [ ] 能说清"为什么返回值位置不能反向推断类型参数"
+- [ ] 能读懂 `useState<T>` / `useRef<T>` / `Promise<T>` 的签名结构
+- [ ] 至少写过一处"事件名 → 载荷"这类键值联动类型
 
 ---
 
 ## 练习
 
-1. 写泛型函数 `last<T>(arr: T[]): T | undefined` 返回最后一个元素。
-2. 用 `T extends object` 约束写一个 `getKeys<T extends object>(o: T): (keyof T)[]`。
-3. 写泛型类 `Queue<T>` 实现 `enqueue`/`dequeue`。
-4. 给 `interface Box<T = string>` 加默认值，分别用 `Box` 和 `Box<number>` 实例化。
+1. **删掉一个无用的泛型**：找一个 `function f<T>(x: T): T` 式的"假泛型"，改成具体类型或 `unknown`，确认调用方代码没变。  
+   *自检*：能说明"泛型只在表达关系时才有价值"。
+2. **给泛型加约束**：把 `function pluck<T>(obj: T, key: string)` 改成 `K extends keyof T` 的版本，让返回值类型精确。  
+   *自检*：调用 `pluck(user, 'name')` 返回 `string`，`pluck(user, 'nope')` 编译报错。
+3. **补默认值**：给一个需要 2 个类型参数的接口加默认值，让 80% 的调用只写 1 个。  
+   *自检*：能说明默认值降低了 API 的"仪式感成本"。

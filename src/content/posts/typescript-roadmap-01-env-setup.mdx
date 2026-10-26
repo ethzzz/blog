@@ -1,168 +1,161 @@
 ---
-title: '01 · 环境搭建与第一个 TypeScript 程序'
-published: 2026-09-27T11:00:00+08:00
-description: '从零搭建 TypeScript 开发环境：安装 Node 与 tsc、编写并编译第一个 hello.ts、理解 tsconfig.json 关键字段、配置 VS Code、用 npm scripts 与 tsx/ts-node 提升开发体验。'
-tags: [TypeScript, 环境搭建, tsc, tsconfig, npm]
+title: '01 · 环境与工具链'
+published: 2026-09-30T09:30:00+08:00
+description: 'tsc / tsx / 打包器三条运行路径各自负责什么，最小可用的 tsconfig 怎么开，strict 为什么必须第一天就打开，以及"编辑器不报错但构建报错"这类分裂的成因。'
+tags: [TypeScript, tsc, tsconfig, 工具链, strict]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> 本篇目标：在你的电脑上跑通 TypeScript 工具链，写出第一个能被编译运行的 TS 文件，并建立对 `tsconfig.json` 的初步认识。
+## 先分清三个角色
+
+新手最常见的混乱：以为 `tsc` 就是"运行 TS 的东西"。实际上是三个角色的分工：
+
+| 角色 | 谁做 | 干什么 | 是否检查类型 |
+| --- | --- | --- | --- |
+| **类型检查** | `tsc --noEmit` | 语义分析、报错 | ✅ |
+| **转译** | esbuild / swc / babel / `tsc` | 删类型、降语法 | ❌（esbuild/swc/babel 不检查） |
+| **运行** | `tsx` / `node --experimental-strip-types` / 打包后产物 | 真正跑起来 | ❌ |
+
+所以四种常见组合：
+
+```bash
+# A. 只写类型，构建交给打包器（前端项目最常见）
+"dev": "vite"                    # esbuild 转译，不检查
+"build": "tsc --noEmit && vite build"   # 构建前补一次检查
+
+# B. Node 脚本 / CLI 工具，直接跑 TS
+npx tsx src/cli.ts               # 转译 + 运行，快，不检查类型
+
+# C. 纯 tsc 项目（库、老项目）
+"build": "tsc -p tsconfig.build.json"   # 编译并产出 d.ts
+
+# D. Node 22+ 原生类型剥离（实验/简单脚本）
+node --experimental-strip-types src/x.ts # 只能删类型，不支持 enum/namespace
+```
+
+**判断标准**：`tsx`、`vite dev`、`node --strip-types` 都**不会告诉你类型错了**。所以 `typecheck` 必须作为一个独立命令存在（见 14 篇）。
 
 ---
 
-## 1. 安装 Node.js
-
-TypeScript 编译器 `tsc` 本身是一个 Node.js 程序，所以第一步是装 Node。
-
-```bash
-# 查看是否已安装（建议 18+）
-node -v
-npm -v
-```
-
-没装的话去 [nodejs.org](https://nodejs.org/) 下载 LTS 版本即可。装好后 `npm` 也一并就绪。
-
----
-
-## 2. 安装 TypeScript 编译器
-
-推荐**项目级安装**（而非全局），这样不同项目能锁定不同版本：
-
-```bash
-# 在当前项目目录初始化并安装
-npm init -y
-npm install -D typescript
-
-# 验证安装
-npx tsc -v
-```
-
-`npx tsc` 会调用本地安装的 `tsc`。如果想全局装也可以 `npm install -g typescript`，但团队项目强烈建议走 `devDependencies`。
-
----
-
-## 3. 第一个 TypeScript 程序
-
-新建 `hello.ts`：
-
-```ts
-// hello.ts
-function greet(name: string): string {
-  return `你好，${name}！`;
-}
-
-const message = greet("TypeScript");
-console.log(message);
-```
-
-注意 `name: string` 和 `: string` 这两处类型注解——这就是 TS 比 JS 多的部分。
-
-编译它：
-
-```bash
-npx tsc hello.ts
-```
-
-会生成一个 `hello.js`（类型注解被擦除后的纯 JS）。运行：
-
-```bash
-node hello.js
-# 输出：你好，TypeScript！
-```
-
-试着改错传参，体验类型检查：
-
-```ts
-greet(123); // ❌ 报错：Argument of type 'number' is not assignable to parameter of type 'string'
-```
-
-不用运行，编译器就拦住了你——这就是 TS 的价值。
-
----
-
-## 4. tsconfig.json 初探
-
-每次手动指定文件太麻烦。用配置文件让 `tsc` 自动处理整个项目：
-
-```bash
-npx tsc --init
-```
-
-这会生成 `tsconfig.json`。几个最关键、初学者先记住的字段：
+## 最小可用的 tsconfig
 
 ```jsonc
+// tsconfig.json
 {
   "compilerOptions": {
-    "target": "ES2020",      // 编译成哪个 JS 版本
-    "module": "CommonJS",    // 模块系统（Node 用 CommonJS，前端用 ESNext）
-    "outDir": "./dist",      // 编译产物输出目录
-    "rootDir": "./src",      // 源码根目录
-    "strict": true,          // 开启全部严格检查（强烈建议）
-    "esModuleInterop": true, // 兼容默认导入（import fs from 'fs'）
-    "skipLibCheck": true     // 跳过 .d.ts 内部检查，提速
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+
+    // 第一天就开，别等代码长起来
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+
+    "isolatedModules": true,       // 兼容 esbuild/swc 的"单文件转译"
+    "esModuleInterop": true,
+    "skipLibCheck": true,          // 不检查 node_modules 里的 d.ts（否则慢到不可用）
+    "forceConsistentCasingInFileNames": true,
+
+    "noEmit": true                 // 前端项目：只检查，不产出
   },
-  "include": ["src/**/*"],   // 参与编译的文件
-  "exclude": ["node_modules", "dist"]
+  "include": ["src"]
 }
 ```
 
-之后直接 `npx tsc` 就能编译整个 `src` 目录到 `dist`。
+三个必讲项：
 
-> 第 13 篇会**逐字段**拆解 tsconfig，这里先混个脸熟。
+### `strict: true` 必须第一天开
+
+它不是一个开关，是一组规则（`noImplicitAny`、`strictNullChecks`、`strictFunctionTypes`、`strictBindCallApply`、`noImplicitThis`、`useUnknownInCatchVariables`…）。
+
+**后开的代价是线性的**：新项目开 `strict` 是 0 成本；3 万行项目再开，一次冒出几百个错，团队会选择"关掉一半"，最后等于没开。
+
+### `noUncheckedIndexedAccess` 是照妖镜
+
+```ts
+const arr = ['a', 'b'];
+const first = arr[0];      // 类型是 string | undefined，不是 string
+first.toUpperCase();       // ❌ 编译报错，必须处理 undefined
+```
+
+它把"数组/字典可能取不到"这件事显式化。线上崩溃的大头在这里。
+
+### `moduleResolution` 选错会连环报错
+
+| 场景 | 值 | 后果 |
+| --- | --- | --- |
+| Vite/Webpack 前端 | `bundler` | 可省略扩展名，支持 `exports` 字段 |
+| Node 原生 ESM | `node16` / `nodenext` | **必须写 `.js` 扩展名**（相对导入） |
+| 老项目/CommonJS | `node10`（旧名 `node`） | 不认 `exports`，容易找不到模块 |
 
 ---
 
-## 5. 配置 VS Code
+## 目录与 include
 
-VS Code 对 TS 开箱即用（内置 TS 语言服务）。建议：
-
-- 状态栏右下角确认 TS 版本是**项目本地版本**（点版本号可切换），避免用到全局旧版。
-- 开启 `strict` 后，编辑器会实时标红类型错误，不用等编译。
-- 装官方扩展 **TypeScript + JavaScript Nightly**（可选，抢先体验新版特性）。
-
----
-
-## 6. 让开发更顺手
-
-每篇都手敲 `tsc` 太累，把常用命令写进 `package.json`：
+```text
+src/
+  index.ts
+test/
+  *.test.ts
+tsconfig.json          # 主配置，include: ["src"]
+tsconfig.build.json    # 发布用，exclude 测试
+```
 
 ```jsonc
+// tsconfig.build.json —— 库项目常见拆分
 {
-  "scripts": {
-    "build": "tsc",           // 编译
-    "watch": "tsc -w",        // 监听改动自动编译
-    "start": "node dist/index.js"
-  }
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": false, "declaration": true, "outDir": "dist" },
+  "exclude": ["test", "**/*.test.ts"]
 }
 ```
 
-开发时直接 `npm run watch` 后台编译，`npm start` 跑。
-
-如果想**跳过编译直接跑 TS**（开发调试更爽），用 `tsx`：
-
-```bash
-npm install -D tsx
-npx tsx src/index.ts   # 直接运行 TS，无需先 tsc
-```
-
-`tsx` 基于 esbuild，速度极快，是 `ts-node` 的现代替代品。
+`include`/`exclude` 写错最典型的症状：**编辑器里 `tsc` 报"文件不在项目内"**（因为该文件没被 include，TS 只能把它当独立文件处理，拿不到全局类型）。
 
 ---
 
-## 小结
+## 编辑器与命令行为什么会不一致
 
-- TS 工具链 = **Node + tsc + tsconfig + IDE**。
-- `npx tsc file.ts` 单文件编译；`tsconfig.json` + `tsc` 项目级编译。
-- `strict: true` 是安全底线，别关。
-- 开发期用 `tsx` 直接跑 TS，省去编译步骤。
+同一份配置下仍可能出现"编辑器绿、命令行红"，常见三个原因：
+
+1. **编辑器用的是自己的 TS 版本**：VS Code 自带的 TS 可能比项目里 `typescript` 旧。解决：命令面板 → `TypeScript: Select TypeScript Version` → 选 `node_modules/typescript`。
+2. **编辑器打开的是单个文件，没加载 tsconfig**：文件不在 `include` 范围内，但编辑器仍会按"孤立文件"给它类型。
+3. **构建走的是 esbuild**（不检查），而编辑器走了 tsserver（检查）——这类"编辑器红、构建绿"是预期的，说明你缺 `typecheck` 命令。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `Cannot find module 'fs'` | 没装 `@types/node` | `pnpm add -D @types/node` |
+| `Cannot find module './x'`（Node ESM） | `moduleResolution: node16` 下必须写 `.js` | 导入写 `./x.js`（指向编译后文件名） |
+| 用了 `Array.prototype.at` 报不存在 | `lib` 没含对应版本 | `lib` 补 `ES2022` |
+| 改了类型但编辑器不更新 | 编辑器用了内置 TS 版本 | 切到 workspace 版本 |
+| `tsc` 报一堆 `node_modules` 的错 | 没开 `skipLibCheck` | 打开（代价见 12 篇） |
+| `enum` 在 esbuild 下行为异常 | `isolatedModules` 下 const enum 不支持 | 改用联合字面量（02 篇） |
+
+---
+
+## 验收清单
+
+- [ ] 项目里有独立的 `typecheck` 命令（`tsc --noEmit`），且 `build` 会调用它
+- [ ] `strict: true`，且没有用 `// @ts-nocheck` 关掉整个文件
+- [ ] 知道 `tsx` / `vite dev` / `tsc --noEmit` 三者谁检查、谁不检查
+- [ ] 编辑器里的 TS 版本指向 `node_modules/typescript`（不是内置版）
+- [ ] `include` 覆盖了所有源码，`.d.ts` 不会被误当源码编译
+- [ ] 能说出你这套 `moduleResolution` 为什么选它
 
 ---
 
 ## 练习
 
-1. 新建一个项目，安装 TypeScript，写函数 `sum(a: number, b: number): number` 并返回和，编译运行验证。
-2. 故意把 `sum("1", 2)` 传进去，观察 `tsc` 报什么错。
-3. 用 `tsc --init` 生成 tsconfig，把 `outDir` 改成 `./build` 后编译，确认产物去了哪里。
-4. 装 `tsx`，用 `npx tsx` 直接运行你的 TS 文件。
+1. **验证"构建不检查类型"**：写 `const n: number = 'abc'`，跑 `vite build`（或 `tsx` 运行），确认不报错；再跑 `tsc --noEmit`，确认报错。  
+   *自检*：能解释 esbuild 为什么不做类型检查（纯转译、追求速度、不做跨文件语义分析）。
+2. **制造一次"文件不在项目内"**：把一个 `.ts` 移到 `include` 之外，在编辑器里打开看是否报 `Cannot find name`。  
+   *自检*：能说出 `include` 决定的是"项目成员"，不是"能否被打开"。
+3. **切换编辑器 TS 版本**：把 workspace TS 降到大版本（如 4.9），看新语法（`satisfies`）是否报错。  
+   *自检*：能指出"编辑器版本 ≠ 项目版本"是团队里最常见的假报错来源。

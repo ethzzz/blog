@@ -1,145 +1,184 @@
 ---
-title: '07 · 泛型进阶与内置工具类型'
-published: 2026-09-27T17:00:00+08:00
-description: 'TypeScript 类型编程核心：条件类型 T extends U ? X : Y、infer 提取类型、映射类型 { [K in keyof T]: ... }、keyof 与索引访问，以及 Partial/Required/Readonly/Pick/Omit/Record/ReturnType 等内置工具类型的原理与用法。'
-tags: [TypeScript, 条件类型, infer, 映射类型, 工具类型, keyof]
+title: '07 · 工具类型与类型运算'
+published: 2026-09-30T12:30:00+08:00
+description: 'keyof / typeof / 索引访问 / 映射类型四件套，内置工具类型的实现原理，模板字面量类型，以及三个真实好用的自研工具类型（DeepPartial、PickByValue、MakeOptional）。'
+tags: [TypeScript, 工具类型, 映射类型, keyof, 模板字面量]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> 本篇进入"类型编程"：用类型去操作类型。条件类型、infer、映射类型是 TS 类型系统的三把瑞士军刀，内置工具类型都建立在它们之上。
+## 四个基础算子
+
+工具类型不是魔法，全部由这四个算子拼出来：
+
+```ts
+interface User { id: string; name: string; age: number }
+
+type Keys = keyof User;              // "id" | "name" | "age"
+type NameType = User['name'];        // string（索引访问）
+type AgeOrName = User['age' | 'name']; // number | string
+
+const u: User = { id: '1', name: 'a', age: 1 };
+type UserType = typeof u;            // { id: string; name: string; age: number }（值 → 类型）
+```
+
+`typeof` 的实战价值：**从运行时对象反推类型，避免写两份**。
+
+```ts
+const ROUTES = { home: '/', post: '/p/:id' } as const;
+type RouteName = keyof typeof ROUTES;        // "home" | "post"
+type RoutePath = (typeof ROUTES)[RouteName]; // "/" | "/p/:id"
+```
 
 ---
 
-## 1. 条件类型
-
-语法像三元表达式，但在类型层面：
+## 映射类型：在类型上做循环
 
 ```ts
-type IsString<T> = T extends string ? "yes" : "no";
-type A = IsString<"hi">;  // "yes"
-type B = IsString<42>;    // "no"
+type Mapped = {
+  [K in keyof User]: User[K] | null;    // 每个字段都允许 null
+};
+
+// 带修饰符：去掉可选（-?）、加只读（+readonly）
+type Required<T> = { [K in keyof T]-?: T[K] };
+type ReadonlyDeep<T> = { +readonly [K in keyof T]: T[K] };
+
+// 键重映射（TS 4.1+）：改名 / 过滤
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+// { getId: () => string; getName: () => string; ... }
+
+type OnlyStrings<T> = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K];
+};
 ```
 
-注意 `T extends U` 在条件类型里，若 `T` 是**联合**，会发生**分布式条件**——对联合每个成员分别求值：
-
-```ts
-type ToArray<T> = T extends any ? T[] : never;
-type R = ToArray<string | number>; // string[] | number[]
-```
-
-想**关闭分发**，用元组包一层：`[T] extends [any]`。
+`as` 子句里返回 `never` 就是**删除这个键**——这是"按值类型筛字段"的标准手法。
 
 ---
 
-## 2. infer 提取类型
-
-`infer` 在 `extends` 中"占位"提取一部分类型：
+## 内置工具类型：先手写再背
 
 ```ts
-type ElementType<T> = T extends (infer U)[] ? U : T;
-type E = ElementType<number[]>; // number
+type MyPartial<T>  = { [K in keyof T]?: T[K] };
+type MyRequired<T> = { [K in keyof T]-?: T[K] };
+type MyReadonly<T> = { readonly [K in keyof T]: T[K] };
+type MyPick<T, K extends keyof T> = { [P in K]: T[P] };
+type MyOmit<T, K extends keyof any> = MyPick<T, Exclude<keyof T, K>>;
+type MyRecord<K extends keyof any, V> = { [P in K]: V };
 
-type ReturnOf<T> = T extends (...args: any[]) => infer R ? R : never;
-type R = ReturnOf<() => boolean>; // boolean
+type MyExclude<T, U> = T extends U ? never : T;        // 条件类型的雏形（09 篇）
+type MyExtract<T, U> = T extends U ? T : never;
+type MyNonNullable<T> = T & {};                        // 或 T extends null | undefined ? never : T
+
+type MyReturnType<F> = F extends (...args: any[]) => infer R ? R : never;
+type MyParameters<F> = F extends (...args: infer P) => any ? P : never;
 ```
 
-`infer U` 表示"这里有个待推断的类型"，匹配成功后被绑定到 `U`。
+**为什么值得手写一遍**：面试会问，更重要的是——遇到"内置类型不够用"时（下面三个自研例子），你知道怎么改。
 
 ---
 
-## 3. keyof 与索引访问
+## 模板字面量类型：把字符串规则编码进类型
 
 ```ts
-interface User { id: number; name: string }
-type Keys = keyof User;        // "id" | "name"
-type NameType = User["name"];  // string
-type AllValues = User[keyof User]; // number | string
+type EventName = 'click' | 'focus';
+type HandlerName = `on${Capitalize<EventName>}`;   // "onClick" | "onFocus"
+
+// 实用场景：给对象批量加前缀
+type Prefixed<T, P extends string> = {
+  [K in keyof T as `${P}${string & K}`]: T[K];
+};
+type Api = Prefixed<{ list: () => void; get: () => void }, 'api'>;
+// { apilist: ...; apiget: ... }
+
+// 解析路径参数（路由库常用）
+type PathParams<P extends string> =
+  P extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | PathParams<`/${Rest}`>
+    : P extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+type Params = PathParams<'/user/:id/post/:postId'>;   // "id" | "postId"
 ```
 
-`keyof T` 得到 T 所有键的联合；`T[K]` 得到键 K 对应的值类型。两者结合可写出"按 key 取值"的泛型：
+这已经接近"类型体操"了——**够用就停**，别为了炫技写没人看得懂的类型。
+
+---
+
+## 三个真用得上的自研工具类型
+
+### 1. `DeepPartial`（配置覆盖场景）
 
 ```ts
-function getProp<T, K extends keyof T>(obj: T, key: K): T[K] {
-  return obj[key];
+type DeepPartial<T> = T extends object
+  ? { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
+
+const defaults = { a: { b: 1, c: 2 } };
+function withDefaults(override: DeepPartial<typeof defaults>) {
+  return { ...defaults, ...override, a: { ...defaults.a, ...override.a } };
 }
-getProp({ id: 1, name: "Tom" }, "name"); // 返回 string，类型精确
 ```
 
----
+内置 `Partial` 只做一层，嵌套对象还得全部给——`DeepPartial` 才能写"只覆盖一半"。
 
-## 4. 映射类型
-
-遍历一个类型的所有键，逐一变换：
+### 2. `PickByValue`（按值类型挑字段）
 
 ```ts
-type Optional<T> = {
-  [K in keyof T]?: T[K];
+type PickByValue<T, V> = {
+  [K in keyof T as T[K] extends V ? K : never]: T[K];
 };
-type PartialUser = Optional<User>; // { id?: number; name?: string }
+
+type User = { id: string; name: string; age: number; vip: boolean };
+type StringFields = PickByValue<User, string>;   // { id: string; name: string }
 ```
 
-`in keyof T` 遍历键；`?` 加可选；`T[K]` 取原值类型。这是 `Partial` 的底层实现。
+表单场景很实用："只取所有字符串字段做输入框"。
+
+### 3. `MakeOptional`（部分字段可选）
+
+```ts
+type MakeOptional<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
+
+type UserPatch = MakeOptional<User, 'id' | 'name'>;  // 新建时这两个可以不传
+```
+
+比 `Partial<T>` 精确：只把"确实可选"的字段放宽。
 
 ---
 
-## 5. 内置工具类型（必背）
+## 常见坑
 
-| 工具类型 | 作用 | 近似实现 |
+| 现象 | 根因 | 解法 |
 | --- | --- | --- |
-| `Partial<T>` | 全部变可选 | `{ [K in keyof T]?: T[K] }` |
-| `Required<T>` | 全部必填 | `{ [K in keyof T]-?: T[K] }` |
-| `Readonly<T>` | 全部只读 | `{ readonly [K in keyof T]: T[K] }` |
-| `Pick<T, K>` | 挑部分键 | `{ [P in K]: T[P] }` |
-| `Omit<T, K>` | 排除部分键 | `Pick<T, Exclude<keyof T, K>>` |
-| `Record<K, V>` | 键到值的映射 | `{ [P in K]: V }` |
-| `Exclude<T, U>` | 排除联合成员 | `T extends U ? never : T` |
-| `Extract<T, U>` | 提取联合成员 | `T extends U ? T : never` |
-| `NonNullable<T>` | 去掉 null/undefined | `T extends null | undefined ? never : T` |
-| `ReturnType<T>` | 函数返回值类型 | 用 infer |
-| `Parameters<T>` | 函数参数元组 | 用 infer |
-
-用法示例：
-
-```ts
-type UserPreview = Pick<User, "id" | "name">; // { id: number; name: string }
-type UserInput = Omit<User, "id">;            // 创建时不需要 id
-type Dict = Record<string, number>;          // { [k: string]: number }
-
-function load(): { data: string } { return { data: "" }; }
-type LoadResult = ReturnType<typeof load>;    // { data: string }
-```
+| `keyof` 拿到 `string \| number \| symbol` | 对象有索引签名 | 用 `Record<'a' \| 'b', X>` 收窄，或 `Exclude` 掉 |
+| `Pick<T, 'a'>` 报"不存在" | `'a'` 不在 `keyof T` | 检查字段名拼写与可选性 |
+| 映射类型把函数/数组也展开了 | 没做分支判断 | `T extends object ? ... : T`，并排除 `Function` |
+| `Capitalize<K>` 报错 | `K` 可能是 `string \| number \| symbol` | `Capitalize<string & K>` |
+| 工具类型嵌套三层后报错看不懂 | 类型太复杂 | 抽成命名的中间类型，报错会定位到具体那层 |
+| `Omit` 掉一个不存在的键不报错 | `Omit<T, K extends keyof any>` 过于宽松 | 自己写 `StrictOmit<T, K extends keyof T>` |
 
 ---
 
-## 6. 组合使用
+## 验收清单
 
-工具类型可嵌套组合，表达复杂变换：
-
-```ts
-type DeepPartial<T> = {
-  [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
-};
-```
-
-这是递归映射类型（类型体操入门，第 9 篇深入）。
-
----
-
-## 小结
-
-- 条件类型 `T extends U ? X : Y`，联合会分发；`[T]` 包元组可关分发。
-- `infer` 在 extends 中提取子类型。
-- `keyof` + `T[K]` 实现"按键取值"的精确类型。
-- 映射类型 `{ [K in keyof T]: ... }` 遍历变换键。
-- `Partial/Pick/Omit/Record/ReturnType` 等内置工具建立在这四者之上。
+- [ ] 能默写 `Partial` / `Pick` / `Omit` / `Record` 的实现
+- [ ] 项目里至少有一个自研工具类型解决重复（而不是到处复制对象结构）
+- [ ] 会用 `as const` + `keyof typeof` 从常量表推导联合类型
+- [ ] 键重映射（`as` + `never`）用过一次（按值筛字段）
+- [ ] 能说清 `typeof` 用在"值→类型"、`keyof` 用在"类型→键"的区别
+- [ ] 没有写超过 3 层嵌套的工具类型（可读性红线）
 
 ---
 
 ## 练习
 
-1. 用 `infer` 实现 `FirstArg<F>` 提取函数第一个参数类型。
-2. 用映射类型实现 `Mutable<T>`（去掉所有 readonly）。
-3. 用 `Pick` 和 `Omit` 从 `interface Post { id; title; body; author }` 派生 `PostMeta`（去掉 body）。
-4. 用 `Record` 定义 `type HttpCodes = Record<"OK" | "NotFound", number>` 并赋值。
+1. **手写一遍再对比**：不看文档写出 `MyOmit`，然后用 `tsd` 或 `expect-type` 断言与内置 `Omit` 行为一致。  
+   *自检*：能说出 `Omit` 为什么是 `Pick + Exclude`。
+2. **做 `PickByValue`**：给一个混合类型的对象，挑出所有 `number` 字段，用于"只读数值字段"的场景。  
+   *自检*：故意让某个字段类型是 `number | undefined`，确认它是否被选中（取决于 `extends` 判定）。
+3. **解析路由参数**：用模板字面量类型从 `'/user/:id/post/:postId'` 提取 `"id" | "postId"`。  
+   *自检*：能解释递归为什么终止（最后一段不含 `/`）。

@@ -1,0 +1,206 @@
+---
+title: '11 · 运行时校验与类型安全边界'
+published: 2026-09-30T14:30:00+08:00
+description: '类型在运行时不存在——所以响应、URL、存储、表单、环境变量这五个边界必须做运行时校验。给出 zod / valibot 的落地写法、从 schema 反推类型、错误映射，以及"校验会不会拖慢性能"的答案。'
+tags: [TypeScript, zod, 运行时校验, schema, 类型安全]
+category: TypeScript学习路线
+draft: false
+---
+
+## 一句话戳破幻觉
+
+```ts
+interface User { id: string; name: string }
+
+const data = (await res.json()) as User;   // 编译通过
+data.name.toUpperCase();                   // 运行时：Cannot read property 'toUpperCase' of undefined
+```
+
+**类型在编译后被完全擦除**。`as User` 只是让编译器闭嘴，它没有检查任何东西。
+
+所以有一条铁律：
+
+> **凡是从"代码边界之外"进来的数据，类型都不可信，必须运行时校验。**
+
+---
+
+## 五个必须校验的边界
+
+| 边界 | 典型代码 | 不校验的后果 |
+| --- | --- | --- |
+| **HTTP 响应** | `res.json()` | 后端改字段/返回错误体，前端在深处崩 |
+| **URL / 路由参数** | `new URL(location).searchParams` | `page=abc` 导致 NaN 查询 |
+| **本地存储** | `JSON.parse(localStorage.getItem(x))` | 旧版本数据、被用户改过 |
+| **表单输入** | `formData.get('age')` | 拿到 `string` 却当 `number` 用 |
+| **环境变量 / 构建注入** | `import.meta.env.VITE_X` | `undefined` 一路传到底层 |
+
+还有一个隐性边界：**`postMessage` / `window.name` / 第三方 SDK 回调**。
+
+---
+
+## zod：schema 即类型
+
+```bash
+pnpm add zod
+```
+
+```ts
+import { z } from 'zod';
+
+const UserSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1, '名字不能为空'),
+  age: z.number().int().min(0).max(150).optional(),
+  role: z.enum(['admin', 'user']),
+  tags: z.array(z.string()).default([]),
+});
+
+type User = z.infer<typeof UserSchema>;    // 类型从 schema 推导，永不漂移
+```
+
+关键点：**类型是推导出来的，不是手写的**。这消灭了"接口类型和校验逻辑对不上"这个经典问题。
+
+### 两种用法：parse 与 safeParse
+
+```ts
+// 1) 抛错式：适合"不合法就中断"的场景
+try {
+  const user = UserSchema.parse(await res.json());
+} catch (e) {
+  if (e instanceof z.ZodError) console.error(e.issues);
+}
+
+// 2) 返回结果式：适合 UI 需要展示错误的场景
+const parsed = UserSchema.safeParse(input);
+if (!parsed.success) {
+  // parsed.error.issues: [{ path: ['age'], message: '...' }]
+  const fieldErrors = parsed.error.flatten().fieldErrors;
+} else {
+  const user = parsed.data;   // ✅ 已收窄为 User
+}
+```
+
+### 在请求层统一收口
+
+```ts
+export async function request<T>(
+  url: string,
+  schema: z.ZodType<T>,
+  init?: RequestInit,
+): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) throw new ApiError(res.status, await res.text());
+
+  const json: unknown = await res.json();     // 先拿 unknown
+  const parsed = schema.safeParse(json);
+  if (!parsed.success) {
+    throw new ContractError(url, parsed.error.issues);   // 契约破裂，单独一类错误
+  }
+  return parsed.data;
+}
+
+// 使用：类型自动推导，且运行时真的校验过
+const page = await request('/api/tasks', z.object({
+  items: z.array(TaskSchema),
+  total: z.number(),
+  hasNext: z.boolean(),
+}));
+```
+
+把"契约破裂"和"网络错误"分成两类异常，是这一步最大的收益——**线上报警时你能一眼分清是后端改了还是网断了**。
+
+### 表单校验：同一份 schema 复用两次
+
+```ts
+const FormSchema = z.object({
+  title: z.string().min(1, '请输入标题').max(60, '最多 60 字'),
+  due: z.coerce.date().min(new Date(), '不能早于今天'),
+});
+```
+
+- **提交时**：`safeParse` + `flatten().fieldErrors` → 字段级错误提示；
+- **类型上**：`z.infer` 直接给表单值类型，不用手写两遍。
+
+`z.coerce` 很关键：表单里 `input.value` 永远是字符串，`z.coerce.number()` 会先转再校验。
+
+---
+
+## valibot：更小的替代
+
+```ts
+import * as v from 'valibot';
+
+const UserSchema = v.object({
+  id: v.string(),
+  name: v.pipe(v.string(), v.minLength(1)),
+});
+type User = v.InferOutput<typeof UserSchema>;
+```
+
+差别：**valibot 是函数式 + 可 tree-shake**，打包体积通常只有 zod 的 1/5–1/10（zod 约 12–14KB gzip，valibot 按需约 1–3KB）。取舍：zod 生态更全（表单库、OpenAPI 集成更好），valibot 体积敏感场景更合适。
+
+---
+
+## 性能：校验会不会拖慢？
+
+实测经验（1KB 左右的对象，20 个字段）：
+
+| 操作 | 量级 |
+| --- | --- |
+| 一次 `safeParse` | 10–30 微秒 |
+| 1000 次/秒 | 约 1–3% 单核占用 |
+
+结论：**接口响应级别的校验完全不用担心**。真正要注意的是：
+
+- 不要在 `render` 里对大数据集逐项校验（列表 5000 条 × 每条校验）；
+- 大 schema 在**模块顶层**创建一次，不要每次请求都 `z.object(...)`；
+- 超大数据（几 MB JSON）先判断体积，再决定是否全量校验。
+
+---
+
+## 服务端契约的进阶做法
+
+| 做法 | 适用 | 代价 |
+| --- | --- | --- |
+| 手写 schema | 接口少、变动慢 | 有漂移风险（后端改了要记得改） |
+| **OpenAPI → 类型/schema 生成** | 后端有规范契约 | 需要后端配合 |
+| 契约测试（CI 里打真实接口校验） | 前后端联调期 | 环境依赖 |
+| tRPC / GraphQL 共享类型 | 同栈全栈 | 架构绑定 |
+
+最小可行方案：**schema 放仓库里，CI 跑一次真实接口的 `safeParse`**（开发环境），契约变了立刻红。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `as User` 后字段缺失照样崩 | 类型不检查运行时 | 换成 schema 校验 |
+| 校验通过但类型对不上 | 手写 interface 与 schema 不同步 | 只用 `z.infer`，不再手写 |
+| 表单数字字段报"期望 number" | `input.value` 是字符串 | `z.coerce.number()` |
+| 错误提示拿不到字段名 | 用了 `parse` 抛错而没解析 `issues` | `safeParse` + `flatten().fieldErrors` |
+| 每次请求都新建 schema，慢 | schema 在函数内定义 | 提到模块顶层 |
+| 校验失败被当成网络错误 | 异常没分类 | 单独 `ContractError` |
+| 体积涨了 12KB | 全量引入 zod | 换 valibot，或按需拆 schema |
+
+---
+
+## 验收清单
+
+- [ ] 五个边界（响应/URL/存储/表单/env）都有运行时校验
+- [ ] 类型来自 `z.infer`，没有"手写 interface + 手写校验"的双份维护
+- [ ] 契约失败与网络失败是两类不同的错误
+- [ ] 校验错误能映射到表单字段（`fieldErrors`）
+- [ ] 项目里搜不到 `as SomeResponseType`（或每处都有理由）
+- [ ] 能说出 zod 与 valibot 的体积差与取舍
+
+---
+
+## 练习
+
+1. **让一个 `as` 变成真校验**：找项目里 `as XxxResponse`，改成 `safeParse`，然后人为让后端少返回一个字段，观察错误出现的**位置差异**（解析处 vs 渲染深处）。  
+   *自检*：能说明"越早失败越便宜"。
+2. **做一次契约测试**：把 schema 放在 `shared/` 下，写一个脚本对本地后端跑 `safeParse`，故意把字段名改错，确认能红。  
+   *自检*：能说出这一步在 CI 里的位置（联调 job，不进生产构建）。
+3. **量一次校验成本**：对 1000 条列表数据做 `safeParse`，测耗时，判断是否需要"只校验第一页"。  
+   *自检*：能给出数字并说明结论（通常不需要优化）。

@@ -1,0 +1,162 @@
+---
+title: '15 · 类型测试与发布类型'
+published: 2026-09-30T16:30:00+08:00
+description: '类型也是 API：用 tsd / expect-type 给类型写测试，用 d.ts 打包与 exports.types 让别人真能用上，以及怎么在 CI 里发现"这次改动破坏了调用方类型"。'
+tags: [TypeScript, 类型测试, tsd, d.ts, npm 发布]
+category: TypeScript学习路线
+draft: false
+---
+
+## 为什么类型也要测试
+
+单元测试验证"运行时行为"，但下面这些**只有类型系统知道**：
+
+- 传入错误参数会不会报错？
+- 返回值是否精确到字面量？
+- 泛型推断是否符合预期？
+- 这次改动是否**破坏了调用方**？
+
+如果这些没测，你的库可能"运行时没问题，但升级后所有用户编译失败"——这是最伤信誉的一类事故。
+
+---
+
+## `expect-type`：轻量、够用
+
+```bash
+pnpm add -D expect-type vitest
+```
+
+```ts
+import { expectTypeOf } from 'expect-type';
+import { describe, it } from 'vitest';
+import { createStore } from '../src';
+
+describe('createStore 的类型', () => {
+  it('能推断出 state 的类型', () => {
+    const store = createStore({ count: 0, name: 'a' });
+
+    expectTypeOf(store.getState).returns.toEqualTypeOf<{ count: number; name: string }>();
+    expectTypeOf(store.setState).parameter(0).toEqualTypeOf<Partial<{ count: number; name: string }>>();
+  });
+
+  it('拒绝非法字段', () => {
+    const store = createStore({ count: 0 });
+    // @ts-expect-error 不存在的字段必须报错
+    store.setState({ nope: 1 });
+  });
+});
+```
+
+两个关键点：
+
+1. **`expectTypeOf` 是编译期断言**，类型不符时 `tsc` 会报错——所以它必须跑在 `typecheck` 步骤里；
+2. **`@ts-expect-error` 是反向测试**：如果这段代码**没有**报错，TS 反而会提示"多余的错误抑制"，测试就红了。这是"确保该报错的地方真的报错"的唯一手段。
+
+---
+
+## `tsd`：库作者的标准工具
+
+```bash
+pnpm add -D tsd
+```
+
+```ts
+// test-d/index.test-d.ts
+import { expectType, expectError } from 'tsd';
+import { parse } from '../';
+
+expectType<{ id: string }>(parse('{"id":"1"}'));
+expectError(parse(123));                 // 传 number 必须报错
+```
+
+```json
+{ "scripts": { "test:types": "tsd" } }
+```
+
+`tsd` 会**独立编译**你的 `test-d/` 目录（用发布后的 `types` 入口），所以它验证的是"用户真实拿到的那份类型"，而不是源码。这一点比 `expectTypeOf` 更接近真实场景。
+
+---
+
+## 发布类型：三件套
+
+```jsonc
+// package.json
+{
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist"],
+  "sideEffects": false
+}
+```
+
+三条硬要求：
+
+1. **`exports.types` 必须排在 `import`/`require` 之前**（顺序有意义，TS 靠它解析类型）；
+2. **`files` 只带 `dist`**，别把 `src` 里的 `.ts` 也发上去（会引发重复类型）；
+3. **`types` 文件要真的存在**：`tsc --declaration` 或打包器插件产出，不能手写。
+
+验证方式（发布前必做）：
+
+```bash
+npm pack --dry-run          # 看包里到底有什么
+npx @arethetypeswrong/cli --pack .   # 检查 exports/types 是否配对（attw）
+```
+
+`attw` 会直接告诉你："CJS 用户拿到的类型是错的""ESM 解析到 .d.cts 失败"——这类问题**只有打包后才会暴露**。
+
+---
+
+## 破坏性变更怎么提前发现
+
+| 手段 | 能发现 | 成本 |
+| --- | --- | --- |
+| `tsd` / `expectTypeOf` | 显式测试过的类型约定 | 低 |
+| 对下游做集成测试（真实项目引用本地包） | 真实使用方式被破坏 | 中 |
+| API 快照（`api-extractor`） | 导出签名变化（含 `.api.md` diff） | 中 |
+| Semver 检查（`changesets` + 人工评审） | 版本级别是否合理 | 低 |
+
+最小可行组合：**类型测试 + `attw` + changesets 的版本评审**。三者加起来不到一小时配置，能挡掉 90% 的"发了个补丁版结果全员编译失败"。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 用户装了包但没有类型提示 | 没写 `types` / `exports.types` | 补齐，并用 `attw` 验证 |
+| ESM 用户报"找不到模块的类型" | `exports` 里没配 `types` | 每个入口都配 `types` |
+| 类型测试全绿但用户报错 | 测试跑的是源码，不是发布产物 | 用 `tsd`（跑发布入口） |
+| `@ts-expect-error` 测试失效 | 该报错的地方其实没报错 | 这正是它要抓的问题（会红） |
+| 包体积翻倍 | `files` 没限制，把 src 与 sourcemap 都发了 | 限制 `files`，map 单独上传 |
+| 升级后下游全红 | 类型收紧了但发的是 patch | 用 changesets 判定为 major |
+
+---
+
+## 验收清单
+
+- [ ] 库里有类型测试（`tsd` 或 `expectTypeOf`），且跑在 CI
+- [ ] 至少有一处 `@ts-expect-error` 反向测试（确保该报错时真的报错）
+- [ ] `exports.types` 在每个入口都配了，顺序在 `import` 前
+- [ ] `npm pack --dry-run` 里只有 `dist`（+ package.json/README）
+- [ ] 用 `attw` 检查过打包结果
+- [ ] 类型层面的破坏性变更走 major 版本
+
+---
+
+## 练习
+
+1. **写一个会失败的类型测试**：用 `expectTypeOf` 断言一个错误类型，确认 `tsc` 报错（而不是运行时）。  
+   *自检*：能说明"类型测试的失败信号来自编译器，不是断言库"。
+2. **跑一次 `attw`**：给自己的包跑 `npx @arethetypeswrong/cli --pack .`，看懂输出里的 `FalseCJS` / `NoTypes` 标记。  
+   *自检*：能指出至少一个入口的类型解析问题并修掉。
+3. **做一次反向测试**：把某个参数类型从 `string` 放宽为 `string | number`，确认原有的 `@ts-expect-error` 变成"多余的错误抑制"并让 CI 变红。  
+   *自检*：能说明这为什么等价于"类型层面的回归测试"。

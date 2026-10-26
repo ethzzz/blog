@@ -1,197 +1,193 @@
 ---
-title: '02 · 基础类型与类型注解'
-published: 2026-09-27T12:00:00+08:00
-description: 'TypeScript 基础类型全解：原始类型、数组与元组、枚举（含 const enum 陷阱）、any/unknown/never/void 的区别与取舍、类型推断机制、字面量类型，建立"类型即约束"的核心直觉。'
-tags: [TypeScript, 基础类型, 类型注解, 类型推断, enum]
+title: '02 · 基础类型与字面量'
+published: 2026-09-30T10:00:00+08:00
+description: 'any / unknown / never 的分工，字面量类型与 as const 的收窄效果，satisfies 解决了什么问题，数组与元组的取舍，以及为什么新代码不建议用 enum。'
+tags: [TypeScript, 基础类型, unknown, satisfies, as-const]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> 本篇讲 TS 的"原子"——基础类型。理解它们和类型推断，是后续所有类型组合的地基。
+## 一条主线：类型越窄越好，但只能在"确定"时收窄
+
+TS 新手常犯两类错：
+
+- **太宽**：到处 `any`，等于没写类型；
+- **假装很窄**：`as User` 把 `unknown` 强行说成 `User`，编译通过、运行时炸。
+
+真正要建立的习惯是：**边界处收宽（`unknown`），确认后收窄（守卫），永不断言**。这篇讲的就是这套工具。
 
 ---
 
-## 1. 类型注解语法
+## 三个"特殊"类型的分工
 
-TS 在变量/参数/返回值后加 `: 类型`：
-
-```ts
-let age: number = 18;
-function add(a: number, b: number): number {
-  return a + b;
-}
-```
-
-但**大多数时候你不用手写注解**——TS 会推断（见第 4 节）。注解主要用于：函数参数（无法推断）、对象结构、想收窄类型时。
-
----
-
-## 2. 原始类型
-
-| 类型 | 说明 | 示例 |
+| 类型 | 含义 | 用在哪 |
 | --- | --- | --- |
-| `string` | 字符串 | `"hello"` |
-| `number` | 所有数字（含整数/浮点/NaN） | `42`、`3.14` |
-| `boolean` | 布尔 | `true` |
-| `bigint` | 大整数 | `100n` |
-| `symbol` | 唯一符号 | `Symbol("k")` |
-| `null` / `undefined` | 空值 | —— |
+| `any` | 关闭检查 | **只在迁移期临时用**，且必须有 TODO |
+| `unknown` | 未知，但**使用前必须收窄** | 所有外部输入：`JSON.parse`、`catch (e)`、`postMessage`、第三方回调 |
+| `never` | 不可能存在的值 | 穷尽检查、`throw` 函数返回值、过滤联合类型 |
 
 ```ts
-let title: string = "TS 入门";
-let count: number = 0;
-let done: boolean = false;
-```
+// any：进来就失控
+function f1(x: any) { x.foo.bar(); }   // 编译通过，运行时可能炸
 
-> TS 里**没有** `int`/`float` 之分，数字统一是 `number`（编译到 JS 都是 `number`）。
-
----
-
-## 3. 数组与元组
-
-```ts
-// 数组：两种写法等价
-let nums: number[] = [1, 2, 3];
-let nums2: Array<number> = [1, 2, 3];
-
-// 元组：固定长度、固定位置类型
-let pair: [string, number] = ["age", 18];
-pair[0].toUpperCase(); // ✅ string 方法可用
-pair[1].toFixed(2);    // ✅ number 方法可用
-```
-
-元组常用于"固定结构的多返回值"，比如 `useState` 的 `[state, setState]`。
-
----
-
-## 4. 枚举 enum
-
-枚举给一组相关常量起名字：
-
-```ts
-enum Direction {
-  Up,
-  Down,
-  Left,
-  Right,
-}
-Direction.Up;    // 0
-Direction.Down;  // 1
-```
-
-可指定值：
-
-```ts
-enum Status {
-  Success = 200,
-  NotFound = 404,
-  Error = 500,
+// unknown：不确认就不让用
+function f2(x: unknown) {
+  // x.foo;            // ❌ 报错
+  if (typeof x === 'object' && x !== null && 'foo' in x) {
+    // 这里 x 被收窄为 object & Record<'foo', unknown>
+  }
 }
 ```
 
-字符串枚举：
+`catch` 的变量在 `strict` + `useUnknownInCatchVariables` 下就是 `unknown`——**这是好事**，因为抛出的可能是 string、可能是 Error、也可能是任意值：
 
 ```ts
-enum Role {
-  Admin = "ADMIN",
-  User = "USER",
+try { await save(); } catch (e) {
+  const msg = e instanceof Error ? e.message : String(e);   // ✅ 必须显式判断
 }
 ```
 
-⚠️ **陷阱：const enum**。普通 enum 会编译成 JS 对象，有运行时开销；`const enum` 在编译期被**内联替换**，但配合某些打包器（尤其 `isolatedModules`）会报错。现代项目多用**字符串字面量联合**替代 enum（见第 8 篇），更轻量也更 TS 化。
+---
+
+## 字面量类型：让类型携带"值"
+
+```ts
+type Status = 'idle' | 'loading' | 'success' | 'error';   // 不是 string，是四个具体值
+let s: Status = 'idle';
+s = 'done';      // ❌ 编译报错
+```
+
+配合 `as const` 把"值"固定下来：
+
+```ts
+const config = { mode: 'dark', retries: 3 };
+// 推断：{ mode: string; retries: number }  ← 太宽，'dark' 丢了
+
+const config2 = { mode: 'dark', retries: 3 } as const;
+// 推断：{ readonly mode: "dark"; readonly retries: 3 }  ← 精确到字面量
+```
+
+`as const` 的两个作用：**字面量收窄** + **深度 readonly**。
 
 ---
 
-## 5. any / unknown / never / void
+## `satisfies`：校验但不改变推断
 
-这四个容易混，务必分清：
+`as const` 的问题是它同时冻结了类型。而 `: Type` 注解的问题是**它会丢失具体推断**：
 
-### any —— "关掉类型检查"
 ```ts
-let val: any = 4;
-val = "hello";
-val.foo.bar; // 不报错，但运行时炸
+type Route = { path: string; auth: boolean };
+
+// 用注解：items 的类型被抹成 Route[]，拿不到具体 path 字面量
+const routesA: Route[] = [
+  { path: '/home', auth: false },
+  { path: '/admin', auth: true },
+];
+routesA[0].path;      // string（丢了 '/home'）
+
+// 用 satisfies：既校验结构，又保留精确推断
+const routesB = [
+  { path: '/home', auth: false },
+  { path: '/admin', auth: true },
+] satisfies Route[];
+routesB[0].path;      // "/home"（保住了）
 ```
-`any` 会**逃逸整个类型系统**，能调用任何成员。尽量少用；实在要接不明来源数据时，优先 `unknown`。
 
-### unknown —— "安全的 any"
+判断规则：
+
+- 只要**校验**（结构对不对）→ `satisfies`
+- 要**当常量字典用**（值要参与类型推导）→ `as const satisfies X`（TS 4.9+）
+- **不要**用 `as` 做校验：`as` 是"闭嘴"，不是"检查"
+
 ```ts
-let input: unknown = getUserInput();
-// input.toUpperCase(); // ❌ 必须先收窄类型
-if (typeof input === "string") {
-  input.toUpperCase(); // ✅ 收窄后可用
+// 经典用法：配置表既要约束又要保留 key
+const theme = {
+  primary: '#3b82f6',
+  danger: '#ef4444',
+} as const satisfies Record<string, string>;
+
+type ThemeKey = keyof typeof theme;   // "primary" | "danger"
+```
+
+---
+
+## 数组、元组、readonly
+
+```ts
+const list: string[] = ['a'];           // 可变长同类型
+const pair: [number, string] = [1, 'a']; // 元组：定长、定位置类型
+const ro: readonly string[] = ['a'];     // 只读数组（不能 push）
+```
+
+元组真正的价值是**函数返回多值**：
+
+```ts
+function parse(input: string): [ok: true, value: number] | [ok: false, error: string] {
+  const n = Number(input);
+  return Number.isFinite(n) ? [true, n] : [false, `不是数字: ${input}`];
 }
-```
-`unknown` 是"我还不知道类型"，使用前必须做类型守卫，安全得多。
 
-### never —— "永远不会发生"
-```ts
-function fail(msg: string): never {
-  throw new Error(msg);
-}
+const [ok, result] = parse('12');
+if (ok) result.toFixed(2);   // result 被收窄为 number
 ```
-`never` 表示函数**不返回**（抛异常/死循环），或"一个不可能存在的值"。它常用于**穷尽性检查**（第 8 篇联合类型会用到）。
 
-### void —— "没有返回值"
-```ts
-function log(msg: string): void {
-  console.log(msg);
-}
-```
-`void` 表示函数不返回有意义的值。注意：`undefined` 是具体值，`void` 是"无返回"的语义。
+比 `{ ok: boolean; value?: number; error?: string }` 强得多——**后者永远需要判空两次**。
 
 ---
 
-## 6. 类型推断
-
-TS 能自动推断绝大多数类型，不必处处注解：
+## 为什么新代码别用 `enum`
 
 ```ts
-let x = 10;          // 推断为 number
-x = "hi";            // ❌ 不能改成 string
-
-const arr = [1, 2];  // 推断为 number[]
+enum Status { Idle, Loading }        // 运行时产物：一个双向映射对象
+const enum Fast { A }               // 编译期替换，但 isolatedModules/esbuild 不支持
 ```
 
-推断规则速记：
-- 用 `let` 初始化 → 推断为**值的类型**。
-- 用 `const` 初始化对象/数组 → 推断为**足够宽**的类型（数组是 `T[]`，不是元组）。
-- 函数返回值 → 由 `return` 推断；无 return 为 `void`。
+三个问题：
 
-**最佳实践**：函数参数、导出对象结构显式注解；局部变量交给推断。
+1. **运行时体积**：`enum` 会生成真实对象（`{0:'Idle', Idle:0}`），还不能被 tree-shake；
+2. **类型是名义的**：`Status.Idle` 不能直接和数字比较，跨文件传递容易失败；
+3. **与 `const enum` 的坑**：`isolatedModules`（esbuild/swc/Vite 必需）下不支持，编译直接报错。
+
+替代方案就是字面量联合 + `as const`：
+
+```ts
+const STATUS = { idle: 'idle', loading: 'loading' } as const;
+type Status = (typeof STATUS)[keyof typeof STATUS];   // "idle" | "loading"
+```
+
+**唯一例外**：你在写需要位运算的权限标志（`1 << 0`），那种场景确实适合常量对象 + 位运算函数，也不需要 enum。
 
 ---
 
-## 7. 字面量类型
+## 常见坑
 
-字面量不仅能当值，也能当类型——值本身成为类型：
-
-```ts
-let mode: "light" | "dark" = "light";
-mode = "dark";   // ✅
-mode = "blue";   // ❌
-
-const port = 8080; // const 下推断为字面量类型 8080（不是 number）
-```
-
-字面量类型 + 联合 = 可辨识联合（第 8 篇核心），是 TS 最实用的特性之一。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `Object is possibly 'null'` 到处出现 | 没做判空 | `if (!x) return`、可选链 + 默认值；别用 `!` |
+| `as const` 后不能改属性 | 它同时加 `readonly` | 需要可变时用 `as const` 后在局部展开 `{...obj}` |
+| `satisfies` 报"类型不满足"但看不出哪 | 嵌套深 | 先抽成类型别名，让报错定位到具体字段 |
+| `JSON.parse` 返回值当对象直接用 | 返回 `any` | 立刻赋给 `unknown`，或直接过 schema（11 篇） |
+| 枚举值在接口里变成字符串 | 反向映射理解错 | 改用字面量联合 |
+| `catch (e)` 里 `e.message` 报错 | `e` 是 `unknown` | `e instanceof Error` 判断 |
 
 ---
 
-## 小结
+## 验收清单
 
-- 原始类型 `string/number/boolean/bigint/symbol/null/undefined`。
-- 数组 `T[]`、元组 `[T, U]`（固定结构）。
-- `enum` 方便但有运行时开销，现代偏好字面量联合。
-- `any`(关检查)/`unknown`(需收窄)/`never`(不返回)/`void`(无返回) 各自有清晰边界。
-- 类型推断省注解，但参数和导出结构要显式写。
+- [ ] 项目里 `any` 的数量可统计（`grep -rn ": any"`），每一处都有理由或 TODO
+- [ ] 所有外部输入（响应、存储、URL、`postMessage`）落地时是 `unknown`，不是 `any`
+- [ ] 常量表用 `as const satisfies`，能从中推导出 key 的联合类型
+- [ ] 多返回值函数用元组，而不是三个可选字段
+- [ ] 没有 `enum` / `const enum`（或能说出唯一例外）
+- [ ] 能说清 `as`、`satisfies`、`as const` 三者的差别
 
 ---
 
 ## 练习
 
-1. 定义 `let user: { name: string; age: number }`，试把 `age` 改成字符串看报错。
-2. 写一个返回 `never` 的 `assertNever(x: never): never` 函数。
-3. 用字面量联合定义 `type Theme = "light" | "dark" | "system"`，并写函数 `applyTheme(t: Theme)`。
-4. 对比 `let n = 1` 与 `const n = 1` 推断出的类型差异（用 VS Code 悬浮查看）。
+1. **对比推断结果**：分别写 `const a = { mode: 'dark' }`、`as const`、`: { mode: string }` 三个版本，用编辑器悬停看类型差异。  
+   *自检*：能说出 `as const` 在 `mode` 上做了什么（字面量 + readonly）。
+2. **用 `satisfies` 修一个真实问题**：给一份路由表或主题表加 `satisfies` 约束，同时保留 key 的字面量类型，用它做 `keyof typeof`。  
+   *自检*：故意删掉一个必填字段，确认报错位置精确到那一行。
+3. **替换一处 `as`**：找项目里 `as SomeType` 的用法，改成"`unknown` + 守卫/schema"，说明哪个版本能在字段改名时报警。  
+   *自检*：能指出 `as` 只在"你比编译器更懂"时成立，而那种时候通常是错的。

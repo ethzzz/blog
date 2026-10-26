@@ -1,165 +1,168 @@
 ---
-title: '03 · 接口与类型别名'
-published: 2026-09-27T13:00:00+08:00
-description: 'TypeScript 结构化类型的核心：interface 的定义、可选与只读成员、索引签名、接口继承、函数类型接口；type 类型别名的用法；interface 与 type 的取舍；交叉类型 & 的组合技巧。'
-tags: [TypeScript, interface, type, 类型别名, 交叉类型]
+title: '03 · 对象类型：interface / type / 索引签名'
+published: 2026-09-30T10:30:00+08:00
+description: 'interface 与 type 的真实差异（声明合并 vs 不可变），扩展方式该用哪个，索引签名与 Record 的陷阱，{} / object / Record<string, never> 的区别，以及为什么新代码不该写 namespace。'
+tags: [TypeScript, interface, type, 索引签名, namespace]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> 本篇讲 TS 描述"对象形状"的两大工具：`interface` 与 `type`。掌握它们，等于掌握了 TS 描述数据结构的语法。
+## 别背表格，理解"能不能被重新打开"
+
+`interface` 和 `type` 在 90% 的场景下可以互换。真正决定选择的只有一件事：**这个类型定义能不能被别处"再打开"一次**。
+
+```ts
+// interface：同名声明会合并（declaration merging）
+interface User { id: string }
+interface User { name: string }
+// 结果：User 有两个字段，而且没有任何报错
+
+// type：同名声明直接冲突
+type User = { id: string };
+type User = { name: string };   // ❌ Duplicate identifier
+```
+
+**这个差异既是特性也是地雷**：
+
+- 特性：给第三方库的类型"打补丁"（`declare module` 里扩字段）、在全局注入（`Window` 加属性）。
+- 地雷：两个模块不小心都定义了 `interface Config`，字段会**静默合并**成一个谁都不认识的类型，报错位置离现场很远。
 
 ---
 
-## 1. interface 定义对象形状
+## 差异对照
+
+| 维度 | `interface` | `type` |
+| --- | --- | --- |
+| 声明合并 | ✅ | ❌ |
+| 扩展方式 | `extends A, B` | 交叉 `A & B` |
+| 能表达联合 | ❌ | ✅ `A \| B` |
+| 能表达元组/字面量/条件类型 | ❌ | ✅ |
+| 能表达映射类型 | ❌ | ✅ |
+| 报错可读性 | 略好（名字保留在报错里） | 复杂交叉类型会展开成一大坨 |
+| 性能 | 略好（TS 内部对接口有缓存） | 复杂组合时可能变慢 |
+
+**实践建议**（团队统一比"正确答案"重要）：
+
+- **对象形状**：用 `interface`，尤其对外导出的公共类型（可扩展、报错好看）；
+- **联合、映射、条件、工具类型**：只能 `type`；
+- **一个文件里别混着用两种风格描述同一层概念**，否则 review 时谁也说不清。
+
+---
+
+## 可选、只读、索引签名
 
 ```ts
-interface User {
-  id: number;
-  name: string;
-  email: string;
-}
-
-function sendEmail(user: User): void {
-  console.log(`给 ${user.name} 发邮件`);
+interface Task {
+  readonly id: string;        // 创建后不可改（编译期保证）
+  title: string;
+  done?: boolean;             // 可选：类型是 boolean | undefined
+  tags: readonly string[];    // 只读数组，避免被 push 污染
 }
 ```
 
-只要传入的对象**结构匹配**（有 `id/name/email`），就通过——TS 是**结构化类型系统**（鸭子类型），不看"是不是同一个类"，只看"长得像不像"。
+⚠️ `readonly` 是**浅层**的：`readonly tags: string[]` 只能阻止重新赋值 `task.tags = []`，仍能 `task.tags.push('x')`。要深层只读得用 `readonly string[]` 或 `Readonly<T>` 逐层套。
+
+### 索引签名：方便的代价
+
+```ts
+interface Dict { [key: string]: number }
+
+const d: Dict = { a: 1 };
+d.b = 2;         // ✅ 任何 key 都合法
+d['不存在的键'];  // 类型是 number —— 但运行时是 undefined ⚠️
+```
+
+这就是索引签名最大的问题：**类型说谎**。开 `noUncheckedIndexedAccess` 后它会变成 `number | undefined`（务必开）。
+
+更好的替代：
+
+```ts
+// 1) 键已知 → 用映射类型，键受约束
+type PageMeta = Record<'home' | 'about' | 'post', { title: string }>;
+
+// 2) 键未知但要安全 → 用 Map（取值自带 undefined）
+const cache = new Map<string, number>();
+
+// 3) 从常量推导键 → as const satisfies
+const ROUTES = { home: '/', post: '/p' } as const;
+type RouteKey = keyof typeof ROUTES;
+```
+
+### `{}`、`object`、`Record<string, never>` 的区别
+
+| 写法 | 含义 | 常见误用 |
+| --- | --- | --- |
+| `{}` | **任何非 null/undefined 的值**（包括 `'abc'`、`123`） | 想表达"空对象"却写它 |
+| `object` | 任何非原始类型 | 不能索引取值 |
+| `Record<string, never>` | 真正的"空对象" | 过于严格，很少需要 |
+| `Record<string, unknown>` | 任意键值 | 取值要判空 |
+
+`{}` 的语义最反直觉：它**不表示"没有属性"**，而是"任何有值的类型"。要表达空对象，用 `Record<string, never>`。
 
 ---
 
-## 2. 可选与只读
+## 交叉类型：注意"不可能的交叉"
 
 ```ts
-interface User {
-  id: number;
-  name: string;
-  bio?: string;            // ? 可选成员
-  readonly createdAt: Date; // readonly 只读，赋值后不可改
+type A = { kind: 'a'; a: number };
+type B = { kind: 'b'; b: string };
+type AB = A & B;      // kind 同时是 'a' 和 'b' → 实际是 never
+```
+
+`A & B` 不会报错，但它是一个**永远无法构造**的类型。这类"不可能类型"往往在深层才暴露，症状是"某个变量类型是 `never`，赋值怎么都不对"。
+
+判断技巧：交叉里有**同名字段且类型互斥**时，结果就是 `never`。遇到时先检查是不是该用联合（`A | B`）而不是交叉。
+
+---
+
+## namespace：新代码别用
+
+```ts
+// ❌ 老写法：编译后生成真实对象，不能 tree-shake，还和 ESM 打架
+namespace Utils {
+  export function foo() {}
 }
-
-const u: User = { id: 1, name: "Tom" }; // bio 可省略
-u.createdAt = new Date(); // ❌ readonly 不可重新赋值
 ```
 
-> `readonly` 只约束**编译期**的重新赋值，不保证深层不可变（数组元素、对象属性仍可被改）。深层冻结要用 `Object.freeze` 或 `Readonly<T>`（第 7 篇）。
+三个理由：
+
+1. **它会产生运行时对象**，与"类型在编译期消失"的直觉冲突；
+2. **与 ESM 混用会冲突**（同一个名字既是命名空间又是模块导出，容易 `Cannot redeclare`）；
+3. **现代替代方案更简单**：一个文件就是一个模块，要分组就用目录。
+
+`namespace` 唯一还有价值的场景：**全局 `.d.ts` 里给旧库补类型**（`declare global { namespace JSX {...} }`）——那是"描述已有结构"，不是"组织自己的代码"。
 
 ---
 
-## 3. 索引签名
+## 常见坑
 
-当你不知道对象有哪些键、但知道键值类型时用索引签名：
-
-```ts
-interface StringMap {
-  [key: string]: string;
-}
-const dict: StringMap = { a: "1", b: "2" };
-```
-
-常见场景：配置对象、字典结构。注意：一旦有索引签名，所有显式成员的类型必须**兼容**该签名的值类型。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 两个文件定义了同名 interface，字段莫名多出来 | 声明合并 | 改用 `type`，或给 interface 加前缀 |
+| `Record<string, T>` 取不存在的键不报错 | 索引签名 + 未开 `noUncheckedIndexedAccess` | 开严格索引检查；或用 `Map` |
+| `{}` 类型接受字符串/数字 | `{}` 语义是"非空值" | 用 `Record<string, never>` 或具体字段 |
+| `A & B` 之后类型变 `never` | 同名字段互斥 | 检查是否该用 `\|` |
+| `readonly arr: string[]` 仍能被 push | readonly 是浅层 | 用 `readonly string[]` |
+| `Cannot redeclare block-scoped variable` | namespace 与模块同名 | 删掉 namespace，改文件模块 |
 
 ---
 
-## 4. 函数类型接口
+## 验收清单
 
-接口也能描述函数：
-
-```ts
-interface SearchFn {
-  (source: string, keyword: string): boolean;
-}
-const search: SearchFn = (s, k) => s.includes(k);
-```
-
-不过函数类型更常用 `type` 写（见第 4 篇），接口更偏向对象。
-
----
-
-## 5. 接口继承 extends
-
-接口可继承多个：
-
-```ts
-interface Animal {
-  name: string;
-}
-interface Dog extends Animal {
-  bark(): void;
-}
-// Dog = { name: string; bark(): void }
-```
-
----
-
-## 6. type 类型别名
-
-`type` 给任意类型起名字，不只是对象：
-
-```ts
-type ID = number | string;
-type Point = { x: number; y: number };
-type Callback = (err: Error | null, data: string) => void;
-```
-
-`type` 还能配合联合、交叉、条件类型做复杂组合（后续多篇大量用到）。
-
----
-
-## 7. interface vs type：怎么选
-
-这是高频面试题，结论如下：
-
-| 场景 | 推荐 |
-| --- | --- |
-| 描述对象/类的公开形状 | `interface` |
-| 需要被类 `implements` | `interface` |
-| 联合类型、元组、基本类型别名 | `type` |
-| 需要交叉 `&`、条件、映射类型 | `type` |
-| 想被**声明合并**扩展 | `interface` |
-
-关键差异：
-- **声明合并**：同名 `interface` 会**自动合并**；同名 `type` 会**报错**。
-  ```ts
-  interface Foo { a: number }
-  interface Foo { b: string } // ✅ 合并为 { a: number; b: string }
-  ```
-- **继承方式**：interface 用 `extends`，type 用交叉 `&`。
-
-**实践建议**：写对象/数据结构优先 `interface`（可读性好、可合并）；涉及联合/交叉/工具类型用 `type`。团队统一即可。
-
----
-
-## 8. 交叉类型 &
-
-交叉把多个类型合并成一个"全部都有"的类型：
-
-```ts
-type A = { x: number };
-type B = { y: string };
-type C = A & B; // { x: number; y: string }
-
-const c: C = { x: 1, y: "hi" };
-```
-
-对象交叉 = 成员并集；同名成员若类型冲突（如 `x: number & x: string`）会变成 `never`，要小心。
-
----
-
-## 小结
-
-- `interface` 描述对象形状，支持可选 `?`、只读 `readonly`、索引签名、继承 `extends`、声明合并。
-- `type` 更通用，可表达联合/交叉/基本类型别名。
-- 对象结构用 `interface`，组合类型用 `type`。
-- 交叉 `&` 合并成员，同名冲突会变 `never`。
+- [ ] 团队有明确约定：什么情况用 `interface`、什么情况用 `type`
+- [ ] 没有"同名 interface 意外合并"的地方（`grep` 一下重名）
+- [ ] 索引签名的类型不是"说谎的"（开了 `noUncheckedIndexedAccess`，或改用 `Map`）
+- [ ] 没有 `namespace`（除了 `.d.ts` 里补全局类型）
+- [ ] 能说清 `{}`、`object`、`Record<string, never>` 三者的区别
+- [ ] 交叉类型里没有互斥同名字段（不产生 `never` 类型）
 
 ---
 
 ## 练习
 
-1. 定义 `interface Product { id: number; name: string; price: number; discount?: number }`，写函数计算最终价。
-2. 用 `type` 定义 `type Coordinate = { lat: number; lng: number }`，再用交叉 `&` 加 `type WithName = Coordinate & { name: string }`。
-3. 验证声明合并：写两个同名 `interface Config`，观察合并结果。
-4. 思考 `type X = { a: number } & { a: string }` 中 `a` 是什么类型？
+1. **制造一次声明合并**：在两个文件里各写一个 `interface Config { ... }`，在第三个文件里导入使用，观察类型变成"两者的并集"且无报错。  
+   *自检*：能说出"为什么这种 bug 在 CI 里查不出来"（它不报错，只是类型变宽）。
+2. **修一个说谎的索引签名**：把 `Record<string, Task>` 改成 `Map<string, Task>`，对比取值时的类型提示与判空要求。  
+   *自检*：能说明 `Map.get` 返回 `T | undefined` 是"诚实的类型"。
+3. **验证 `{}` 的语义**：写 `function f(x: {}) {}`，分别传 `'abc'`、`123`、`null`，看哪些能过。  
+   *自检*：能解释"`{}` 只是排除了 null/undefined"。

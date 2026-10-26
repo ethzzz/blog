@@ -15,13 +15,22 @@ export default defineConfig({
 	site: "https://haolo.cloud",
 	base: "/blog",
 	trailingSlash: "always",
-	// 旧链接兜底：前端工程化模块重排后，毕业项目从 12 挪到 15（2026-10-26）。
-	// 保留跳转页，避免外部书签/RSS 里的旧地址 404。
+	// 旧链接兜底：模块重排后保留跳转页，避免外部书签/RSS 里的旧地址 404。
 	// ⚠️ value 必须手写 `/blog` 前缀：Astro 不会把 base 自动加到 redirect 目标上，
 	//    而 key 不能带前缀（否则产物会落到 dist/client/blog/blog/...）。
 	redirects: {
+		// 前端工程化（2026-10-26）：毕业项目 12 → 15
 		"/posts/engineering-roadmap-12-project-delivery-gates/":
 			"/blog/posts/engineering-roadmap-15-project-delivery-gates/",
+		// TypeScript（2026-10-26）：装饰器并入 05、模块/namespace 并入 12，其余整体重排
+		"/posts/typescript-roadmap-10-decorators/": "/blog/posts/typescript-roadmap-05-class-and-oop/",
+		"/posts/typescript-roadmap-11-modules/": "/blog/posts/typescript-roadmap-12-declaration-files/",
+		"/posts/typescript-roadmap-13-engineering-tsconfig/":
+			"/blog/posts/typescript-roadmap-14-tsconfig-performance/",
+		"/posts/typescript-roadmap-14-framework-integration/":
+			"/blog/posts/typescript-roadmap-16-framework-integration/",
+		"/posts/typescript-roadmap-15-project-type-safe-sdk/":
+			"/blog/posts/typescript-roadmap-17-project-type-safe-sdk/",
 	},
 	// 混合渲染（hybrid）：整站仍是静态产物（默认 prerender=true），
 	// 只有 src/pages/solutions/ 下的两个页面显式 `export const prerender = false`。

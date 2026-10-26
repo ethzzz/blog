@@ -1,0 +1,178 @@
+---
+title: '13 · 从 JS 渐进迁移到 TS'
+published: 2026-09-30T15:30:00+08:00
+description: '真实工作里最常见的任务：把存量 JS 项目迁到 TS。讲 allowJs/checkJs 共存、JSDoc 过渡、迁移顺序（边界先动）、any 预算与 @ts-expect-error 治理，以及怎么用数字证明迁移在推进。'
+tags: [TypeScript, 迁移, allowJs, JSDoc, 渐进式重构]
+category: TypeScript学习路线
+draft: false
+---
+
+## 别停摆，也别大爆炸
+
+两种失败方式：
+
+- **"等有人重构时一起改"**：永远不开始；
+- **"一次性全改"**：三周后 800 个错误，PR 大到没人敢 review，最后关掉 `strict` 收场。
+
+可行的是第三条：**共存 + 按顺序啃 + 用数字管理进度**。
+
+---
+
+## 第一步：让 JS 与 TS 共存
+
+```jsonc
+// tsconfig.json
+{
+  "compilerOptions": {
+    "allowJs": true,          // 允许 .js 参与编译
+    "checkJs": false,         // 暂不检查 JS（先别开，会瞬间爆红）
+    "strict": true,           // 新写的 TS 直接严格（别为了兼容老代码关掉）
+    "noEmit": true
+  },
+  "include": ["src"]
+}
+```
+
+关键决策：**`strict` 保持 true**。老 JS 文件因为 `checkJs: false` 不参与严格检查，新 TS 文件从第一天就严格——这比"先关 strict 以后开"好得多。
+
+---
+
+## 第二步：用 JSDoc 给 JS 文件"半类型"
+
+`checkJs: true` 后，JS 文件里的 JSDoc 注解会被真正检查：
+
+```js
+/**
+ * @param {string} id
+ * @param {{ retries?: number }} [opts]
+ * @returns {Promise<import('./types').User | null>}
+ */
+export async function fetchUser(id, opts = {}) {
+  // 这里 id 已经是 string，opts.retries 是 number | undefined
+}
+```
+
+JSDoc 的价值：**不用改文件名就能拿到类型保护**，适合"这个文件半年内不会重写，但现在老出 bug"的情况。
+
+局限：表达能力有限（复杂泛型基本写不出来），所以它只是过渡，不是终点。
+
+---
+
+## 第三步：按这个顺序迁移
+
+```text
+1. 类型定义（types/）        ← 先有词汇表
+2. 边界层（api/、store/）    ← 数据入口收口，收益最大
+3. 工具函数（utils/）        ← 纯函数，最容易测
+4. 组件（components/）       ← 数量多、改动风险高，放最后
+5. 页面/路由                ← 顺手改
+```
+
+**为什么边界优先**：改了 `api/` 的类型，所有调用方立刻获得提示；而且边界是"运行时校验 + 类型"最该落地的地方（11 篇）。
+
+反例：从组件开始改。组件依赖的 API 返回类型还是 `any`，你只是给 `any` 加了个名字。
+
+---
+
+## 第四步：`any` 预算 + 错误治理
+
+先给现状拍个数：
+
+```bash
+# any 出现次数
+grep -rn ": any\|<any>\|as any" src --include=*.ts --include=*.tsx | wc -l
+
+# TS 文件占比
+find src -name "*.ts" -o -name "*.tsx" | wc -l
+find src -name "*.js" -o -name "*.jsx" | wc -l
+```
+
+把这两个数字**每周记一次**，贴在 PR 模板里。迁移的本质是"这两个数字朝一个方向走"，不需要精确的里程碑。
+
+### `@ts-expect-error` vs `@ts-ignore`
+
+```ts
+// ❌ 永远不会报错，即使错误已经修好（技术债无声堆积）
+// @ts-ignore
+foo();
+
+// ✅ 如果这行不再报错，TS 会告诉你"多余的错误抑制"
+// @ts-expect-error 待后端修 OpenAPI 后移除 (issue #123)
+foo();
+```
+
+规矩：**仓库里只允许 `@ts-expect-error`，并且必须带原因与 issue 号**。`@ts-ignore` 可以直接加 ESLint 规则禁掉（`@typescript-eslint/ban-ts-comment`）。
+
+### 分批开严格项
+
+`strict` 是一组开关，可以逐个开：
+
+```jsonc
+{
+  "strict": false,
+  "noImplicitAny": true,        // 第一批：先禁掉隐式 any
+  "strictNullChecks": false,    // 最后开（错误最多）
+  "noImplicitThis": true,
+  "alwaysStrict": true
+}
+```
+
+推荐顺序：`noImplicitAny` → `strictFunctionTypes` → `strictNullChecks`。最后这项错误量最大，建议按目录推进：
+
+```jsonc
+// 用多个 tsconfig 分目录治理（或 ESLint 的 overrides 只对某些目录严格）
+{ "include": ["src/features/new-**"], "compilerOptions": { "strict": true } }
+```
+
+---
+
+## 第五步：改文件名的正确姿势
+
+```bash
+# 一次只改一个目录，保证 PR 可 review
+git mv src/utils/date.js src/utils/date.ts
+npx tsc --noEmit   # 只看这个文件带来的错误
+```
+
+改完立刻修三类错误（按频率）：
+
+| 错误 | 修法 |
+| --- | --- |
+| `Parameter implicitly has an 'any' type` | 补参数类型（能从调用方反推的先看调用方） |
+| `Object is possibly 'undefined'` | 加判空，**不要 `!`** |
+| `Property does not exist` | 补接口字段，或用判别联合 |
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 迁移后构建变慢一倍 | `.js` 也进了类型检查 | `checkJs` 按目录选择性开 |
+| 混用 `.js`/`.ts` 后 import 报错 | 扩展名推断规则不一致 | 统一 `moduleResolution: bundler`；或导入时不写扩展名 |
+| 老代码 `require` 与 ESM 冲突 | 模块系统混用 | 分阶段：先统一 ESM（`"type": "module"`），再迁类型 |
+| 一次性开 `strictNullChecks` 全爆 | 错误量太大 | 按目录/模块分批，配 `// @ts-expect-error` 过渡 |
+| 迁移中功能退化 | 类型改了运行时没同步 | 每次迁移一个文件就跑一次相关单测 |
+| 进度不可见 | 没有度量 | 每周记录 any 数与 TS 文件比例 |
+
+---
+
+## 验收清单
+
+- [ ] `allowJs: true` + `strict: true` 共存，新代码全严格
+- [ ] 迁移顺序从"类型定义 → 边界 → 工具 → 组件"，有明确的下一步目标目录
+- [ ] 仓库里没有 `@ts-ignore`，只有带原因和 issue 的 `@ts-expect-error`
+- [ ] `any` 数量与 TS 文件占比有周度记录，且在下降
+- [ ] 每个迁移 PR 都跑相关单测，功能无回归
+- [ ] 能说出"哪些文件暂时不迁"及原因（而不是无限期搁置）
+
+---
+
+## 练习
+
+1. **给一个 JS 文件加 JSDoc 并开 `checkJs`**：选一个常出 bug 的工具文件，加 JSDoc 后打开检查，记录新增的错误数。  
+   *自检*：能从错误里找出至少 1 个真实 bug（比如参数可能为 null）。
+2. **做一次"边界优先"验证**：只改 `api/` 的类型，看看有多少调用方立刻出现类型提示。  
+   *自检*：能对比"从组件开始改"的收益差（没有类型来源，提示全是 any）。
+3. **清理一处 `@ts-ignore`**：换成 `@ts-expect-error`，如果 TS 报"未使用"，说明那个错误其实已经不存在了。  
+   *自检*：能说出 `@ts-expect-error` 的"自校验"价值。

@@ -1,146 +1,178 @@
 ---
-title: '09 · 高级类型与类型体操入门'
-published: 2026-09-27T19:00:00+08:00
-description: 'TypeScript 类型体操入门：模板字面量类型、递归类型、索引访问类型进阶，并手搓 MyPick / MyReadonly / MyOmit / MyAwaited 等工具类型，建立"用类型描述类型"的推导思维。'
-tags: [TypeScript, 类型体操, 模板字面量, 递归类型, 工具类型实现]
+title: '09 · 条件类型与 infer'
+published: 2026-09-30T13:30:00+08:00
+description: '条件类型的分发行为（以及怎么关掉它）、infer 的五种提取姿势、递归类型的终止条件，最后给一条"什么时候该停止类型体操"的红线。'
+tags: [TypeScript, 条件类型, infer, 类型体操, 递归类型]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> "类型体操"指用 TS 类型系统做复杂推导（社区梗，形容像体操一样绕）。本篇带你手搓几个经典工具类型，理解推导套路即可，不必追求炫技。
+## 条件类型的语法只有一句，行为有三层
+
+```ts
+type IsString<T> = T extends string ? true : false;
+```
+
+看起来像 `if`，但有三件事必须知道：**分发**、**联合的分配律**、**如何阻断分发**。
+
+### 第一层：裸类型参数会分发
+
+```ts
+type ToArray<T> = T extends unknown ? T[] : never;
+
+type R = ToArray<string | number>;   // string[] | number[]（不是 (string|number)[]）
+```
+
+因为 `T` 是"裸"的（直接出现在 `extends` 左边），TS 会把联合拆开逐个判断，再把结果**并起来**。
+
+这个行为有时正是你要的：
+
+```ts
+type Exclude<T, U> = T extends U ? never : T;
+type R = Exclude<'a' | 'b' | 'c', 'a'>;   // 'b' | 'c'  ← 靠分发删掉成员
+```
+
+### 第二层：怎么关掉分发
+
+把类型包一层（通常是元组）：
+
+```ts
+type ToArrayNoDist<T> = [T] extends [unknown] ? T[] : never;
+type R2 = ToArrayNoDist<string | number>;   // (string | number)[]
+```
+
+判断口诀：**裸参数 = 分发；包成 `[T]` = 不分发**。
+
+### 第三层：`never` 的特殊行为
+
+```ts
+type Wrap<T> = T extends string ? T : never;
+type R3 = Wrap<never>;      // never（不是 "never 不匹配"）
+```
+
+因为"分发空联合"得到空联合。这个坑常出现在：**给一个可能为 `never` 的类型做条件判断，结果整个类型消失了**。
 
 ---
 
-## 1. 模板字面量类型
+## `infer`：在类型里做模式匹配
 
-类型层面也能做字符串拼接：
+`infer` 声明一个"占位变量"，由编译器在匹配时填入。
 
-```ts
-type World = "world";
-type Hello = `hello ${World}`; // "hello world"
-
-type EventName<T extends string> = `${T}Changed`;
-type E = EventName<"name">; // "nameChanged"
-```
-
-配合联合会**笛卡尔展开**：
+### 1. 提取函数返回值 / 参数
 
 ```ts
-type Color = "red" | "blue";
-type Size = "s" | "m";
-type Class = `${Color}-${Size}`; // "red-s" | "red-m" | "blue-s" | "blue-m"
+type MyReturnType<F> = F extends (...args: any[]) => infer R ? R : never;
+type MyParameters<F> = F extends (...args: infer P) => any ? P : never;
+
+type F = (a: string, b: number) => boolean;
+type R = MyReturnType<F>;    // boolean
+type P = MyParameters<F>;    // [a: string, b: number]
 ```
 
-实战：给 CSS 属性名加前缀、给事件名加 `on` 等。
+### 2. 提取数组/元组元素
+
+```ts
+type ElementOf<T> = T extends readonly (infer E)[] ? E : never;
+type E = ElementOf<string[]>;         // string
+
+type First<T extends unknown[]> = T extends [infer H, ...unknown[]] ? H : never;
+type F1 = First<[1, 2, 3]>;           // 1
+```
+
+### 3. 解包 Promise
+
+```ts
+type Unwrap<T> = T extends Promise<infer V> ? Unwrap<V> : T;
+type U = Unwrap<Promise<Promise<number>>>;   // number（递归解到不是 Promise 为止）
+```
+
+### 4. 字符串解析（模板字面量 + infer）
+
+```ts
+type Split<S extends string, Sep extends string> =
+  S extends `${infer Head}${Sep}${infer Tail}` ? [Head, ...Split<Tail, Sep>] : [S];
+
+type Parts = Split<'a/b/c', '/'>;    // ['a', 'b', 'c']
+```
+
+### 5. 多个 `infer` 同时匹配
+
+```ts
+type ToFunc<T> = T extends (...args: infer A) => infer R ? { args: A; ret: R } : never;
+```
 
 ---
 
-## 2. 递归类型
-
-类型可递归引用自身，处理嵌套结构：
+## 递归类型：必须能终止
 
 ```ts
-type Json =
-  | string | number | boolean | null
-  | Json[]
-  | { [key: string]: Json };
-```
-
-递归类型描述树/JSON 等自相似数据。配合映射类型可写 `DeepReadonly`、`DeepPartial`（第 7 篇提过）。
-
----
-
-## 3. 索引访问进阶
-
-```ts
-type Prop<T, K extends keyof T> = T[K];
-type Nested = { user: { name: string } };
-type Name = Nested["user"]["name"]; // string（链式索引访问）
-```
-
----
-
-## 4. 手搓工具类型（核心练习）
-
-### `MyPick<T, K>`
-```ts
-type MyPick<T, K extends keyof T> = {
-  [P in K]: T[P];
-};
-type R = MyPick<{ a: 1; b: 2 }, "a">; // { a: 1 }
-```
-
-### `MyReadonly<T>`
-```ts
-type MyReadonly<T> = {
-  readonly [K in keyof T]: T[K];
-};
-```
-
-### `MyOmit<T, K>`
-```ts
-type MyOmit<T, K extends keyof T> = Pick<T, Exclude<keyof T, K>>;
-// 或
-type MyOmit2<T, K extends keyof T> = {
-  [P in Exclude<keyof T, K>]: T[P];
-};
-```
-
-### `MyAwaited<T>`（处理 Promise 嵌套）
-```ts
-type MyAwaited<T> =
-  T extends Promise<infer U>
-    ? U extends Promise<any>
-      ? MyAwaited<U>
-      : U
-    : never;
-type R = MyAwaited<Promise<Promise<number>>>; // number
-```
-
-### `MyCapitalize<T>`（用内置大小写映射）
-```ts
-type MyCapitalize<T extends string> =
-  T extends `${infer F}${infer Rest}`
-    ? `${Uppercase<F>}${Rest}`
+// ✅ 终止条件在"不是对象"时
+type DeepReadonly<T> = T extends (infer U)[]
+  ? ReadonlyArray<DeepReadonly<U>>
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
     : T;
-type R = MyCapitalize<"hello">; // "Hello"
+
+// ✅ 终止条件在"字符串耗尽"
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & string]: T[K] extends object
+        ? `${K}.${Paths<T[K]>}`
+        : K;
+    }[keyof T & string]
+  : never;
 ```
 
----
-
-## 5. 类型体操的套路
-
-1. **拆**：把目标类型拆成"键的集合"与"值的变换"。
-2. **遍历**：用 `[K in keyof T]` 或 `[K in U]` 映射。
-3. **提取**：用 `infer` 在条件类型里抓子类型。
-4. **递归**：遇到嵌套用自身再调一次。
-5. **约束**：用 `K extends keyof T` 保证合法。
-
-这些也是 `type-challenges`（社区题库）的常考题。
+**递归不终止的表现**：`tsc` 报 `Type instantiation is excessively deep and possibly infinite`，或编辑器直接卡死。加一层 `T extends any[] ? ... : ...` 的分支或加深度上限（`Depth extends number[]` 计数）能解决。
 
 ---
 
-## 6. 现实中的边界
+## 类型体操的边界
 
-类型体操很酷，但**生产代码别过度**：类型越复杂，编译越慢、可读性越差。原则：
-- 库作者/通用工具值得做；业务代码能用内置 `Partial/Pick/Omit` 就别手写。
-- 类型报错难读时，先想"是不是设计太复杂"，而非硬刚。
+写类型的能力和可读性成反比。三条红线：
+
+1. **超过 3 层嵌套条件类型** → 拆成命名中间类型，否则报错没人看得懂；
+2. **需要写注释解释"这个类型在干什么"** → 说明它太聪明了，考虑用泛型 + 简单工具类型替代；
+3. **只有你能维护** → 团队里没人敢改，等于给自己造了个只进不出的坑。
+
+值得投入的类型体操只有两类：
+
+- **库/框架作者**：SDK、ORM、路由、状态管理，类型就是 API；
+- **业务里的高频模式**：表单字段推导、API 响应包装、路由参数提取（做过一次，全项目受益）。
+
+其它场景，**清晰的具体类型 > 聪明的泛型**。
 
 ---
 
-## 小结
+## 常见坑
 
-- 模板字面量类型可做类型级字符串拼接与联合展开。
-- 递归类型描述自相似结构（JSON/树）。
-- 手搓 `MyPick`/`MyReadonly`/`MyOmit`/`MyAwaited` 掌握映射+infer 套路。
-- 类型体操适可而止，业务里优先用内置工具类型。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 条件类型结果"整个没了" | 分发遇到 `never` | 检查输入是否可能是 `never`，用 `[T] extends [U]` 阻断 |
+| `infer` 拿到 `unknown` | 匹配位置太宽（`(...args: any[])` 已匹配） | 收紧匹配模式 |
+| 递归报 excessively deep | 没有终止分支，或嵌套过深 | 加非对象分支；或限制深度 |
+| 联合被拆开后结果不对 | 没意识到"裸参数分发" | 包成元组 `[T]` |
+| 模板字面量 infer 结果带引号 | 字符串类型 vs 字面量 | 用 `extends string` 约束，必要时 `& string` |
+| 编辑器卡死 | 复杂类型在超大联合上展开 | 给联合加 `as const` 收窄、或改运行时方案 |
+
+---
+
+## 验收清单
+
+- [ ] 能解释 `T extends U ? X : Y` 的"分发"行为，并知道怎么关闭
+- [ ] 手写过 `ReturnType` / `Parameters` / `Awaited` 的简化版
+- [ ] 知道 `never` 在条件类型里的特殊行为（空联合）
+- [ ] 项目里的递归类型都有明确终止分支
+- [ ] 没有超过 3 层嵌套的条件类型（或已拆成命名类型）
+- [ ] 能判断一个类型体操"值不值得写"
 
 ---
 
 ## 练习
 
-1. 实现 `MyExclude<T, U>`（`T extends U ? never : T`）。
-2. 实现 `MyRecord<K extends keyof any, V>`（`{ [P in K]: V }`）。
-3. 用模板字面量实现 `Handler<T extends string>` 类型，结果为 `on${Capitalize<T>}` 这样的键名。
-4. 实现递归 `MyDeepReadonly<T>`，让嵌套对象全部只读。
+1. **验证分发与阻断**：写 `type A<T> = T extends string ? 1 : 0`，分别传 `'a' | 1` 与 `['a' | 1]` 版本，观察结果差异。  
+   *自检*：能说出 `string | number` 分发后为什么得到 `1 | 0`。
+2. **手写 `Awaited`**：实现 `Unwrap<T>` 解包任意层 `Promise`，并解释递归终止条件。  
+   *自检*：`Unwrap<Promise<Promise<string>>>` 得到 `string`。
+3. **写一个 `Paths` 类型**：把嵌套对象变成 `'a.b' | 'a.c'` 形式的联合，用于表单路径提示。  
+   *自检*：能说清为什么只能用 `keyof T & string` 过滤掉 symbol/number 键。

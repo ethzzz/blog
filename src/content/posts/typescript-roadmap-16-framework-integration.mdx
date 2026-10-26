@@ -1,0 +1,230 @@
+---
+title: '16 · 与框架/运行时集成'
+published: 2026-09-30T17:00:00+08:00
+description: 'React 的 ComponentProps 与泛型组件、event 类型、Context 与 ref；Vue 3 的宏与 PropType；Node 的 @types/node 与 ESM/CJS 双出口。以及一个通用套路：从已有组件/库的类型里"取"类型而不是抄。'
+tags: [TypeScript, React, Vue, Node, 类型集成]
+category: TypeScript学习路线
+draft: false
+---
+
+## 通用心法：类型要"取"，不要"抄"
+
+新手最常见的做法是把别人的类型抄一遍：
+
+```ts
+// ❌ 抄：组件库改了 props，你的类型不会跟着变
+interface ButtonProps {
+  type?: 'primary' | 'default';
+  size?: 'small' | 'large';
+  onClick?: (e: React.MouseEvent) => void;
+}
+```
+
+正确做法是从源类型**推导**：
+
+```ts
+// ✅ 取：源组件加了 props，你自动获得
+type ButtonProps = React.ComponentProps<typeof Button>;
+```
+
+这条心法适用于 90% 的"包装现有组件"场景，也适用于第三方库（`Parameters<typeof fn>`、`ReturnType<typeof fn>`）。
+
+---
+
+## React
+
+### 组件的类型该怎么写
+
+```tsx
+// 1) 普通函数组件：不用 React.FC（它曾隐式带 children，且不利于泛型）
+function Card({ title, children }: { title: string; children?: React.ReactNode }) {
+  return <section><h3>{title}</h3>{children}</section>;
+}
+
+// 2) 需要透传原生属性
+type InputProps = React.ComponentPropsWithoutRef<'input'> & { label: string };
+
+// 3) 需要 ref
+type FancyProps = React.ComponentPropsWithRef<'button'>;
+```
+
+### 事件类型：三条规律
+
+```tsx
+// 1. 原生事件：React.XxxEvent<元素>
+const onChange = (e: React.ChangeEvent<HTMLInputElement>) => e.target.value;
+
+// 2. 直接内联：从参数位置"取"类型，最省事
+<button onClick={(e) => { /* e 自动是 MouseEvent<HTMLButtonElement> */ }} />
+
+// 3. 自定义事件的载荷：自己定义
+type SelectEvent = { value: string; source: 'click' | 'keyboard' };
+```
+
+⚠️ `e.target` 与 `e.currentTarget` 的区别：`target` 是事件源头（可能是子元素，类型宽），`currentTarget` 是绑定元素（类型准）。**取值用 `currentTarget`**。
+
+### 泛型组件
+
+```tsx
+interface ListProps<T> {
+  items: T[];
+  renderItem: (item: T, index: number) => React.ReactNode;
+}
+
+// 注意写法：函数声明 + 泛型参数，别用 React.FC<T>
+function List<T>({ items, renderItem }: ListProps<T>) {
+  return <ul>{items.map((it, i) => <li key={i}>{renderItem(it, i)}</li>)}</ul>;
+}
+
+// 推断正确：T 从 items 推出
+<List items={users} renderItem={(u) => u.name} />
+```
+
+`React.FC<T>` 无法表达泛型，这是它在新代码里被弃用的主要原因之一。
+
+### Context
+
+```tsx
+type Theme = { mode: 'light' | 'dark'; setMode: (m: Theme['mode']) => void };
+
+const ThemeCtx = React.createContext<Theme | null>(null);
+
+export function useTheme(): Theme {
+  const v = React.useContext(ThemeCtx);
+  if (!v) throw new Error('useTheme 必须在 ThemeProvider 内使用');
+  return v;      // ✅ 返回非空类型，调用方不用判空
+}
+```
+
+这个"内部判空 + 对外非空"的包装，能消掉全项目里成百上千个 `ctx?.`。
+
+---
+
+## Vue 3
+
+```vue
+<script setup lang="ts">
+// defineProps：两种写法，泛型写法更简洁
+const props = defineProps<{
+  title: string;
+  items?: Item[];
+  mode?: 'list' | 'grid';
+}>();
+
+// 需要默认值：withDefaults
+const props2 = withDefaults(defineProps<{ size?: number }>(), { size: 1 });
+
+// defineEmits：用类型签名，事件名与载荷一起约束
+const emit = defineEmits<{
+  select: [id: string];              // 3.3+ 元组语法
+  'update:modelValue': [v: string];
+}>();
+
+emit('select', 'a');                 // ✅
+emit('select');                      // ❌ 缺参数
+</script>
+```
+
+运行时 props（需要复杂默认值或校验时）：
+
+```ts
+import type { PropType } from 'vue';
+const props = defineProps({
+  items: { type: Array as PropType<Item[]>, required: true },
+  mode: { type: String as PropType<'list' | 'grid'>, default: 'list' },
+});
+```
+
+`ref` 的泛型要写清楚：
+
+```ts
+const list = ref<Item[]>([]);        // ✅ Ref<Item[]>
+const el = ref<HTMLDivElement>();    // 没写会让后续 el.value.xxx 报错
+```
+
+---
+
+## Node
+
+```bash
+pnpm add -D @types/node
+```
+
+```ts
+// 环境变量：手动收窄，别直接 process.env.X
+const PORT: number = Number(process.env.PORT ?? 3000);
+if (!Number.isInteger(PORT)) throw new Error('PORT 必须是整数');
+
+// 或者用一个 schema（推荐，见 11 篇）
+const EnvSchema = z.object({ PORT: z.coerce.number().int().default(3000) });
+```
+
+### ESM / CJS 双出口的类型
+
+```jsonc
+{
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  }
+}
+```
+
+坑：`import` 与 `require` 指向不同的 `.d.ts`（`.d.ts` / `.d.cts`）时，**两份类型必须签名一致**，否则同一份代码在 ESM 与 CJS 下类型行为不同。这也是 `attw` 主要检查的内容。
+
+---
+
+## 扩展第三方类型（主题/配置）
+
+```ts
+// src/types/theme.d.ts
+import 'some-ui-lib';
+
+declare module 'some-ui-lib' {
+  interface ThemeVars {
+    brandColor: string;       // 给组件库的主题加自定义变量
+  }
+}
+```
+
+前提：库把它导出为 `interface`（`type` 无法合并）。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 包装组件后 props 类型对不上 | 手抄了 props | `ComponentProps<typeof X>` |
+| `e.target.value` 报错 | `target` 类型宽（可能是任意元素） | 用 `currentTarget` |
+| 泛型组件用 `React.FC<T>` 报错 | FC 不支持泛型 | 用函数声明 + 泛型参数 |
+| `useContext` 返回值到处判空 | Context 默认值给了 `null` | 封装 hook，内部判空并抛错 |
+| Vue 的 `emit('x')` 不报缺参 | 用了字符串数组形式的 emits | 用 3.3+ 的元组签名语法 |
+| `process.env.X` 是 `string \| undefined` 到处报错 | 没做收窄 | 显式转换 + 校验（schema） |
+| 库的类型扩不上 | 库把它定义成了 `type` | 只能等库改成 `interface`，或用包装类型 |
+
+---
+
+## 验收清单
+
+- [ ] 包装第三方组件时用 `ComponentProps<typeof X>`，没有手抄 props
+- [ ] 泛型组件用函数声明，不用 `React.FC<T>`
+- [ ] Context 的消费 hook 对外返回非空类型
+- [ ] Vue 的 `defineEmits` 用元组签名（事件名与载荷一起约束）
+- [ ] `process.env` 的读取有收窄或 schema 校验
+- [ ] 自己包装的元素事件用 `currentTarget`（不是 `target`）
+
+---
+
+## 练习
+
+1. **改造一个包装组件**：把一个手写 props 的 `MyButton` 改成 `ComponentProps<typeof Button>`，然后给原组件加一个新 prop，确认 MyButton 自动获得。  
+   *自检*：能说明"取类型"与"抄类型"在库升级时的差别。
+2. **写一个泛型组件**：`List<T>` 用 `renderItem` 推导 T，故意传错类型看报错位置。  
+   *自检*：能指出 `React.FC` 版本为什么做不到。
+3. **给 Context 加非空 hook**：把 `useTheme()` 改成内部抛错的版本，统计调用方删掉了多少个 `?.`。  
+   *自检*：能说明"边界判空一次，优于随处判空"。

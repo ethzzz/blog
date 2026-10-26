@@ -1,0 +1,189 @@
+---
+title: '14 · tsconfig 与类型检查性能'
+published: 2026-09-30T16:00:00+08:00
+description: '类型检查慢到没人跑，等于没有门禁。讲清 tsc 慢的四个真实原因、incremental 与 project references 的正确用法、skipLibCheck 的账，以及把 90 秒压到 15 秒的步骤清单。'
+tags: [TypeScript, tsconfig, 性能, project-references, 增量编译]
+category: TypeScript学习路线
+draft: false
+---
+
+## 先说结论：慢 = 一定会被绕过
+
+`tsc --noEmit` 跑 90 秒的团队，最终一定会发生三件事：
+
+1. 本地 pre-commit 注释掉它；
+2. CI 里它单独一个 job，红了几次之后被允许"不阻塞合并"；
+3. 类型错误在代码里堆积到没人敢修。
+
+所以**性能不是优化项，是门禁能否存在的前提**。目标：5 万行项目 ≤ 20 秒。
+
+> 与[工程化 05](/blog/posts/engineering-roadmap-05-babel-typescript/) 的分工：那边讲"类型检查在流水线里的位置"，这里讲"怎么让它跑得快、组织得多包"。
+
+---
+
+## 慢的四个原因
+
+| 原因 | 表现 | 解法 |
+| --- | --- | --- |
+| **每次都全量分析** | 改一行也要从头检查 | `incremental` + `tsBuildInfoFile` |
+| **把 node_modules 的 d.ts 也检查了** | `tsc` 时间大头在 `@types` | `skipLibCheck: true` |
+| **一个巨型项目** | 任何改动都要重查全部 | `project references` 拆项目 |
+| **类型过于复杂** | 单个文件编译就几秒 | 减少深递归/巨大联合，见 09 篇 |
+
+诊断手段：
+
+```bash
+# 总耗时 + 各阶段耗时
+npx tsc --noEmit --diagnostics
+
+# 生成 Chrome 可打开的 trace（看哪个文件/类型最慢）
+npx tsc --noEmit --generateTrace ./trace
+```
+
+`--diagnostics` 会输出 `Files`、`Types`、`Instantiations`（类型实例化次数）等指标。**`Instantiations` 超过百万级**基本可以确定是类型体操写太狠了。
+
+---
+
+## `incremental`：最便宜的一档提速
+
+```jsonc
+{
+  "compilerOptions": {
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.tsbuildinfo"
+  }
+}
+```
+
+- 首次构建慢，之后只重查变化的文件与其依赖；
+- `.tsbuildinfo` 里存了文件哈希与符号信息，**不要提交到 git**（放 `node_modules/.cache` 或 `dist`）；
+- 用法要点：**必须使用同一个 `tsconfig`**，换了配置等价于全量。
+
+实测收益（3 万行项目，无引用拆分）：90s → 12–18s。
+
+---
+
+## `project references`：多包项目的唯一正解
+
+单仓多包（Monorepo）时不拆项目，等于每次改动都重查全部包。拆法：
+
+```jsonc
+// packages/ui/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,           // 必须：产出 .d.ts + tsbuildinfo
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"]
+}
+```
+
+```jsonc
+// apps/web/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "composite": true },
+  "references": [{ "path": "../../packages/ui" }]   // 声明依赖
+}
+```
+
+```jsonc
+// 根 tsconfig.json（只是一个"总目录"，不参与编译）
+{
+  "files": [],
+  "references": [
+    { "path": "packages/ui" },
+    { "path": "apps/web" }
+  ]
+}
+```
+
+```bash
+npx tsc -b            # 按依赖顺序构建，已构建的跳过
+npx tsc -b --clean    # 清理所有产物与 tsbuildinfo
+```
+
+三个坑：
+
+1. **`composite: true` 是硬要求**，否则 reference 直接报错；
+2. 被引用的包必须**能产出 `.d.ts`**（`declaration: true`），类型来自产物而非源码；
+3. 改了被引用包的源码后，**必须 `tsc -b`** 才会更新产物——编辑器有时看到的是旧类型，这是最常见的"我改了啊怎么没生效"。
+
+---
+
+## `skipLibCheck`：账面收益
+
+| 项目规模 | `skipLibCheck: false` | `true` | 差额 |
+| --- | --- | --- | --- |
+| 3 千行 | 6s | 4s | 小 |
+| 3 万行 | 48s | 22s | 大 |
+| 10 万行 + 重依赖 | 3min+ | 60s | 巨大 |
+
+代价前面说过：**不会发现第三方 d.ts 之间的冲突**。所以配套要做的是"依赖版本收敛"（`pnpm.overrides` / `catalog`），把冲突从源头消掉。
+
+---
+
+## 编辑器卡顿怎么办
+
+编辑器用的是 tsserver，卡顿原因与 `tsc` 不完全相同：
+
+| 现象 | 排查 |
+| --- | --- |
+| 打开某个文件就卡 | 该文件里有巨大联合/深递归类型，用 `--generateTrace` 定位 |
+| 全局卡 | `include` 范围太大（把 `dist`、测试产物、生成代码也包进来了） |
+| 补全变慢 | 项目里 `any` 与重载过多；或没开 `skipLibCheck` |
+| 内存涨到 2G+ | TS 版本过旧（5.x 有明显改善）；或 tsconfig 项目过多 |
+
+实用命令：VS Code 命令面板 → `TypeScript: Restart TS Server`（重启后第一次分析会慢，之后正常）。
+
+---
+
+## 一份"从 90 秒到 15 秒"的清单
+
+按投入产出排序，逐项做、逐项量：
+
+1. **开 `skipLibCheck`**（可能直接砍一半）；
+2. **开 `incremental`**（第二次起几乎瞬时）；
+3. 把 `include` 收窄到 `src`（别把 `scripts/`、`dist/`、生成代码包进来）；
+4. 多包项目上 **project references**；
+5. 减少巨型联合与深递归（09 篇的红线）；
+6. 升级 TS 到最新 minor（编译器本身也在变快）；
+7. 把 `typecheck` 与 `test` 拆成并行 job（CI 层面，见工程化 08）。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 改了包源码，引用方类型没更新 | 没跑 `tsc -b`，产物是旧的 | 开发用 `tsc -b --watch` |
+| `.tsbuildinfo` 提交进 git，天天冲突 | 放错位置 | 移到 `node_modules/.cache` 并 gitignore |
+| `tsc -b` 报 composite 相关错误 | 缺 `composite` / `declaration` | 补齐两个开关与 `rootDir` |
+| 增量后报"找不到模块" | tsbuildinfo 损坏或配置变了 | `tsc -b --clean` 重来 |
+| 编辑器与命令行为不同步 | tsserver 缓存 | 重启 TS Server |
+| CI 里比本地慢 3 倍 | 没有缓存 `.tsbuildinfo` | CI 缓存该文件（key 含 lock 哈希） |
+
+---
+
+## 验收清单
+
+- [ ] `typecheck` 在 5 万行以内 ≤ 20 秒（有实测数字）
+- [ ] 开了 `skipLibCheck`，并有依赖版本收敛策略
+- [ ] 开了 `incremental`，`.tsbuildinfo` 不进 git
+- [ ] 多包项目用 `project references`，`tsc -b` 能增量构建
+- [ ] 知道怎么用 `--diagnostics` / `--generateTrace` 定位慢点
+- [ ] CI 缓存了 tsbuildinfo，与本地行为一致
+
+---
+
+## 练习
+
+1. **量一次增量收益**：同一项目测三次——首次、无 incremental 的第二次、有 incremental 的第二次，记录耗时。  
+   *自检*：能解释"增量检查的是变化文件的依赖闭包，而不是全部"。
+2. **拆一个 project reference**：把 `utils` 拆成独立包并让 app 引用，比较改动 `utils` 后的检查耗时。  
+   *自检*：能说明"没变的下游包被跳过"是收益来源。
+3. **定位一次类型爆炸**：故意写一个 5 层递归的条件类型，用 `--diagnostics` 看 `Instantiations` 飙升。  
+   *自检*：能给出"超过多少就该重构类型"的经验值。

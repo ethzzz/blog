@@ -1,180 +1,179 @@
 ---
-title: '05 · 类与面向对象'
-published: 2026-09-27T15:00:00+08:00
-description: 'TypeScript 类系统详解：class 基础、public/private/protected 修饰符、readonly、参数属性、继承 extends 与 super、abstract 抽象类、implements 实现接口、getter/setter 存取器、静态成员。'
-tags: [TypeScript, class, 面向对象, 继承, 抽象类, implements]
+title: '05 · 类与面向对象（含装饰器）'
+published: 2026-09-30T11:30:00+08:00
+description: '修饰符与参数属性简写、private 与 # 的本质区别、abstract/implements/override 的正确用法、继承与组合的取舍，以及读懂框架源码所需的装饰器知识（legacy 与 stage 3 两套）。'
+tags: [TypeScript, class, 装饰器, 面向对象, 抽象类]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> TS 的 `class` 是 ES6 class 的超集，额外加了**访问控制、抽象类、参数属性**等 OOP 利器。本篇讲清类在 TS 里的正确打开方式。
+## 类在 TS 里是"两样东西"
 
----
+一个 `class` 同时提供：
 
-## 1. 类的基础
+- **类型**（描述实例的形状）；
+- **值**（运行时的构造函数）。
 
 ```ts
-class Person {
-  name: string;
-  constructor(name: string) {
-    this.name = name;
-  }
-  greet(): string {
-    return `我是 ${this.name}`;
-  }
-}
-const p = new Person("Tom");
+class User { constructor(public name: string) {} }
+
+const u: User = new User('a');   // User 作类型
+const c: typeof User = User;      // typeof User 才是"构造函数类型"
 ```
+
+搞不清这一点，就会在"想给类本身加约束"时卡住（比如"传一个类进来而不是实例"）。
 
 ---
 
-## 2. 访问修饰符
-
-| 修饰符 | 可见范围 |
-| --- | --- |
-| `public` | 默认，哪都能访问 |
-| `private` | 仅类内部（编译期约束，**不等于**运行时私有） |
-| `protected` | 类内部 + 子类 |
-| `readonly` | 只读，初始化后不可改 |
+## 修饰符：编译期 vs 运行时
 
 ```ts
 class Account {
-  private balance = 0;
-  readonly id = "A001";
-  deposit(n: number): void {
-    this.balance += n; // ✅ 内部可访问
+  public owner: string;         // 默认就是 public，一般省略
+  private balance = 0;          // 编译期私有：运行时仍可 obj['balance'] 访问
+  protected currency = 'CNY';   // 子类可见
+  readonly id: string;          // 只能构造时赋值
+  #secret = 'x';                // 运行时真私有（ES 私有字段）
+
+  constructor(public readonly name: string, id: string) {
+    this.id = id;               // 参数属性简写：自动声明 + 赋值
   }
 }
-const a = new Account();
-// a.balance; // ❌ private 外部不可访问
 ```
 
-> 注意：TS 的 `private` 是**编译期**检查，运行时仍可访问（编译后是普通属性）。需要真运行时私有用 `#field`（JS 原生私有字段）。
+| 修饰符 | 编译期 | 运行时 | 何时用 |
+| --- | --- | --- | --- |
+| `private` | 外部不可访问 | **仍可访问**（`obj['x']`） | 团队内部约定，够用 |
+| `#field` | 外部不可访问 | 真不可访问（语法层面） | 需要防"有人绕过"（库/SDK） |
+| `protected` | 子类可见 | 可访问 | 有继承体系时 |
+| `readonly` | 不可重新赋值 | 可改（浅层） | 不可变字段 |
+
+**实践**：业务代码用 `private` 足够；对外发布的类用 `#`，因为使用者可能用 `as any` 或下标绕过。
 
 ---
 
-## 3. 参数属性（简写）
-
-构造函数里直接加修饰符，会自动声明并赋值成员，少写样板：
+## abstract / implements / override
 
 ```ts
-class User {
-  constructor(
-    public id: number,
-    public name: string,
-    private token: string,
-  ) {}
-}
-const u = new User(1, "Tom", "x");
-u.id;    // ✅
-u.token; // ❌ private
-```
+abstract class Repository<T> {
+  abstract findById(id: string): Promise<T | null>;   // 只声明，不实现
 
-等价于手写 `id: number; constructor(id) { this.id = id; }`，但更简洁。
-
----
-
-## 4. 继承 extends 与 super
-
-```ts
-class Animal {
-  constructor(public name: string) {}
-  move(): void { console.log(`${this.name} 移动`); }
-}
-class Dog extends Animal {
-  constructor(name: string, public breed: string) {
-    super(name); // 必须先调 super
-  }
-  bark(): void { console.log("汪"); }
-}
-```
-
-子类构造函数**必须**先 `super()` 再访问 `this`。
-
----
-
-## 5. 抽象类 abstract
-
-抽象类不能实例化，用于定义骨架：
-
-```ts
-abstract class Shape {
-  abstract area(): number; // 子类必须实现
-  describe(): string {
-    return `面积 ${this.area()}`;
+  async exists(id: string): Promise<boolean> {         // 模板方法：公共逻辑放在基类
+    return (await this.findById(id)) !== null;
   }
 }
-class Circle extends Shape {
-  constructor(public r: number) { super(); }
-  area(): number { return Math.PI * this.r ** 2; }
+
+interface Cacheable { cacheKey(): string; }
+
+class UserRepo extends Repository<User> implements Cacheable {
+  override async findById(id: string) { return db.users.find(id); }
+  cacheKey() { return 'user'; }
 }
-// new Shape(); // ❌ 抽象类不能 new
 ```
+
+三个要点：
+
+1. **`abstract` 是"契约 + 部分实现"**：适合模板方法模式（基类定流程，子类填细节）。
+2. **`implements` 只检查形状，不继承实现**：一个类可以实现多个接口，但只能 `extends` 一个类。
+3. **`override` 必须写**（`noImplicitOverride: true` 时）：防止基类改方法名后，子类悄悄变成一个"没人调用的新方法"。
 
 ---
 
-## 6. implements 实现接口
-
-类可以"实现"接口，保证具备接口要求的成员：
+## 继承 vs 组合：TS 只给你单继承，这是提醒
 
 ```ts
-interface Loggable {
-  log(): void;
-}
-class Logger implements Loggable {
-  log(): void { console.log("log"); }
+// ❌ 继承链一深，改基类就全员地震
+class Base { log() {} }
+class ApiClient extends Base {}
+class GithubClient extends ApiClient {}     // 只为了复用 log
+
+// ✅ 组合：把能力做成独立对象
+const logger = { log: (m: string) => console.log(m) };
+class GithubClient {
+  constructor(private deps: { logger: typeof logger }) {}
 }
 ```
 
-`implements` 只做**结构检查**，不继承实现——接口里没有方法体。一个类可实现多个接口。
-
-> 接口 vs 抽象类：接口**只约束形状**（多实现、无状态）；抽象类可**带实现与状态**（单继承）。
+判断标准：**"is-a" 用继承，"has-a / can-do" 用组合**。前端业务里 90% 的情况是组合。
 
 ---
 
-## 7. 存取器 getter / setter
+## 装饰器：只为"读懂框架"
+
+TypeScript 有两套装饰器，混用会踩坑：
+
+| | Legacy（`experimentalDecorators`） | Stage 3（TS 5.0+，默认） |
+| --- | --- | --- |
+| 开启方式 | `"experimentalDecorators": true` | 无需配置 |
+| 参数形态 | `(target, key, descriptor)` | `(value, context)` |
+| 谁在用 | Angular、NestJS、TypeORM、老 MobX | 新库、TC39 标准 |
+| 能否加新字段 | 能（改 descriptor） | 只能返回替换值 |
+
+**新项目不要主动用装饰器**（它是元编程，调试栈难读）。但读框架源码必须认得：
 
 ```ts
-class Temperature {
-  private _c = 0;
-  get celsius(): number { return this._c; }
-  set celsius(v: number) {
-    if (v < -273.15) throw new Error("低于绝对零度");
-    this._c = v;
-  }
-  get fahrenheit(): number { return this._c * 9 / 5 + 32; }
+// Legacy：方法装饰器（NestJS 的 @Get() 就是这个形态）
+function Log(target: unknown, key: string, descriptor: PropertyDescriptor) {
+  const original = descriptor.value;
+  descriptor.value = function (...args: unknown[]) {
+    console.log(`→ ${key}`, args);
+    return original.apply(this, args);
+  };
+  return descriptor;
+}
+
+class UserService {
+  @Log
+  find(id: string) { return { id }; }
 }
 ```
-
-getter/setter 让"看似属性访问"实则带校验逻辑，且只在 `target >= ES5` 时可用。
-
----
-
-## 8. 静态成员
 
 ```ts
-class MathUtil {
-  static PI = 3.14159;
-  static square(n: number): number { return n * n; }
+// Stage 3：同样的需求，形态完全不同
+function logged<This, Args extends unknown[], R>(
+  value: (this: This, ...args: Args) => R,
+  context: ClassMethodDecoratorContext,
+) {
+  return function (this: This, ...args: Args): R {
+    console.log(`→ ${String(context.name)}`, args);
+    return value.apply(this, args);
+  };
 }
-MathUtil.square(3); // 不需要实例
 ```
+
+判断你项目用的是哪套：看 `tsconfig.json` 有没有 `experimentalDecorators`，以及依赖里有没有 `reflect-metadata`。
 
 ---
 
-## 小结
+## 常见坑
 
-- 修饰符 `public/private/protected/readonly` 控制可见性与可变性（编译期）。
-- 参数属性 `constructor(public x)` 一键声明+赋值。
-- `extends` 继承，`super()` 必须先调用；`abstract` 定义骨架。
-- `implements` 让类满足接口（多实现、无继承）；getter/setter 带逻辑的属性访问；`static` 类级成员。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 子类重写方法后行为没变 | 基类方法名改了，子类成了新方法 | 开 `noImplicitOverride`，写 `override` |
+| `private` 字段被外部改了 | `private` 只是编译期 | 用 `#` 字段 |
+| 装饰器报 `Unable to resolve signature` | 两套装饰器混用 | 检查 `experimentalDecorators` 与 TS 版本 |
+| `this` 丢失 | 方法被解构传递 | 用箭头函数属性，或 `bind` |
+| 抽象类被直接 `new` | 忘了 `abstract` | 加 `abstract class` |
+| 类作为值传递时类型写错 | 用了实例类型而非 `typeof Class` | 用 `typeof X` 或 `new () => X` |
+
+---
+
+## 验收清单
+
+- [ ] 对外暴露的类，敏感字段用 `#` 而不是 `private`
+- [ ] 开了 `noImplicitOverride`，子类重写都写 `override`
+- [ ] 能说出 `implements` 与 `extends` 的差别（一个查形状、一个继承实现）
+- [ ] 继承层级不超过 2 层，超出的部分改成组合
+- [ ] 能判断项目用的是哪一套装饰器（看 tsconfig 与依赖）
+- [ ] 没有为了"复用一行代码"而建立继承关系
 
 ---
 
 ## 练习
 
-1. 写一个 `abstract class Vehicle { abstract wheels(): number }`，派生 `Car` 和 `Bike` 实现。
-2. 用参数属性写一个 `class Point { constructor(public x, public y) }`，加 `distance()` 方法。
-3. 用 `implements` 让一个 `class Cache` 满足 `interface Storage { get(k): string; set(k, v): void }`。
-4. 给某属性加 setter 做范围校验（如年龄 0–150），越界抛错。
+1. **验证 `private` 与 `#` 的差别**：写一个 `private x` 和一个 `#y`，用 `obj['x']` 和 `obj['y']` 分别访问。  
+   *自检*：能说明"为什么给外部用的 SDK 要用 `#`"（编译期约束拦不住 `as any`）。
+2. **写一个 legacy 方法装饰器**：给方法加上"耗时统计"，不改变原方法签名。  
+   *自检*：能解释 `descriptor.value` 被替换后，`this` 为什么必须用 `apply` 传递。
+3. **重构一段继承**：把"三个子类都继承了一个带 `log()` 的基类"改成组合注入 logger。  
+   *自检*：能说出重构后"新增一个类不需要再改基类"的好处。

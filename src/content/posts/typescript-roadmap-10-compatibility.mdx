@@ -1,0 +1,190 @@
+---
+title: '10 · 类型兼容性与变型'
+published: 2026-09-30T14:00:00+08:00
+description: '为什么两个形状相同的接口可以互相赋值、为什么 Array<string> 能赋给 Array<unknown> 却不安全、strictFunctionTypes 到底管什么——所有"这里为什么报错"的终极答案。'
+tags: [TypeScript, 类型兼容, 变型, 结构化类型, strictFunctionTypes]
+category: TypeScript学习路线
+draft: false
+---
+
+## TS 比的是形状，不是名字
+
+```ts
+interface Point { x: number; y: number }
+interface Coord { x: number; y: number }
+
+const p: Point = { x: 1, y: 2 };
+const c: Coord = p;      // ✅ 完全没有报错
+```
+
+这就是**结构化类型（structural typing）**：只要形状够，就能赋值。对比 Java/C# 的名义类型（nominal）——必须显式 `implements`。
+
+两个直接后果：
+
+1. **好处**：不用为了"实现接口"写样板；第三方库的类型能自动兼容。
+2. **坑**：两个语义不同但形状相同的类型会被误判为兼容。
+
+```ts
+type UserId = string;
+type OrderId = string;
+const uid: UserId = 'u1';
+const oid: OrderId = uid;    // ✅ 通过——但它们语义完全不同
+```
+
+要"名义化"（branded type）：
+
+```ts
+type Brand<T, B extends string> = T & { readonly __brand: B };
+type UserId = Brand<string, 'UserId'>;
+type OrderId = Brand<string, 'OrderId'>;
+
+const uid = 'u1' as UserId;
+const oid: OrderId = uid;    // ❌ 报错：__brand 不匹配
+```
+
+代价：每次构造都要 `as`（通常在边界处转一次，内部全用 Brand 类型）。
+
+---
+
+## 多余属性检查：只对"新鲜对象字面量"生效
+
+```ts
+interface Opts { a: number }
+const extra = { a: 1, b: 2 };
+
+const o1: Opts = { a: 1, b: 2 };    // ❌ 对象字面量：多余属性报错
+const o2: Opts = extra;              // ✅ 变量：不报错（结构兼容）
+```
+
+这条规则常让人困惑：为什么"直接写"不行，"先赋给变量"就行？因为字面量的多余属性**通常是笔误**（拼错字段名），TS 特意拦它。
+
+绕过（不推荐，除非确实要透传）：
+
+```ts
+const o3: Opts = { a: 1, b: 2 } as Opts;        // 断言绕过
+const o4: Opts = { ...{ a: 1, b: 2 } };         // 展开绕过
+```
+
+---
+
+## 协变、逆变、双变：三个词的实际含义
+
+假设 `Dog extends Animal`（狗是动物）。
+
+| 变型 | 含义 | 例子 |
+| --- | --- | --- |
+| **协变**（covariant） | 子类型关系**保持同向** | `Array<Dog>` 可赋给 `Array<Animal>` |
+| **逆变**（contravariant） | 子类型关系**反向** | `(a: Animal) => void` 可赋给 `(a: Dog) => void` |
+| **双变**（bivariant） | 两个方向都允许（不安全但灵活） | TS 的**方法简写**位置 |
+
+### 为什么参数是逆变的
+
+```ts
+type AnimalHandler = (a: Animal) => void;
+type DogHandler = (d: Dog) => void;
+
+const handleAnimal: AnimalHandler = (a) => a.eat();
+const h: DogHandler = handleAnimal;      // ✅ 能处理所有动物，当然能处理狗
+
+const handleDog: DogHandler = (d) => d.bark();
+const h2: AnimalHandler = handleDog;     // ❌ 只能处理狗，来只猫就炸
+```
+
+一句话：**"能接受更宽的输入"才安全**。
+
+### 数组协变是 TS 的历史妥协
+
+```ts
+const dogs: Dog[] = [new Dog()];
+const animals: Animal[] = dogs;     // ✅ 允许（协变）
+animals.push(new Cat());            // ⚠️ 运行时 dogs 里混进了一只猫
+dogs[1].bark();                     // 💥 炸
+```
+
+这是类型系统里的经典漏洞（Java 也有）。TS 选择保留，因为禁止会让日常代码极其难写。要安全就用 `readonly Dog[]`：
+
+```ts
+const ro: readonly Animal[] = dogs;  // ✅
+ro.push(new Cat());                  // ❌ 只读，推不进去
+```
+
+**结论：函数参数用 `readonly T[]`，能挡掉一半的协变坑。**
+
+### `strictFunctionTypes` 与"方法的双变"
+
+```ts
+// 函数类型属性：逆变（严格）
+interface A { handler: (a: Animal) => void }
+// 方法简写：双变（宽松）
+interface B { handler(a: Animal): void }
+```
+
+TS 为了兼容大量 JS 库（它们普遍用方法简写），对方法位置保留双变。所以你会遇到"同样是回调，写成属性就报错、写成方法就不报错"——这不是 bug，是刻意的妥协。
+
+---
+
+## 实战：为什么这里会报错
+
+### 场景 1：事件总线
+
+```ts
+type Handler<T> = (payload: T) => void;
+
+const dogHandler: Handler<Dog> = (d) => d.bark();
+const animalHandler: Handler<Animal> = dogHandler;   // ❌ 逆变不允许
+```
+
+修法：让泛型出现在"输出"位置，或在内部做收窄。
+
+### 场景 2：集合工具
+
+```ts
+function sort<T>(arr: T[], cmp: (a: T, b: T) => number): T[] {}
+
+sort(dogs, (a: Animal, b: Animal) => a.age - b.age);  // ✅ 参数更宽，安全
+sort(animals, (a: Dog, b: Dog) => a.age - b.age);     // ❌ 参数更窄，不安全
+```
+
+### 场景 3：`Record<string, T>` 与具体对象
+
+```ts
+const user = { id: '1', name: 'a' };
+const dict: Record<string, string> = user;   // ❌ 索引签名要求所有键都是 string
+```
+
+`Record` 的语义是"任意键"，而具体对象没有索引签名——这是"更宽的类型不能赋给更窄的"。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 两个形状相同的接口互相兼容导致混用 | 结构化类型 | 用 Branded type 区分语义 |
+| 对象字面量报"多余属性" | fresh literal 检查 | 先赋变量，或用 `satisfies` |
+| 传回调报逆变错 | 参数位置逆变 | 回调参数用更宽的类型，内部收窄 |
+| 数组赋值后混入错误元素 | 数组协变（不安全） | 用 `readonly T[]` |
+| 方法简写不报错、属性写法报错 | 方法双变 | 知道即可；要严格就统一用属性写法 |
+| `Record<string, X>` 赋不上 | 缺索引签名 | 显式写索引签名，或改用具体类型 |
+
+---
+
+## 验收清单
+
+- [ ] 能解释"TS 比形状不比名字"，并举出它的一个坑
+- [ ] 重要 ID 类型用 Branded type 区分（至少 UserId / OrderId 这类）
+- [ ] 函数参数收数组时用 `readonly T[]`（避免协变漏洞）
+- [ ] 能判断一个赋值报错是"协变/逆变"还是"缺索引签名"
+- [ ] 知道方法简写与函数属性的双变差异
+- [ ] 项目里没有靠 `as` 硬压过去的兼容性错误
+
+---
+
+## 练习
+
+1. **复现数组协变漏洞**：`Dog[]` 赋给 `Animal[]`，push 一个 `Cat`，再调用 `dogs[1].bark()`，观察运行时报错。  
+   *自检*：能解释"编译期通过但运行时炸"的原因，并给出 `readonly` 修法。
+2. **制造一次逆变报错**：写 `Handler<Animal>` 与 `Handler<Dog>` 的互相赋值，记录哪边报错。  
+   *自检*：能用自己的话说明"为什么能接受更宽输入的函数更安全"。
+3. **给 ID 加 Brand**：把 `type UserId = string` 改成 branded，找出项目里能靠它拦住的 2 处误用。  
+   *自检*：能说明"为什么 brand 字段要 `readonly` 且永不出现在运行时"。

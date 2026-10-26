@@ -1,154 +1,198 @@
 ---
-title: '04 · 函数类型深入'
-published: 2026-09-27T14:00:00+08:00
-description: 'TypeScript 函数类型的完整体系：函数类型表达式、参数与返回值注解、可选/默认/rest 参数、函数重载（overload）、this 参数与 this 类型、回调函数中的 this 安全。'
-tags: [TypeScript, 函数类型, 重载, this类型, 函数表达式]
+title: '04 · 函数类型'
+published: 2026-09-30T11:00:00+08:00
+description: '函数签名该怎么写、重载什么时候真需要、this 参数的意义、回调参数的逆变为什么会导致"传进去就报错"，以及用 never 返回值做断言函数。'
+tags: [TypeScript, 函数类型, 重载, 逆变, 断言函数]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> 函数是 JS 的一等公民，TS 给函数类型提供了远超参数注解的能力：重载、this 约束、灵活的参数形态。本篇一次讲透。
+## 先立一条：参数由调用方给，返回值由实现方定
+
+这句话解释了函数类型里 80% 的报错：
+
+- **参数**：调用方传什么，实现方就得能接住 → 所以参数类型是**逆变**（实现方可以更宽）；
+- **返回值**：实现方给什么，调用方就得能用 → 所以返回值是**协变**（实现方可以更窄）。
+
+记不住没关系，记住一个例子就够（下面"回调逆变"一节）。
 
 ---
 
-## 1. 函数类型表达式
-
-把"函数长什么样"抽成类型：
+## 基础写法
 
 ```ts
-type Greet = (name: string) => string;
+// 函数声明
+function add(a: number, b: number): number { return a + b; }
 
-const sayHi: Greet = (n) => `hi ${n}`;
+// 函数表达式（返回类型可省，让 TS 推断）
+const sub = (a: number, b: number) => a - b;
+
+// 类型别名（推荐：可复用、报错好看）
+type Handler = (event: string, payload?: unknown) => void;
+
+// 对象里的方法简写
+interface Service {
+  fetch(id: string): Promise<void>;
+}
 ```
 
-注意区分两种箭头：
-- `(name: string) => string` 是**类型**里的函数签名。
-- `(name: string): string => {}` 是**值**里的箭头函数（返回类型注解在参数外）。
+可选参数与默认值：
+
+```ts
+function greet(name: string, greeting = '你好'): string   // greeting?: string 由默认值推断
+function retry<T>(fn: () => T, times?: number): T          // 可选 → number | undefined
+```
+
+⚠️ 可选参数必须在必选参数之后（`(a?: string, b: number)` 非法）——这是 JS 的调用语义决定的。
 
 ---
 
-## 2. 参数形态
+## 重载：只在"输入输出强相关"时才用
+
+重载（overload）适合这种场景：**参数类型决定返回类型**，且实现内部要做判别。
 
 ```ts
-// 可选参数 ?
-function build(name: string, age?: number): string {
-  return age ? `${name}/${age}` : name;
-}
-
-// 默认参数（默认参数自动推断类型）
-function fetch(url: string, method = "GET"): void {}
-
-// rest 参数
-function sum(...nums: number[]): number {
-  return nums.reduce((a, b) => a + b, 0);
+// 输入是 string → 输出对象；输入是对象 → 输出 string
+function parse(input: string): Record<string, unknown>;
+function parse(input: Record<string, unknown>): string;
+function parse(input: string | Record<string, unknown>) {
+  return typeof input === 'string' ? JSON.parse(input) : JSON.stringify(input);
 }
 ```
 
-规则：可选参数和默认参数**必须放在必填参数之后**；rest 永远最后。
+三个替代方案，优先级从高到低：
+
+| 方案 | 适用 | 例子 |
+| --- | --- | --- |
+| **泛型 + 条件类型** | 关系可以用类型表达 | `function first<T>(arr: T[]): T` |
+| **判别联合参数** | 输入有 `kind` 之类的标记 | `(arg: { kind: 'a'; a: number } \| { kind: 'b'; b: string })` |
+| **真重载** | 上述都不行（如库的兼容签名） | `parse` 上面那个 |
+
+重载的**代价**：每个签名都要手写一遍，且实现签名对调用方不可见——**能用泛型就别用重载**。
 
 ---
 
-## 3. 函数重载 overload
-
-JS 函数常根据参数类型/个数返回不同结果。TS 用**重载签名 + 实现签名**表达：
+## `this` 参数：只在写回调/工具函数时需要
 
 ```ts
-// 重载签名（对外可见，无函数体）
-function reverse(x: string): string;
-function reverse(x: number): number;
-
-// 实现签名（对外不可见，需兼容所有重载）
-function reverse(x: string | number): string | number {
-  if (typeof x === "string") return x.split("").reverse().join("");
-  return Number(String(x).split("").reverse().join(""));
+function bindLabel(this: HTMLElement, text: string) {
+  this.textContent = text;
 }
 
-reverse("abc");  // ✅ string
-reverse(123);    // ✅ number
-reverse(true);   // ❌ 不在重载列表中
+const btn = document.querySelector('button')!;
+bindLabel.call(btn, '提交');   // ✅ this 被检查为 HTMLElement
+bindLabel('提交');             // ❌ 没有 this 绑定，编译报错
 ```
 
-要点：
-- 重载签名可以有多个，实现签名只有一个且**必须兼容全部重载**。
-- 调用时按重载签名匹配，类型更精确（返回值是 `string` 而非 `string | number`）。
+`this` 参数是**编译期的假参数**（运行时不占位）。日常业务代码很少需要；常见于 jQuery 风格的工具函数与 Vue 2 的 options API 类型。
 
 ---
 
-## 4. this 类型与 this 参数
-
-JS 里 `this`  notoriously 难推断。TS 用**显式 this 参数**标注：
+## 回调逆变：为什么"我传了个更具体的函数反而报错"
 
 ```ts
-interface Counter {
-  count: number;
-  inc(this: Counter): void;
-}
-const c: Counter = {
-  count: 0,
-  inc() { this.count++; },
-};
+type Listener = (e: Event) => void;
+
+function on(event: string, listener: Listener) {}
+
+// ❌ 报错：Type '(e: MouseEvent) => void' is not assignable to type '(e: Event) => void'
+on('click', (e: MouseEvent) => {});
+
+// ✅ 反方向可以
+const l: (e: MouseEvent) => void = (e: Event) => {};
 ```
 
-不写 `this: Counter` 时，方法内 `this` 会被推断为 `Counter`，一般够用。但当函数被**抽离调用**时容易丢 `this`：
+原因：`on` 承诺"我会用**任意** Event 调用你的 listener"，而你的函数只能处理 `MouseEvent`；万一它传进来的是 `KeyboardEvent`，你的函数就会在 `e.clientX` 上炸。
+
+**这就是"参数逆变"的实际含义**：作为参数传入的函数，其参数类型必须**更宽或相等**。
+
+日常怎么绕：
 
 ```ts
-function print(this: User): void {
-  console.log(this.name);
-}
-const u: User = { name: "Tom", print } as any;
-// 把 print 当回调传出去时，若没约束 this 会报错
+// 1. 在回调内部自己收窄（最推荐）
+on('click', (e) => {
+  const ev = e as MouseEvent;   // 或 if (e instanceof MouseEvent)
+});
+
+// 2. 让库的签名更精确（自己写的库）
+function on<E extends Event>(event: string, listener: (e: E) => void) {}
 ```
 
-`this` 参数**必须放在参数列表第一位**，且只用于类型检查，编译后会被擦除。
+规则：`strictFunctionTypes` 打开时，**函数类型的位置**（作为参数）才做逆变检查，**方法简写**位置（`obj.method(e: Event)`）仍按双变处理——这是 TS 为兼容 JS 生态留的口子。
 
 ---
 
-## 5. 回调里的 this
-
-常见坑：回调函数中 `this` 指向丢失。配合 `this` 类型可约束：
+## 返回 `never`：让"不可能"变成类型
 
 ```ts
-interface Handlers {
-  onClick(this: Button, e: Event): void;
+// 1. 永不返回（抛错/死循环）
+function fail(msg: string): never {
+  throw new Error(msg);
 }
-class Button {
-  label = "btn";
-  bind(h: Handlers) {
-    document.addEventListener("click", () => h.call(this, event));
-  }
+
+// 2. 断言函数：调用后，TS 相信参数是某类型
+function assertIsString(v: unknown): asserts v is string {
+  if (typeof v !== 'string') throw new TypeError('期望 string');
+}
+
+function handle(v: unknown) {
+  assertIsString(v);
+  v.toUpperCase();      // ✅ 之后 v 是 string
 }
 ```
 
-这样 `h` 里只能用 `Button` 的 `this`，避免回调里误用外层 `this`。
+`asserts x is T` 是**唯一能让"函数调用"改变类型收窄**的手段（普通类型守卫返回 boolean，必须写在 `if` 里）。校验库（zod 的 `parse`、Node 的 `assert`）都靠这个机制。
 
 ---
 
-## 6. 构造函数类型
-
-用 `new` 描述可 `new` 的东西：
+## 调用签名与构造签名
 
 ```ts
-type Constructor = new (name: string) => Animal;
-function create(Ctor: Constructor, name: string): Animal {
-  return new Ctor(name);
+// 可调用对象
+interface Callable {
+  (x: number): string;
+  description: string;      // 还能带属性
+}
+
+// 可 new 的对象
+interface Constructable {
+  new (x: number): { value: number };
 }
 ```
 
+这类写法主要在**描述第三方库**（如 `express()` 既能调用又有属性）时用，业务代码几乎不需要。
+
 ---
 
-## 小结
+## 常见坑
 
-- 函数类型表达式 `(a: T) => R` 用于注解函数变量。
-- 可选 `?`、默认、rest 参数各有位置约束。
-- 重载 = 多个对外签名 + 一个兼容实现，提升调用侧精度。
-- `this` 参数放在第一位，约束方法/回调里的 `this`，编译后擦除。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 传 `(e: MouseEvent) => void` 给 `(e: Event) => void` 报错 | 参数逆变 | 回调参数标成 `Event`，内部收窄 |
+| 重载写了 5 个签名还是报错 | 实现签名与重载签名不兼容 | 实现签名用联合类型（对调用方不可见） |
+| `this` 在回调里是 `any` | 没标 `this` 参数 | 用箭头函数，或显式声明 `this: T` |
+| 函数返回 `void`，但里面 `return value` | `void` 允许返回任意值被忽略 | 需要返回值就别标 void |
+| 可选参数放在必选参数前 | 语法限制 | 调整顺序，或用对象参数 `{ a?, b }` |
+| 断言函数用 `boolean` 返回 | 返回 boolean 不是断言 | 改成 `asserts x is T` 且**不返回值** |
+
+---
+
+## 验收清单
+
+- [ ] 公共函数都有显式返回类型（避免"改实现悄悄改了 API"）
+- [ ] 没有为了兼容而写 5 个以上重载（能用泛型/判别联合就换掉）
+- [ ] 回调参数类型与库签名一致（不靠 `as` 硬塞）
+- [ ] 校验类函数用 `asserts x is T`，而不是返回 boolean 让人手写 if
+- [ ] 能解释"为什么把更具体的回调传进去会报错"
+- [ ] 参数超过 3 个的函数，考虑改成对象参数（可读性 + 可选字段）
 
 ---
 
 ## 练习
 
-1. 写 `type BinaryOp = (a: number, b: number) => number`，实现 `add/sub/mul` 三个符合该类型的值。
-2. 用重载实现 `pad(s: string, n: number): string` 与 `pad(n: number, len: number): string`（数字补零）。
-3. 写一个需要 `this: { value: number }` 的 `double(this: { value: number }): number` 方法并测试。
-4. 解释"实现签名必须兼容所有重载签名"的含义，并故意写个不兼容的看报错。
+1. **复现一次逆变报错**：写 `function on(cb: (e: Event) => void)`，传入 `(e: MouseEvent) => void`，读报错原文。  
+   *自检*：能用自己的话说明"为什么这个赋值不安全"。
+2. **把重载改成泛型**：把 `function get(key: 'a'): A; function get(key: 'b'): B;` 改成 `function get<K extends 'a' | 'b'>(key: K): Map[K]` 的形式。  
+   *自检*：调用方仍能拿到精确类型，且少写了两行签名。
+3. **写一个断言函数并验证收窄**：`assertIsArray(v): asserts v is unknown[]`，在调用后直接 `v.map`，确认不再报错。  
+   *自检*：能解释"断言函数必须抛错或返回，否则类型是假的"。

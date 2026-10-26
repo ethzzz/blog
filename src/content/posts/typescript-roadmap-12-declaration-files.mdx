@@ -1,141 +1,198 @@
 ---
 title: '12 · 声明文件与类型生态'
-published: 2026-09-27T22:00:00+08:00
-description: 'TypeScript 声明文件详解：.d.ts 是什么、declare 关键字、第三方库类型 @types 与 DefinitelyTyped、全局声明 declare global、为无类型的 JS 库补声明、编写可发布的类型包。'
-tags: [TypeScript, 声明文件, d.ts, declare, "@types", DefinitelyTyped]
+published: 2026-09-30T15:00:00+08:00
+description: '给没有类型的库补声明：declare 的几种形态、module augmentation 扩第三方类型、全局注入的正确姿势、@types 与 types 字段的关系，以及 skipLibCheck 关掉的是什么检查。'
+tags: [TypeScript, d.ts, 声明文件, '@types', 类型生态]
 category: TypeScript学习路线
 draft: false
 ---
 
-> [!NOTE]
-> 很多 JS 库没有类型，TS 怎么认得它们？答案是**声明文件 `.d.ts`**——只描述形状、不含实现的"类型说明书"。本篇讲清它的全部玩法。
-
----
-
-## 1. 什么是 .d.ts
-
-`.d.ts` 是**只有类型、没有值**的文件，编译后不产生 JS。它告诉 TS："某个东西长这样，你按这个检查就行"。打开 `node_modules/@types/node` 能看到一大堆 `.d.ts`，那是 Node 的"说明书"。
-
----
-
-## 2. declare 关键字
-
-在 `.d.ts` 里用 `declare` 声明外部存在的值/类型：
+## `.d.ts` 是什么：只有形状，没有实现
 
 ```ts
-// globals.d.ts
-declare const API_URL: string;
-declare function greet(name: string): void;
-declare module "legacy-lib" {
-  export function doThing(): void;
+// math.d.ts
+export function add(a: number, b: number): number;
+```
+
+它只描述"有什么、类型如何"，没有函数体。用途三类：
+
+1. **给 JS 库补类型**（库自己不带类型）；
+2. **描述非 JS 资源**（`*.css`、`*.svg` 的 import）；
+3. **给编译产物配类型**（`tsc --declaration` 自动生成）。
+
+---
+
+## `declare` 的四种形态
+
+```ts
+// 1) 声明值：告诉 TS "运行时存在这个东西"
+declare const VERSION: string;
+declare function init(opts: Record<string, unknown>): void;
+declare class LegacyClient { connect(): void }
+
+// 2) 声明模块：给"没有类型的包"或"非代码文件"用
+declare module 'untyped-lib';                      // 整个模块当 any
+declare module '*.svg' {
+  const src: string;
+  export default src;                             // 精确一点
+}
+declare module 'legacy' {
+  export interface Options { url: string }
+  export function create(o: Options): void;
+}
+
+// 3) 声明全局：给 window 挂属性
+declare global {
+  interface Window { __APP_CONFIG__?: { apiBase: string } }
+  var __BUILD_ID__: string;
+}
+export {};   // ⚠️ 有这句才是"模块"，declare global 才合法
+
+// 4) 声明命名空间：只为描述旧库结构
+declare namespace jQuery { interface AjaxSettings { url?: string } }
+```
+
+⚠️ 最常见的坑：**在 `.ts` 里写 `declare global` 却忘了 `export {}`**，TS 会把文件当成脚本（全局作用域），`declare global` 报错。
+
+---
+
+## 给无类型库写声明：从最小到准确
+
+```ts
+// types/untyped-lib.d.ts
+declare module 'untyped-lib' {
+  export interface Options {
+    /** 请求超时（毫秒） */
+    timeout?: number;
+    /** 是否自动重试 */
+    retry?: boolean;
+  }
+
+  export interface Response<T = unknown> {
+    data: T;
+    status: number;
+  }
+
+  export function request<T = unknown>(url: string, options?: Options): Promise<Response<T>>;
+
+  const _default: { request: typeof request };
+  export default _default;
 }
 ```
 
-`declare` 的意思是"这个东西在别处定义了，我只声明它的类型"。在普通 `.ts` 里也能用 `declare` 避免重复实现（如只为已有全局变量补类型）。
+写声明的顺序：
+
+1. **先让它能编译**（`declare module 'x';` 一行搞定）；
+2. **再按实际用法补**（用到哪个函数补哪个，不要试图一次写全）；
+3. **最后加注释**（JSDoc 会显示在编辑器提示里，这是文档）。
+
+判断"我写的对不对"：在编辑器里悬停函数名，看提示是否与库文档一致。
 
 ---
 
-## 3. 第三方库类型 @types
-
-绝大多数流行库的类型在 `@types/xxx` 里：
+## `@types` 生态与 `types` 字段
 
 ```bash
-npm install -D @types/lodash @types/node
+pnpm add -D @types/node @types/lodash
 ```
 
-装好后 TS 自动找到类型。这些包来自社区维护的 **DefinitelyTyped** 仓库。如果库自带类型（包里含 `.d.ts` 或 `package.json` 的 `types` 字段），则**不用**装 `@types`。
+- 当库本身不带类型时，社区会在 `@types/<pkg>` 维护；
+- TS 默认**自动加载** `node_modules/@types/*` 下的全局声明；
+- `compilerOptions.types: ["node", "vite/client"]` 会**限制只加载这些**（写了就收窄了，别乱写）。
+
+`typeRoots` 则是改"去哪里找 `@types`"，通常不需要动。
 
 ---
 
-## 4. 全局声明 declare global
-
-给全局对象（如 `window`）加自定义属性：
+## Module Augmentation：扩第三方类型
 
 ```ts
-// global.d.ts
-declare global {
-  interface Window {
-    myConfig: { theme: string };
-  }
-}
-export {}; // 让本文件成为模块（否则 declare global 不生效）
-```
+// src/types/express.d.ts
+import 'express';
 
-之后 `window.myConfig` 就有类型了。给 `process.env` 加自定义变量同理：
-
-```ts
-declare namespace NodeJS {
-  interface ProcessEnv {
-    API_KEY: string;
+declare module 'express-serve-static-core' {
+  interface Request {
+    requestId?: string;
+    user?: { id: string; role: 'admin' | 'user' };
   }
 }
 ```
 
+要点：
+
+1. **必须 `import` 原模块**（否则你是在"新建模块"而不是"扩展模块"）；
+2. 扩展的是**接口**（`type` 不能合并）；
+3. 路径要与库内部的实际模块名一致（`express-serve-static-core` 而不是 `express`）——这一点查库的 `.d.ts` 才知道。
+
 ---
 
-## 5. 为无类型库补声明
-
-遇到老库没类型、也不想装 `@types`（或不存在），自己写个 `.d.ts`：
+## 全局注入：环境变量与构建常量
 
 ```ts
-// types/my-lib.d.ts
-declare module "my-old-lib" {
-  export function compute(input: string): number;
-  export const version: string;
+// src/env.d.ts
+interface ImportMetaEnv {
+  readonly VITE_API_BASE: string;
+  readonly VITE_FEATURE_NEW_UI?: string;
+}
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
 }
 ```
 
-然后把 `types` 目录加进 `tsconfig` 的 `include` 或 `typeRoots`。这样 `import` 该库就有类型，且不会 `any`。
+没有这段，`import.meta.env.VITE_X` 永远是 `any`，拼错名字也不报错——**这是 Vite 项目最常见的一处类型漏洞**。
 
-若库导出太复杂，先用 `declare module "x";` 让它整体为 `any`，再逐步细化：
-
-```ts
-declare module "x"; // 最粗粒度：整个模块 any，至少能 import
-```
+同理，`declare const __BUILD_ID__: string;` 对应构建时 `define` 注入的常量。
 
 ---
 
-## 6. 编写可发布的类型包
-
-若你开源一个 JS 库，给用户好体验就带上类型：
+## `skipLibCheck`：关掉的是什么
 
 ```jsonc
-// package.json
-{
-  "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } }
-}
+{ "skipLibCheck": true }
 ```
 
-用 `tsc` 的 `declaration: true` 自动从 `.ts` 生成 `.d.ts`：
+它跳过**所有 `.d.ts` 文件之间的类型兼容性检查**（不跳过你自己代码的类型检查）。
 
-```jsonc
-{ "compilerOptions": { "declaration": true, "emitDeclarationOnly": true, "outDir": "dist" } }
-```
+| 打开 | 关掉 |
+| --- | --- |
+| 检查快（大型项目能快 30–50%） | 能发现第三方类型定义之间的冲突 |
+| 第三方 d.ts 有版本冲突时不会红 | 两个 `@types` 版本不兼容会让你修不了 |
+
+现实结论：**99% 的项目应该打开**。第三方类型冲突应该用 `overrides` 统一版本解决，而不是让 `tsc` 天天报错。
+
+代价是真实的：你**不会**发现"某个库的 d.ts 与你的 TS 版本不兼容"这类问题，直到运行时炸。
 
 ---
 
-## 7. 类型与实现分离的最佳实践
+## 常见坑
 
-- 业务逻辑写在 `.ts`，类型声明由 `tsc` 生成，不要手写维护 `.d.ts`（易与实现脱节）。
-- 只有**描述外部/全局**才手写 `.d.ts`。
-- 严格项目开 `skipLibCheck: true`，跳过 `.d.ts` 内部一致性检查，避免第三方类型拖累你的编译速度（你不负责修它们的类型）。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `declare global` 报"只能在模块里用" | 文件被当成脚本 | 加 `export {}` |
+| 扩 `express` 类型不生效 | `declare module 'express'` 不匹配内部模块名 | 改成 `express-serve-static-core` |
+| 声明文件不生效 | 没包含在 `include` 或 `typeRoots` 里 | 放进 `src/types` 并确保被 include |
+| `Cannot find module './x.css'` | 没有资源声明 | `declare module '*.css'` |
+| `@types` 装了却提示找不到全局 | `types` 字段把它排除了 | 从 `types` 里加上，或删掉该字段 |
+| 自己的 d.ts 与源码重名冲突 | 同一模块声明两次 | 删掉手写的，让 `tsc` 生成 |
 
 ---
 
-## 小结
+## 验收清单
 
-- `.d.ts` = 只有类型、编译后消失的"说明书"。
-- `declare` 声明外部存在的值/类型；`declare module "x"` 为库补类型。
-- 第三方库优先 `@types/xxx`（DefinitelyTyped）。
-- `declare global` 扩展 `window`/`process.env`。
-- 自己库用 `declaration: true` 自动产出 `.d.ts`，别手写维护。
+- [ ] 项目里所有无类型依赖都有声明（或用了 `declare module 'x'` 兜底并记了 TODO）
+- [ ] `ImportMetaEnv` 声明完整，`import.meta.env.X` 拼错会报错
+- [ ] 全局注入（`Window` / `declare const`）都放在 `src/types/*.d.ts`
+- [ ] 扩展第三方类型时 import 了原模块，且模块名与库内部一致
+- [ ] 知道 `skipLibCheck` 关掉的是什么，且能说出代价
+- [ ] 发布的库由 `tsc --declaration` 生成 d.ts，而不是手写
 
 ---
 
 ## 练习
 
-1. 找一个没类型的库（或假设 `my-lib`），写 `.d.ts` 补 `declare module "my-lib"` 并 import 测试。
-2. 用 `declare global` 给 `window` 加 `appVersion: string`，在代码里访问。
-3. 开 `declaration: true` 编译一个含函数的 `.ts`，观察生成的 `.d.ts`。
-4. 解释何时用 `@types/xxx`、何时自己写 `.d.ts`、何时用 `declare module "x";`。
+1. **给一个无类型库补声明**：找一个只有 JS 的小包（或自己写一个 `.js` 文件），写 `declare module` 让它有类型提示，验证编辑器能跳转出参数类型。  
+   *自检*：故意把 `export default` 写成 `export =`，观察 import 写法有什么变化。
+2. **补 `ImportMetaEnv`**：故意把 `VITE_API_BASE` 写成 `VITE_API_BASEE`，确认编译报错（在此之前通常是 `any` 不报错）。  
+   *自检*：能说明"没有声明时 env 是 any"是团队最常见的类型漏洞之一。
+3. **做一次 module augmentation**：给 `Window` 加一个 `__APP_CONFIG__`，并让读取处获得类型提示。  
+   *自检*：能指出"忘了 `export {}` 会怎样"。
