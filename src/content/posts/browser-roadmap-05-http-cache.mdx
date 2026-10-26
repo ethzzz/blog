@@ -1,69 +1,163 @@
 ---
 title: '05 · 网络与 HTTP 缓存'
-published: 2026-09-31T19:00:00+08:00
-description: '前端绕不开的网络：HTTP 缓存的强缓存（Cache-Control/max-age/ETag）与协商缓存（304），CDN 边缘缓存，以及"缓存策略怎么配才不会拿到旧资源"。'
-tags: [浏览器, HTTP缓存, Cache-Control, ETag, CDN]
+published: 2026-10-26T10:00:00+08:00
+description: '强缓存与协商缓存的组合规则、immutable 必须与 index.html 的 no-cache 配对、preload/prefetch/preconnect 该怎么选，以及 HTTP/2 之后为什么"合并请求"反而拖慢。'
+tags: [浏览器, HTTP缓存, ServiceWorker, 网络, preload]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 缓存是性能的半壁江山
+## 缓存分三层，别只记一层
 
-很多"慢"其实是不该发生的请求。HTTP 缓存让浏览器/CDN 复用已下载的资源，**省掉网络往返甚至省掉下载**。配错了则会"永远拿到旧版"。
+```text
+1. 强缓存（不发请求）        Cache-Control: max-age / immutable
+2. 协商缓存（发请求但可 304）  ETag / If-None-Match、Last-Modified / If-Modified-Since
+3. Service Worker 缓存（可编程）  Cache Storage + 自定义策略
+```
+
+命中顺序：先看强缓存是否新鲜 → 不新鲜就带 `If-None-Match` 问服务端 → 服务端回 304（用本地）或 200（用新的）。
 
 ---
 
-## 强缓存：不询问，直接用
+## 强缓存：四种组合的实际效果
 
-靠响应头：
+| 响应头 | 行为 |
+| --- | --- |
+| `Cache-Control: no-store` | 完全不缓存（含内存），敏感接口用 |
+| `Cache-Control: no-cache` | **可以存，但每次都要协商**（≠ 不缓存！） |
+| `Cache-Control: max-age=3600` | 1 小时内直接用本地，不发请求 |
+| `Cache-Control: max-age=31536000, immutable` | 一年内不请求，**用户手动刷新也不请求** |
 
-```
-Cache-Control: max-age=31536000, immutable
-```
+最常见的两个误解：
 
-- `max-age=秒`：资源在这么长时间内**绝对新鲜**，不发请求直接用（200 from cache）。
-- `immutable`：内容永不变（如带 hash 的文件名），连验证都省。
-- 强缓存期间浏览器连服务端都不问。
+1. **`no-cache` 不是"不缓存"**，而是"每次验证"。真正的不缓存是 `no-store`。
+2. **`immutable` 意味着连刷新都不回源**，所以只能给**内容变则文件名必变**的资源用（带 hash 的 JS/CSS）。
 
----
+### 配对规则（配错就是白屏）
 
-## 协商缓存：问一句"我这份还新吗"
+| 文件 | 策略 | 原因 |
+| --- | --- | --- |
+| `index.html` | `no-cache` | 它是"版本指针"，缓存住就拿不到新的资源引用 |
+| `app.[hash].js/css` | `immutable, max-age=31536000` | 内容变则名变，永久缓存安全 |
+| 图片/字体（带 hash） | 同上 | 同上 |
+| 接口 JSON | `no-store` 或短 `max-age` | 取决于业务实时性 |
 
-当强缓存过期，浏览器带条件去问服务端：
-
-```
-请求：If-None-Match: "<ETag值>"
-响应：304 Not Modified（无 body，极快）
-```
-
-- `ETag`：资源指纹，内容变则变。
-- `Last-Modified`：最后修改时间（精度低，文件 1 秒内改回原值会误判）。
-
-服务端比对后发现没变 → 返回 `304`，浏览器继续用本地副本。
+> 这套配对和[工程化 13 篇](/blog/posts/engineering-roadmap-13-release-rollback/)的"发布回滚"是同一件事的两面：**HTML 不缓存 + 旧产物保留两个版本**，缺一个就会出现"HTML 是新的、引用的 JS 已经 404"。
 
 ---
 
-## 实践策略
+## 协商缓存：`ETag` 与 `Last-Modified`
 
-- **带 hash 的静态资源**（如 `app.a1b2c3.js`）：`Cache-Control: max-age=31536000, immutable`。内容变→hash 变→URL 变→自动取新版，旧 URL 永久缓存安全。
-- **HTML（入口）**：`no-cache` 或短缓存，确保能及时拿到新引用。
-- **CDN**：边缘节点缓存静态资源，用户就近取，延迟大降。
+```http
+HTTP/1.1 200 OK
+ETag: "v123"
+Last-Modified: Mon, 20 Oct 2026 10:00:00 GMT
 
-> 本博客部署用 `contenthash` 文件名正是为了这套缓存策略：内容不变 URL 不变，可放心长缓存。
+# 下次请求
+If-None-Match: "v123"
+```
+
+服务端判断未变 → 回 `304 Not Modified`（无 body，只有头）。省的是**带宽**，不省往返（仍需一次 RTT）。
+
+`ETag` 优于 `Last-Modified`（时间精度到秒，且文件可能"改了内容但时间没变"）。两者都提供时浏览器优先用 `ETag`。
 
 ---
 
-## 小结
+## HTTP/2、/3 之后缓存策略变了什么
 
-- 强缓存（max-age/immutable）：不发请求，最快。
-- 协商缓存（ETag/304）：发请求但省下载。
-- 带 hash 资源长缓存 + HTML 短缓存 = 安全又快的经典组合。
-- CDN 把资源推到离用户更近的地方。
+| | HTTP/1.1 | HTTP/2 | HTTP/3 |
+| --- | --- | --- | --- |
+| 并发 | 每域 6 个连接 | **单连接多路复用** | 单连接 + QUIC（UDP） |
+| 队头阻塞 | 有（连接级） | 缓解（流级），但 TCP 层仍有 | 基本消除 |
+| 合并请求 | 必要（减少连接数） | **不再必要** | 不必要 |
+| 域名分片 | 常见 | 反而有害（多连接开销） | 有害 |
+
+所以老项目里这两个做法该删掉：
+
+- **雪碧图 / 大 bundle 合并**：在 HTTP/2 下，拆成多个小文件反而能利用多路复用 + 更精准的缓存。
+- **多域名 CDN 分片**：每个域名都要另建连接与 TLS 握手。
+
+---
+
+## 资源提示：preload / prefetch / preconnect
+
+| 指令 | 含义 | 何时用 |
+| --- | --- | --- |
+| `preload` | **当前页面**马上就要用，提前高优下载 | 关键字体、首屏大图、必须的 JS chunk |
+| `prefetch` | **下一个页面**可能用，空闲时低优下载 | 用户大概率会去的下一页 |
+| `preconnect` | 提前建连（DNS + TCP + TLS） | 第三方域（CDN、API） |
+| `dns-prefetch` | 只做 DNS | preconnect 的降级 |
+| `modulepreload` | 预加载 ES 模块并解析依赖 | 关键入口 chunk |
+
+```html
+<link rel="preconnect" href="https://cdn.example.com" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/f/main.woff2" crossorigin>
+<link rel="preload" as="image" href="/img/hero.webp" fetchpriority="high">
+```
+
+**`preload` 误用会反效果**：每个 `preload` 都抢带宽与优先级。把 8 个资源都设成 preload，等于"什么都优先"，结果关键 CSS 反而排队——实测 LCP 会掉 0.3–0.5s。
+
+判断标准：**只 preload"首屏渲染必需、且发现得晚"的那 1–2 个资源**（通常是字体与 hero 图）。
+
+---
+
+## Service Worker：可编程的缓存层
+
+```js
+// sw.js —— 三段式策略：导航走网络优先，静态资源缓存优先
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      fetch(request).catch(() => caches.match('/offline.html')),
+    );
+    return;
+  }
+  event.respondWith(
+    caches.match(request).then((hit) => hit ?? fetch(request)),
+  );
+});
+```
+
+代价与风险：
+
+- **必须处理更新**：新 SW 装好后处于 `waiting`，要 `skipWaiting` + `clients.claim` 才会接管，否则用户可能长期用旧缓存；
+- **调试坑**：本地开发容易缓存住旧代码，记得 DevTools → Application → Service Workers → Update on reload；
+- **不要给 HTML 做强缓存**（同上，会导致版本指针卡死）。
+
+普通内容站**不需要 SW**；需要离线可用或强缓存控制时才上。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 发布后白屏 | `index.html` 被强缓存 | 改 `no-cache`，并保留旧产物 |
+| 改了代码用户看不到 | 资源没带 hash，被 `immutable` 缓存 | 文件名带内容哈希 |
+| `preload` 加了反而更慢 | 抢了关键资源带宽 | 只 preload 1–2 个必需资源 |
+| 304 但页面还是旧的 | 是 HTML 被缓存，不是资源 | 排查 HTML 的缓存头 |
+| SW 上线后老用户一直用旧版 | 没做 `skipWaiting` | 加更新提示 + `skipWaiting` |
+| 首屏字体闪烁（FOUT/FOIT） | 字体未 preload 或 `font-display` 不当 | `font-display: swap` + preload 关键字体 |
+
+---
+
+## 验收清单
+
+- [ ] 能区分 `no-store` / `no-cache` / `max-age` / `immutable` 的实际行为
+- [ ] HTML 是 `no-cache`，带 hash 的静态资源是 `immutable`
+- [ ] 项目里能说清哪些资源用了 `preload`，以及为什么只有这几个
+- [ ] 知道 HTTP/2 下"合并请求/域名分片"的坏处
+- [ ] 若用了 Service Worker：有更新策略，且不会缓存 HTML 到过期
+- [ ] 能在 DevTools 的 Network 里区分 `from memory cache` / `from disk cache` / `304`
 
 ---
 
 ## 练习
 
-1. 给一个静态资源配 `Cache-Control: max-age=31536000, immutable`，用 DevTools 看二次访问是否 200 (from cache)。
-2. 改资源内容但保持文件名不变，观察协商缓存返回 304 还是重新下载。
-3. 解释为什么 HTML 入口不宜设 `immutable` 长缓存。
+1. **验证 `no-cache` 与 `no-store`**：给同一个接口分别设置两个头，各请求两次，看第二次是否有请求发出。  
+   *自检*：能说出"no-cache = 每次验证，no-store = 完全不存"。
+2. **做一次 preload 反例**：给 6 个资源都加 `preload`，用 Lighthouse 对比加之前的 LCP。  
+   *自检*：能给出前后数字，并解释"优先级通胀"。
+3. **数一次缓存命中**：打开一个真实站点，Network 面板看 `Size` 列里的 `(memory cache)` / `(disk cache)` / 实际字节，判断哪些命中了强缓存。  
+   *自检*：能指出"哪个文件本该缓存却没缓存"。

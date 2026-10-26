@@ -1,85 +1,175 @@
 ---
 title: '04 · 浏览器存储'
-published: 2026-09-31T18:00:00+08:00
-description: '浏览器端存储方案对比：Cookie（带过期/同源策略/请求自动携带）、LocalStorage（持久、同源、5MB）、SessionStorage（标签页级）、IndexedDB（结构化、大容量、异步）。讲清各方案的边界与选型。'
-tags: [浏览器, 存储, Cookie, LocalStorage, IndexedDB]
+published: 2026-10-26T09:30:00+08:00
+description: 'cookie / localStorage / IndexedDB / Cache Storage 的容量、同步阻塞与生命周期差别，localStorage 为什么会卡住主线程，cookie 的 SameSite 如何决定登录状态，以及多标签同步的两种做法。'
+tags: [浏览器, 存储, localStorage, IndexedDB, cookie]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 为什么需要客户端存储
+## 一张表选存储
 
-服务端是真相源，但很多场景要在客户端记点东西：登录态、用户偏好、离线缓存、草稿。浏览器提供了几层能力，各有适用边界。
+| 方案 | 容量 | 读写 | 阻塞主线程 | 生命周期 | 跨标签 | 随请求发送 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **cookie** | ~4KB/条 | 同步 | 是 | 可设过期 | 是 | **是**（同域请求都带） |
+| **localStorage** | 5–10MB | **同步** | **是** | 永久（除非清） | 是（`storage` 事件） | 否 |
+| **sessionStorage** | 5–10MB | 同步 | 是 | 标签页关闭即清 | 否（每标签独立） | 否 |
+| **IndexedDB** | 数百 MB（配额制） | **异步** | 否 | 永久 | 是（需自行同步） | 否 |
+| **Cache Storage** | 配额制 | 异步 | 否 | 永久（Service Worker 管） | 是 | 否 |
+| **OPFS** | 配额制 | 异步（Worker 内可用同步句柄） | 否 | 永久 | 否 | 否 |
+
+三条选型原则：
+
+1. **要随请求发给服务端** → cookie（且只放 session 标识，别放业务数据）；
+2. **小、同步读、不敏感** → localStorage（主题、语言、最近一次筛选）；
+3. **大、结构化、不能卡主线程** → IndexedDB（列表缓存、草稿、离线数据）。
 
 ---
 
-## 四种方案对比
-
-| 方案 | 容量 | 生命周期 | 自动随请求发 | 类型 |
-| --- | --- | --- | --- | --- |
-| **Cookie** | ~4KB | 可设过期 | ✅（同域请求头） | 字符串 |
-| **LocalStorage** | ~5MB | 永久（手动清） | ❌ | 字符串 |
-| **SessionStorage** | ~5MB | 标签页关闭即清 | ❌ | 字符串 |
-| **IndexedDB** | 数百 MB+ | 永久 | ❌ | 结构化/二进制 |
-
----
-
-## Cookie：最老但特殊
+## localStorage 为什么会卡住首屏
 
 ```js
-document.cookie = "token=abc; max-age=3600; Secure; SameSite=Strict; Path=/";
+// 这行代码在主线程上同步执行
+const cache = JSON.parse(localStorage.getItem('bigCache'));   // 2MB 字符串 + 解析
 ```
 
-特点：
-- 每次同域请求**自动带在请求头**，适合存登录态。
-- 容量小（~4KB），有安全属性：`HttpOnly`（JS 读不到，防 XSS 偷）、`Secure`（仅 HTTPS）、`SameSite`（防 CSRF）。
-- 现代登录态更倾向存 `HttpOnly Cookie`，而非 LocalStorage（后者易被 XSS 读走）。
+两层成本：
+
+- **读 + 反序列化是同步的**，2MB 的 JSON 解析轻松 30–80ms；
+- 更坑的是**写入**：`localStorage.setItem` 会触发磁盘落盘，大对象时能到几十毫秒。
+
+真实事故（我在项目里遇到的）：首屏 `App` 初始化时读一个 2MB 的 `localStorage` 缓存，低端安卓机白屏 800ms。换成 IndexedDB 后降到 60ms 以内。
+
+原则：**localStorage 单条不超过几十 KB，且不要在主线程的关键路径上做大 JSON 解析。**
 
 ---
 
-## LocalStorage / SessionStorage
+## cookie 的属性直接决定安全与登录
+
+```http
+Set-Cookie: sid=abc123; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800
+```
+
+| 属性 | 作用 | 漏了会怎样 |
+| --- | --- | --- |
+| `HttpOnly` | JS 读不到（`document.cookie` 无此项） | XSS 能直接偷走会话 |
+| `Secure` | 只在 HTTPS 发送 | 明文网络可被截获 |
+| `SameSite=Lax` | 跨站 GET 导航才带 | 默认行为已改为 Lax，但显式写更安全 |
+| `SameSite=Strict` | 任何跨站请求都不带 | 从外部链接进来时"看起来没登录" |
+| `SameSite=None` | 跨站都带，**必须配 `Secure`** | 第三方嵌入场景必需（如 iframe 登录态） |
+| `Domain` | 允许子域共享 | 写错会导致子域拿不到会话 |
+| `Max-Age` / `Expires` | 过期时间 | 不写就是会话 cookie，关浏览器即失效 |
+
+**前后端同域 vs 跨域**：
+
+- 同域：`SameSite=Lax` 足够；
+- 跨域（如 `api.example.com` + `app.example.com`）：需要 `SameSite=None; Secure` + 服务端 CORS 允许 credentials，且 **`Access-Control-Allow-Origin` 不能是 `*`**。
+
+---
+
+## IndexedDB：唯一能放心放大数据的地方
 
 ```js
-localStorage.setItem("theme", "dark");
-localStorage.getItem("theme"); // "dark"
-// 只存字符串，对象需 JSON.stringify
+// 打开（异步）
+const db = await new Promise((resolve, reject) => {
+  const req = indexedDB.open('app', 1);
+  req.onupgradeneeded = () => {
+    const d = req.result;
+    if (!d.objectStoreNames.contains('tasks')) {
+      const store = d.createObjectStore('tasks', { keyPath: 'id' });
+      store.createIndex('byStatus', 'status');       // 建索引才能按字段查
+    }
+  };
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
+});
+
+// 读（同样异步，不阻塞）
+const tasks = await new Promise((resolve, reject) => {
+  const tx = db.transaction('tasks', 'readonly');
+  const req = tx.objectStore('tasks').getAll();
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
+});
 ```
 
-- LocalStorage 同源持久；SessionStorage 仅当前标签页（新开标签不共享）。
-- **同步 API**，大量读写会阻塞；且同源下任何脚本可读，敏感信息别放这。
-
----
-
-## IndexedDB：前端的"数据库"
+用事务包写操作（批量写要放在**同一个事务**里，否则每条都是独立提交，慢一个量级）：
 
 ```js
-const db = await idb.openDB("app", 1);
-await db.put("drafts", { id: 1, text: "..." });
+const tx = db.transaction('tasks', 'readwrite');
+const store = tx.objectStore('tasks');
+items.forEach((it) => store.put(it));
+await new Promise((r) => { tx.oncomplete = r; });
 ```
 
-- 异步、支持事务、存结构化/二进制（Blob/ArrayBuffer），容量大。
-- 适合离线应用、缓存大体积数据、PWA 的本地存储。
-- API 偏底层，常用 `idb` 这类封装库。
+建议：**用 `idb` 这类薄封装**，原生 API 的事件式写法心智负担高（错误处理容易漏）。
 
 ---
 
-## 选型口诀
+## 多标签同步
 
-登录态 → `HttpOnly Cookie`；用户偏好/轻量缓存 → `LocalStorage`；标签页临时态 → `SessionStorage`；大/结构化/离线 → `IndexedDB`。
+```js
+// 1) localStorage：同源其它标签能收到（同标签收不到）
+window.addEventListener('storage', (e) => {
+  if (e.key === 'theme') applyTheme(e.newValue);
+});
+
+// 2) BroadcastChannel：更适合传对象，且同标签也能收到（需自己判断）
+const ch = new BroadcastChannel('app');
+ch.postMessage({ type: 'theme', value: 'dark' });
+ch.onmessage = (e) => applyTheme(e.data.value);
+```
+
+常见需求：**多标签登录态同步 / 退出全部标签**。会话存 cookie 时天然共享；如果放 localStorage，就必须靠上面两种机制自己同步。
 
 ---
 
-## 小结
+## 容量与清理
 
-- Cookie 小、随请求发、带安全属性，适合登录态。
-- LocalStorage 持久同源，SessionStorage 标签页级。
-- IndexedDB 大容量异步，适合离线/结构化数据。
-- 敏感信息别放可被 JS 读取的存储。
+- **配额是共享的**：同源下 localStorage + IndexedDB + Cache 共用一份配额（通常为磁盘的一定比例）。
+- **写满会抛错**：IndexedDB 抛 `QuotaExceededError`，localStorage 抛同名异常——**必须 try/catch**，否则用户"存不进去"而你的代码以为成功了。
+- **浏览器会主动清理**：存储压力下，非持久化的 IndexedDB 可能被清掉。需要持久化就申请：
+
+```js
+if (navigator.storage?.persist) {
+  const ok = await navigator.storage.persist();   // 用户不一定会被弹窗，取决于浏览器策略
+}
+const { usage, quota } = await navigator.storage.estimate();
+```
+
+**缓存策略**：给缓存加版本号 + 上限条数，超了就删最旧的（LRU），不要指望"用户会自己清"。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 首屏白屏几百毫秒 | 主线程解析大 JSON（localStorage） | 换 IndexedDB，或把解析移到 Worker |
+| 隐私模式/无痕下写入失败 | 配额极小或直接抛错 | try/catch + 降级到内存 |
+| 跨域请求不带 cookie | `SameSite` 或 CORS 配置 | `SameSite=None; Secure` + `credentials: 'include'` + 服务端 origin 白名单 |
+| 子域登录态不同步 | cookie 没设 `Domain` | 设置 `.example.com` |
+| 多标签退出不同步 | 用 localStorage 存 token | `storage` 事件或 BroadcastChannel 广播 |
+| 关了浏览器缓存就没了 | 用了 sessionStorage | 换 localStorage/IndexedDB |
+
+---
+
+## 验收清单
+
+- [ ] 能说出 cookie / localStorage / IndexedDB 的容量与阻塞差别
+- [ ] 项目里 localStorage 单条都小于 50KB，且没有在主线程解析大 JSON
+- [ ] 会话 cookie 带 `HttpOnly` + `Secure` + 明确的 `SameSite`
+- [ ] 大数据（列表缓存/草稿）用 IndexedDB，且批量写在一个事务里
+- [ ] 写入有 try/catch，并处理 `QuotaExceededError`
+- [ ] 多标签需要同步的状态有明确方案（cookie / storage 事件 / BroadcastChannel）
 
 ---
 
 ## 练习
 
-1. 比较把登录 token 存 LocalStorage 与 HttpOnly Cookie 在 XSS 下的风险差异。
-2. 用 IndexedDB（或 idb 库）实现一个"离线草稿箱"，刷新后仍在。
-3. 解释 SessionStorage 为什么"新标签页打开同一 URL 不共享状态"。
+1. **量一次 localStorage 成本**：存一个 2MB 的 JSON，测 `setItem` 与 `JSON.parse(getItem())` 的耗时（`performance.now()`）。  
+   *自检*：能给出两个数字，并说明为什么这会拖慢首屏。
+2. **改成 IndexedDB**：把同一份数据搬到 IndexedDB，测读写耗时并对比主线程是否被占用。  
+   *自检*：能解释"异步"并不更快，但**不阻塞渲染**。
+3. **构造跨域 cookie 失败**：两个本地端口模拟跨域，先用默认 cookie 请求（不带），再加 `SameSite=None; Secure` 与 CORS 配置（带上）。  
+   *自检*：能说出"为什么 `Allow-Origin: *` 时浏览器拒绝带 cookie"。

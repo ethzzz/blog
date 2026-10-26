@@ -1,63 +1,172 @@
 ---
-title: '07 · 性能指标'
-published: 2026-09-31T21:00:00+08:00
-description: '用指标量化体验：TTFB、FCP、LCP、CLS、INP 各自衡量什么，Core Web Vitals 的阈值，以及如何用 Lighthouse / Web Vitals 采集真实数据。指标驱动优化，而非凭感觉。'
-tags: [浏览器, 性能指标, CoreWebVitals, LCP, CLS]
+title: '07 · 性能指标与测量'
+published: 2026-10-26T11:00:00+08:00
+description: 'LCP / INP / CLS / TTFB 各测什么、为什么会变差、实验室数据与真实用户的差别，为什么只看 P75，以及怎么用 PerformanceObserver 把数据采回来。'
+tags: [浏览器, 性能指标, CoreWebVitals, LCP, INP, RUM]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 没有度量就没有优化
+## 先有指标，才有方向
 
-"感觉有点慢"无法指导优化。**Core Web Vitals** 把体验拆成可量化指标，达标才算好。
+"页面很慢"不是问题描述。可行动的问题长这样：
+
+> 移动端 P75 的 LCP 是 3.4s，其中 1.9s 花在 hero 图下载上（4G 下 480KB），TTFB 只有 0.2s。
+
+这一篇就是教你把前者变成后者的方法论。
 
 ---
 
-## 关键指标
+## 四个核心指标
 
-| 指标 | 衡量 | 好的阈值 |
+| 指标 | 测什么 | 好 / 需改进 / 差 | 常见变差原因 |
+| --- | --- | --- | --- |
+| **TTFB** | 请求发出到收到首字节 | < 0.8s / < 1.8s / > 1.8s | 服务端慢、DNS/TLS 慢、无 CDN、重定向 |
+| **LCP** | 视口内最大内容元素的渲染时间 | < 2.5s / < 4s / > 4s | 大图/大标题、阻塞 CSS、字体、服务端渲染慢 |
+| **INP** | 交互到下一帧绘制的延迟（P98） | < 200ms / < 500ms / > 500ms | 长任务、大列表渲染、同步布局、重计算 |
+| **CLS** | 布局偏移累计得分 | < 0.1 / < 0.25 / > 0.25 | 图片无尺寸、字体切换、动态插入、广告位 |
+
+> INP 在 2023 年取代 FID。FID 只测"输入延迟"，INP 测的是**整个交互从输入到画面更新**，更接近用户感受，也更难优化。
+
+三个补充指标：**FCP**（首次内容绘制，看"有没有东西"）、**TBT**（总阻塞时间，实验室里代理 INP）、**Speed Index**（内容填充速度）。
+
+---
+
+## 实验室 vs 真实用户：两套数据不能互相替代
+
+| | 实验室（Lighthouse / Performance 面板） | 真实用户（RUM） |
 | --- | --- | --- |
-| **TTFB** | 服务器响应首个字节耗时 | < 800ms |
-| **FCP** | 首次绘制任意内容 | < 1.8s |
-| **LCP** | 最大内容（如大图/标题）绘制完成 | < 2.5s |
-| **CLS** | 布局稳定性（视觉跳动） | < 0.1 |
-| **INP** | 交互响应延迟（替代 FID） | < 200ms |
+| 环境 | 固定机型、固定网速、清空缓存 | 千奇百怪的设备与网络 |
+| 能定位到原因 | ✅ 有火焰图 | ❌ 只有数字 |
+| 能代表用户 | ❌ 只代表"一种用户" | ✅ 但要看分布 |
+| 用途 | **找根因、验证改动** | **判断真实体验、设阈值** |
 
-- **LCP** 关注"用户看到主要内容多快"——常受大图、阻塞渲染的 JS 影响。
-- **CLS** 关注"页面稳不稳"——图片无宽高、字体闪烁、插入内容都会导致跳动。
-- **INP** 关注"点了有没有反应"——长任务占主线程是主因。
+**只看 Lighthouse 会翻车**：它给你 95 分，但你的用户里有 40% 在用三年前的安卓机。
 
----
-
-## 采集方式
-
-- **Lighthouse**：实验室数据，本地跑分、查瓶颈（DevTools 自带）。
-- **web-vitals 库**：采集**真实用户（RUM）** 数据，反映真实环境。
-- **CrUX / 监控平台**：聚合全量用户的字段数据，看长期趋势。
-
-> 实验室数据（Lighthouse）找问题，真实字段数据（RUM）验效果。两者结合。
+看分布：**P75 是行业标准**（Google 也用 P75）。均值会被大量"秒开"的旗舰机稀释，P75 才代表"四分之三用户的体验"。
 
 ---
 
-## 指标驱动优化
+## 采集：一段能直接用的代码
 
-- LCP 差 → 优化首屏大图（压缩/优先加载/预加载）、削减阻塞 JS。
-- CLS 差 → 给图片/广告位预留尺寸、`font-display: swap` 减少字体跳动。
-- INP 差 → 拆分长任务、用 Web Worker 移出主线程（下篇）。
+```ts
+// src/monitor/vitals.ts
+import { onCLS, onINP, onLCP, onTTFB, type Metric } from 'web-vitals';
+
+function send(m: Metric) {
+  navigator.sendBeacon(
+    '/api/rum',
+    JSON.stringify({
+      name: m.name,          // LCP / INP / CLS / TTFB
+      value: m.value,
+      rating: m.rating,      // good / needs-improvement / poor
+      id: m.id,
+      // 分维度才能定位：设备档位、网络、页面
+      device: navigator.hardwareConcurrency >= 8 ? 'high' : 'low',
+      conn: (navigator as any).connection?.effectiveType ?? 'unknown',
+      path: location.pathname,
+      release: window.__BUILD_ID__,
+    }),
+  );
+}
+
+onLCP(send);
+onINP(send);
+onCLS(send);
+onTTFB(send);
+```
+
+三个要点：
+
+1. **`sendBeacon`**：页面关闭时也能发出去；`fetch` 会被取消。
+2. **带 `release`**：没有版本号，"指标变差"你无法归因到哪次发布。
+3. **带维度**（设备/网络/路径）：不然你只知道"慢了"，不知道"谁慢了"。
+
+`buffered: true` 注意：`web-vitals` 内部已经处理"页面加载前发生的指标"（比如 LCP 在脚本加载前就发生了）。
 
 ---
 
-## 小结
+## INP 难在哪：拆成三段看
 
-- 核心指标：LCP（加载）、CLS（稳定）、INP（交互）。
-- 阈值：LCP&lt;2.5s、CLS&lt;0.1、INP&lt;200ms。
-- Lighthouse 找瓶颈，RUM 验真实效果。
-- 先测指标，再针对性优化，避免盲调。
+```text
+用户按下 → [输入延迟] → [事件处理] → [呈现延迟] → 画面更新
+             ↑ 主线程在忙           ↑ 渲染/合成排队
+```
+
+| 段 | 常见原因 | 对应手段 |
+| --- | --- | --- |
+| 输入延迟 | 主线程有长任务在跑 | 拆分任务、`scheduler.yield`、Web Worker |
+| 事件处理 | 回调里做了重计算/大量 setState | 减少同步计算、`startTransition`、批量更新 |
+| 呈现延迟 | 一次更新渲染太多 DOM | 虚拟滚动、`content-visibility`、减少布局抖动 |
+
+定位工具：Performance 面板 → Interactions 轨道，能直接看到每个交互的三段耗时。
+
+---
+
+## 长任务与 LoAF：找到"谁占住了主线程"
+
+```js
+// Long Animation Frames（Chrome 123+）：比 longtask 更能定位到脚本
+new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    if (entry.duration < 50) continue;
+    console.warn('长帧', entry.duration.toFixed(0), 'ms', {
+      blocking: entry.blockingDuration,
+      scripts: entry.scripts?.map((s) => ({
+        source: s.sourceURL,
+        fn: s.sourceFunctionName,
+        dur: s.duration,
+      })),
+    });
+  }
+}).observe({ type: 'long-animation-frame', buffered: true });
+```
+
+老的 `longtask` 只告诉你"有 200ms 卡顿"，LoAF 能告诉你 **`sourceFunctionName` 是哪个函数**——这是从"指标"到"代码行"的关键一跃。
+
+---
+
+## 定阈值：别抄，按你的用户定
+
+| 场景 | 建议目标（P75，移动端） |
+| --- | --- |
+| 内容站 / 博客 | LCP < 2.0s，CLS < 0.05 |
+| 中后台 | LCP < 2.5s，INP < 200ms |
+| 电商 / 转化关键页 | LCP < 2.5s，INP < 200ms，CLS < 0.1 |
+
+设阈值的原则：**先测两周拿到基线，再定"比基线好 20%"为目标**；抄 Google 的绝对值容易变成"永远不达标"。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| Lighthouse 95 但用户抱怨慢 | 实验室≠真实用户 | 上 RUM，看 P75 |
+| 指标时好时坏 | 看的是均值 | 改看 P75 与分布 |
+| 优化后指标没动 | 改的不是瓶颈（如优化了 TTFB，问题在 LCP 的图片） | 先拆 LCP 四段（11 篇） |
+| INP 数据缺失 | 页面交互太少（SPA 首页无点击） | 结合 TBT 与自定义交互打点 |
+| CLS 报 0 但页面明显抖 | 偏移发生在用户交互后 500ms 内（不计入） | 用 PerformanceObserver 自己采 `layout-shift` |
+| 无法归因到发布 | 上报没带版本号 | 加 `release` 字段 |
+
+---
+
+## 验收清单
+
+- [ ] 能说出四个核心指标的"测什么"和"常见变差原因"
+- [ ] 有 RUM 数据，且看的是 P75（不是均值）
+- [ ] 上报带了版本号与设备/网络/路径维度
+- [ ] 能用 LoAF 或 Performance 面板定位到具体函数
+- [ ] 每个指标有明确目标值，且是"按自己基线定的"
+- [ ] 知道实验室与真实用户数据各自用来干什么
 
 ---
 
 ## 练习
 
-1. 用 Lighthouse 给你的页面跑分，记录 LCP/CLS/INP，找出最差的一项。
-2. 故意去掉一张大图的宽高属性，观察 CLS 变差；补回后恢复。
-3. 在页面接入 `web-vitals` 库，打印真实用户的 LCP 值。
+1. **采一次真实数据**：给任意页面接上上面的 `vitals.ts`，用 4G 限速 + CPU 4x 降速跑 10 次，记录 P75。  
+   *自检*：能给出三个指标的数字，并指出哪个最差。
+2. **定位一次长帧**：用 LoAF 录一次点击后的卡顿，找到 `sourceFunctionName`，回到源码确认耗时逻辑。  
+   *自检*：能说出"这 180ms 具体花在哪个函数"。
+3. **对比实验室与真机**：同一页面分别用 Lighthouse（模拟移动）与你手机实测，列出差异最大的指标并解释原因。  
+   *自检*：能说明"为什么模拟环境总会乐观一些"。

@@ -1,55 +1,178 @@
 ---
-title: '01 · 渲染流水线'
-published: 2026-09-31T15:00:00+08:00
-description: '从输入 URL 到像素上屏：解析 HTML 建 DOM、CSSOM，合成渲染树，Layout 布局、Paint 绘制、Composite 合成。理解每个阶段的开销，才知道优化该压哪一环。'
-tags: [浏览器, 渲染流水线, DOM, CSSOM, 合成]
+title: '01 · 进程模型与渲染流水线'
+published: 2026-10-26T08:00:00+08:00
+description: '浏览器为什么是多进程、主线程为什么既跑 JS 又算样式、一次页面从 HTML 到像素要经过哪几步，以及 CSS 阻塞渲染、JS 阻塞解析背后的真实原因。'
+tags: [浏览器, 进程模型, 渲染流水线, 关键渲染路径, 主线程]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 一段"看不见"的旅程
+## 一个 tab 崩了，为什么别的还在
 
-你写 `index.html` + `style.css`，浏览器要把它变成屏幕上的像素，经历一条**渲染流水线**。每一步都有成本，瓶颈常在某一环。
+因为浏览器是**多进程**架构。Chrome 里至少有这么几类进程：
+
+| 进程 | 职责 | 崩了会怎样 |
+| --- | --- | --- |
+| **浏览器主进程** | 地址栏、书签、标签管理、权限 | 整个浏览器退出 |
+| **渲染进程** | 每个站点一个：HTML/CSS/JS/布局/绘制 | 该 tab 白屏，其它不受影响 |
+| **GPU 进程** | 合成、光栅化、视频解码 | 页面卡但不崩 |
+| **网络进程** | 请求、DNS、缓存（新版本已并入主进程） | 加载失败 |
+| **插件/Utility** | PDF、图片解码等沙箱任务 | 该功能不可用 |
+
+**站点隔离（Site Isolation）**：不同站点默认**不同渲染进程**，这是为了安全（一个站点的漏洞读不到另一个站点的内存）。副作用：内存占用高，`iframe` 跨站会多开一个进程。
+
+> 实用推论：**你在同一个页面里塞多个跨域 iframe，等于多开了几个进程**，低端机上直接卡。
 
 ---
 
-## 流水线五阶段
+## 渲染进程内部：主线程是瓶颈
 
-1. **解析 HTML → DOM**：字节流按标签解析成 DOM 树。JS 会阻塞解析（见下）。
-2. **解析 CSS → CSSOM**：样式规则构造成 CSSOM 树。
-3. **合成 Render Tree（渲染树）**：合并 DOM 与 CSSOM，**只含可见节点**（`<head>`、`:display:none` 的都不进）。
-4. **Layout（布局/重排）**：计算每个节点的几何位置与尺寸。最贵的一步之一。
-5. **Paint（绘制）**：把每个节点画成像素，生成绘制记录。
-6. **Composite（合成）**：把各层合并，提交 GPU 上屏。
+一个渲染进程里有几条线程，但**只有主线程会跑你的 JS**：
 
+```text
+渲染进程
+├── 主线程（Main Thread）← 你的 JS、样式计算、布局、绘制指令，全在这里排队
+├── 合成线程（Compositor）← 处理滚动、transform 动画，能脱离主线程干活
+├── 光栅线程（Raster）    ← 把绘制指令变成像素
+└── Worker 线程          ← 你创建的 Web Worker（不碰 DOM）
 ```
-HTML ─┐
-      ├─▶ DOM + CSSOM ─▶ Render Tree ─▶ Layout ─▶ Paint ─▶ Composite ─▶ 屏幕
-CSS  ─┘
+
+这就是所有性能问题的根源：**JS 一卡，样式算不了、布局做不了、点击响应不了**。所谓"页面卡了"，99% 是主线程被占住了。
+
+`transform` / `opacity` 动画为什么流畅？因为它们能在**合成线程**处理，不需要主线程参与。
+
+---
+
+## 关键渲染路径：从 HTML 到像素
+
+```text
+字节 → HTML 字符 → DOM 树
+       CSS 字符 → CSSOM
+              ↓
+        Render Tree（只含可见节点）
+              ↓
+        Layout（算位置尺寸）
+              ↓
+        Paint（生成绘制指令）
+              ↓
+        Composite（合成图层 → 屏幕）
 ```
 
----
+三个容易混淆的点：
 
-## 关键认知
-
-- **JS 阻塞解析**：`<script>` 默认会暂停 HTML 解析去执行，放底部或用 `defer`/`async` 避免。
-- **CSS 阻塞渲染**：CSSOM 没建好，渲染树没法合成，所以 CSS 要尽早加载。
-- **Layout 是重活**：改了几何属性（宽高、位置）触发 Layout，连锁影响后续 Paint/Composite。
-- **合成层走 GPU**：某些属性（transform/opacity）可单独合成，不触发 Layout/Paint，最快。
+1. **`display: none` 的节点不进 Render Tree**；`visibility: hidden` 进，但不绘制。
+2. **Layout 不是每次都发生**：改颜色只到 Paint，改 `transform` 可能只到 Composite。
+3. **合成层（Compositing Layer）** 是 GPU 内存里的位图，单独合成能跳过 Layout/Paint（见 02 篇）。
 
 ---
 
-## 小结
+## CSS 与 JS 为什么"阻塞"
 
-- 渲染流水线：DOM+CSSOM → 渲染树 → Layout → Paint → Composite。
-- JS 阻塞解析、CSS 阻塞渲染，二者都要早加载/异步化。
-- Layout 最贵；transform/opacity 走合成层最快。
-- 优化要先判断瓶颈在 Layout / Paint / Composite 哪一步。
+### CSS 阻塞渲染，也阻塞后续 JS
+
+```html
+<link rel="stylesheet" href="app.css">
+<script>console.log(document.body.offsetHeight);</script>  <!-- 必须等 CSS -->
+```
+
+原因：脚本可能读取布局信息（`offsetHeight`、`getComputedStyle`），浏览器必须**先把 CSS 算完**才能给出正确答案。所以：
+
+> **CSS 越大、越晚，JS 执行就越晚，首屏就越晚。**
+
+### JS 阻塞解析
+
+```html
+<!-- ❌ 默认：下载 + 执行都阻塞 DOM 解析 -->
+<script src="app.js"></script>
+
+<!-- ✅ defer：并行下载，解析完 DOM 再按顺序执行 -->
+<script defer src="app.js"></script>
+
+<!-- ✅ async：并行下载，下载完立刻执行（顺序不定，可能打断解析） -->
+<script async src="analytics.js"></script>
+
+<!-- ✅ type=module：默认 defer 语义 -->
+<script type="module" src="app.js"></script>
+```
+
+| 方式 | 下载 | 执行时机 | 适用 |
+| --- | --- | --- | --- |
+| 默认 | 阻塞 | 立刻，阻塞解析 | 极少数必须前置的脚本 |
+| `defer` | 并行 | DOM 解析完，按文档顺序 | **业务入口脚本** |
+| `async` | 并行 | 下载完立刻，顺序不定 | 独立第三方（埋点） |
+| `type=module` | 并行 | 同 defer | 现代入口 |
+
+---
+
+## 帧预算：16.7ms 到底怎么花
+
+60Hz 屏幕一帧 16.7ms，浏览器还要留时间做样式/布局/绘制/合成，**真正给 JS 的预算约 10ms**。120Hz 屏幕只有 8.3ms。
+
+```text
+一帧 16.7ms
+├── 事件处理 / JS        ← 你写的代码
+├── 样式计算
+├── 布局
+├── 绘制
+└── 合成 + 显示
+```
+
+超过 50ms 的任务叫 **long task**，会直接导致掉帧与输入延迟（INP 变差）。
+
+---
+
+## 常用观测手段
+
+```js
+// 1) 长任务（>50ms）—— 定位卡顿第一手证据
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) {
+    console.log('long task', e.startTime, e.duration, e.attribution?.[0]?.containerSrc);
+  }
+}).observe({ type: 'longtask', buffered: true });
+
+// 2) 主线程忙不忙：requestAnimationFrame 的间隔
+let last = performance.now();
+requestAnimationFrame(function loop(now) {
+  const delta = now - last;
+  if (delta > 32) console.warn('掉帧', delta.toFixed(1), 'ms');
+  last = now;
+  requestAnimationFrame(loop);
+});
+```
+
+Chrome DevTools → Performance → 勾选 **Screenshots + Web Vitals**，录一段交互，能直接看到"这段时间主线程被谁占了"。
+
+---
+
+## 常见坑
+
+| 现象 | 机制 | 解法 |
+| --- | --- | --- |
+| 改了 CSS 后 JS 报错/取值不对 | CSS 阻塞导致脚本在旧布局上执行 | 脚本用 `defer`，或把读布局逻辑放到 DOMContentLoaded 后 |
+| 页面白屏很久才出内容 | 大 CSS + 同步脚本阻塞首次渲染 | 关键 CSS 内联、脚本 defer、拆分首屏样式 |
+| 埋点脚本导致白屏 | `async` 脚本下载完成时打断解析 | 换成 `defer`，或用 `requestIdleCallback` 延后初始化 |
+| 多 iframe 页面内存暴涨 | 站点隔离 → 多进程 | 减少跨域 iframe，或合并为同域 |
+| `type=module` 脚本没执行 | 需要 `http(s)` 协议（`file://` 下 CORS 失败） | 用本地 server 打开 |
+
+---
+
+## 验收清单
+
+- [ ] 能说出浏览器至少四类进程及各自职责
+- [ ] 知道主线程负责什么、合成线程负责什么（为什么 transform 动画更便宜）
+- [ ] 能画出从 HTML 到像素的完整路径，并指出 Layout/Paint/Composite 各在哪
+- [ ] 能解释"CSS 阻塞渲染"与"JS 阻塞解析"，并说出 `defer`/`async` 的差别
+- [ ] 会看 Performance 面板里的 Main 轨道，找到超过 50ms 的任务
+- [ ] 知道自己项目首屏有几个阻塞资源（CSS/JS 各几个）
 
 ---
 
 ## 练习
 
-1. 在 DevTools Performance 面板录制一次页面加载，对照各阶段耗时。
-2. 把脚本从 `<head>` 移到 `<body>` 末尾，对比渲染开始时间。
-3. 解释为什么 CSS 没加载完，页面会白屏而非显示无样式内容。
+1. **数一次阻塞资源**：打开你项目的 Network，勾掉"隐藏 data URL"，看首屏有几个 CSS/JS 是 blocking 的。  
+   *自检*：能说出其中哪几个可以 defer/内联/拆走。
+2. **制造一次 CSS 阻塞**：在 `<head>` 里插一个 500ms 才返回的 CSS（用 CDP 延迟），观察白屏时间变化。  
+   *自检*：能解释"为什么 JS 也要等这个 CSS"。
+3. **量一次主线程占用**：用上面的 rAF 探针，在页面滚动时记录 `delta`，找出 >32ms 的帧，再用 Performance 面板定位到具体函数。  
+   *自检*：能给出"这段代码耗时 X ms"的具体数字。

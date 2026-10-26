@@ -1,72 +1,168 @@
 ---
 title: '03 · 事件机制'
-published: 2026-09-31T17:00:00+08:00
-description: 'DOM 事件的捕获与冒泡三阶段模型，addEventListener 的第三个参数（capture/once/passive），事件委托的原理与性能价值，以及 passive  listener 解决滚动卡顿。'
-tags: [浏览器, 事件, 冒泡, 事件委托, passive]
+published: 2026-10-26T09:00:00+08:00
+description: '捕获、目标、冒泡三阶段与两个 stop 的区别，事件委托为什么会漏掉不冒泡的事件，passive 如何救回滚动性能，以及中文输入法下 composition 事件为什么必须处理。'
+tags: [浏览器, 事件, 事件委托, passive, composition]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 一次点击走了三步
+## 三阶段与两条"停止"命令
 
-点击一个按钮，事件不是直接打到它，而是沿 DOM 树**三阶段**传播：
-
-1. **捕获阶段**：从 `window` 向下到目标父级。
-2. **目标阶段**：到达被点的元素。
-3. **冒泡阶段**：从目标向上回到 `window`。
+```text
+        捕获阶段                目标阶段              冒泡阶段
+window → document → ... → 事件源元素 → ... → document → window
+```
 
 ```js
-el.addEventListener("click", handler, true);  // true=捕获阶段触发
-el.addEventListener("click", handler);        // 默认冒泡阶段触发
+el.addEventListener('click', handler, true);   // 捕获阶段（第三个参数 true 或 {capture:true}）
+el.addEventListener('click', handler);         // 冒泡阶段（默认）
 ```
+
+两个容易混的 API：
+
+| API | 作用 | 副作用 |
+| --- | --- | --- |
+| `e.stopPropagation()` | 阻止事件继续传播到**其它元素** | 同元素上的其它监听器**照样执行** |
+| `e.stopImmediatePropagation()` | 连**同元素上后续监听器**也阻止 | 容易把别人的逻辑也杀掉 |
+
+`preventDefault()` 是另一回事：它阻止**默认行为**（表单提交、链接跳转），不影响传播。
 
 ---
 
-## 事件委托：一个监听管一片
-
-给 1000 个 `<li>` 各绑监听既费内存又难维护。利用冒泡，在**父容器**上绑一个，靠 `event.target` 判断谁被点：
+## 事件委托：好用，但有三个坑
 
 ```js
-list.addEventListener("click", e => {
-  const li = e.target.closest("li");
-  if (li) handle(li);
+// ✅ 1000 个列表项只挂 1 个监听器
+list.addEventListener('click', (e) => {
+  const item = e.target.closest('[data-id]');
+  if (!item) return;
+  select(item.dataset.id);
 });
 ```
 
-好处：动态增删子项无需重新绑事件，性能与可维护性双赢。这是 React 事件系统底层思路的来源之一。
+三个坑：
+
+1. **不是所有事件都冒泡**：`focus` / `blur` / `mouseenter` / `mouseleave` / `load` 不冒泡。要用它们的冒泡版本：`focusin` / `focusout` / `mouseover` / `mouseout`，或直接 `addEventListener(..., true)` 用捕获。
+2. **`e.target` 可能是子元素**：`textContent` / `dataset` 要在 `closest()` 得到的元素上取。
+3. **动态内容要确认容器稳定**：监听器挂在会随路由重建的容器上，重建后监听就丢了（这也是 SPA 里"点了没反应"的常见原因）。
 
 ---
 
-## addEventListener 的进阶选项
+## `passive`：滚动卡顿的常见解药
 
 ```js
-el.addEventListener("scroll", onScroll, { passive: true }); // 告诉浏览器我不会 preventDefault
-el.addEventListener("click", once, { once: true });          // 只触发一次后自动解绑
+// 默认：浏览器不知道你会不会 preventDefault，滚动前必须等你执行完
+window.addEventListener('touchmove', handler);
+
+// ✅ 明确"我不会阻止默认行为" → 滚动可以立刻开始
+window.addEventListener('touchmove', handler, { passive: true });
 ```
 
-**`passive: true` 关键**：移动端 `touchmove`/`wheel` 监听若调用 `preventDefault` 会阻塞滚动。标记为 passive 后浏览器可放心异步滚动，消除卡顿（Chrome 对部分事件已默认 passive）。
+**为什么这很重要**：移动端滚动时，浏览器要等 `touchmove` 回调执行完才能决定是否滚动。回调里有 10ms 逻辑，滚动就延迟 10ms，感觉"粘手"。
+
+Chrome 从 56 起把 `touchstart/touchmove/wheel` 在 **window/document/body** 上的监听默认设为 `passive: true`——所以你会遇到"我明明写了 `preventDefault` 却不生效"：
+
+```js
+// ❌ 在 window 上无效（被动监听，preventDefault 被忽略，控制台有警告）
+window.addEventListener('touchmove', (e) => e.preventDefault());
+
+// ✅ 显式声明非被动（但请确保真的需要）
+el.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+```
 
 ---
 
-## 止损与注意
+## 合成事件 vs 原生事件
 
-- 委托时记得判断 `target` 是否真是你想要的元素（`closest` 兜底）。
-- 组件卸载要 `removeEventListener` 解绑，否则内存泄漏。React 的 `useEffect` 清理函数就是干这个。
-- 阻止冒泡用 `e.stopPropagation()`，但别滥用——会打断上层逻辑（如全局点击关闭弹窗）。
+React 17 之前事件都挂在 `document` 上，17 起改挂在**根容器**上（`createRoot` 的第一个参数）。这带来两个实际影响：
+
+1. **和原生事件混用时顺序不同**：同一元素上，原生监听（捕获阶段）先于 React 的合成事件。
+2. **`e.stopPropagation()` 只影响 React 合成事件树**，不会阻止容器外的原生监听——要阻止得在原生层做。
+
+```js
+// 判断某元素在 React 里归属哪个根
+el.closest('[data-reactroot], #root');
+```
 
 ---
 
-## 小结
+## 中文输入法：必须处理 composition
 
-- 事件三阶段：捕获 → 目标 → 冒泡。
-- 事件委托靠冒泡 + `closest`，一个监听管全部子项。
-- `passive` 让滚动事件不阻塞；`once` 自动解绑。
-- 卸载时解绑监听，防止内存泄漏。
+输入中文时，用户按的每个拼音字母都会触发 `keydown/input`。如果你在 `input` 里做搜索/校验，会**拿拼音去查**（"nihao"），体验极差。
+
+```js
+let composing = false;
+
+input.addEventListener('compositionstart', () => { composing = true; });
+input.addEventListener('compositionend', (e) => {
+  composing = false;
+  handleInput(e.target.value);        // 只有确定输入后才处理
+});
+input.addEventListener('input', (e) => {
+  if (composing) return;              // 拼音阶段直接忽略
+  handleInput(e.target.value);
+});
+```
+
+React 里同理，`onCompositionStart/End` 配合 state 标记；受控输入框还要注意"合成期间不要回写 value"，否则光标会跳。
+
+---
+
+## 高频事件的性能处理
+
+| 事件 | 频率 | 处理 |
+| --- | --- | --- |
+| `scroll` | 每帧多次 | 只读不算；用 `requestAnimationFrame` 合并；`passive: true` |
+| `resize` | 拖拽时极高 | 防抖 100–200ms |
+| `mousemove` | 极高 | 节流到 rAF；或只在拖拽时监听 |
+| `input` | 每次按键 | 防抖 200–300ms，注意 composition（上面） |
+| `wheel` | 高 | `passive`，别在里面同步改布局 |
+
+```js
+// 用 rAF 合并 scroll（比节流更贴近渲染节奏）
+let ticking = false;
+window.addEventListener('scroll', () => {
+  if (ticking) return;
+  ticking = true;
+  requestAnimationFrame(() => {
+    updateHeader();
+    ticking = false;
+  });
+}, { passive: true });
+```
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `preventDefault` 无效 | 被动监听（`passive: true`） | 显式 `{ passive: false }` |
+| 委托监听不到 `focus`/`hover` | 这些事件不冒泡 | 用 `focusin`/`mouseover` 或捕获 |
+| `stopPropagation` 后别人收不到 | 事件被中途截断 | 只在必要时阻止，优先用"判断来源" |
+| 中文输入时搜索乱跳 | 没处理 composition | 加 `compositionstart/end` 守卫 |
+| 移动端滚动"粘手" | `touchmove` 里有同步逻辑 | `passive` + 把逻辑移到 rAF |
+| 路由切换后点击失效 | 委托容器被重建 | 挂在稳定父节点，或随组件重新绑定 |
+
+---
+
+## 验收清单
+
+- [ ] 能画出三阶段，并说清两个 `stop` 的差别
+- [ ] 项目里长列表用事件委托，且没有依赖"不冒泡事件"的委托
+- [ ] `touchmove/wheel/scroll` 的监听是 `passive`（或确有必要才非被动）
+- [ ] 所有受控输入框处理了中文输入法（composition）
+- [ ] 高频事件有节流/防抖或 rAF 合并
+- [ ] 知道 React 事件的挂载点（根容器）与原生事件的顺序
 
 ---
 
 ## 练习
 
-1. 在父容器上用事件委托处理动态列表点击，对比"每项是绑"的内存差异。
-2. 给 `wheel` 监听加 `passive: true`，用 Performance 看滚动是否仍流畅。
-3. 在捕获阶段和冒泡阶段各绑一个监听，点击目标元素，观察打印顺序。
+1. **复现被动监听陷阱**：在 `window` 上加 `touchmove` 并 `preventDefault`，用移动端模拟看控制台警告；再加 `{ passive:false }` 对比。  
+   *自检*：能解释"为什么浏览器默认不让 window 上的 touchmove 阻止滚动"。
+2. **给委托加一个不冒泡事件**：用 `focus` 做委托（失败），再改 `focusin`（成功）。  
+   *自检*：能列出至少 4 个不冒泡的事件名。
+3. **输入法测试**：写一个带 debounce 的搜索框，用中文输入"你好"，观察不加 composition 守卫时会发出几次请求（通常是 2–4 次拼音查询）。  
+   *自检*：加守卫后请求数应为 1 次。

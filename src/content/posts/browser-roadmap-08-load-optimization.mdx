@@ -1,65 +1,158 @@
 ---
 title: '08 · 加载性能优化'
-published: 2026-09-31T22:00:00+08:00
-description: '围绕"让首屏更快"的加载优化：减少关键资源、压缩与 modern 构建、资源预加载（preload/prefetch）、图片优化（格式/响应式/lazy）、字体与第三方脚本治理。'
-tags: [浏览器, 加载优化, 预加载, 图片优化, 关键渲染路径]
+published: 2026-10-26T11:30:00+08:00
+description: '读懂瀑布图找关键路径、图片与字体的正确姿势、首屏 JS 怎么砍、preload 该给谁，以及为什么"合并资源"在 HTTP/2 下已经过时。'
+tags: [浏览器, 加载优化, 关键路径, 图片优化, 字体]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 加载优化的核心：缩短关键渲染路径
+## 先读瀑布图：找出"关键路径"
 
-用户看到内容前，必须下载并执行关键资源（HTML/CSS/阻塞 JS）。优化思路：**更少、更小、更早、更聪明地加载**。
+打开 Network，按时间排序，重点看三件事：
 
----
+1. **谁在关键路径上**：HTML → CSS → 首屏 JS → 字体/图片，任何一环慢都会拖累 LCP；
+2. **有没有串行**：JS 里再请求接口、接口回来再请求图片，这种"瀑布"能吃掉几百毫秒；
+3. **优先级是否合理**：首屏 hero 图如果是 `Low`，说明它被别的东西挤了。
 
-## 1. 减少与压缩
+一个典型坏样本：
 
-- **删无用代码**：tree-shaking、按需引入（见工程化篇）。
-- **压缩**：JS/CSS 用 gzip/brotli；文本类资源压缩率极高。
-- **modern 构建**：给现代浏览器发 ES2017+（更小），老浏览器走兜底（`@vitejs/plugin-legacy`）。
-
----
-
-## 2. 预加载关键资源
-
-```html
-<link rel="preload" href="critical.css" as="style" />
-<link rel="prefetch" href="next-page.js" as="script" />
+```text
+HTML 200ms → app.js 400ms → 接口 300ms → hero 图 500ms → LCP 1400ms+
 ```
 
-- **preload**：**当前页**马上要用的资源，提前拿（如首屏大图、关键字体）。
-- **prefetch**：**下一页**可能要用的，空闲时预取。
-- 用错（preload 了用不到的）反而拖慢，按需使用。
+改善方向：**让不该串行的并行**（接口预取、图片预连接）、**把不在关键路径上的挪走**（非首屏 chunk 动态加载）。
 
 ---
 
-## 3. 图片优化（最大头的常客）
+## 图片：最大的单点收益
 
-- **现代格式**：webp/avif 比 jpg/png 小 30–50%。
-- **响应式**：`<img srcset>` 按屏给不同分辨率，移动端不下载桌面大图。
-- **懒加载**：`<img loading="lazy">` 滚到视口才加载，省首屏带宽。
-- **给尺寸**：`width/height` 预留空间防止 CLS 抖动（见指标篇）。
+| 手段 | 收益 | 注意 |
+| --- | --- | --- |
+| **WebP / AVIF** | 同画质体积降 25–60% | 用 `<picture>` 或服务端按 Accept 协商 |
+| **正确尺寸** | 往往比换格式收益更大 | `srcset` + `sizes`，别用 2000px 图放 300px 容器 |
+| `loading="lazy"` | 首屏省带宽 | **首屏图绝对不要 lazy**（会延迟 LCP） |
+| `fetchpriority="high"` | 提升首屏大图优先级 | 只给 1 张 hero |
+| 显式 `width`/`height` | 消除 CLS | 或用 `aspect-ratio` |
+
+```html
+<picture>
+  <source type="image/avif" srcset="/hero-800.avif 800w, /hero-1600.avif 1600w" sizes="100vw">
+  <source type="image/webp" srcset="/hero-800.webp 800w, /hero-1600.webp 1600w" sizes="100vw">
+  <img src="/hero-800.jpg" alt="首屏主图" width="1600" height="900"
+       fetchpriority="high" decoding="async">
+</picture>
+```
+
+⚠️ 一个反直觉点：**`loading="lazy"` 加在首屏大图上会让 LCP 变差**（浏览器要等布局算完才决定加载）。这个坑我在两个项目里都见过。
 
 ---
 
-## 4. 字体与第三方脚本
+## 字体：FOIT/FOUT 与体积
 
-- **字体**：`font-display: swap` 先显示回退字体再替换，避免"看不见文字"；子集化只打包用到的字。
-- **第三方脚本**（统计/广告）：用 `async`/`defer` 不阻塞解析；能延迟/按需就别首屏加载，它们常是性能刺客。
+字体是"隐形的大文件"：一个中文字体动辄 3–8MB。
+
+| 手段 | 做法 |
+| --- | --- |
+| **子集化** | 只保留用到的字符（`fonttools subset`），中文站常见从 6MB 降到 100–300KB |
+| `font-display: swap` | 先用系统字体渲染，字体到了再换（避免文字不可见） |
+| `preload` | 只对**首屏必需的那一个字重**做 preload |
+| 可变字体 | 多字重场景一个文件搞定 |
+
+```html
+<link rel="preload" as="font" type="font/woff2"
+      href="/fonts/main-subset.woff2" crossorigin>
+```
+
+```css
+@font-face {
+  font-family: 'App';
+  src: url('/fonts/main-subset.woff2') format('woff2');
+  font-display: swap;
+  unicode-range: U+4E00-9FFF;   /* 只对需要的字符集生效 */
+}
+```
+
+`font-display: swap` 会带来一次"字体切换"，可能造成 CLS 或视觉跳变——用 `size-adjust` / `ascent-override` 匹配系统字体度量可以缓解。
 
 ---
 
-## 小结
+## 首屏 JS：最该砍的地方
 
-- 关键路径：更少（删代码）、更小（压缩）、更早（preload）、更聪明（lazy）。
-- 图片是头号优化对象：现代格式 + 响应式 + 懒加载 + 预留尺寸。
-- 第三方脚本和字体要专门治理，别让它们堵首屏。
+顺序：**先量，再砍，别猜**。
+
+```bash
+# 1) 看首屏到底加载了哪些 JS、各多大（gzip）
+# Network 面板筛 JS + Size 列；或用构建工具的体积报告（工程化 09 篇）
+
+# 2) 判断哪些"不该在首屏"
+#    - 弹窗、编辑器、图表、地图、导出
+#    - 非首屏路由
+```
+
+```ts
+// 把非首屏能力改成动态导入
+const openEditor = () => import('./RichEditor');       // 独立 chunk
+const Chart = lazy(() => import('./Chart'));
+
+// 路由级分割
+const routes = [{ path: '/report', component: () => import('./Report') }];
+```
+
+三条经验值：
+
+- 首屏 JS（gzip）> **170KB** 时，中低端机解析+执行就要 1s 以上；
+- 单个 chunk > 250KB（未压缩）应该拆；
+- 第三方库（埋点、客服）用 `async` 且**不要**在首屏初始化。
+
+---
+
+## 服务端与传输层
+
+| 手段 | 效果 | 代价 |
+| --- | --- | --- |
+| CDN | TTFB 从 300ms 降到 30ms 级别 | 成本 |
+| Brotli | 比 gzip 再小 15–20% | nginx 需装模块 |
+| HTTP/2 或 /3 | 多路复用，减少连接数 | 需全站 HTTPS |
+| 服务端渲染 / 流式 SSR | 首屏内容更早可见 | 架构复杂度（见 Next.js 篇） |
+
+**不要在 HTTP/2 下做的事**：
+
+- 雪碧图（把小图拼大图）——多路复用下拆开更利于缓存与优先级；
+- 域名分片——每个域名要另建连接；
+- 上百个 JS 合并成一个大包——首屏要下载完全部才能执行，反而不如按路由拆分。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| LCP 一直 4s+ | hero 图太大或 lazy | 换 AVIF/WebP + `fetchpriority=high` + 去掉 lazy |
+| 首屏文字长时间不可见 | 字体阻塞（FOIT） | `font-display: swap` + 子集化 |
+| 页面"跳一下"才出现内容 | 图片/广告位无尺寸 | `width/height` 或 `aspect-ratio` |
+| 首屏 JS 800KB | 全量引入组件库/图标 | 按需引入 + 动态导入 |
+| 加了 preload 反而慢 | 优先级通胀 | 只 preload 字体与 hero 图 |
+| 首屏多了一次重定向 | `http` → `https`、域名跳转 | 直接输出最终地址，配 HSTS |
+
+---
+
+## 验收清单
+
+- [ ] 能画出首屏的关键路径（HTML → CSS → JS → 字体/图片的顺序）
+- [ ] 首屏图片是 WebP/AVIF 且有 `srcset`，**没有** `loading="lazy"`
+- [ ] 字体做了子集化，并配 `font-display: swap`
+- [ ] 首屏 JS（gzip）有具体数字，非首屏能力走动态导入
+- [ ] 所有图片/广告位有显式尺寸（不产生 CLS）
+- [ ] 没在 HTTP/2 下做雪碧图与域名分片
 
 ---
 
 ## 练习
 
-1. 给首屏一张大图换 webp 格式并加 `loading="lazy"`，对比传输体积。
-2. 用 `<link rel="preload">` 提前加载关键 CSS，观察 FCP 是否改善。
-3. 审计你页面的第三方脚本，把非首屏的改成延迟加载。
+1. **算一次图片收益**：把一张首屏 PNG 转成 AVIF + 正确尺寸，比较体积与 LCP（用 4G 限速）。  
+   *自检*：能给出"体积降了多少、LCP 提前了多少"两个数字。
+2. **制造一次 lazy 反例**：给首屏大图加 `loading="lazy"`，看 LCP 变化。  
+   *自检*：能解释"浏览器要先算布局才决定是否加载"。
+3. **砍一次首屏 JS**：把一个大依赖（图表/编辑器）改成动态导入，对比首屏 chunk 体积与 FCP。  
+   *自检*：能看到首屏请求数不变但字节数显著下降，且交互时才加载新 chunk。

@@ -1,84 +1,161 @@
 ---
 title: '10 · Web Workers 与多线程'
-published: 2026-09-31T23:30:00+08:00
-description: 'JS 单线程的突破：Web Worker 把重计算移出主线程，避免卡 UI。讲清 Worker 的通信模型（postMessage/结构化克隆）、使用场景与限制，以及 Comlink 这类更易用的封装。'
-tags: [浏览器, WebWorkers, 多线程, 主线程, 并发]
+published: 2026-10-26T12:30:00+08:00
+description: '什么任务才值得搬到 Worker、通信成本（结构化克隆 vs Transferable）怎么算、模块化 Worker 与构建工具支持，以及 SharedArrayBuffer 为什么需要 COOP/COEP。'
+tags: [浏览器, WebWorkers, 多线程, Transferable, 性能]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 单线程的墙
+## 只有一类任务值得上 Worker
 
-前面说过 JS 单线程，重计算（如大数组排序、图像/音频处理、加密）会卡住主线程，UI 冻结。Web Worker 提供了**真正的多线程**：把这类活丢到后台线程跑。
+判断标准两条，**必须同时满足**：
+
+1. **计算超过 50ms**（低于这个，通信开销就把它抵消了）；
+2. **不碰 DOM**（Worker 里没有 DOM、没有 `window`）。
+
+| 适合 | 不适合 |
+| --- | --- |
+| 大 JSON/CSV 解析 | 任何 DOM 操作 |
+| 图片处理（`OffscreenCanvas`） | 很轻的计算（小于 10ms） |
+| 加密/哈希/压缩 | 需要每帧同步的交互 |
+| 复杂 diff、语法高亮、Markdown 渲染 | 频繁小任务（通信比计算贵） |
+| 大量数据排序/聚合 | 依赖 `window`/`document` 的库 |
+
+真实例子里最有价值的是**首屏大 JSON 解析**：2MB 接口响应在主页解析要 100ms+，搬到 Worker 后主线程完全不受影响。
 
 ---
 
-## Worker 基本用法
+## 通信成本：免费的是"转移"，不是"克隆"
 
 ```js
-// main.js
-const worker = new Worker("worker.js");
-worker.postMessage({ type: "calc", data: bigArray });
-worker.onmessage = (e) => console.log("结果", e.data);
+// ❌ 结构化克隆：复制一份，10MB 对象可能耗 30–80ms
+worker.postMessage(bigArrayBuffer);
 
-// worker.js
+// ✅ Transferable：把所有权转移过去，主线程这边变成"已分离"，几乎零成本
+worker.postMessage(bigArrayBuffer, [bigArrayBuffer]);
+console.log(bigArrayBuffer.byteLength);   // 0 —— 已经不能用了
+```
+
+可转移的类型：`ArrayBuffer`、`MessagePort`、`ImageBitmap`、`OffscreenCanvas`、`ReadableStream`。
+
+```js
+// 完整流程
+const buf = await res.arrayBuffer();          // 主线程拿到二进制
+worker.postMessage(buf, [buf]);               // 转移所有权
+
+// worker 内
 self.onmessage = (e) => {
-  const result = heavyCompute(e.data.data);
-  self.postMessage(result);
+  const rows = new TextDecoder().decode(e.data);   // 解析
+  self.postMessage(rows.length);                    // 只回传必要结果
 };
 ```
 
-- 主线程与 Worker **不共享内存**，通过 `postMessage` 传数据。
-- 数据用**结构化克隆**传递（默认拷贝；大对象可用 `Transferable` 转移所有权，零拷贝）。
+**经验**：传"原始二进制"而不是"解析后的对象"，传"结果摘要"而不是"完整数组"。频繁传大对象会让 Worker 变成负优化。
 
 ---
 
-## 适用场景
+## 三种 Worker
 
-- 大数组/矩阵运算、排序、压缩。
-- 图像处理（canvas 像素级操作）。
-- 音视频编解码、加密解密。
-- 解析大 JSON / 文档。
-
-不适合：直接操作 DOM（Worker 里没有 `document`）、频繁小消息（通信也有开销）。
-
----
-
-## 现代封装：Comlink
-
-手写 `postMessage` 像在写 RPC，繁琐。`Comlink` 把 Worker 暴露的对象变成可 `await` 的远程对象：
+| 类型 | 创建方式 | 隔离 | 用途 |
+| --- | --- | --- | --- |
+| **Dedicated** | `new Worker(url)` | 与创建者一对一 | 最常见 |
+| **Shared** | `new SharedWorker(url)` | 多个标签共享 | 少见，多标签共享连接 |
+| **Service Worker** | `navigator.serviceWorker.register` | 全局拦截网络 | 离线/缓存（05 篇），**不能用于计算** |
 
 ```js
-// worker.js
-import * as Comlink from "comlink";
-Comlink.expose({ heavyCompute });
-
-// main.js
-const api = Comlink.wrap(new Worker("worker.js"));
-await api.heavyCompute(data); // 像调本地函数
+// Dedicated + 模块化（现代构建工具都支持）
+const worker = new Worker(new URL('./image.worker.ts', import.meta.url), { type: 'module' });
 ```
 
----
-
-## 限制与权衡
-
-- Worker 有启动/通信成本，轻量计算不值得搬。
-- 复杂共享状态可用 `SharedWorker`（多标签页共享）或 `SharedArrayBuffer`（需COOP/COEP 头）。
-- 模块 Worker：`new Worker(url, { type: "module" })` 支持 ESM。
+⚠️ `type: 'module'` 在构建工具里必须用 `new URL(..., import.meta.url)` 的写法，**不能拼字符串路径**——否则打包器无法静态分析，产物里找不到这个文件（Vite/Webpack 都一样）。
 
 ---
 
-## 小结
+## 一个可复用的封装
 
-- Web Worker 把重计算移出主线程，保 UI 流畅。
-- 通过 `postMessage` 通信，数据走结构化克隆（大对象用 Transferable）。
-- 适合重计算，不适合操作 DOM 或超高频小消息。
-- Comlink 让 Worker 调用像本地异步函数。
+```ts
+// src/lib/worker-client.ts
+export function createWorker<Req, Res>(url: URL) {
+  const w = new Worker(url, { type: 'module' });
+  const pending = new Map<number, { resolve: (v: Res) => void; reject: (e: Error) => void }>();
+  let seq = 0;
+
+  w.onmessage = (e: MessageEvent<{ id: number; ok: boolean; data?: Res; error?: string }>) => {
+    const task = pending.get(e.data.id);
+    if (!task) return;
+    pending.delete(e.data.id);
+    e.data.ok ? task.resolve(e.data.data as Res) : task.reject(new Error(e.data.error));
+  };
+
+  return {
+    run(payload: Req, transfer: Transferable[] = []) {
+      const id = ++seq;
+      return new Promise<Res>((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        w.postMessage({ id, payload }, transfer);
+      });
+    },
+    terminate: () => w.terminate(),
+  };
+}
+```
+
+要点：**带 id 做请求响应配对**（Worker 是单线程队列，但多条消息可能交错返回）；`terminate` 要在组件卸载时调用，否则 Worker 常驻。
+
+---
+
+## SharedArrayBuffer：需要跨源隔离
+
+```js
+// 必须同时有这两个响应头，否则 SAB 不可用
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+代价很实在：开了 COEP 后，**所有跨域资源都要带 `Cross-Origin-Resource-Policy` 或 CORS**——第三方图片、iframe、CDN 字体都可能被拦。所以除非真需要多线程共享内存（音视频处理、大数组并行），不要开。
+
+`Atomics.wait` 在主线程被禁止（会卡住 UI），只能在 Worker 里用。
+
+---
+
+## 何时不该用：三个反例
+
+1. **为了"并行请求"**：HTTP 本身就是并行的，Worker 不会更快。
+2. **为了"渲染不卡"**：渲染必须在主线程，Worker 只能帮你分担计算。
+3. **把 10ms 的计算搬过去**：一次 `postMessage` 的往返开销就可能 0.3–1ms，加上序列化，净亏。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| Worker 加载 404 | 用了字符串路径，打包器没处理 | `new URL('./x.worker.ts', import.meta.url)` |
+| Worker 里报 `document is not defined` | 代码依赖 DOM | 把 DOM 操作留在主线程，只传数据 |
+| 传大对象后主线程卡顿 | 结构化克隆复制 | 用 Transferable 或减小传输量 |
+| Worker 内存一直涨 | 没 `terminate`，或消息无配对 | 卸载时 terminate，用 id 配对并在完成后清理 |
+| SAB 报未定义 | 缺 COOP/COEP | 加两个头，并处理跨域资源 |
+| 用了 Worker 反而更慢 | 任务太小 / 传输太大 | 先量 50ms 阈值，再决定 |
+
+---
+
+## 验收清单
+
+- [ ] 能判断一个任务"该不该"搬 Worker（>50ms 且不碰 DOM）
+- [ ] 传输用 `Transferable`，或在传之前把数据缩到最小
+- [ ] Worker 用 `new URL(..., import.meta.url)` 创建，构建后能正常加载
+- [ ] 有请求-响应配对机制，且组件卸载时 `terminate`
+- [ ] 知道 SharedArrayBuffer 需要 COOP/COEP 及其代价
+- [ ] 有"搬之前/搬之后"的主线程长任务对比数字
 
 ---
 
 ## 练习
 
-1. 写一个 Worker 做"大数组排序"，对比放主线程时页面是否冻结。
-2. 用 `Transferable` 传递一个大 `ArrayBuffer`，体会零拷贝。
-3. 用 Comlink 重构上面的 Worker 调用，对比代码可读性。
+1. **量一次搬移收益**：把 2MB JSON 的解析分别放在主线程与 Worker，用 Performance 记录主线程长任务时长。  
+   *自检*：主线程长任务应接近消失，总耗时可能只降一点——能解释这个差别。
+2. **对比克隆与转移**：同一个 50MB `ArrayBuffer` 分别用克隆与 Transferable 传递，测耗时。  
+   *自检*：能给出两个数字，并说明"转移后原对象为什么是 0 字节"。
+3. **做一个会报错的 Worker**：用字符串路径创建 Worker，构建后观察 404，再改成 `new URL` 修好。  
+   *自检*：能在产物目录里指出 Worker 文件被单独打出来的位置。

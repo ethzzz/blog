@@ -1,66 +1,173 @@
 ---
 title: '09 · 运行时性能'
-published: 2026-09-31T23:00:00+08:00
-description: '页面"加载完但用着卡"的运行时优化：长任务与主线程阻塞、用 Performance 面板定位、避免频繁重排、虚拟列表、requestAnimationFrame 与节流防抖，让交互始终流畅。'
-tags: [浏览器, 运行时性能, 长任务, 主线程, 节流防抖]
+published: 2026-10-26T12:00:00+08:00
+description: '50ms 长任务阈值、INP 为什么比 FID 难、大列表与频繁更新的处理、内存泄漏的四类来源与排查手法，以及什么时候该把计算搬到 Worker。'
+tags: [浏览器, 运行时性能, INP, 长任务, 内存泄漏]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 卡顿的根源：主线程被占满
+## 一句话：所有卡顿都是主线程被占住
 
-浏览器的**主线程**负责 JS 执行、样式计算、布局、绘制编排。一旦一段 JS 跑了太久（>50ms），主线程被独占，用户点击/滚动无响应——这就是"长任务"。INP 指标直接反映这个体验。
+主线程要同时干：执行 JS、算样式、布局、绘制指令。任何一环超过 50ms，用户就能感觉到"点了没反应"。
 
----
-
-## 用 Performance 面板定位
-
-录制一次交互，看火焰图：哪段脚本占了长条？是否出现"Long Task"红色标记？聚焦最贵的函数，别瞎优化。
-
----
-
-## 常见运行时杀手与对策
-
-**1. 频繁重排**：循环里"读写交替"触发强制同步布局。批量读写、用 `requestAnimationFrame` 把视觉更新集中到下一帧。
-
-```js
-// 节流：高频事件（scroll/resize）限制执行频率
-function throttle(fn, wait) {
-  let last = 0;
-  return (...args) => {
-    const now = Date.now();
-    if (now - last >= wait) { last = now; fn(...args); }
-  };
-}
-window.addEventListener("scroll", throttle(onScroll, 100));
+```text
+主线程时间轴
+[长任务 240ms                    ][短任务][长任务 180ms]
+        ↑ 这期间点击、滚动、输入全部排队
 ```
 
-**2. 大列表渲染**：1 万行 DOM 必卡 → 虚拟列表（见 React 性能篇）。
-
-**3. 大量 DOM 操作**：用文档片段（DocumentFragment）或先 `display:none` 改完再显示，减少重排次数。
-
-**4. 复杂计算**：移到 Web Worker（下篇），不占主线程。
+所以优化顺序永远是：**先减少长任务的数量与时长，再谈其它**。
 
 ---
 
-## rAF 与防抖节流
+## 五个最常见的长任务来源
 
-- **requestAnimationFrame**：把动画/视觉更新对齐浏览器刷新节奏（~16ms/帧），避免掉帧。
-- **debounce**：停止触发 N 毫秒后才执行（搜索输入，等用户停下来再请求）。
-- **throttle**：固定间隔最多执行一次（滚动处理，限频）。
+| 来源 | 典型场景 | 手段 |
+| --- | --- | --- |
+| **大列表一次性渲染** | 1000 行表格、聊天记录 | 虚拟滚动 / `content-visibility` / 分页 |
+| **频繁 setState** | 输入框每次按键都重渲整棵树 | 防抖、`startTransition`、把状态下沉到叶子 |
+| **同步重计算** | 每次渲染都 `JSON.parse` / 排序 / 正则 | `useMemo`、缓存、把计算移到 Worker |
+| **强制同步布局** | 循环里读写 DOM 交替 | 批量读 → 批量写（02 篇） |
+| **大库初始化** | 图表/编辑器/地图在首屏 import | 动态导入，交互时再加载 |
 
 ---
 
-## 小结
+## 虚拟滚动：长列表唯一正解
 
-- 卡顿 = 长任务占满主线程；用 Performance 面板定位最贵函数。
-- 避免循环读写交替、大列表全量渲染、无节制的 DOM 操作。
-- 防抖/节流控频率；rAF 对齐帧；重计算进 Worker。
+```ts
+// 思路：只渲染视口内的 N 条 + 上下占位撑起滚动高度
+const ITEM_H = 48;
+const visibleCount = Math.ceil(viewportH / ITEM_H) + 2;
+
+const start = Math.floor(scrollTop / ITEM_H);
+const slice = items.slice(start, start + visibleCount);
+```
+
+三条必须处理的细节：
+
+1. **占位高度**：上下各放一个 `div`（`height: start*ITEM_H`），否则滚动条长度不对；
+2. **不定高**：需要测量缓存（react-virtuoso / TanStack Virtual 已处理）；
+3. **滚动时的读取**：监听 `scroll` 用 `passive: true`，并用 rAF 合并（03 篇）。
+
+如果只是"长页面里有很多块"，不一定需要虚拟滚动——`content-visibility: auto` + `contain-intrinsic-size` 更省事（02 篇）。
+
+---
+
+## 频繁更新：三种手段的选择
+
+| 手段 | 适用 | 副作用 |
+| --- | --- | --- |
+| 防抖/节流 | 输入、滚动、resize | 有延迟，交互场景要小心 |
+| 状态下沉 | 输入框的值影响范围过大 | 需要重构组件边界 |
+| `startTransition`（React 18） | 非紧急更新（列表过滤） | 更新可被打断，需要接受"稍后生效" |
+| 分批处理（`scheduler.yield`） | 大量 DOM 操作 | 逻辑要能拆成多步 |
+
+```ts
+// React 18：把"列表过滤"标记为非紧急，输入框输入不再卡
+const [query, setQuery] = useState('');
+const [list, setList] = useState(all);
+
+function onChange(v: string) {
+  setQuery(v);                                  // 紧急：输入框必须立刻响应
+  startTransition(() => setList(filter(all, v)));  // 非紧急：可以被打断
+}
+```
+
+```js
+// 纯 JS：把一个大循环让出主线程
+async function processAll(items, handle) {
+  for (let i = 0; i < items.length; i++) {
+    handle(items[i]);
+    if (i % 200 === 0) await scheduler.yield?.() ?? new Promise((r) => setTimeout(r, 0));
+  }
+}
+```
+
+`await` 让出后，浏览器有机会处理输入与渲染——这是"把 300ms 降到 3×100ms"的标准做法（每段都在 50ms 以下，就感觉不卡了）。
+
+---
+
+## 内存泄漏：四类来源
+
+| 类型 | 例子 | 排查 |
+| --- | --- | --- |
+| **全局引用** | `window.__cache.push(x)` 永不清理 | 搜索挂到 `window` 上的东西 |
+| **未清理的监听/定时器** | `addEventListener` / `setInterval` 没在卸载时移除 | SPA 路由切换后内存阶梯上升 |
+| **闭包持有大对象** | 回调里引用了整个列表 | Heap snapshot 看 retained size |
+| **detached DOM** | 移除节点但 JS 还持有引用 | Heap snapshot 搜 "Detached" |
+
+排查流程（Chrome）：
+
+1. DevTools → Memory → **Heap snapshot**，操作前后各拍一张；
+2. 对比两张的 `Objects` 增长，按 `Retained Size` 排序；
+3. 看 `Detached HTMLElement` 数量——正常应该接近 0；
+4. 反复切换 5 次，如果内存阶梯上升且不回落，就是泄漏。
+
+```js
+// 典型修复：卸载时清理
+useEffect(() => {
+  const id = setInterval(poll, 5000);
+  const onResize = () => update();
+  window.addEventListener('resize', onResize);
+  return () => {
+    clearInterval(id);
+    window.removeEventListener('resize', onResize);
+  };
+}, []);
+```
+
+---
+
+## 什么时候该上 Worker
+
+判断标准很简单：**这段计算超过 50ms、且不碰 DOM**。
+
+- ✅ 适合：大 JSON 解析、图片处理（OffscreenCanvas）、加密/哈希、复杂 diff、CSV 导出、语法高亮
+- ❌ 不适合：要读写 DOM、很轻的计算（通信开销 > 计算收益）、需要高频同步交互
+
+```js
+// 主线程
+const worker = new Worker(new URL('./parse.worker.ts', import.meta.url), { type: 'module' });
+worker.postMessage(arrayBuffer, [arrayBuffer]);   // 第二个参数：Transferable，零拷贝
+worker.onmessage = (e) => render(e.data);
+```
+
+通信成本是关键：结构化克隆复制数据，10MB 对象传一次可能几十毫秒。**用 `Transferable`（ArrayBuffer/ImageBitmap）或 `SharedArrayBuffer` 才能真省。**
+
+详见 10 篇。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 滚动列表卡 | 上千节点 + 无虚拟化 | 虚拟滚动 / `content-visibility` |
+| 输入框打字卡 | 每次输入重渲大列表 | 防抖 + `startTransition` + 状态下沉 |
+| 切换页面越用越卡 | 监听/定时器未清理 | 卸载清理，Heap snapshot 验证 |
+| 图表页打开就卡 1s | 图表库在首屏同步 import | 动态导入 + 骨架屏 |
+| 优化后仍卡 | 改的是渲染量，瓶颈是同步布局 | 用 Performance 找 Layout/Recalculate Style |
+| Worker 用了反而更慢 | 传了大对象（结构化克隆） | 用 Transferable 或改小传输量 |
+
+---
+
+## 验收清单
+
+- [ ] 能在 Performance 面板里数出一次交互里有几个 >50ms 的任务
+- [ ] 长列表（>200 项）有虚拟滚动或 `content-visibility`
+- [ ] 输入/搜索类交互有防抖，且没有"整棵树重渲"
+- [ ] 组件卸载时清理了定时器、监听、订阅
+- [ ] 能用 Heap snapshot 判断"是否泄漏"（有没有 detached DOM）
+- [ ] CPU 密集任务（>50ms 且不碰 DOM）已移到 Worker
 
 ---
 
 ## 练习
 
-1. 用 Performance 录制一个卡顿交互，找出最长的 Long Task 并定位函数。
-2. 写一个高频 `input` 搜索，用 debounce 避免每次按键都发请求。
-3. 把一段"循环里反复改 style 触发重排"的代码改成 rAF 批量更新。
+1. **数一次长任务**：给一个 1000 行的表格打点，用 Performance 录制首次渲染，数出长任务个数与总时长。  
+   *自检*：能给出"共 3 个长任务、合计 620ms"这类数字。
+2. **做一次分批**：把上面的渲染改成每 200 行 `await yield()`，再测 INP 与总时长。  
+   *自检*：总时长可能没降，但**首帧与交互响应明显变快**——能解释这个反差。
+3. **抓一次泄漏**：写一个每次路由切换都 `addEventListener` 而不移除的组件，切换 5 次后拍 Heap snapshot，看监听器与 detached 节点增长。  
+   *自检*：能定位到具体是哪个监听没清理。

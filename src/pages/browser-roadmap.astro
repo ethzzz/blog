@@ -109,7 +109,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 
 		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
 			<p class="font-medium mb-1">💡 学习建议</p>
-			<p>性能优化必须建立在"理解渲染流水线"之上：先搞清楚从输入 URL 到像素上屏经历了什么，才知道瓶颈在哪。指标用 Lighthouse/WebPageTest 量化，优化后用数据说话，别凭感觉。安全篇（XSS/CSRF）是上线前的必答题。</p>
+			<p>按三层推进：<strong>L1（01–05）</strong>讲机制，渲染流水线与重排重绘必须连读，否则后面的优化都是背口诀；<strong>L2（06–09）</strong>讲"为什么慢"——先看 <code>07 指标</code> 建立度量，再按症状选 <code>08 加载</code>（首屏慢）或 <code>09 运行时</code>（点了卡）；<strong>L3（10–11）</strong>是手段，<code>11 首屏优化</code> 把 LCP 拆成四段逐段对症，是收益最大的一篇。用 Lighthouse 找线索、用真实用户 P75 做判断，每一步都要有"改前/改后"的数字。安全篇（XSS/CSRF/CORS）是上线前的必答题。</p>
 		</div>
 
 		<div class="mt-4 flex flex-wrap gap-4 text-sm">
