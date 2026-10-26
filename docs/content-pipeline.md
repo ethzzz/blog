@@ -17,7 +17,8 @@
 
 - `src/pages/roadmaps.astro`、`xxx-roadmap.astro`、首页分页、归档、标签、`rss.xml.ts`、`sitemap`、Pagefind 索引，全部在**构建期**从 `src/content/posts` 生成。
 - 后台 `/admin/blog-gen` 的「新建 / 更新」调用 Java `BlogContentController` → `BlogArticleService` → `BlogRepoService`，最终是**往服务器上的博客仓 clone（`/root/blog-src`）写 `src/content/posts/*.md` → git commit/push**。它不是另一套内容库。
-- 后台 `/admin/blog-deploy` 触发服务器本地构建（实测约 80 秒），发布后博客是新的静态产物；GitHub Actions 那条链路仍在，但 scp 上传实测很慢，不作为主发布路径。
+- 后台 `/admin/blog-deploy` 触发服务器本地构建（实测约 80 秒），发布后博客是新的静态产物。
+- GitHub Actions 那条链路**已与后台同源**（2026-10-16 起）：runner 只跑 `npm ci` + `npm run build` 做构建校验，产物**不再 scp 上传**；真正的发布是 `appleboy/ssh-action` 进服务器跑 `ops/deploy-ssr.sh`（`git pull` → 构建 → 发布），与后台「发布并部署」走同一个脚本，靠 flock 串行化。
 - 解答（`solutions`）2026-10-15 起改为「数据库为真相 + 博客运行时读接口」，因为解答数量多、单条小、要求发布即生效；而且它有独立的 `solutions` collection 与聚合页，不参与首页/归档/RSS。
 - 预览页 `src/pages/preview/[token].astro` 是 `prerender = false`，正文运行时取、渲染管线与线上一致，仅用于未发布草稿。
 
