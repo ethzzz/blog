@@ -1000,7 +1000,7 @@ export function useDebouncedValue<T>(value: T, delay = 300): T {
 
 - 列表行 `TaskRow` 没加 `React.memo`：父组件每次翻页都**整体换数据**，memo 只会增加比较成本。
 - `useTaskList` 的 `queryFn` 是箭头函数、每次渲染都新建：TanStack Query 只依赖 `queryKey`，不需要 `useCallback`。
-- **什么时候才加**：DevTools Profiler 里看到某个子组件在父组件无关更新时反复重渲染，且它渲染成本高（长列表、图表）。先度量，再优化——见[性能那篇](/blog/posts/react-roadmap-09-performance/)。
+- **什么时候才加**：DevTools Profiler 里看到某个子组件在父组件无关更新时反复重渲染，且它渲染成本高（长列表、图表）。先度量，再优化——见[性能那篇](/blog/posts/react-roadmap-12-performance/)。
 
 ### 6. 一条命令验收后端契约
 
