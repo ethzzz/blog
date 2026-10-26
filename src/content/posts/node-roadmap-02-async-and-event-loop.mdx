@@ -110,7 +110,7 @@ await pipeline(
 
 `pipeline` 是我强烈推荐的组合方式，它替代了老的 `.pipe()`——**老写法出错时不关闭流，会泄漏文件描述符**，`pipeline` 自动做错误传播和资源清理。
 
-流自带的**背压（backpressure）**机制也值得知道：写端消费不过来时，读端自动暂停，防止内存堆积。用 `pipeline` 就自动获得了背压处理，手写 `write` 循环才需要自己监听 `drain` 事件。
+流自带的**背压**（backpressure）机制也值得知道：写端消费不过来时，读端自动暂停，防止内存堆积。用 `pipeline` 就自动获得了背压处理，手写 `write` 循环才需要自己监听 `drain` 事件。
 
 ## 4. worker_threads：CPU 密集的逃生通道
 

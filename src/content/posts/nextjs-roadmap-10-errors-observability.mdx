@@ -73,7 +73,7 @@ export default function Error({
 | 可恢复系统错误 | 第三方超时、限流 | 重试/降级 + warn 日志 |
 | 不可恢复异常 | 空指针、数据库断连 | 抛出 + 上报 + 500 |
 
-最糟糕的写法是所有错误都 `catch` 后返回 `{ ok: false }`，日志里一片安静，用户只看到「操作失败」。** silently swallowed error 是运维的噩梦。**
+最糟糕的写法是所有错误都 `catch` 后返回 `{ ok: false }`，日志里一片安静，用户只看到「操作失败」。**silently swallowed error 是运维的噩梦**。
 
 Server Action 里尤其要注意：
 

@@ -107,7 +107,7 @@ CSRF 的本质：**别的站点诱导用户浏览器带着 cookie 发请求**。
 | CSRF Token | 服务端下发，提交时必须带上 | 老系统的标准做法 |
 | 校验 `Origin` / `Referer` | 服务端拒绝异常来源 | 简单有效，建议都做 |
 
-因为 `SameSite=Lax` 已成默认，纯跨站表单攻击基本失效；但**`SameSite=None` 的场景（第三方嵌入）仍然需要 Token**。
+因为 `SameSite=Lax` 已成默认，纯跨站表单攻击基本失效；但 **`SameSite=None` 的场景（第三方嵌入）仍然需要 Token**。
 
 ---
 
