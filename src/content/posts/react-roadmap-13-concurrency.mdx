@@ -1,0 +1,237 @@
+---
+title: '13 · 并发特性与 Suspense：让输入不再卡'
+published: 2026-10-06T00:00:00+08:00
+description: '并发渲染到底改变了什么、useTransition 与 useDeferredValue 的区别与选择、Suspense 的挂起语义与错误处理、React 19 的 Actions/useActionState/useOptimistic/use，以及"哪些卡顿并发特性救不了"。'
+tags: [React, 并发, useTransition, useDeferredValue, Suspense, React19]
+category: React学习路线
+draft: false
+---
+
+12 讲"减少渲染量"，这一篇讲另一种情况：**渲染量减不下去，但可以让它别挡着用户**。
+
+典型场景：搜索框输入时列表要过滤 5000 项。要么减少计算（用索引、虚拟化），要么**让输入先响应，列表稍后跟上**——后者就是并发特性。
+
+## 并发渲染改变了什么
+
+React 18 起，渲染可以被**中断**：
+
+```
+旧模型：setState → 一路渲染到底（阻塞主线程）→ 提交
+新模型：setState → 渲染（可被打断）→ 更高优先级来了就先放下 → 稍后继续/重来 → 提交
+```
+
+关键约束：**Render 阶段可中断，Commit 阶段不可中断**。所以：
+
+- 渲染必须纯（01 讲过）——被打断重来是正常现象；
+- 副作用不能放在渲染期——可能执行两次；
+- **"渲染被丢弃"是合法的**：一次渲染算到一半发现过期了，直接扔掉，不提交。
+
+这解释了 StrictMode 的双调用，也解释了为什么"在渲染里改 ref"是危险的。
+
+## useTransition：把更新标记为"可以等"
+
+```tsx
+const [isPending, startTransition] = useTransition();
+
+function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
+	const next = e.target.value;
+	setInput(next);                       // 高优先级：立刻更新输入框
+	startTransition(() => {
+		setKeyword(next);                 // 低优先级：列表过滤，可以被输入打断
+	});
+}
+```
+
+效果：用户每敲一个字，输入框立刻显示新字符；列表的过滤计算如果被打断，就重来——**输入永远不会卡**。
+
+```tsx
+{isPending && <Spinner />}   {/* 过渡进行中，可用来显示"正在筛选" */}
+```
+
+**什么时候用**：一次更新会引起大量渲染，而这个更新不是用户"正在等"的那个。典型：搜索过滤、tab 切换、大列表排序。
+
+**什么时候不该用**：更新很小（没必要）、或者这个更新本身就是用户最想看到的（比如点击"保存"后的结果）。
+
+## useDeferredValue：同一个东西的"降级副本"
+
+```tsx
+const [keyword, setKeyword] = useState("");
+const deferredKeyword = useDeferredValue(keyword);
+
+// 输入框用实时的，列表用降级的
+<input value={keyword} onChange={e => setKeyword(e.target.value)} />
+<SlowList keyword={deferredKeyword} />
+```
+
+区别很关键：
+
+| | `useTransition` | `useDeferredValue` |
+|---|---|---|
+| 控制什么 | **更新的优先级**（决定谁先渲染） | **一个值的新旧**（决定下游用哪个版本） |
+| 需要包装 setState | 是 | 否 |
+| 适合 | 自己发起的更新 | 别人传下来的值、无法改造的组件 |
+| 拿到的信号 | `isPending` | `deferred !== current` 表示在追 |
+
+```tsx
+// 用 useDeferredValue 判断"是否落后于最新值"
+const isStale = keyword !== deferredKeyword;
+<div style={{ opacity: isStale ? 0.5 : 1 }}>...</div>
+```
+
+**经验法则**：能改 setState 就用 `useTransition`（信号更明确）；值来自外部/第三方组件，用 `useDeferredValue`。
+
+## Suspense：等，但不卸载
+
+```tsx
+<Suspense fallback={<Skeleton />}>
+	<Comments postId={id} />
+</Suspense>
+```
+
+当 `Comments` 内部"挂起"（抛出一个 promise）时，React 显示 fallback，**保留其他已渲染内容**。
+
+三种挂起来源：
+
+1. `lazy()` 加载的组件（11 讲过，这是最常用、最稳的）；
+2. React 19 的 `use(promise)`；
+3. 支持 Suspense 的数据框架（Next.js 的 RSC、React Router 的 `defer`）。
+
+**要点**：
+
+- **fallback 要"形状一致"**（骨架屏而不是 spinner），否则布局跳动（CLS）；
+- **不要把整个页面包一个 Suspense**：那样任何一处挂起都会让整页回退到骨架，等于白做；
+- **Suspense 不处理错误**：抛错要靠 ErrorBoundary（14），两者配合使用。
+
+```tsx
+<ErrorBoundary fallback={<ErrorCard />}>
+	<Suspense fallback={<Skeleton />}>
+		<Comments postId={id} />
+	</Suspense>
+</ErrorBoundary>
+```
+
+## React 19 的 Actions 系列
+
+React 19 把"提交"这件事收进了一套 API，减少手写 loading/error 样板。
+
+### useActionState：一个 hook 管住"提交中 + 错误 + 结果"
+
+```tsx
+import { useActionState } from "react";
+
+async function createTask(_prev: State, formData: FormData): Promise<State> {
+	const title = String(formData.get("title") ?? "").trim();
+	if (!title) return { error: "标题不能为空" };
+
+	try {
+		await api.createTask({ title });
+		return { ok: true };
+	} catch (err) {
+		return { error: err instanceof ApiError ? err.message : "创建失败" };
+	}
+}
+
+function TaskForm() {
+	const [state, formAction, isPending] = useActionState(createTask, { ok: false });
+
+	return (
+		<form action={formAction}>
+			<input name="title" />
+			<button disabled={isPending}>{isPending ? "保存中…" : "保存"}</button>
+			{state.error && <p role="alert">{state.error}</p>}
+		</form>
+	);
+}
+```
+
+三个收益：**不需要手写 `useState` 管 loading/error`**；**天然防重复提交**（`isPending`）；**表单可以渐进增强**（没有 JS 时浏览器直接提交到 action）。
+
+### useOptimistic：把"猜结果"变成一行
+
+```tsx
+import { useOptimistic } from "react";
+
+function TodoList({ todos, addTodo }: { todos: Todo[]; addTodo: (t: Todo) => Promise<void> }) {
+	const [optimistic, addOptimistic] = useOptimistic(
+		todos,
+		(state, newTodo: Todo) => [...state, newTodo],
+	);
+
+	async function handleAdd(formData: FormData) {
+		const t = { id: crypto.randomUUID(), title: String(formData.get("title")), done: false };
+		addOptimistic(t);       // 立刻显示
+		await addTodo(t);       // 失败了会自动回滚到 todos
+	}
+
+	return (
+		<form action={handleAdd}>
+			{optimistic.map(t => <li key={t.id}>{t.title}</li>)}
+			<input name="title" />
+		</form>
+	);
+}
+```
+
+比 09 里手写的"快照 + 回滚"干净得多——**回滚是自动的**，因为 `optimistic` 是 `todos` 的派生视图，`todos` 没变它自然就回去了。
+
+**仍然只适合几乎不会失败的操作**（勾选、添加）。删除/支付老实等结果。
+
+### use：在渲染中读 Promise 或 Context
+
+```tsx
+import { use } from "react";
+
+function Comments({ promise }: { promise: Promise<Comment[]> }) {
+	const comments = use(promise);   // 挂起直到 resolve，必须包在 Suspense 里
+	return <ul>{comments.map(c => <li key={c.id}>{c.body}</li>)}</ul>;
+}
+
+// Context 也可以 use（可以写在 if 里，这是唯一能条件调用的情况）
+if (showTheme) { const theme = use(ThemeContext); }
+```
+
+⚠️ `use` 的 promise **必须来自"稳定来源"**（父组件用 `useMemo` 或框架提供）。在渲染里现造 promise，会导致每次渲染都重新请求：
+
+```tsx
+// ❌ 每次渲染新建 promise → 无限挂起
+const data = use(fetch("/api").then(r => r.json()));
+
+// ✅ promise 由上层的缓存/框架管理
+<Comments promise={commentsPromise} />
+```
+
+## 并发特性救不了的四种卡顿
+
+| 症状 | 为什么救不了 | 该做什么 |
+|---|---|---|
+| 首次加载慢（白屏） | 并发不管下载和解析 | 代码分割（11）、减包（工程化 09） |
+| 单个组件渲染就要 200ms | 只是"延后"，总量没变 | 虚拟化、拆分、Web Worker（浏览器 10） |
+| 第三方库同步阻塞（如大图表） | 它不受 React 调度控制 | 懒加载 + 延迟挂载 |
+| 内存泄漏导致的持续变慢 | 与渲染优先级无关 | Heap snapshot 排查 |
+
+一句话：**并发特性优化的是"感知延迟"，不是"总计算量"。**
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| `startTransition` 没效果 | 里面的更新很快，没必要 | 先 Profiler 确认耗时 |
+| 输入框还是卡 | 输入本身也在过渡里 | 输入更新必须在过渡外 |
+| `isPending` 一直为 true | 过渡里在等 promise（旧版本不支持） | 用 `useActionState`/Suspense |
+| Suspense 触发整页骨架 | fallback 边界放太高 | 把 Suspense 下沉到局部 |
+| `use(promise)` 无限挂起 | 渲染里新建 promise | promise 来自稳定引用 |
+| 丢掉了用户输入 | 用了 `useDeferredValue` 后还读实时值做提交 | 提交时读实时值，渲染用 deferred |
+
+## 拦路的几道题
+
+1. 搜索框过滤 5000 项，打字卡。分别用 `useTransition` 和 `useDeferredValue` 写一遍，说明两者差别。
+2. 为什么 `startTransition` 里的更新不能包含输入框自己的 `setState`？
+3. 一个页面有三块内容，其中一块很慢。Suspense 边界放在哪？放在页面顶层有什么问题？
+4. 用 `useOptimistic` 实现"勾选完成"，要求失败自动回滚、成功后以服务端为准。
+5. 判断：给一个首屏 3MB JS 的应用加 `useTransition` 能让它变快吗？
+
+**自检标准**：第 2 题能说出"输入必须高优先级，否则打字也变慢"；第 5 题能明确说出"不能，并发优化感知延迟，不减少加载量"。
+
+## 下一步
+
+渲染、并发都讲完了，还差一个"出错时怎么办"——14 讲错误边界：为什么 `try/catch` 接不住渲染错误，以及线上白屏怎么兜。

@@ -1,74 +1,208 @@
 ---
-title: '05 · Hooks 基础（useState / useEffect）'
-published: 2026-09-30T11:00:00+08:00
-description: 'Hooks 让函数组件拥有状态与副作用。useState 的用法与惰性初始化，useEffect 的执行时机与依赖数组，清理函数避免内存泄漏，以及"依赖数组"最容易踩的坑。'
-tags: [React, Hooks, useState, useEffect, 依赖数组]
+title: '05 · Hooks 基础：useState 与 useEffect 的真相'
+published: 2026-10-02T00:00:00+08:00
+description: 'Hooks 为什么只能写在顶层、useState 的值存在哪、useEffect 是"同步外部系统"而不是生命周期、依赖数组的三种写法、清理函数的时机，以及 StrictMode 双调用的原因。'
+tags: [React, hooks, useState, useEffect, 依赖数组]
 category: React学习路线
 draft: false
 ---
 
-## 为什么有 Hooks
+Hooks 的规则（只能在顶层调用、只能在 React 函数里调用）不是风格约定，是**实现决定的**：React 用"调用顺序"来对应每个 Hook 的存储槽位。理解这一点，后面所有规则都变得合理。
 
-以前状态/生命周期只在 class 组件有，函数组件只是"纯渲染"。Hooks（React 16.8）让函数组件也能用状态和副作用，且逻辑可抽成自定义 Hook 复用——这是现代 React 的分水岭。
+## Hooks 的值存在哪
 
----
-
-## useState
-
-```jsx
-const [count, setCount] = useState(0);
-// 惰性初始化（只在首次执行，避免每次渲染都算）
-const [user, setUser] = useState(() => loadUser());
+```tsx
+function Counter() {
+	const [n, setN] = useState(0);
+	const [text, setText] = useState("");
+	...
+}
 ```
 
-更新函数式写法（依赖上一次值）：`setCount(c => c + 1)`，避免闭包拿到旧值。
+每次渲染，这个函数都会重新执行，`n` 和 `text` 是**新的局部变量**。但它们的**值**不是重新初始化的——它们存在组件对应的 fiber 节点上，按调用顺序排成一串：
 
----
+```
+fiber.memoizedState = [ {state: 0}, {state: ""}, ... ]
+                        ↑ useState 第 1 次调用    ↑ 第 2 次
+```
 
-## useEffect：处理副作用
+所以：
 
-副作用 = 渲染之外的操作：请求数据、订阅、操作 DOM、定时器。
+- **不能在 `if` 里调用 Hook**：一旦某次渲染跳过了一个 Hook，后面所有 Hook 的槽位全部错位——`text` 会读到 `n` 的值。这就是那条 ESLint 规则的真实原因。
+- **`useState(0)` 的 `0` 只在首次挂载时用到**，后续渲染直接读 fiber 上的值（所以 02 里"props 复制进 state 不更新"才成立）。
 
-```jsx
+## useState 的两个细节
+
+```tsx
+const [n, setN] = useState(0);
+
+// 1) 惰性初始化：初始值需要计算时传函数，避免每次渲染都算一遍
+const [data, setData] = useState(() => expensiveParse(raw));
+
+// 2) 函数式更新：新值依赖旧值时必须用
+setN(prev => prev + 1);
+```
+
+第二个在 02 讲过原理，这里补一个更隐蔽的场景——**在 effect 里更新 state 时**：
+
+```tsx
 useEffect(() => {
-  const id = setInterval(tick, 1000);
-  return () => clearInterval(id); // 清理函数，组件卸载/重跑前执行
-}, [dep]); // 依赖数组
+	const timer = setInterval(() => {
+		setN(n + 1);          // ❌ n 永远是首次渲染的 0
+		setN(prev => prev + 1); // ✅
+	}, 1000);
+	return () => clearInterval(timer);
+}, []);  // 依赖是空数组，所以闭包里的 n 永远不变
 ```
 
-**执行时机取决于依赖数组**：
-- `[]`：仅挂载时跑一次。
-- `[dep]`：挂载 + `dep` 变化后跑。
-- 不写：每次渲染都跑（几乎总是不对的）。
+这就是**闭包陷阱**（07 详述）：effect 里的函数捕获的是"创建它那次渲染"的变量。
 
-**清理函数**防止内存泄漏（定时器、订阅未取消）。
+## useEffect 到底在做什么
 
----
+先把心法换掉：**`useEffect` 不是"组件挂载后执行"，而是"让某个外部系统和当前 state 保持同步"。**
 
-## 依赖数组的坑
-
-最常见 bug：effect 里用了某个变量却没放进依赖，导致用的是旧值。
-
-```jsx
+```tsx
 useEffect(() => {
-  fetchData(userId); // 若 userId 变化却没进依赖，不会重新请求
-}, []); // ❌ 缺 userId
+	// 同步：把 state 推给外部系统
+	document.title = `${count} 条未读`;
+
+	// 清理：把这次同步撤销
+	return () => {
+		// 这里通常不需要恢复 title，因为下次 effect 会重设
+	};
+}, [count]);
 ```
 
-ESLint 的 `exhaustive-deps` 规则就是为此——听它的。如果确实只想跑一次，把变量写进依赖；若逻辑需要"只跑一次"，用 `ref` 或 `useRef` 缓存。
+执行时机：
 
----
+```
+Render 阶段（算新树）
+  ↓
+Commit 阶段（写 DOM）
+  ↓
+useLayoutEffect（同步，绘制前）
+  ↓
+浏览器绘制
+  ↓
+useEffect（异步，绘制后）
+```
 
-## 小结
+所以：**需要读 DOM 尺寸、要防止闪烁** → `useLayoutEffect`；**其余一律 `useEffect`**（服务端渲染时 `useLayoutEffect` 会警告）。
 
-- `useState` 管理状态，函数式更新避免旧值；`useState(() => ...)` 惰性初始化。
-- `useEffect` 管副作用，依赖数组控制时机，清理函数防泄漏。
-- 依赖数组写全所用的外部变量，`eslint exhaustive-deps` 当真听。
+### 依赖数组的三种写法
 
----
+| 写法 | 何时执行 |
+|---|---|
+| 不写 | 每次渲染后都执行（几乎总是错的） |
+| `[]` | 只在挂载后执行一次（清理在卸载时） |
+| `[a, b]` | 挂载后 + `a` 或 `b` 变化时（`Object.is` 比较） |
 
-## 练习
+**依赖数组不是"我想什么时候跑"，而是"这个 effect 用到了哪些响应式值"**。它应该由 effect 内部用到的变量决定，而不是由你的意图决定。
 
-1. 写一个每秒自增的时钟组件，用 `useEffect` 设 `setInterval` 并在清理函数里 `clearInterval`。
-2. 故意把 `userId` 依赖漏掉，观察改 userId 后数据不刷新，补上后修复。
-3. 解释 `useState(() => heavy())` 与 `useState(heavy())` 的区别（后者每次渲染都执行 heavy）。
+```tsx
+// ❌ 想"只在 userId 变化时请求"，但漏了 page
+useEffect(() => { fetchUser(userId, page); }, [userId]);
+// page 变了不重新请求，且闭包里是旧 page
+
+// ✅ 用到的都写上
+useEffect(() => { fetchUser(userId, page); }, [userId, page]);
+```
+
+### 清理函数的三个作用
+
+```tsx
+useEffect(() => {
+	const controller = new AbortController();
+	fetch(`/api/tasks?q=${q}`, { signal: controller.signal })
+		.then(r => r.json())
+		.then(setData)
+		.catch(err => { if (err.name !== "AbortError") setError(err); });
+
+	return () => controller.abort();  // 1) 取消上一次请求，避免"后发先至"覆盖新结果
+}, [q]);
+```
+
+1. **取消/中断**：请求、定时器、订阅、WebSocket；
+2. **移除监听**：`removeEventListener`、`unsubscribe`；
+3. **防止竞态**：旧 effect 的异步结果回来时，用标志位或 Abort 丢掉。
+
+竞态是真实 bug：快速切换筛选条件，先发的请求可能后返回，把新数据覆盖成旧的。**不处理就会变成"偶尔显示错数据"这种最难查的 bug。**
+
+## StrictMode 为什么跑两次
+
+开发环境下 React 会：**挂载 → 卸载 → 再挂载**，effect 执行两次。目的不是折腾你，而是**逼出"清理函数没写对"的 bug**——如果两次挂载之间状态/监听没清干净，说明这段代码在真实场景（路由切换、条件渲染）里也会漏。
+
+```tsx
+// ❌ 清理没写全：两次挂载后有两个监听器，一次点击触发两次
+useEffect(() => {
+	window.addEventListener("resize", onResize);
+}, []);
+
+// ✅
+useEffect(() => {
+	window.addEventListener("resize", onResize);
+	return () => window.removeEventListener("resize", onResize);
+}, []);
+```
+
+**生产环境不会双调用**（`StrictMode` 的双调用只在 `NODE_ENV=development` 生效），所以"线上只请求一次"和"开发请求两次"并不矛盾。
+
+如果一段请求确实不该发两次（比如支付），说明它不该放在 effect 里——应该由用户事件触发。
+
+## 什么时候不该用 useEffect
+
+这是 React 官方近年反复强调的：**大部分 effect 可以删掉**。
+
+| 你想做的事 | 不要用 effect，用这个 |
+|---|---|
+| props/state 变化时算出新值 | 直接渲染期算，或 `useMemo` |
+| 用户点了按钮才请求 | 事件处理函数里请求 |
+| props 变了要重置 state | 给组件加 `key` |
+| 提交表单后通知父组件 | 在事件处理函数里调用回调 |
+| 初始化时加载数据（纯客户端） | 可以 effect，但更好的方案是 Query（09） |
+
+真正需要 effect 的只有：**和 React 之外的系统同步**——DOM 操作、订阅、定时器、第三方库实例、日志上报、非 React 的数据源。
+
+一句话自检：**"如果这段代码删掉，UI 会不会算错？"** 会算错 → 说明是派生值，不该用 effect。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| effect 无限循环 | effect 里 set 了依赖数组里的 state，且每次都新建对象/数组 | 依赖换成原始值；或用函数式更新；或干脆别用 effect |
+| 定时器里的 state 永远是初始值 | 闭包捕获了旧渲染的值 | 函数式更新，或把值放进 `useRef` |
+| 开发环境请求两次 | StrictMode | 正常；确认清理函数正确 |
+| 切换筛选后显示旧数据 | 竞态 | AbortController 或 `ignore` 标志 |
+| `useEffect` 里拿到 `null` 的 ref | effect 在 ref 赋值前？不对——`ref.current` 在 Commit 前已赋值 | 若仍为 null，检查节点是否条件渲染 |
+| 滚动位置跳动 | 在 `useEffect` 里读布局 | 改用 `useLayoutEffect` |
+| `useState` 初始化很慢 | 每次渲染都执行了初始化表达式 | `useState(() => ...)` |
+
+## 拦路的几道题
+
+1. 写出下面代码点击后的输出，并解释：
+
+```tsx
+const [n, setN] = useState(0);
+useEffect(() => {
+	const id = setInterval(() => console.log(n), 1000);
+	return () => clearInterval(id);
+}, []);
+```
+
+2. 为什么 Hook 不能写在 `if` 里？用"槽位"解释，并举一个会读到错值的例子。
+3. 一个搜索框 `q` 变化就请求，要求：连续输入只发最后一个请求的结果、切换时不显示旧数据。写出 effect 与清理函数。
+4. 判断下面哪些 effect 应该删掉，换成什么：
+
+```tsx
+useEffect(() => { setTotal(items.reduce((s, i) => s + i.price, 0)); }, [items]);
+useEffect(() => { document.title = title; }, [title]);
+useEffect(() => { if (isOpen) setDraft(initial); }, [isOpen, initial]);
+```
+
+5. 解释"StrictMode 双调用"和"生产只跑一次"为什么不矛盾，以及它到底帮你发现了什么。
+
+**自检标准**：第 1 题能说出"永远打印 0"；第 4 题能说出第 1、3 个该删（派生值 + 用 key 重置）。
+
+## 下一步
+
+基础 Hook 会用了，06 讲其余六个常用 Hook——重点是 `useRef`（不是只能拿 DOM）、`useMemo`/`useCallback`（什么时候真有用），以及 `useReducer` 什么时候比 `useState` 好。

@@ -1,0 +1,251 @@
+---
+title: '15 · 测试：测行为，不测实现'
+published: 2026-10-08T00:00:00+08:00
+description: 'RTL 的查询优先级、user-event 与 fireEvent 的区别、三态测试、MSW 拦截请求、带 Provider 的自定义 render、renderHook 测自定义 Hook、覆盖率只卡改动、E2E 只写 3–5 条与 flaky 治理。'
+tags: [React, 测试, Vitest, TestingLibrary, MSW]
+category: React学习路线
+draft: false
+---
+
+React 项目里最没价值的测试是这样写的：
+
+```tsx
+// ❌ 测的是实现，不是行为
+expect(wrapper.state("count")).toBe(1);
+expect(component.find("Button").prop("onClick")).toBeDefined();
+```
+
+它会在重构时全部失败，却抓不到任何真实 bug。**测试应该描述"用户看到什么、做了什么、结果如何"**，这三件事不随实现变化。
+
+## 查询优先级：像用户一样找元素
+
+Testing Library 的查询顺序是有讲究的，越靠前越接近真实用户：
+
+```tsx
+// 1. 可访问角色 + 名称（最推荐）
+screen.getByRole("button", { name: "保存" });
+screen.getByRole("textbox", { name: "标题" });
+
+// 2. label 文本（表单）
+screen.getByLabelText("邮箱");
+
+// 3. 占位符 / 可见文本
+screen.getByPlaceholderText("请输入");
+screen.getByText("共 3 条");
+
+// 4. 最后手段：data-testid
+screen.getByTestId("task-row");
+```
+
+**为什么坚持用 `getByRole`**：它同时验证了"这个元素可访问"——如果按钮没有文本、input 没有 label，`getByRole` 会失败。**测试顺便成了 a11y 检查**。
+
+`data-testid` 只在实在没有语义时用（如 canvas、复杂表格单元）。**给每个 div 都加 testid，等于放弃了可访问性检查。**
+
+## 一个完整的组件测试
+
+```tsx
+// TaskList.test.tsx
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+
+const server = setupServer(
+	http.get("/api/tasks", ({ request }) => {
+		const url = new URL(request.url);
+		const status = url.searchParams.get("status");
+		const all = [
+			{ id: "1", title: "写文档", status: "todo" },
+			{ id: "2", title: "修 bug", status: "done" },
+		];
+		const items = status ? all.filter(t => t.status === status) : all;
+		return HttpResponse.json({ items, total: items.length, hasNext: false });
+	}),
+);
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));  // 未声明的请求直接失败
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+it("加载中显示骨架，成功后显示列表", async () => {
+	render(<TaskList />, { wrapper: Providers });
+
+	expect(screen.getByRole("status")).toHaveTextContent("加载中");     // 三态之一
+	expect(await screen.findByText("写文档")).toBeInTheDocument();       // 自动等待
+	expect(screen.getAllByRole("listitem")).toHaveLength(2);
+});
+
+it("筛选 todo 后只剩未完成的", async () => {
+	const user = userEvent.setup();
+	render(<TaskList />, { wrapper: Providers });
+	await screen.findByText("写文档");
+
+	await user.selectOptions(screen.getByLabelText("状态"), "todo");
+
+	await waitFor(() => {
+		expect(screen.queryByText("修 bug")).not.toBeInTheDocument();
+	});
+});
+
+it("接口 500 时显示错误并能重试", async () => {
+	server.use(http.get("/api/tasks", () => HttpResponse.json({}, { status: 500 })));
+	render(<TaskList />, { wrapper: Providers });
+
+	expect(await screen.findByRole("alert")).toHaveTextContent("加载失败");
+	expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+});
+```
+
+### 几个关键选择
+
+**`onUnhandledRequest: "error"`**：没有被 mock 的请求会让测试失败，而不是静默发到真实网络（那会让测试忽快忽慢、偶发失败）。**这一条能省掉大量 flaky。**
+
+**`user-event` 而不是 `fireEvent`**：`user.click()` 会模拟完整的交互序列（mousedown、focus、mouseup、click），而 `fireEvent.click` 只派发一个事件。很多 bug 只在真交互序列下暴露。
+
+```tsx
+const user = userEvent.setup();
+await user.type(input, "hello");      // 逐字符输入，触发 onChange 多次
+await user.keyboard("{Enter}");       // 键盘
+await user.tab();                     // 焦点移动（测焦点管理必用）
+```
+
+**`findBy*` vs `getBy*`**：`findBy` 会等待（默认 1s），用于异步出现的内容；`getBy` 立刻断言，用于已渲染的内容。**用错会导致"偶发失败"**——`getBy` 在数据还没回来时查，测试就挂了。
+
+## 三态必须都测
+
+列表页的三个状态（加载 / 空 / 错误）是 bug 高发区，每个都该有一条测试：
+
+```tsx
+it("空数据时显示空态", async () => {
+	server.use(http.get("/api/tasks", () => HttpResponse.json({ items: [], total: 0, hasNext: false })));
+	render(<TaskList />, { wrapper: Providers });
+	expect(await screen.findByText("还没有任务")).toBeInTheDocument();
+});
+```
+
+**空的三种情况要分开**：真的没数据、筛选后没结果、加载失败。三者文案完全不同，混在一起用户就懵了。
+
+## 带 Provider 的自定义 render
+
+```tsx
+// test/utils.tsx
+export function renderWithProviders(ui: React.ReactElement, { route = "/" } = {}) {
+	const queryClient = new QueryClient({
+		defaultOptions: { queries: { retry: false, gcTime: 0 } },   // 测试里别重试，别缓存
+	});
+
+	return render(
+		<QueryClientProvider client={queryClient}>
+			<MemoryRouter initialEntries={[route]}>
+				<AuthProvider>{ui}</AuthProvider>
+			</MemoryRouter>
+		</QueryClientProvider>,
+	);
+}
+```
+
+两个必设项：
+
+- **`retry: false`**：否则失败场景要等三次重试才报错，测试慢且超时；
+- **`gcTime: 0`**：避免测试间缓存串味。
+
+`MemoryRouter` 的 `initialEntries` 让"URL 即状态"的页面可以直接测：
+
+```tsx
+it("从 URL 恢复筛选条件", async () => {
+	renderWithProviders(<TaskList />, { route: "/tasks?status=todo&page=2" });
+	expect(await screen.findByDisplayValue("todo")).toBeInTheDocument();
+});
+```
+
+## 测自定义 Hook
+
+```tsx
+import { renderHook, waitFor } from "@testing-library/react";
+
+it("useDebouncedValue 在 delay 后才更新", async () => {
+	vi.useFakeTimers();
+	const { result, rerender } = renderHook(({ v }) => useDebouncedValue(v, 300), {
+		initialProps: { v: "a" },
+	});
+
+	rerender({ v: "b" });
+	expect(result.current).toBe("a");
+
+	await act(async () => { vi.advanceTimersByTime(300); });
+	expect(result.current).toBe("b");
+	vi.useRealTimers();
+});
+```
+
+**测 Hook 的价值点**：像 `useDebouncedValue`、`useInterval` 这种"时序敏感"的逻辑，用组件测很别扭，`renderHook` 直击核心。
+
+## 覆盖率：只卡改动
+
+```ts
+// vitest.config.ts
+coverage: {
+	provider: "v8",
+	thresholds: { lines: 70, branches: 60 },   // 全局底线，别定太高
+}
+```
+
+**别追 90%**。追高覆盖率的代价是写一堆断言实现细节的测试，重构时全废。
+
+更有效的做法：**只对改动的文件要求覆盖**（CI 里用 diff-coverage 工具）。这样既保证新代码有测试，又不逼人补历史债。
+
+## E2E：只写 3–5 条
+
+Playwright 只测"整条链能不能走通"，不测细节：
+
+1. **登录 → 进列表 → 新建 → 列表出现新项**（核心路径）；
+2. **筛选 + 分页 + 刷新后状态保持**（URL 即状态）；
+3. **删除有二次确认，确认后消失**；
+4. **一个必现的线上事故回归用例**（每修一次加一条）。
+
+**E2E 越多越不稳定**。它跑在真实浏览器 + 真实网络里，任何环境抖动都会让它红。所以只保留"挂了就说明产品废了"的那几条。
+
+### flaky 治理：失败就重跑是掩盖，不是修复
+
+```ts
+// ❌ 靠 retries 掩盖
+retries: 3
+
+// ✅ 定位根因
+```
+
+四个常见根因：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| 偶发找不到元素 | 断言用了 `getBy` 而不是 `findBy` | 改 `findBy`，或 `waitFor` |
+| 偶发点了没反应 | 元素还没挂载/被遮挡 | `await user.click(await screen.findByRole(...))` |
+| 测试间互相影响 | 共享了模块级状态/缓存 | `resetHandlers` + `gcTime: 0` + 每例独立 render |
+| 只在本地失败 | 时区/语言/字体差异 | 固定 `TZ`、`locale` |
+
+**允许 `retries: 1` 只用于 E2E**（网络抖动客观存在），单元测试一次都不该重试。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 报 "not wrapped in act(...)" | 状态更新发生在测试之外 | 用 `findBy`/`waitFor`，或用 `await user.xxx` |
+| `toHaveBeenCalled` 断言事件 | 测了实现 | 改成断言 UI 变化 |
+| 测试跑得慢（10s+） | 真的发了网络请求 | 全部走 MSW，`onUnhandledRequest: "error"` |
+| 改了样式，测试全红 | 断言了 class 名 | 断言文本/角色，不断言 class |
+| `getByText` 命中多个 | 文本重复 | `getByRole(..., { name })` 精确匹配 |
+
+## 拦路的几道题
+
+1. 一个按钮的文案在 loading 时变成"保存中…"，怎么写测试既验证了状态又不耦合实现？
+2. `fireEvent.click` 和 `userEvent.click` 有什么区别？什么场景必须用后者？
+3. 列表页的空态有"没数据"和"筛选无结果"两种，怎么各写一条测试？
+4. 一个组件用了 `useQuery`，测试里不加 `retry: false` 会怎样？
+5. 判断：把覆盖率从 70% 提到 95%，值得吗？
+
+**自检标准**：第 1 题能用 `getByRole("button", { name: "保存中…" })` 而非断言 state；第 5 题能说出"边际收益递减，且容易写出耦合实现的测试"。
+
+## 下一步
+
+测试是"证明它没坏"，16 讲"怎么组织才不容易坏"——工程实战与坑：StrictMode、水合、目录结构、TypeScript 集成、以及那些只有真上过线才会知道的坑。

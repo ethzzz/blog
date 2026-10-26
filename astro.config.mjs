@@ -36,6 +36,15 @@ export default defineConfig({
 		"/posts/js-roadmap-04-inheritance/": "/blog/posts/js-roadmap-07-inheritance/",
 		"/posts/js-roadmap-06-this-binding/": "/blog/posts/js-roadmap-04-this-binding/",
 		"/posts/js-roadmap-07-execution-context/": "/blog/posts/js-roadmap-03-execution-context/",
+		// React（2026-10-26）：三层重构，条件渲染并入 03、路由与数据拆成 09/11、后续整体后移
+		"/posts/react-roadmap-03-events-forms/": "/blog/posts/react-roadmap-04-events-forms/",
+		"/posts/react-roadmap-04-render-list-key/": "/blog/posts/react-roadmap-03-render-and-keys/",
+		"/posts/react-roadmap-09-performance/": "/blog/posts/react-roadmap-12-performance/",
+		"/posts/react-roadmap-10-router-data/": "/blog/posts/react-roadmap-11-routing/",
+		"/posts/react-roadmap-11-engineering-pitfalls/":
+			"/blog/posts/react-roadmap-16-engineering-pitfalls/",
+		"/posts/react-roadmap-12-project-task-board/":
+			"/blog/posts/react-roadmap-17-project-task-board/",
 	},
 	// 混合渲染（hybrid）：整站仍是静态产物（默认 prerender=true），
 	// 只有 src/pages/solutions/ 下的两个页面显式 `export const prerender = false`。

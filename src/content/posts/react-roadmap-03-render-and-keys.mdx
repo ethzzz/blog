@@ -1,0 +1,188 @@
+---
+title: '03 · 渲染与协调：什么时候会重渲染，key 到底在做什么'
+published: 2026-10-01T00:00:00+08:00
+description: '渲染阶段与提交阶段的分工、重渲染的三个触发条件、协调算法与 key 的真实作用、index 作 key 会串值的机制、条件渲染的正确写法，以及"状态没变 UI 却变了"的排查法。'
+tags: [React, 渲染, 协调, key, diff]
+category: React学习路线
+draft: false
+---
+
+React 的"玄学"里，八成来自这一篇的三个问题：**组件为什么重渲染了 / 为什么没重渲染 / 列表删了一项为什么输入框串了**。它们全是同一个机制的不同侧面。
+
+## 一次更新分两个阶段
+
+```
+setState  →  [Render 阶段]  →  [Commit 阶段]  →  浏览器绘制
+             调用组件函数        把差异写进 DOM
+             产出虚拟树          执行 effect / ref
+             可被打断、可重来      不可打断
+```
+
+**Render 阶段**就是"执行你的组件函数，拿到新的元素树"。它可能：
+
+- 被调用多次（StrictMode、并发渲染中断重来）
+- 被跳过（父组件重渲染但子组件 props 没变、被 `memo` 挡住）
+- 中途作废（有更高优先级更新插队，如用户输入打断一次大列表渲染）
+
+**Commit 阶段**才真正碰 DOM，并且是同步、不可打断的。顺序是：`useLayoutEffect` → 浏览器绘制 → `useEffect`（见 05）。
+
+理解这个分工，才能理解两件事：
+
+1. 为什么渲染期不能有副作用——Render 阶段可能跑两遍或作废；
+2. 为什么"状态改了但 DOM 还没变"——你读的是 Render 阶段的值，DOM 在 Commit 才更新。
+
+## 重渲染的三个触发条件
+
+组件重渲染，只有这三种原因：
+
+1. **自己的 state 变了**（用 setter 且新值 `Object.is` 不等）
+2. **父组件重渲染了**（不管 props 有没有变，默认都会往下走）
+3. **自己订阅的 Context 值变了**（见 08）
+
+注意第二点：**父组件重渲染 → 所有子组件默认都重渲染**。`memo` 就是用来打破这一条的（见 12）。
+
+```tsx
+function Parent() {
+	const [n, setN] = useState(0);
+	return (
+		<>
+			<button onClick={() => setN(n + 1)}>{n}</button>
+			<Child />   {/* 没有 props，但 Parent 重渲染时它也会重渲染 */}
+		</>
+	);
+}
+```
+
+反过来，**state 没变不会重渲染**：
+
+```tsx
+setN(0);      // n 已经是 0，Object.is(0, 0) → React 直接 bail out
+setObj(obj);  // 同一引用 → 不重渲染
+```
+
+这是 02 那条铁律的另一面。排查"UI 没更新"第一步就是问：**新值和旧值是同一个引用吗？**
+
+## 协调：React 怎么对比两棵树
+
+React 不跑通用树 diff（O(n³) 太贵），而是用两条启发式假设，把复杂度降到 O(n)：
+
+1. **不同类型的元素 → 直接重建**：`<div>` 变 `<p>`，整个子树卸载重挂（state 全丢）。
+2. **同类型元素 → 保留 DOM 节点，只更新变化的属性**：`<div className="a">` 变 `<div className="b">`，只改 class。
+
+同一层级的多个子元素，React 靠什么配对？——**顺序 + key**。
+
+```jsx
+// 没有 key：React 按位置配对。第 1 个对第 1 个，第 2 个对第 2 个
+<ul>
+	<li>甲</li>
+	<li>乙</li>
+</ul>
+```
+
+## key 的真实作用：告诉 React "这个节点还是原来那个"
+
+这是全篇最重要的一段。
+
+```jsx
+// ❌ 用 index 作 key
+{items.map((item, i) => (
+	<li key={i}>
+		<input defaultValue={item.name} />
+	</li>
+))}
+```
+
+初始数据 `[A, B, C]`，现在删掉 A，数据变成 `[B, C]`。用 index 作 key 时：
+
+| 位置 | 之前 | 之后 | React 的判断 |
+|---|---|---|---|
+| key=0 | A（input 里可能有用户输入） | B | **同一个节点**，只改文本 → input 的 DOM 被保留，用户输的内容留在"B"那一行 |
+| key=1 | B | C | 同上 |
+| key=2 | C | — | 卸载 |
+
+结果：**内容错位、输入框串值、勾选状态错行、动画乱飞**。这就是"删除一项后整列表都变了"的根因。
+
+换成 `key={item.id}`，React 会看到 key=0 消失了 → 卸载 A 的节点，key=1/2 保留原节点 → 一切正常。
+
+**什么时候 index 可以当 key？** 三者同时满足：列表不增删、不排序、项内没有内部状态（输入框、展开状态、动画）。生产里几乎不满足，所以**默认用业务 id**。
+
+### 其他 key 用法
+
+```jsx
+// 1) 强制重挂载（清空内部所有状态）——比手动 reset 一堆 state 干净
+<ProfileForm key={userId} user={user} />
+
+// 2) Fragment 列表必须用显式 Fragment 才能加 key
+{list.map(item => (
+	<Fragment key={item.id}>
+		<dt>{item.k}</dt>
+		<dd>{item.v}</dd>
+	</Fragment>
+))}
+
+// 3) key 只在兄弟之间唯一，不需要全局唯一
+```
+
+## 条件渲染：四种写法的取舍
+
+```jsx
+// 1) 三元：二选一
+{isLoading ? <Spinner /> : <List data={data} />}
+
+// 2) &&：有或没有（注意 0 的坑）
+{error && <ErrorBar msg={error} />}
+
+// 3) 提前 return：整块 UI 不同
+if (!user) return <Login />;
+
+// 4) 变量：分支复杂时最好读
+let content;
+if (status === "loading") content = <Spinner />;
+else if (status === "error") content = <ErrorBar />;
+else content = <List />;
+```
+
+**别用 `&&` 做二选一**（`{ok && <A/>}{!ok && <B/>}`）——两个分支各自独立判断，改逻辑时极易漏。
+
+嵌套超过两层就用第 4 种，或者干脆拆组件。**深层嵌套的三元是代码评审里最常被打回的东西。**
+
+## 一个必须知道的细节：同位置换类型会丢状态
+
+```jsx
+// ❌ 用户点了"编辑"，输入框内容全丢
+{isEdit ? <input defaultValue={name} /> : <span>{name}</span>}
+```
+
+看着像"切换显示"，实际是 `<input>` 和 `<span>` 类型不同 → React 卸载重建 → 输入框内容清空。
+
+如果想要"切换但保留"，就保持同类型或让状态存在 React 里（受控），别指望 DOM 保留。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 删除列表项后内容串位 | index 作 key | 用业务 id |
+| 弹窗关闭再打开还是旧数据 | 组件没卸载，state 保留 | 加 `key`，或关闭时 `return null` 之外还要 reset |
+| 切换 tab 后表单内容丢了 | 条件渲染导致卸载 | 受控 state 提到父级，或用 CSS 隐藏 |
+| `memo` 加了没用 | 传了内联对象/函数，每次都是新引用 | `useMemo`/`useCallback`（见 06） |
+| 列表报 `Each child should have a unique key` | 忘了 key 或 key 重复 | 加 key，检查数据是否有重复 id |
+| 渲染两次、日志打两遍 | StrictMode 故意的 | 开发环境正常，生产不会；同时检查是否有真副作用 |
+
+## 拦路的几道题
+
+1. 一个可勾选的待办列表，用 index 作 key 时"删掉第一项后，第二项变成已勾选"，解释原因并给出修法。
+2. 下面这段为什么"点编辑后输入框内容会丢"？给出两种修法。
+
+```jsx
+{isEdit ? <input defaultValue={name} /> : <span>{name}</span>}
+```
+
+3. 父组件重渲染，子组件没有 props，它会重渲染吗？如果不想让它重渲染，有几种办法？
+4. `<ProfileForm key={userId} />` 里的 key 改变了什么行为？和"在 effect 里手动 reset 表单"相比好在哪？
+5. 判断：`setState` 之后立刻读 `document.querySelector('.x').textContent`，拿到的是新值吗？为什么？
+
+**自检标准**：第 1 题能说出"React 按位置配对，key=0 的 DOM 节点被复用给了新数据"；第 5 题能说出"DOM 在 Commit 阶段才更新，读到的是旧值"。
+
+## 下一步
+
+知道了"何时重渲染"，接下来是"交互怎么进来"——04 讲事件系统与表单，里面有两个高频坑：合成事件的池化（旧版本）、以及受控输入的光标跳动。

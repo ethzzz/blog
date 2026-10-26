@@ -1,0 +1,295 @@
+---
+title: '09 · 数据请求与缓存：TanStack Query 的正确用法'
+published: 2026-10-04T00:00:00+08:00
+description: '为什么 useEffect 拉数据是反模式、queryKey 怎么设计、staleTime 与 gcTime 的区别、加载态三态、变更与失效、乐观更新与回滚、取消请求、分页与无限滚动，以及错误分类处理。'
+tags: [React, 数据请求, TanStackQuery, 缓存, 乐观更新]
+category: React学习路线
+draft: false
+---
+
+浏览器里最难的不是"发请求"，而是**请求之后的一堆状态**：加载中、失败、过期、重复、竞态、改完之后列表要不要刷新。这些代码手写过一遍就知道，它比业务本身还长。
+
+TanStack Query（下称 Query）把这些收进一个模型：**数据由 key 标识，什么时候该刷新由 stale 时间决定**。理解这两句，剩下的都是推论。
+
+## 为什么不在 useEffect 里拉数据
+
+```tsx
+// ❌ 看起来能跑，实际上有 6 个问题
+function TaskList() {
+	const [data, setData] = useState<Task[]>([]);
+	const [loading, setLoading] = useState(true);
+	const [error, setError] = useState<Error | null>(null);
+
+	useEffect(() => {
+		setLoading(true);
+		fetch("/api/tasks")
+			.then(r => r.json())
+			.then(setData)
+			.catch(setError)
+			.finally(() => setLoading(false));
+	}, []);
+
+	return loading ? <Spinner /> : error ? <Err /> : <List data={data} />;
+}
+```
+
+问题清单：
+
+1. **没有缓存**：每次挂载都重新请求，切页面回来白屏一次；
+2. **没有去重**：三个组件用同一份数据 → 三个请求；
+3. **有竞态**：快速切筛选，旧响应覆盖新数据（05 讲过）；
+4. **没有重试**：一次网络抖动就永久失败；
+5. **错误态粗糙**：拿不到 HTTP 状态码，无法区分"未登录"和"服务挂了"；
+6. **改完不刷新**：新增一条后要手动 `refetch`，还容易漏。
+
+Query 把这六件事都做掉了。**它不是"请求库"，是"服务端状态缓存"**——这个定位很重要，它跟 `axios` 不是替代关系（Query 内部用 fetch 或 axios 都行）。
+
+## 先写好请求层
+
+缓存的语义依赖"错误是什么样"。所以先给请求套一层统一的错误类型：
+
+```ts
+// src/api/client.ts
+export class ApiError extends Error {
+	constructor(
+		public status: number,          // HTTP 状态码；0 表示网络层失败
+		message: string,
+		public detail?: unknown,
+	) {
+		super(message);
+		this.name = "ApiError";
+	}
+
+	get isNetwork() { return this.status === 0; }
+	get isAuth() { return this.status === 401 || this.status === 403; }
+	get isNotFound() { return this.status === 404; }
+	get isServer() { return this.status >= 500; }
+}
+
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+	let res: Response;
+	try {
+		res = await fetch(`${import.meta.env.VITE_API_BASE}${path}`, {
+			headers: { "Content-Type": "application/json", ...init?.headers },
+			...init,
+		});
+	} catch {
+		throw new ApiError(0, "网络不可用，请检查连接");   // fetch 只有网络错误才 reject
+	}
+
+	if (!res.ok) {
+		let detail: unknown;
+		try { detail = await res.json(); } catch { /* 可能是空 body */ }
+		throw new ApiError(res.status, `请求失败（${res.status}）`, detail);
+	}
+
+	return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
+}
+```
+
+**关键点：`fetch` 不会因为 404/500 而 reject**，只有网络中断才 reject。不检查 `res.ok` 的代码会把错误响应当成功数据用——这是最常见的"接口错了但页面不报错"。
+
+## queryKey：缓存的地址
+
+```tsx
+const { data, isPending, error } = useQuery({
+	queryKey: ["tasks", { page, status, q }],
+	queryFn: () => api.listTasks({ page, status, q }),
+});
+```
+
+**key 的设计原则：把影响结果的每个参数都放进去，且结构要能被前缀匹配。**
+
+```ts
+// 推荐的 key 工厂
+export const taskKeys = {
+	all: ["tasks"] as const,
+	lists: () => [...taskKeys.all, "list"] as const,
+	list: (params: ListParams) => [...taskKeys.lists(), params] as const,
+	detail: (id: string) => [...taskKeys.all, "detail", id] as const,
+};
+```
+
+好处是失效时能按层级批量操作：
+
+```ts
+queryClient.invalidateQueries({ queryKey: taskKeys.all });        // 全部任务相关
+queryClient.invalidateQueries({ queryKey: taskKeys.lists() });    // 只失效列表
+```
+
+**三个常见错误**：
+
+- 参数没进 key → 换页了还显示第一页的数据（缓存命中错的那条）；
+- 对象字面量顺序不稳定 → `{a,b}` 和 `{b,a}` 在 Query 里是一样的（它会对 key 做稳定序列化），但如果 key 里有函数或 `Map` 会出问题；
+- key 里放了每次新建的对象（如 `new Date()`）→ 永不命中缓存。
+
+## staleTime 与 gcTime：两个不同的钟
+
+| 概念 | 含义 | 默认 |
+|---|---|---|
+| `staleTime` | 数据多久算"新鲜"，新鲜期内不重新请求 | **0**（一挂载就重新请求） |
+| `gcTime` | 没有组件使用后，缓存保留多久（原 `cacheTime`） | 5 分钟 |
+
+```tsx
+useQuery({
+	queryKey: ["tasks", params],
+	queryFn: ...,
+	staleTime: 30_000,          // 30 秒内切换页面不重新请求
+	gcTime: 5 * 60_000,
+	refetchOnWindowFocus: true, // 默认开：用户切回来时后台刷新
+});
+```
+
+**默认 `staleTime: 0` 的后果**：每次挂载都重新请求，即使数据刚拿到。所以第一步优化通常就是把全局默认设成 30 秒：
+
+```tsx
+new QueryClient({
+	defaultOptions: {
+		queries: {
+			staleTime: 30_000,
+			retry: (count, err) => {
+				if (err instanceof ApiError && err.status >= 400 && err.status < 500) return false; // 4xx 重试没意义
+				return count < 2;
+			},
+		},
+	},
+});
+```
+
+## 三种状态，别只写两种
+
+```tsx
+function TaskList() {
+	const { data, isPending, isError, error, isFetching } = useQuery({ ... });
+
+	if (isPending) return <Skeleton />;              // 首次加载（没有缓存）
+	if (isError) return <ErrorBar error={error} />;  // 失败
+
+	if (data.items.length === 0) return <Empty />;   // ✅ 空态：第三个状态
+
+	return (
+		<>
+			{isFetching && <RefreshingBar />}         {/* 后台刷新，不要盖掉已有数据 */}
+			<List items={data.items} />
+		</>
+	);
+}
+```
+
+- **`isPending` 不是 `isLoading`**：`isPending` 表示"还没有数据"；`isLoading` 是 `isPending && isFetching`。后台刷新时 `isFetching` 为真但 `isPending` 为假。
+- **空态必须有**。列表页的三个状态（loading / error / empty）少一个，用户就会看到一片空白。
+- **别用 loading 遮住已有数据**，那是"翻页时闪白屏"的来源。
+
+## 变更：mutation + 失效
+
+```tsx
+const qc = useQueryClient();
+
+const createTask = useMutation({
+	mutationFn: (input: NewTask) => api.createTask(input),
+	onSuccess: () => {
+		qc.invalidateQueries({ queryKey: taskKeys.lists() });  // 列表自动重取
+		toast("已创建");
+	},
+	onError: (err) => {
+		toast(err instanceof ApiError ? err.message : "创建失败");
+	},
+});
+
+// 调用
+createTask.mutate({ title, status });
+```
+
+**"改完自动一致"的秘密就是失效**：不需要手动改任何本地数组，标记旧数据过期，Query 会重新请求并更新所有用到它的组件。这比"手动 push 进本地列表"稳得多（后者在分页、排序、筛选下必错）。
+
+## 乐观更新：快，但要能回滚
+
+```tsx
+const toggle = useMutation({
+	mutationFn: (task: Task) => api.updateTask(task.id, { done: !task.done }),
+
+	onMutate: async (task) => {
+		await qc.cancelQueries({ queryKey: taskKeys.lists() });   // 1) 取消在途请求，防覆盖
+		const snapshot = qc.getQueriesData({ queryKey: taskKeys.lists() }); // 2) 存快照
+
+		qc.setQueriesData({ queryKey: taskKeys.lists() }, (old: TaskPage | undefined) =>
+			old ? { ...old, items: old.items.map(t => (t.id === task.id ? { ...t, done: !t.done } : t)) } : old,
+		);
+
+		return { snapshot };   // 3) 交给 onError
+	},
+
+	onError: (_err, _task, ctx) => {
+		for (const [key, data] of ctx?.snapshot ?? []) qc.setQueryData(key, data);  // 4) 回滚
+	},
+
+	onSettled: () => {
+		qc.invalidateQueries({ queryKey: taskKeys.lists() });   // 5) 无论成败，最终以服务端为准
+	},
+});
+```
+
+五步缺一不可。**少了第 1 步**，在途的旧请求回来会覆盖乐观值；**少了第 4 步**，失败后 UI 停留在"看起来成功了"的状态——这是最坏的用户体验；**少了第 5 步**，本地和服务端会长期漂移。
+
+**乐观更新只用于"几乎不会失败"的操作**（勾选、点赞、排序）。删除、支付这类不可逆的，老老实实等响应。
+
+## 取消与竞态
+
+Query 会自动把 `AbortSignal` 传给你的 queryFn（如果它接受）：
+
+```tsx
+useQuery({
+	queryKey: ["tasks", params],
+	queryFn: ({ signal }) => fetch(url, { signal }).then(r => r.json()),
+});
+```
+
+key 变了之后旧请求会被 abort，**不需要自己写 `ignore` 标志**。但手写的 `fetch` 必须真的把 `signal` 传下去，否则 abort 只是"不管结果"，请求仍在发。
+
+## 分页与无限滚动
+
+```tsx
+// 传统分页：page 进 key
+const { data } = useQuery({
+	queryKey: taskKeys.list({ page }),
+	queryFn: () => api.list({ page }),
+	placeholderData: keepPreviousData,   // 翻页时保留上一页数据，避免闪白
+});
+
+// 无限滚动
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
+	queryKey: ["tasks", "infinite", q],
+	queryFn: ({ pageParam }) => api.list({ page: pageParam, q }),
+	initialPageParam: 1,
+	getNextPageParam: (last) => (last.hasNext ? last.page + 1 : undefined),
+});
+// 渲染：data.pages.flatMap(p => p.items)
+```
+
+`keepPreviousData` 是很值钱的一行：不加它，每次翻页都是骨架屏；加了之后是"旧数据 + 顶部细进度条"，体验差距明显。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 换页后显示上一页数据 | 分页参数没进 `queryKey` | 参数全部进 key |
+| 每次切页面都白屏 | `staleTime` 为 0 | 设全局 `staleTime` |
+| 接口 500 但页面当成功 | 没检查 `res.ok` | 请求层统一抛 `ApiError` |
+| 改完列表不刷新 | 只做了 mutation 没失效 | `invalidateQueries` |
+| 乐观更新失败后 UI 仍是新值 | 没写 `onError` 回滚 | `onMutate` 存快照 + 回滚 |
+| 快速切筛选后数据错乱 | 在途请求覆盖 / key 相同 | 让 key 携带参数，或 `cancelQueries` |
+| 4xx 还在重试 3 次 | 默认 retry 不看状态码 | 自定义 `retry` 函数 |
+
+## 拦路的几道题
+
+1. 写出 `GET /tasks?_page&_limit&status&q` 的 `queryKey` 设计与 key 工厂，说明为什么参数必须全进 key。
+2. `staleTime: 0` 和 `gcTime: 0` 分别会发生什么？各自适合什么场景？
+3. 实现"勾选完成"的乐观更新，要求失败回滚、成功后以服务端为准，写出五步。
+4. 一个页面同时展示"任务列表"和"任务详情"，删除任务后两者都要更新。写出失效策略（最小范围）。
+5. 判断：`useEffect(() => { refetch() }, [filter])` 用 Query 之后还需要吗？
+
+**自检标准**：第 3 题能说出五步各自的作用（取消、快照、写入、回滚、失效）；第 5 题能说出"filter 进 key 就够了，不需要手动 refetch"。
+
+## 下一步
+
+数据层搞定，剩下的"输入"是表单——10 讲表单工程：受控与非受控的取舍、字段级校验、焦点管理，以及超过 10 个字段时怎么不让整个表单每次按键都重渲染。

@@ -1,0 +1,240 @@
+---
+title: '10 · 表单工程：校验、焦点与性能'
+published: 2026-10-04T20:00:00+08:00
+description: '受控与非受控在真实表单里的取舍、React Hook Form + zod 的完整写法、字段级错误与服务端错误映射、焦点落到第一个错误、提交状态机、多步表单与草稿恢复，以及大表单不卡的做法。'
+tags: [React, 表单, 校验, ReactHookForm, zod, 可访问性]
+category: React学习路线
+draft: false
+---
+
+04 讲了表单的语法（`value`/`onChange`/`preventDefault`），这一篇讲**工程**：字段一多、校验一复杂，怎么写才不会变成一坨。
+
+判断一个表单写得好不好，看四个东西：**错误在哪显示、错误怎么聚焦、提交中能不能重复点、刷新后数据丢没丢。**
+
+## 受控 vs 非受控：不是二选一，是分场景
+
+| 场景 | 推荐 | 理由 |
+|---|---|---|
+| 3–5 个字段、需要实时联动 | 受控 `useState` | 简单直接，逻辑一眼看清 |
+| 10+ 个字段 | 非受控（RHF） | 受控时每次按键全表单重渲染 |
+| 有文件上传 | 非受控 | `<input type="file">` 天生非受控 |
+| 值要驱动别的 UI（如价格计算） | 受控或 `watch` 单字段 | |
+| 从服务端回填大量数据 | 非受控 + `reset(data)` | 避免几十个 `setState` |
+
+"受控 = 更好"是错的。**用户输入时只有那一个 input 需要更新，让整个表单重渲染是浪费。** 大表单的正解是"DOM 持有值，校验在提交/失焦时做"。
+
+## 一套能上生产的写法
+
+用 **React Hook Form（RHF）+ zod**。RHF 的模型是"非受控 + 订阅"，zod 负责"一份 schema，类型和校验同源"。
+
+```tsx
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+
+const schema = z.object({
+	title: z.string().trim().min(1, "标题不能为空").max(80, "标题最长 80 字"),
+	status: z.enum(["todo", "doing", "done"]),
+	dueDate: z.string().optional(),
+	priority: z.coerce.number().int().min(1).max(5),   // 表单值是字符串，coerce 转数字
+});
+
+type FormValues = z.infer<typeof schema>;   // 类型从 schema 推导，不手写第二份
+
+export function TaskForm({ defaultValues, onSubmit }: {
+	defaultValues?: Partial<FormValues>;
+	onSubmit: (v: FormValues) => Promise<void>;
+}) {
+	const {
+		register,
+		handleSubmit,
+		formState: { errors, isSubmitting },
+		setError,
+		reset,
+	} = useForm<FormValues>({
+		resolver: zodResolver(schema),
+		defaultValues: { status: "todo", priority: 3, ...defaultValues },
+		mode: "onBlur",        // 失焦校验，不打扰输入；提交时全量校验
+	});
+
+	async function submit(values: FormValues) {
+		try {
+			await onSubmit(values);
+			reset();               // 成功后清空
+		} catch (err) {
+			// 服务端字段级错误映射回表单
+			if (err instanceof ApiError && err.detail?.errors) {
+				for (const [field, msgs] of Object.entries(err.detail.errors)) {
+					setError(field as keyof FormValues, { message: (msgs as string[])[0] });
+				}
+			} else {
+				setError("root", { message: "提交失败，请重试" });
+			}
+		}
+	}
+
+	return (
+		<form onSubmit={handleSubmit(submit)} noValidate>
+			<Field label="标题" error={errors.title?.message}>
+				<input {...register("title")} aria-invalid={!!errors.title} />
+			</Field>
+			{/* ... */}
+			{errors.root && <p role="alert">{errors.root.message}</p>}
+			<button type="submit" disabled={isSubmitting}>
+				{isSubmitting ? "保存中…" : "保存"}
+			</button>
+		</form>
+	);
+}
+```
+
+几个关键点：
+
+- **`z.infer` 让类型只有一份**。写两遍（schema 一份、interface 一份）必然漂移。
+- **`mode: "onBlur"`**：边输入边报错体验很差（用户还没打完就说"格式不对"）。
+- **`isSubmitting` 禁用按钮**：防重复提交。这是必备，不是可选。
+- **`setError("root", ...)`** 放表单级错误（网络失败），和字段级错误分开。
+
+## 字段级错误：三件套
+
+错误提示不是"在下面打一段红字"就完事，要同时满足三件事：
+
+```tsx
+function Field({ label, error, children, hint }: {
+	label: string; error?: string; hint?: string; children: React.ReactNode;
+}) {
+	const id = useId();
+	const errId = `${id}-err`;
+	const hintId = `${id}-hint`;
+
+	return (
+		<div className="field">
+			<label htmlFor={id}>{label}</label>
+			{/* 克隆 children 注入 id 与 aria-describedby */}
+			{cloneElement(children as React.ReactElement, {
+				id,
+				"aria-invalid": !!error,
+				"aria-describedby": [hint && hintId, error && errId].filter(Boolean).join(" ") || undefined,
+			})}
+			{hint && <p id={hintId} className="hint">{hint}</p>}
+			{error && <p id={errId} className="error" role="alert">{error}</p>}
+		</div>
+	);
+}
+```
+
+三件套：**`label` 关联（`htmlFor`/`id`）+ `aria-invalid` + `aria-describedby` 指向错误文本**。缺了 `aria-describedby`，屏幕阅读器只读"标题，输入框，无效"，不读原因。
+
+## 焦点管理：把光标送到错误处
+
+用户点了"提交"，屏幕上有 5 个红字，但他看不到第一个在哪——**把焦点移过去**：
+
+```tsx
+import { flushSync } from "react-dom";
+
+async function submit(values: FormValues) {
+	// ...请求
+}
+
+// 校验失败后（RHF 的 onInvalid 或手动处理）
+const onInvalid = (errs: FieldErrors<FormValues>) => {
+	const first = Object.keys(errs)[0];
+	if (!first) return;
+	// 先渲染错误，再聚焦（否则元素可能还不存在）
+	flushSync(() => { /* 触发一次渲染 */ });
+	const el = document.querySelector<HTMLElement>(`[name="${first}"]`);
+	el?.focus();
+	el?.scrollIntoView({ block: "center", behavior: "smooth" });
+};
+```
+
+更稳的做法是**用 ref 映射**：
+
+```tsx
+const refs = useRef<Record<string, HTMLElement | null>>({});
+const registerWithRef = (name: keyof FormValues) => {
+	const r = register(name);
+	return { ...r, ref: (el: HTMLElement | null) => { r.ref(el); refs.current[name] = el; } };
+};
+```
+
+**焦点顺序要和视觉顺序一致**。如果错误列表在上方而字段在下方，聚焦字段的同时要滚动到可见区域，否则用户会"光标在下面、错误提示在上面"，来回找不到。
+
+## 提交状态机：四个状态不是两个
+
+```tsx
+// ❌ 只有"能点"和"不能点"
+<button disabled={loading}>
+
+// ✅ 区分：空闲 / 校验中 / 提交中 / 成功
+type FormStatus = "idle" | "validating" | "submitting" | "success";
+```
+
+差别在细节：
+
+- `submitting` 时按钮文案变"保存中…"，**并禁用整个 fieldset**（防止用户中途改字段）；
+- `success` 时不要立刻关弹窗——先给 300ms 的视觉反馈，再关，用户才知道"成功了"；
+- 失败时**保留用户填的内容**，只显示错误。清空是最让人恼火的行为之一。
+
+## 多步表单与草稿
+
+```tsx
+// 1) 每步独立校验，通过才允许下一步
+const stepSchemas = [step1Schema, step2Schema, step3Schema];
+
+// 2) 状态集中在一处，步骤切换不丢
+const [draft, setDraft] = useState<Partial<FullForm>>({});
+// 或 useReducer，一次交互改多个字段
+
+// 3) 草稿持久化（防误关页面）
+useEffect(() => {
+	const id = setTimeout(() => sessionStorage.setItem("draft", JSON.stringify(draft)), 500);
+	return () => clearTimeout(id);
+}, [draft]);
+```
+
+**多步表单的关键不是"分步"，是"每步都能独立校验、且能回退而不丢数据"。** 用一个 `useState` 存整个 draft，比每步一个 state 好维护得多。
+
+## 性能：大表单为什么不卡
+
+```tsx
+// ❌ 每个字段一个 state，每次按键整个表单重渲染
+const [title, setTitle] = useState("");
+const [desc, setDesc] = useState("");
+// ... 20 个
+
+// ✅ RHF 的 register 是非受控，输入不触发 React 重渲染
+<input {...register("title")} />
+```
+
+如果必须用自己的方案（不想引库），至少做到：
+
+- **拆分**：把表单拆成独立的小组件，每个组件管自己的 state，提交时汇总；
+- **`useReducer` + 只在需要时更新**：输入时只更新草稿 ref，失焦才 `setState`；
+- **别在渲染期做重计算**：`computed` 用 `useMemo`，依赖只放真正相关的字段。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 提交后页面刷新 | 没 `preventDefault` / button 默认 submit | `onSubmit` 里 `e.preventDefault()`，非提交按钮写 `type="button"` |
+| 双击提交了两次 | 没禁用按钮 | `isSubmitting` + `disabled` |
+| 服务端报"标题重复"，但字段下没提示 | 只 toast 了错误 | `setError('title', ...)` 映射到字段 |
+| 数字字段校验老是失败 | 表单值是字符串 | `z.coerce.number()` |
+| 错误提示屏幕阅读器不读 | 缺 `aria-describedby` / `role="alert"` | 补齐三件套 |
+| 提交失败后内容被清空 | `reset()` 放在 `finally` 里 | 只在成功分支 reset |
+| 输入卡顿（20+ 字段） | 受控 + 全表单重渲染 | RHF 非受控，或拆组件 |
+
+## 拦路的几道题
+
+1. 用 zod 写一个任务表单的 schema（标题必填、状态枚举、优先级 1–5、截止日期可选且不能早于今天），并推导出类型。
+2. 为什么 `mode: "onBlur"` 比 `onChange` 体验好？什么场景必须用 `onChange`？
+3. 服务端返回 `error.detail.errors.title = ["标题已存在"]`，怎么把它显示到标题字段下，并让焦点跳过去？
+4. 一个 15 字段的表单，用户反馈"打字卡"。列出三种可能原因和对应改法。
+5. 判断：提交成功后立刻 `reset()` 并关闭弹窗，有什么体验问题？
+
+**自检标准**：第 3 题能说出 `setError` + `aria-invalid` + 聚焦；第 5 题能说出"没有成功反馈，用户不确定是否保存成功"。
+
+## 下一步
+
+表单和请求都搞定了，还差"页面之间怎么跳"——11 讲路由：URL 即状态、数据路由、代码分割，以及为什么"筛选条件不进 URL"是个长期债务。

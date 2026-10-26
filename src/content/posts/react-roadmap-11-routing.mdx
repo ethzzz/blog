@@ -1,0 +1,220 @@
+---
+title: '11 · 路由与 URL 状态'
+published: 2026-10-05T00:00:00+08:00
+description: 'URL 即状态、useSearchParams 的正确用法、路由表设计、数据路由与 loader、代码分割与懒加载边界、错误路由与 404、路由层的权限控制，以及"筛选没进 URL"带来的三个长期债务。'
+tags: [React, 路由, ReactRouter, URL状态, 代码分割]
+category: React学习路线
+draft: false
+---
+
+路由不只是"切换页面"。在单页应用里，**URL 是唯一能持久、可分享、可回退的状态载体**。把状态放进 URL，很多功能几乎是白送的；不放进 URL，就要自己造轮子，而且造不好。
+
+## URL 即状态：三个白送的能力
+
+```tsx
+// 一个列表页：/tasks?status=todo&page=2&q=bug
+const [params, setParams] = useSearchParams();
+const status = params.get("status") ?? "all";
+const page = Number(params.get("page") ?? 1);
+const q = params.get("q") ?? "";
+```
+
+放进 URL 之后自动获得：
+
+1. **刷新不丢**——用户 F5 或误刷新，回来还是那一页；
+2. **可分享**——把链接发给同事，他看到的是同一个筛选结果；
+3. **后退可用**——浏览器后退键符合直觉（改筛选 = 产生一条历史记录）。
+
+**什么该进 URL**：筛选、分页、排序、tab、搜索词、展开的详情 id。
+**什么不该进 URL**：输入框里还没提交的字符、弹窗动画状态、hover、临时校验错误。
+
+### 更新要"合并"而不是"覆盖"
+
+```tsx
+// ❌ 会把 status 之外的参数全清掉
+setParams({ page: "3" });
+
+// ✅ 合并，且删除空值
+function patchParams(patch: Record<string, string | null>) {
+	setParams(prev => {
+		const next = new URLSearchParams(prev);
+		for (const [k, v] of Object.entries(patch)) {
+			if (v === null || v === "") next.delete(k);
+			else next.set(k, v);
+		}
+		return next;
+	}, { replace: false });
+}
+
+patchParams({ page: "3" });
+patchParams({ q: null });     // 清掉搜索词
+```
+
+`replace: true` 用在哪：**输入即筛选**时（每敲一个字都写一条历史，后退要按 20 次）。这时用 `replace` 只更新当前记录。
+
+### 一个实用的"筛选 hook"
+
+```tsx
+export function useFilters<T extends Record<string, string>>(defaults: T) {
+	const [params, setParams] = useSearchParams();
+
+	const values = useMemo(
+		() => Object.fromEntries(
+			Object.keys(defaults).map(k => [k, params.get(k) ?? defaults[k]])
+		) as T,
+		[params, defaults],
+	);
+
+	const patch = useCallback((p: Partial<Record<keyof T, string | null>>) => {
+		setParams(prev => {
+			const next = new URLSearchParams(prev);
+			for (const [k, v] of Object.entries(p)) {
+				if (v == null || v === "") next.delete(k);
+				else next.set(k, v);
+			}
+			return next;
+		});
+	}, [setParams]);
+
+	return { values, patch, reset: () => setParams({}) };
+}
+```
+
+这个 hook 就是"URL 即状态"的落地件，第 17 篇的毕业项目直接用它。
+
+## 路由表：别写成 300 行的一个数组
+
+```tsx
+// src/router.tsx
+const router = createBrowserRouter([
+	{
+		path: "/",
+		element: <AppLayout />,          // 布局：导航 + <Outlet />
+		errorElement: <RootError />,     // 兜住这一层的渲染错误（14）
+		children: [
+			{ index: true, element: <Navigate to="/tasks" replace /> },
+			{
+				path: "tasks",
+				element: <TaskListPage />,
+				loader: taskListLoader,       // 数据路由：进页面前先拿数据
+			},
+			{
+				path: "tasks/:id",
+				element: <TaskDetailPage />,
+				errorElement: <NotFound />,   // 只兜这一支
+				children: [{ path: "edit", element: <TaskEditPage /> }],
+			},
+			{ path: "*", element: <NotFound /> },
+		],
+	},
+]);
+```
+
+三条设计原则：
+
+1. **布局用嵌套路由**，不要每个页面重复写导航栏；
+2. **`errorElement` 分层放**：根层兜"白屏"，叶子层兜"这一页坏了"；
+3. **路径直接对应功能**，不要 `/:type/:id?/:action?` 这种万能路径——它会让权限控制和埋点都变难。
+
+## 数据路由：把"取数"提前到导航阶段
+
+React Router 的数据路由（6.4+）允许在渲染前拿数据：
+
+```tsx
+export async function taskListLoader({ request }: LoaderFunctionArgs) {
+	const url = new URL(request.url);
+	const params = {
+		page: Number(url.searchParams.get("page") ?? 1),
+		status: url.searchParams.get("status") ?? undefined,
+		q: url.searchParams.get("q") ?? undefined,
+	};
+	return { params, promise: api.listTasks(params) };   // 返回未 await 的 promise，让 Suspense 接管
+}
+```
+
+优点：**进入页面前就知道"没权限/没找到"**，可以 redirect 或抛 404，不会先闪一下空页面。
+
+但要注意：**如果你用 TanStack Query，两套缓存会打架**。实践中的选择是：
+
+- 只用 React Router loader（不用 Query）：适合页面级、粗粒度数据；
+- 只用 Query：适合组件级、需要后台刷新/失效的数据；
+- 混用：loader 里 `await queryClient.ensureQueryData(...)`，把 loader 当成"预热缓存"的入口——这是最干净的组合。
+
+```tsx
+export async function taskListLoader({ request, params }: LoaderFunctionArgs) {
+	const qc = queryClient;   // 从模块导入同一个实例
+	await qc.ensureQueryData({
+		queryKey: taskKeys.list(parseParams(request)),
+		queryFn: () => api.listTasks(parseParams(request)),
+	});
+	return null;   // 组件里 useQuery 直接命中缓存
+}
+```
+
+## 代码分割：按路由切，不按组件切
+
+```tsx
+// React.lazy：只在首次访问时下载该路由的 chunk
+const TaskListPage = lazy(() => import("./pages/TaskList"));
+
+// 或者数据路由的 lazy 写法（React Router 6.4+，能并行加载）
+{ path: "tasks", lazy: () => import("./pages/TaskList.route") }
+```
+
+**边界怎么定**：
+
+- **按路由切**是对的：用户不会同时需要"订单列表"和"设置页"；
+- **按组件切常常是错的**：把一个页面拆成 5 个 chunk，首屏要多发 5 个请求，反而更慢；
+- **例外**：体积巨大的独立功能（富文本编辑器、图表库、地图），它们只在特定交互下才需要，这时按组件切值得。
+
+配套的骨架屏很关键：懒加载期间必须有 fallback，否则用户看到的是空白。
+
+```tsx
+<Suspense fallback={<PageSkeleton />}>
+	<Outlet />
+</Suspense>
+```
+
+## 权限：路由层只做"粗筛"
+
+```tsx
+function RequireAuth({ children }: { children: React.ReactNode }) {
+	const { user, loading } = useAuth();
+	const location = useLocation();
+
+	if (loading) return <FullPageSpinner />;
+	if (!user) return <Navigate to="/login" state={{ from: location }} replace />;
+	return children;
+}
+```
+
+两点必须清楚：
+
+1. **前端路由守卫不是安全边界**。它只是体验优化——真正的权限校验必须在后端每个接口上做。把数据藏在"用户进不去的页面"里，等于没藏。
+2. **登录后要跳回原页面**：`state={{ from: location }}`，登录成功后 `navigate(from ?? "/tasks")`。不做这一步，用户点收藏链接 → 登录 → 被丢到首页，体验很差。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 刷新 404 | 静态服务器没配 fallback 到 index.html | nginx `try_files ... /index.html` |
+| 子路径部署后资源 404 | `base` 没设 | Vite `base: "/admin/"`，路由 `basename` 同步 |
+| 改了筛选，后退要按 20 次 | 每次输入都 push | 输入类更新用 `replace: true` |
+| 更新参数把别的参数清空了 | `setParams` 传了新对象 | 基于 `prev` 合并 |
+| 切页后滚动位置错乱 | 没重置滚动 | 监听 pathname 变化 `scrollTo(0,0)`，或 `ScrollRestoration` |
+| 弹窗关掉后还能后退回去 | 弹窗用了路由但没处理历史 | 关闭用 `navigate(-1)` 或 `replace` |
+| 首屏太大 | 全量 import 页面 | 按路由 `lazy` |
+
+## 拦路的几道题
+
+1. 把"筛选 + 分页 + 搜索"三件事做成 URL 状态，要求：刷新保持、可分享、清空某个筛选不影响其它参数。
+2. `setParams({ page: "2" })` 为什么会把 `status` 弄丢？写出正确写法。
+3. 一个页面 200KB，拆成 5 个 lazy 组件后首屏更慢了，为什么？该怎么切？
+4. 用户从收藏链接进入详情页 → 未登录 → 登录后应该回到哪？写出实现。
+5. 判断：前端路由守卫拦住了 `/admin`，是否等于后台安全了？
+
+**自检标准**：第 2 题能说出"新对象覆盖了整个 query"；第 5 题能明确说出"不是，接口必须自己鉴权"。
+
+## 下一步
+
+L2 到此结束。接下来是 L3 交付层：12 讲性能——从 Profiler 的数字出发，而不是从 `memo` 出发。

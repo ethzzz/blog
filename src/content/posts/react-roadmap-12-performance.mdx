@@ -1,0 +1,233 @@
+---
+title: '12 · 性能优化：从 Profiler 的数字出发'
+published: 2026-10-05T20:00:00+08:00
+description: '重渲染不等于慢、Profiler 怎么读、memo 生效的四个前提与失效原因、useMemo 的收益判断、列表虚拟化、状态下放与拆分、以及"首屏 JS 太大"和"交互卡"两类问题的不同解法。'
+tags: [React, 性能优化, Profiler, memo, 虚拟列表]
+category: React学习路线
+draft: false
+---
+
+性能优化最常见的错误是**先加 `memo`**。这个顺序是反的：`memo` 本身有成本（比较 props），加错了只会更慢，而且会让代码难读。
+
+正确的顺序是：**测量 → 定位 → 改一处 → 再测量**。这一篇讲怎么测、怎么定位、改什么。
+
+## 先分清两类"慢"
+
+| 症状 | 本质 | 主要手段 |
+|---|---|---|
+| **首屏慢**（白屏久） | 要下载/解析的 JS 太多 | 代码分割、按需加载、减少依赖（见 [工程化 09](/blog/posts/engineering-roadmap-09-bundle-analysis/)） |
+| **交互卡**（点了之后迟滞） | 主线程被长任务占住 | 减少渲染量、拆分更新、并发特性（13） |
+
+这两类问题的解法完全不同。**"我把每个组件都加了 memo，首屏还是 3 秒"**——因为 memo 对首屏加载没有任何影响。先判断是哪一类，再动手。
+
+## 怎么测
+
+### 1. React DevTools Profiler
+
+操作：打开 Profiler → 点录制 → 做一次你觉得卡的操作 → 停止。看三样东西：
+
+- **火焰图里的灰色 vs 彩色**：灰色 = 本次没重渲染（好），彩色 = 重渲染了（看是为什么）；
+- **单次提交耗时**：超过 16ms 就掉帧；
+- **"Why did this render?"**：在设置里打开，它直接告诉你原因（props 变了 / state 变了 / 父组件渲染 / context 变了）。
+
+这一栏是定位的关键。**它会把"父组件渲染"和"props 变化"分开**——前者说明需要 `memo`，后者说明 props 真的变了，`memo` 也救不了。
+
+### 2. `performance.measure` 打点
+
+Profiler 只能测 React，测不了"从点击到数据回来"。用 User Timing API 打通全链路：
+
+```ts
+performance.mark("submit-start");
+await save(data);
+performance.mark("submit-end");
+performance.measure("submit", "submit-start", "submit-end");
+// DevTools → Performance 面板里能看到这段标记
+```
+
+### 3. 一个便宜的渲染计数
+
+```tsx
+function useRenderCount(name: string) {
+	const n = useRef(0);
+	n.current++;
+	if (import.meta.env.DEV) console.log(`[render] ${name} #${n.current}`);
+}
+```
+
+比 Profiler 粗暴，但定位"谁在疯狂重渲染"特别快。**生产环境务必用 DEV 判断包住**。
+
+## 重渲染不等于慢
+
+一个组件重渲染了 100 次，如果每次只返回几个 `<div>`，总耗时可能只有 1ms——**优化它没有意义**。
+
+真正贵的是：
+
+- 渲染期做了重计算（排序 5000 项、正则匹配大文本）；
+- 渲染出大量 DOM（长列表、复杂表格）；
+- 挂载了昂贵的第三方组件（图表、编辑器、地图）。
+
+**判断标准**：Profiler 里这个组件的单次渲染耗时占了多少。占比小的别动。
+
+## memo：四个前提，缺一不可
+
+`memo` 只在**同时满足**以下条件时有效：
+
+1. **组件确实经常因父组件重渲染而重渲染**，且自己的 props 没变；
+2. **props 是浅比较可判等的**（对象/数组/函数每次新建就失效）；
+3. **组件渲染确实贵**（否则省下的不如比较成本）；
+4. **调用方传的 props 引用稳定**（否则第 2 条不成立）。
+
+```tsx
+const Row = memo(function Row({ item, onSelect }: {
+	item: Item;
+	onSelect: (id: string) => void;
+}) { ... });
+
+// ❌ 失效：每次渲染新建函数和对象
+<TaskTable
+	rows={data.filter(x => x.done)}     // 新数组
+	onSelect={(id) => setSelected(id)}  // 新函数
+	style={{ padding: 8 }}              // 新对象
+/>
+
+// ✅
+const rows = useMemo(() => data.filter(x => x.done), [data]);
+const onSelect = useCallback((id: string) => setSelected(id), []);
+const style = useMemo(() => ({ padding: 8 }), []);
+<TaskTable rows={rows} onSelect={onSelect} style={style} />
+```
+
+**这就是 `memo` 最常见的死法**：子组件 memo 了，但父组件每次给它新 props，等于白加。
+
+一个替代思路：**把"稳定"的部分提到组件外**。
+
+```tsx
+// 常量放在模块顶层，天然稳定
+const STYLE = { padding: 8 } as const;
+```
+
+## 比 memo 更有效的三招
+
+### 1. 状态下放（最有效，且零成本）
+
+```tsx
+// ❌ 输入框在父级 → 每敲一个字，整个大列表重渲染
+function Page() {
+	const [q, setQ] = useState("");
+	return (
+		<>
+			<input value={q} onChange={e => setQ(e.target.value)} />
+			<BigList />
+		</>
+	);
+}
+
+// ✅ 输入框自己管，只有需要 q 的部分跟着变
+function SearchBar({ onSearch }: { onSearch: (q: string) => void }) { ... }
+```
+
+**"把 state 移到真正需要它的地方"通常比任何 memo 都有效**，而且代码更简单。这也是 02 规则 3 的性能理由。
+
+### 2. 拆组件，让"变化"隔离
+
+```tsx
+// ❌ 一个组件里既有高频变化（鼠标位置）又有慢渲染（图表）
+function Chart() {
+	const [pos, setPos] = useState({ x: 0, y: 0 });
+	return (
+		<div onMouseMove={e => setPos({ x: e.clientX, y: e.clientY })}>
+			<HeavyChart />          {/* 跟着重渲染 */}
+			<div>{pos.x},{pos.y}</div>
+		</div>
+	);
+}
+
+// ✅ 把高频部分抽出去，HeavyChart 不受影响
+function Cursor() {
+	const [pos, setPos] = useState({ x: 0, y: 0 });
+	return <div onMouseMove={...}>{pos.x},{pos.y}</div>;
+}
+```
+
+### 3. 长列表虚拟化
+
+1000 个 DOM 节点滚动必然卡。用 `@tanstack/react-virtual` 只渲染视口内的十几行：
+
+```tsx
+const virtualizer = useVirtualizer({
+	count: items.length,
+	getScrollElement: () => parentRef.current,
+	estimateSize: () => 56,
+	overscan: 5,
+});
+
+return (
+	<div ref={parentRef} style={{ height: 600, overflow: "auto" }}>
+		<div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+			{virtualizer.getVirtualItems().map(v => (
+				<div
+					key={items[v.index].id}
+					style={{ position: "absolute", top: 0, transform: `translateY(${v.start}px)` }}
+				>
+					{items[v.index].name}
+				</div>
+			))}
+		</div>
+	</div>
+);
+```
+
+三个必须注意的点：
+
+- **行高要确定**（或提供 `measureElement`），否则总高度算错、滚动条乱跳；
+- **`overscan` 别设太大**，5 左右够，多了等于没虚拟化；
+- **`key` 用业务 id**，不要用 index（03 讲过为什么）。
+
+## 什么时候该上并发特性
+
+如果 Profiler 显示"一次更新本身就必须渲染大量内容，无法拆"，那 memo 和虚拟化都救不了——这是 13 的领域（`useTransition` 让高优先级输入先响应）。
+
+简单判断：
+
+- 卡在"打字时输入框延迟" → `useDeferredValue` 或 `useTransition`；
+- 卡在"一次渲染就要 200ms" → 先想办法减少渲染量（虚拟化/拆分），并发只是缓解；
+- 卡在"请求回来之前什么都不显示" → 这是加载体验，用骨架屏而不是并发。
+
+## 一份可执行的优化清单
+
+按 ROI 排序，前三条通常能解决大部分问题：
+
+1. **状态下放 / 拆分高频组件**（零成本）
+2. **长列表虚拟化**（1000 项以上）
+3. **按路由代码分割**（首屏慢时）
+4. **重计算 `useMemo`**（Profiler 显示计算占大头时）
+5. **`memo` + 稳定 props**（上述都做过之后）
+6. 并发特性（13）
+7. 手写缓存 / `useRef` 跳过重复计算（最后的细活）
+
+**每次只改一条，改完再测。** 一次改五处，出了问题不知道是哪条。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 加了 memo 反而更慢 | 比较成本 > 渲染成本，或 props 不稳定 | 先测 Profiler，确认占比 |
+| memo 完全无效 | props 里有内联函数/对象 | `useCallback`/`useMemo`，或常量外提 |
+| 优化后没变化 | 优化错了对象（首屏慢却去优化交互） | 先分类：加载慢还是交互卡 |
+| 列表滚动仍卡 | 虚拟化但行高不定 / overscan 太大 | 固定行高，`overscan: 5` |
+| 内存持续上涨 | 定时器/监听/socket 没清 | Heap snapshot 查 detached 节点 |
+| 开发环境很卡、生产还好 | StrictMode 双调用 + DevTools 开销 | 以生产构建测性能 |
+
+## 拦路的几道题
+
+1. 一个页面"打开要 4 秒、打开后操作很流畅"，该优化什么？列出三条最可能的措施。
+2. 一个 3000 行的表格，输入框在表格上方，打字卡。指出根因和两种改法。
+3. `<Row item={item} onSelect={id => pick(id)} />` 里 `memo` 为什么无效？给出三种修法。
+4. Profiler 显示某组件单次渲染 0.3ms，但一秒钟渲染 50 次。要不要优化？怎么判断？
+5. 判断：把所有组件都加上 `memo` 是"防御性优化"吗？
+
+**自检标准**：第 2 题能说出"输入框 state 在父级，导致整个表格重渲染"，并给出"状态下放"或"虚拟化 + memo"两种改法；第 5 题能说出"不是，比较也有成本，且掩盖了真正的结构问题"。
+
+## 下一步
+
+有些卡顿不是"渲染太多"，而是"一次渲染必须很久"。13 讲并发特性——让高优先级的输入先响应，把重活延后或降级。

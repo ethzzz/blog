@@ -1,0 +1,248 @@
+---
+title: '14 · 错误边界与线上可观测'
+published: 2026-10-07T00:00:00+08:00
+description: '为什么 try/catch 接不住渲染错误、错误边界的正确粒度与重置、React 19 的 onUncaughtError、白屏兜底与降级 UI、上报什么内容才能定位到行、sourcemap 与 release 对齐，以及四类高频崩溃源。'
+tags: [React, 错误边界, ErrorBoundary, 监控, 可观测]
+category: React学习路线
+draft: false
+---
+
+React 里最要命的问题不是"报错"，是**报错之后整页白屏**。一个组件抛异常，React 18 起会卸载整棵树——用户看到的是空白页面，刷新也没用（同样的错误会再抛一次）。
+
+这一篇讲两件事：**在哪个粒度兜住错误**，以及**兜住之后怎么定位到原因**。
+
+## 为什么 try/catch 接不住渲染错误
+
+```tsx
+// ❌ 没用
+try {
+	return <Broken />;
+} catch (e) {
+	return <Fallback />;
+}
+```
+
+原因：`<Broken />` 只是创建了一个元素对象，**真正的渲染发生在 React 内部的调度循环里**，不在你的 `try` 块中。错误抛出时，调用栈早就离开这个函数了。
+
+**同理，事件处理函数里的错误也不会被错误边界捕获**：
+
+```tsx
+<button onClick={() => { throw new Error("x") }}>
+```
+
+这个错误交给浏览器（`window.onerror`），React 不处理。
+
+所以四类错误要四套机制：
+
+| 错误来源 | 谁接 |
+|---|---|
+| 渲染 / 生命周期 | **错误边界** |
+| 事件处理函数 | `window.onerror` / `unhandledrejection` |
+| 异步（promise） | `.catch` / `unhandledrejection` |
+| 服务端渲染 / 数据加载 | 框架层 + 路由 `errorElement` |
+
+## 错误边界：还是得用 class
+
+React 至今没有函数式版的错误边界，因为它依赖 `getDerivedStateFromError` / `componentDidCatch` 这两个生命周期。
+
+```tsx
+import { Component, type ErrorInfo, type ReactNode } from "react";
+
+type Props = { children: ReactNode; fallback: (err: Error, reset: () => void) => ReactNode };
+type State = { error: Error | null };
+
+export class ErrorBoundary extends Component<Props, State> {
+	state: State = { error: null };
+
+	static getDerivedStateFromError(error: Error): State {
+		return { error };       // 渲染期抛出时调用：切到 fallback
+	}
+
+	componentDidCatch(error: Error, info: ErrorInfo) {
+		// 提交后调用：适合上报（有 componentStack）
+		reportError(error, { componentStack: info.componentStack });
+	}
+
+	reset = () => this.setState({ error: null });
+
+	render() {
+		if (this.state.error) return this.props.fallback(this.state.error, this.reset);
+		return this.props.children;
+	}
+}
+```
+
+两个生命周期的分工：
+
+- `getDerivedStateFromError`：**必须是纯函数**，只能返回新 state，用来切 UI；
+- `componentDidCatch`：可以做事（上报、清理），拿得到 `componentStack`（哪个组件的哪一行渲染出错）。
+
+**`componentStack` 是定位的关键**，它告诉你错误发生在组件树里的哪一段，比普通调用栈有用得多。
+
+## 粒度：不要只有一个全局兜底
+
+```tsx
+// ❌ 全站一个边界：任何一处出错，整站白屏
+<ErrorBoundary fallback={FullPageError}>
+	<App />
+</ErrorBoundary>
+
+// ✅ 分层
+<ErrorBoundary fallback={FullPageError}>       {/* 兜底：导航还在 */}
+	<Layout>
+		<ErrorBoundary fallback={SectionError}>   {/* 页面级：只坏这一块 */}
+			<Outlet />
+		</ErrorBoundary>
+		<ErrorBoundary fallback={WidgetError}>    {/* 组件级：推荐位、评论区 */}
+			<RecommendList />
+		</ErrorBoundary>
+	</Layout>
+</ErrorBoundary>
+```
+
+原则：**边界放在"坏了可以不影响别人"的分界上**。导航栏、主体内容、侧栏推荐位各一个，是最小可用配置。
+
+一个反直觉的点：**边界不捕获它自己 fallback 里的错误**。所以 fallback 本身要极简（纯静态 UI），别再嵌套复杂组件。
+
+## 重置：让用户能"重试"
+
+```tsx
+<ErrorBoundary
+	fallback={(err, reset) => (
+		<div role="alert">
+			<p>这块内容加载失败了</p>
+			<button onClick={reset}>重试</button>
+		</div>
+	)}
+>
+	<Comments postId={id} />
+</ErrorBoundary>
+```
+
+但有个陷阱：**如果错误是"数据导致的"，reset 之后会立刻再抛一次**（同样的 props、同样的数据）。所以：
+
+```tsx
+// 好的重置：连"输入"一起换掉
+<ErrorBoundary key={postId} fallback={...}>
+	<Comments postId={postId} />
+</ErrorBoundary>
+```
+
+用 `key` 把整个子树重建（03 讲过），比只清错误的 state 更彻底。
+
+## React 19：根级回调
+
+```tsx
+createRoot(container, {
+	onUncaughtError: (error, info) => {
+		reportError(error, { componentStack: info.componentStack });   // 没被边界接住的
+	},
+	onCaughtError: (error, info) => {
+		// 被边界接住的（默认只 console.error，生产里往往不需要上报）
+	},
+	onRecoverableError: (error, info) => {
+		// 可恢复错误：如水合不一致。这类不影响可用性，但要监控趋势
+	},
+});
+```
+
+`onRecoverableError` 特别值得一提：**水合不一致不会白屏**（React 会客户端重渲染），但说明服务端与客户端输出不同——常见原因是 `Date.now()`、`Math.random()`、`localStorage` 读取。这类问题不报出来就永远发现不了。
+
+## 上报什么才能定位到行
+
+一个"TypeError: Cannot read property 'name' of undefined"在压缩后的代码里毫无意义。上报要带三样：
+
+```ts
+function reportError(error: Error, extra: Record<string, unknown> = {}) {
+	const payload = {
+		message: error.message,
+		stack: error.stack,
+		name: error.name,
+		url: location.href,
+		release: import.meta.env.VITE_APP_VERSION,   // 和 sourcemap 对齐的关键
+		userAgent: navigator.userAgent,
+		breadcrumbs: getBreadcrumbs(),                // 最近的操作/请求记录
+		...extra,
+	};
+	navigator.sendBeacon("/api/errors", JSON.stringify(payload));   // 不阻塞卸载
+}
+```
+
+三个细节：
+
+1. **`release` 必须和 sourcemap 版本对应**，否则堆栈还原不出来。CI 里上传 sourcemap 时打同一个版本号（见 [工程化 08](/blog/posts/engineering-roadmap-08-cicd/)）。
+2. **`sendBeacon`** 用于"页面即将崩溃/关闭"时上报，`fetch` 会被取消。
+3. **面包屑**：记录最近 20 条"用户做了什么"（点击、路由变化、请求），出错时一起发。没有它，你只知道崩了，不知道为什么。
+
+```ts
+// 极简面包屑
+const crumbs: string[] = [];
+export function crumb(msg: string) {
+	crumbs.push(`${new Date().toISOString()} ${msg}`);
+	if (crumbs.length > 20) crumbs.shift();
+}
+// 在请求拦截器、路由变化、关键按钮点击处调用
+```
+
+## 降级 UI 的写法
+
+```tsx
+fallback={(err, reset) => (
+	<div className="error-card" role="alert">
+		<h2>内容加载失败</h2>
+		<p>可以尝试刷新，或稍后再来。</p>
+		<div>
+			<button onClick={reset}>重试</button>
+			<button onClick={() => location.reload()}>刷新页面</button>
+		</div>
+		{import.meta.env.DEV && <pre>{err.stack}</pre>}   {/* 生产不显示堆栈 */}
+	</div>
+)}
+```
+
+三条必须做到：
+
+- **说人话**，不要显示原始错误信息（"undefined is not a function"用户看不懂，还可能泄露内部信息）；
+- **给出口**（重试 / 回首页 / 联系客服），别只说"出错了"；
+- **`role="alert"`** 让屏幕阅读器播报。
+
+## 四类高频崩溃源
+
+| 来源 | 典型代码 | 预防 |
+|---|---|---|
+| 读 undefined 的属性 | `data.items.map()` 而 `data` 未加载 | 可选链 + 默认值；用 Query 的三态 |
+| 数组越界 | `arr[i].name` | 先判存在 |
+| 第三方组件初始化失败 | 图表容器尺寸为 0 | 包一层边界 + 容错默认值 |
+| 序列化/解析 | `JSON.parse(localStorage.getItem(...))` | try/catch + 默认值 |
+
+```ts
+function safeParse<T>(raw: string | null, fallback: T): T {
+	if (!raw) return fallback;
+	try { return JSON.parse(raw) as T; } catch { return fallback; }
+}
+```
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 用了边界还是白屏 | 错误发生在边界外层（如 App 根组件自己） | 在根外再包一层 + `onUncaughtError` |
+| 事件里的错误没被兜住 | 边界不管事件 | 加 `window.onerror` |
+| 重试后又崩 | 数据本身有问题 | 用 `key` 重建整棵子树 |
+| 上报没有堆栈符号化 | 没上传 sourcemap 或 release 不匹配 | CI 上传 + 版本对齐 |
+| 水合警告刷屏但不崩 | SSR/CSR 输出不一致 | `onRecoverableError` 上报，检查随机源 |
+| fallback 里又崩了 | fallback 太复杂 | 保持纯静态 |
+
+## 拦路的几道题
+
+1. 为什么 `try { return <Broken /> } catch {}` 接不住错误？用"渲染发生在哪"解释。
+2. `getDerivedStateFromError` 和 `componentDidCatch` 各能做什么、不能做什么？
+3. 一个页面有"导航 + 主体 + 推荐位"，错误边界怎么放？为什么不能只放一个？
+4. 上报时为什么要带 `release`？不带会怎样？
+5. 判断：错误边界能捕获 `setTimeout` 里抛出的异常吗？
+
+**自检标准**：第 1 题能说出"元素创建不等于渲染，渲染在 React 调度里"；第 5 题能明确说"不能，它只覆盖渲染与生命周期"。
+
+## 下一步
+
+兜底做完，还差"怎么证明它没坏"——15 讲测试：测行为不测实现、MSW 拦请求、以及如何让测试不 flaky。

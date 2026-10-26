@@ -1,0 +1,184 @@
+---
+title: '16 · 工程实战：目录、StrictMode、水合与 TypeScript'
+published: 2026-10-08T20:00:00+08:00
+description: '按功能分层的目录结构、StrictMode 的三个副作用暴露、SSR 水合不一致的五个来源、TypeScript 在 React 里的五个高频写法、环境变量与构建产物、以及一份上线前自检清单。'
+tags: [React, 工程化, StrictMode, 水合, TypeScript]
+category: React学习路线
+draft: false
+---
+
+前 15 篇讲"怎么写对"，这一篇讲"怎么组织才不容易写错"。内容是踩过的坑，不是理论。
+
+## 目录结构：按功能切，不按类型切
+
+```text
+src/
+├── app/                    # 应用装配：路由表、Provider、全局样式
+│   ├── router.tsx
+│   ├── providers.tsx
+│   └── main.tsx
+├── features/               # 按业务功能切（核心）
+│   ├── tasks/
+│   │   ├── api.ts          # 该功能的请求
+│   │   ├── queries.ts      # queryKey 工厂 + useQuery 封装
+│   │   ├── mutations.ts
+│   │   ├── hooks.ts        # 该功能的业务 Hook
+│   │   ├── components/     # 只服务 tasks 的组件
+│   │   └── pages/          # 路由页面
+│   └── auth/
+├── components/             # 跨功能通用组件（Button/Modal/Table）
+├── hooks/                  # 跨功能通用 Hook
+├── lib/                    # 无 UI 的工具（http、date、storage）
+├── styles/
+└── types/
+```
+
+**为什么按功能切**：改一个需求时，你希望相关文件都在一个目录里。按类型切（`components/`、`hooks/`、`utils/` 各放 40 个文件）会导致"改一个功能要跳 6 个目录"。
+
+**判断一个文件该放哪**：问"删掉 tasks 功能，它会被删吗？"——会 → `features/tasks`；不会 → 上一层。
+
+**边界规则**（可 lint 强制）：
+
+- `features/*` 之间不能互相 import（通过 `app` 或共享层通信）；
+- `components/` 不能 import `features/*`；
+- `lib/` 不能 import React 组件。
+
+## StrictMode：不是"烦人"，是"提前暴露"
+
+```tsx
+<StrictMode>
+	<App />
+</StrictMode>
+```
+
+开发环境下它会：
+
+1. **双调用组件函数**（含 `useState` 初始化、`useMemo` 计算）——暴露不纯的渲染；
+2. **挂载 → 卸载 → 再挂载**——暴露清理函数没写对；
+3. **（React 19）双调用 ref 回调**——暴露 ref 清理缺失。
+
+```tsx
+// 会被 StrictMode 抓出来的三个真实 bug
+useEffect(() => { window.addEventListener("resize", onResize); }, []);      // 没清理 → 双监听
+useEffect(() => { initChart(); }, []);                                       // 没销毁 → 两个实例
+const ref = (el) => { if (el) el.focus(); };                                 // 没处理 null
+```
+
+**别为了"让开发环境不双调用"而删掉 StrictMode。** 它抓的正是生产环境会漏的 bug（路由切换、条件渲染都会导致挂载卸载）。
+
+唯一需要处理的是"**数据请求发两次**"：正确做法不是关 StrictMode，而是**让请求幂等**（Query 自动去重），或者把请求从 effect 挪到事件。
+
+## SSR 水合不一致：五个来源
+
+水合（hydration）= 服务端渲染的 HTML 与客户端首次渲染的结果必须一致，否则 React 会警告并客户端重渲染。
+
+| 来源 | 错误写法 | 正确写法 |
+|---|---|---|
+| 时间 | `new Date().toLocaleString()` 直接渲染 | 服务端传固定值，或挂载后再渲染 |
+| 随机 | `Math.random()` 生成 id | `useId()` |
+| 浏览器 API | 渲染期读 `window.innerWidth` | `useSyncExternalStore` 或 effect |
+| 存储 | 渲染期 `localStorage.getItem` | 初始值用默认值，effect 里同步 |
+| 环境 | `import.meta.env.DEV` 影响渲染 | 通过 props/配置注入 |
+
+```tsx
+// 经典修法：两阶段渲染
+function ClientOnly({ children, fallback = null }: { children: React.ReactNode; fallback?: React.ReactNode }) {
+	const [mounted, setMounted] = useState(false);
+	useEffect(() => setMounted(true), []);
+	return mounted ? <>{children}</> : <>{fallback}</>;
+}
+```
+
+代价是这块内容会在客户端"晚一拍"出现。**能用确定性数据就别用 ClientOnly**（它会拖 LCP）。
+
+## TypeScript 在 React 里的五个高频写法
+
+```tsx
+// 1. children 用 ReactNode，不用 JSX.Element
+type Props = { children: React.ReactNode };
+
+// 2. 复用原生元素 props（不要手抄）
+type ButtonProps = React.ComponentPropsWithoutRef<"button"> & { variant?: "primary" };
+
+// 3. 复用别的组件 props（不要复制粘贴 interface）
+type CardProps = React.ComponentProps<typeof Card> & { extra: string };
+
+// 4. 事件类型：从元素推导，不手写完整泛型
+function onChange(e: React.ChangeEvent<HTMLInputElement>) { ... }
+
+// 5. 泛型组件：不要用 React.FC（它会吞掉泛型）
+function Select<T extends string>({ options, value, onChange }: {
+	options: { label: string; value: T }[];
+	value: T;
+	onChange: (v: T) => void;
+}) { ... }
+```
+
+**关于 `React.FC`**：它的问题不是"过时"，是**隐式带 `children`**（React 17 类型里）且**对泛型不友好**。所以现在统一推荐直接声明 props 类型。
+
+`useState` 的类型推断陷阱：
+
+```tsx
+const [items, setItems] = useState([]);              // ❌ never[]
+const [items, setItems] = useState<Task[]>([]);      // ✅
+const [user, setUser] = useState<User | null>(null); // ✅ 有 null 的情况显式声明
+```
+
+## 环境变量：只有 `VITE_` 前缀会进客户端
+
+```bash
+# .env
+VITE_API_BASE=https://api.example.com
+DATABASE_URL=postgres://...        # 不会进客户端（但也不该放在前端仓库）
+```
+
+```ts
+import.meta.env.VITE_API_BASE   // ✅
+import.meta.env.MODE           // ✅ 内置
+```
+
+**红线：任何 `VITE_` 变量都会被编进 JS 产物，能被用户看到。** 密钥、内网地址、第三方 secret 一律不能放。
+
+需要"运行时配置"（一份产物跑多环境）时，用 `/config.js` 在启动时注入（见 [工程化 13](/blog/posts/engineering-roadmap-13-release-rollback/)）。
+
+## 一份上线前自检清单
+
+```text
+□ StrictMode 打开，控制台无 "not wrapped in act"、无 key 警告、无水合警告
+□ 生产构建里 console.log 已被移除（vite esbuild drop）
+□ 所有列表 key 是业务 id
+□ 三个状态齐全：加载 / 空 / 错误
+□ 错误边界覆盖到"页面级"和"推荐位级"
+□ 关键路径有 E2E（登录/列表/增删改）
+□ 首屏 JS 有体积预算且 CI 会拦
+□ 图片有 width/height（防 CLS），首屏图不是 lazy
+□ 表单防重复提交、错误有 aria-describedby
+□ 只在键盘下走一遍核心流程
+```
+
+最后一条最容易被跳过，也最能暴露问题：**用 Tab 键从页面顶部走到提交按钮**，你会发现一堆 `div` 当按钮、焦点不可见、焦点顺序错乱的问题。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 生产环境请求两次 | 不是 StrictMode（它只在 dev） | 查是否有两个组件挂载同一 Query / effect 依赖问题 |
+| 水合警告刷屏 | 服务端与客户端首次渲染不一致 | 见上表五个来源 |
+| `import.meta.env` 是 undefined | 变量没 `VITE_` 前缀，或重启 dev 没生效 | 改 `.env` 后重启 |
+| 类型报错但运行时正常 | 类型只是编译期 | 不要靠类型做运行时校验（TypeScript 11） |
+| 循环依赖导致 undefined | feature 之间互相 import | 抽公共层，加 lint 边界规则 |
+| 部署到子路径后白屏 | `base` 没配 | Vite `base` + 路由 `basename` 同步 |
+
+## 拦路的几道题
+
+1. 画出你的项目目录（或设计一个），说明 `features/tasks` 里该有哪些文件、边界规则怎么落地。
+2. StrictMode 的双调用帮你发现了哪三类 bug？各举一例。
+3. 一个组件渲染"上次登录时间"，SSR 时报水合警告。给出两种修法及各自代价。
+4. 为什么 `React.FC` 不推荐？举一个它导致类型出错的例子。
+5. 判断：把 `VITE_API_TOKEN` 放在 `.env` 里安全吗？
+
+**自检标准**：第 3 题能说出"服务端传固定值"和"ClientOnly 两阶段渲染"两条路；第 5 题能明确说"不安全，会进产物"。
+
+## 下一步
+
+所有零件都讲完了。17 是把它们装成一台能跑的机器——任务中后台，3 阶段交付，25 条验收。

@@ -1,77 +1,192 @@
 ---
-title: '08 · 状态管理'
-published: 2026-09-30T14:00:00+08:00
-description: 'React 状态管理的分层选型：局部用 useState、跨层用 useContext、全局用 Zustand/Redux。讲清什么时候不该上状态库，以及 useReducer 在复杂状态机场景的价值。'
-tags: [React, 状态管理, Redux, Zustand, useReducer]
+title: '08 · Context 与状态管理：先分类，再选型'
+published: 2026-10-03T20:00:00+08:00
+description: '状态按归属分四类：URL、服务端、客户端全局、局部。Context 的性能代价与拆分、Selector 模式的必要性、Zustand/Jotai/Redux 的取舍、为什么服务端状态不该进 store，以及"什么时候什么都不用装"。'
+tags: [React, 状态管理, Context, Zustand, 服务端状态]
 category: React学习路线
 draft: false
 ---
 
-## 先问：真的需要状态库吗
+"该用什么状态管理"这个问题问错了。正确的问题是：**这个状态属于谁？**
 
-我见过太多项目一上来 `npm i redux`，结果 90% 的状态都是局部 `useState` 能解决的。状态管理的代价是**额外的抽象和心智负担**，别为"可能以后要"提前引入。
+同一份数据放错层，后面所有的复杂度都是还债。所以这一篇先分类，再讲工具。
 
-分层决策：
+## 按归属分四类
 
-| 范围 | 工具 | 理由 |
-| --- | --- | --- |
-| 单组件内 | `useState` | 最简单 |
-| 跨多层组件 | `useContext` | 免 prop drilling |
-| 多个不相关组件共享 | `useReducer` | 状态逻辑复杂、像状态机 |
-| 真正全局（用户、主题、购物车） | `Zustand` / `Redux` | 跨路由、需可预测/可调试 |
+| 类型 | 例子 | 该放哪 | 工具 |
+|---|---|---|---|
+| **URL 状态** | 筛选、分页、排序、tab、搜索词 | URL query | `useSearchParams`（11） |
+| **服务端状态** | 列表、详情、用户信息 | 请求缓存层 | TanStack Query / SWR（09） |
+| **客户端全局状态** | 登录态、主题、购物车、侧栏展开 | 全局 store | Context / Zustand / Jotai |
+| **局部状态** | 输入框、弹窗开关、hover | 组件内 | `useState` / `useReducer` |
 
----
+**四条判断顺序**（从上往下问，命中就停）：
 
-## useReducer：复杂本地状态
+1. 刷新后应该还在吗？分享链接要带上吗？→ **URL**
+2. 数据是后端来的吗？→ **服务端状态**（不要拷贝进 store）
+3. 跨页面/跨层级多个组件要读写吗？→ **全局**
+4. 都不是 → **局部**
 
-当 state 有多个子值、多种变更动作时，`useReducer` 比一堆 `useState` 清晰：
+第 2 条是最容易被违反的：把接口返回的列表存进 Redux，然后自己写一套"加载中/失败/重新请求/缓存失效"——这是把 Query 的活儿重写一遍，而且必然写得更差。
 
-```jsx
-function reducer(state, action) {
-  switch (action.type) {
-    case "add": return { ...state, items: [...state.items, action.item] };
-    case "remove": return { ...state, items: state.items.filter(i => i.id !== action.id) };
-    default: return state;
-  }
-}
-const [state, dispatch] = useReducer(reducer, { items: [] });
-dispatch({ type: "add", item });
+## Context 的真实代价
+
+Context 解决"跨层传递"，但它有两个硬限制：
+
+**限制 1：value 变化 → 所有消费者重渲染（不管用到哪部分）**
+
+```tsx
+const AppCtx = createContext<{ user: User; theme: string } | null>(null);
+
+// 主题变了，只读 user 的组件也会重渲染
+<AppCtx.Provider value={{ user, theme }}>
 ```
 
----
+**限制 2：没有 selector，无法只订阅一部分**
 
-## 轻量全局：Zustand
+```tsx
+// 想要"只有 count 变时才重渲染"，Context 做不到
+const { count } = useContext(StoreCtx);
+```
 
-```jsx
+### 拆分的三种手段
+
+```tsx
+// 1) 按"变化频率"拆多个 Context
+const UserContext = createContext<User | null>(null);
+const ThemeContext = createContext<Theme>("light");
+const ActionsContext = createContext<Actions | null>(null);  // 函数引用稳定，几乎不变
+
+// 2) value 用 useMemo 稳定
+const value = useMemo(() => ({ user, setUser }), [user]);
+
+// 3) 状态和 dispatch 分开：只读 dispatch 的组件不会因状态变化重渲染
+<StateCtx.Provider value={state}>
+	<DispatchCtx.Provider value={dispatch}>
+		{children}
+	</DispatchCtx.Provider>
+</StateCtx.Provider>
+```
+
+**还有一个结构上的解法**：把 Provider 放在尽可能低的位置。整个 app 一个 Provider，等于全站共享一次重渲染；只包住真正需要的子树，影响面就小。
+
+### 那 Context 什么时候够用
+
+- 值变化很少（主题、locale、当前用户）；
+- 消费方不多，或者本来就要一起重渲染；
+- 只往下传配置/依赖注入（如表单实例、i18n 函数）。
+
+**反例**：高频更新的值（鼠标位置、实时输入、计时器）放 Context = 全站卡顿。这类要么放进用得着的那个组件，要么用外部 store + selector。
+
+## 外部 store：为什么需要 selector
+
+```tsx
+// Zustand：订阅是"按 selector 取"，只有选出来的值变化才重渲染
 import { create } from "zustand";
-const useStore = create(set => ({
-  user: null,
-  setUser: (u) => set({ user: u }),
+
+type TaskStore = {
+	tasks: Task[];
+	add: (t: Task) => void;
+	remove: (id: string) => void;
+};
+
+export const useTaskStore = create<TaskStore>((set) => ({
+	tasks: [],
+	add: (t) => set((s) => ({ tasks: [...s.tasks, t] })),
+	remove: (id) => set((s) => ({ tasks: s.tasks.filter((x) => x.id !== id) })),
 }));
-// 组件内
-const user = useStore(s => s.user);
+
+// 组件只订阅 count
+const count = useTaskStore((s) => s.tasks.length);   // tasks 变了但它算出来还是 3 → 不重渲染
+const add = useTaskStore((s) => s.add);              // 引用稳定
 ```
 
-比 Redux 少一堆样板，按需订阅、无 Provider 包裹，中小型项目首选。
+这就是 Context 做不到的：**订阅粒度到"选出来的值"**。
 
----
+### 选型对照
 
-## Redux 何时值得
+| 方案 | 适合 | 代价 |
+|---|---|---|
+| `useState` + 提升 | 一两个组件共享 | 层级深了 props 穿透 |
+| Context | 低频全局值、依赖注入 | 无 selector，全量重渲染 |
+| **Zustand** | 中大型应用的客户端状态 | 需要约定"什么进 store" |
+| Jotai / Recoil | 大量独立原子、细粒度订阅 | 原子多了难追踪全局 |
+| Redux Toolkit | 需要时间旅行调试、严格 action 审计、大团队规范 | 样板多，容易过度设计 |
+| TanStack Query | **服务端状态**（不是替代 store） | 需要理解缓存语义 |
 
-需要**时间旅行调试、严格可预测、中间件生态**（如 redux-saga 处理复杂异步）的大型应用才上。现代 Redux 用 `@reduxjs/toolkit` 已大幅减负，但样板仍多于 Zustand。
+**默认建议：Context（低频值）+ TanStack Query（服务端）+ Zustand（真的需要全局客户端状态时）。** 三者不冲突，各管一段。
 
----
+## 一个必须讲清的边界：服务端状态不是全局状态
 
-## 小结
+```tsx
+// ❌ 常见反模式：把服务端数据搬进 store
+const useStore = create((set) => ({
+	tasks: [],
+	loading: false,
+	error: null,
+	fetchTasks: async () => {
+		set({ loading: true });
+		try { set({ tasks: await api.list(), loading: false }); }
+		catch (e) { set({ error: e, loading: false }); }
+	},
+}));
+```
 
-- 默认 `useState`；跨层 `useContext`；复杂本地 `useReducer`；真全局才上库。
-- Zustand 是轻量全局状态首选；Redux 留给需要强约束的大型应用。
-- 别提前引入状态库——它带来的是复杂度，不是免费午餐。
+问题：
 
----
+1. **缓存永不失效**：另一个页面改了数据，这里不知道；
+2. **重复请求**：三个组件同时挂载，发三次；
+3. **没有去重/重试/取消/后台刷新**：你要一个个补；
+4. **和 URL/分页耦合**：每个列表都要重写一套。
 
-## 练习
+而 Query 的模型是：**"这份数据由这个 key 标识，什么时候该刷新由 staleTime 决定"**：
 
-1. 把一个"多字段表单 + 多个 action"的 `useState` 堆砌改写成 `useReducer`。
-2. 用 Zustand 建一个 `cart` store，实现添加/删除/计数。
-3. 画一张决策图：什么时候用 useState / context / 状态库。
+```tsx
+const { data, isPending, error } = useQuery({
+	queryKey: ["tasks", { page, status }],
+	queryFn: () => api.list({ page, status }),
+	staleTime: 30_000,
+});
+```
+
+改完之后 `invalidateQueries({ queryKey: ["tasks"] })`，所有相关列表自动刷新——**不需要手动同步任何 store**。这是 09 的主题。
+
+## 状态设计的一个实操模板
+
+拿到需求先填这张表，填完再写代码：
+
+| 状态 | 类型 | 归属 | 备注 |
+|---|---|---|---|
+| `keyword` | URL | `useSearchParams` | 刷新/分享要保留 |
+| `page` | URL | 同上 | |
+| `taskList` | 服务端 | `useQuery(['tasks', {page, keyword}])` | |
+| `editingId` | 局部 | 列表页 `useState` | 只有本页用 |
+| `toast` | 全局 | Context（低频） | |
+| `sidebarOpen` | 全局 | Zustand 或 Context | 跨布局组件 |
+
+**这张表就是"状态树"**，也是 00 里第 1 条验收标准。"先画表再写组件"能省掉后面 80% 的返工。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 全站一起重渲染 | 单个 Context 装了大对象/高频值 | 拆分 Context，或换 selector 方案 |
+| store 里的数据和接口不一致 | 把服务端状态当客户端状态管 | 用 Query，别搬进 store |
+| 状态改了但列表不刷新 | 只更新了本地副本 | `invalidateQueries` |
+| Zustand 里写异步很乱 | 把请求逻辑塞进 store | 请求归 Query，store 只存 UI 状态 |
+| Context 里 value 每次新建 | 内联对象字面量 | `useMemo` |
+| 状态放太高层，父组件反复重渲染 | 状态提升过度 | 能下放就下放（02 规则 3） |
+
+## 拦路的几道题
+
+1. 一个后台有：登录用户、主题、当前页 tab、任务列表、筛选条件、弹窗开关。按四类归属填表，说明每个放哪。
+2. 为什么"把接口数据存进 Redux"通常是错的？列出至少三条你会因此多写的代码。
+3. 一个 Context 里同时放了 `user`（很少变）和 `draft`（每次输入都变），会有什么问题？给出两种改法。
+4. 用 Zustand 写一个 `useToastStore`，要求：任意组件能 `push`，只有一个组件渲染列表，且 `push` 引用稳定。
+5. 判断：小项目（10 个页面、3 人维护）需要 Redux 吗？说出你的判断依据。
+
+**自检标准**：第 1 题能明确把"任务列表"划给服务端状态、把"筛选条件"划给 URL；第 5 题能说出"看是否有跨页共享的客户端状态和审计需求，而不是看项目大小"。
+
+## 下一步
+
+状态归好类，其中最大的一块是"服务端状态"。09 讲 TanStack Query：`queryKey` 怎么设计、乐观更新怎么回滚、取消与并发怎么处理。

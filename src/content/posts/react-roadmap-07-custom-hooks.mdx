@@ -1,74 +1,272 @@
 ---
-title: '07 · 自定义 Hook'
-published: 2026-09-30T13:00:00+08:00
-description: '自定义 Hook 是 React 逻辑复用的正统方式：把状态逻辑抽成以 use 开头的函数，组件间共享行为而非复制代码。用一个 useFetch 实战讲透封装与返回约定。'
-tags: [React, 自定义Hook, 逻辑复用, useFetch]
+title: '07 · 自定义 Hook 与闭包陷阱'
+published: 2026-10-03T00:00:00+08:00
+description: '自定义 Hook 是逻辑复用而非状态共享、命名与返回值设计、闭包陷阱的四种现场与三种解法、依赖数组的正确收敛、事件与 effect 的取舍，以及 useEvent/useLatest 模式。'
+tags: [React, hooks, 自定义Hook, 闭包, 依赖数组]
 category: React学习路线
 draft: false
 ---
 
-## 为什么需要自定义 Hook
+自定义 Hook 是 React 里最重要的复用手段——它替代了 HOC 和 render props，也替代了"继承"在逻辑层的位置。但它有一个反直觉的性质，很多人用了很久都没意识到：
 
-当多个组件出现"相同的 state + effect 逻辑"（如"请求数据并显示 loading"），复制粘贴会散落 bug。自定义 Hook 把这段逻辑收口到一个函数里，**复用的是行为，不是 UI**。
+**两个组件调用同一个自定义 Hook，它们的状态是独立的。**
 
----
-
-## 命名与形态
-
-- 必须以 `use` 开头（让 React 识别这是 Hook，并套用 Hooks 规则）。
-- 内部可以调用其他 Hook。
-- 返回一个对象/数组，把状态和操作交还组件。
-
----
-
-## 实战：useFetch
-
-```jsx
-function useFetch(url) {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    fetch(url)
-      .then(r => r.json())
-      .then(d => !cancelled && setData(d))
-      .catch(e => !cancelled && setError(e))
-      .finally(() => !cancelled && setLoading(false));
-    return () => { cancelled = true; }; // 卸载/url 变化取消，避免竞态
-  }, [url]);
-
-  return { data, loading, error };
+```tsx
+function useCounter() {
+	const [n, setN] = useState(0);
+	return { n, inc: () => setN(v => v + 1) };
 }
-// 使用
-const { data, loading } = useFetch("/api/user");
+
+function A() { const c = useCounter(); ... }  // 自己的 n
+function B() { const c = useCounter(); ... }  // 另一个 n
 ```
 
-注意 `cancelled` 标志：URL 变化或组件卸载后，旧请求的结果不再写入 state，防止竞态与内存泄漏。
+因为 Hook 只是"把一段用 Hook 的逻辑抽出来"，`useState` 仍然属于调用它的那个组件。**自定义 Hook 共享的是逻辑，不是状态。** 想共享状态要用 Context 或外部 store（08）。
 
----
+## 一个标准写法
 
-## 复用契约
+```tsx
+// src/hooks/useDebouncedValue.ts
+import { useEffect, useState } from "react";
 
-- **输入**：参数（如 url、配置）。
-- **输出**：稳定结构（建议返回对象，未来加字段不破坏调用方）。
-- **副作用**：在内部 `useEffect` 管理，调用方无感知。
+/**
+ * 返回 value 的防抖副本：value 停止变化 delay 毫秒后才更新。
+ * 用于"输入即搜索"：输入框显示实时值，请求用防抖后的值。
+ */
+export function useDebouncedValue<T>(value: T, delay = 300): T {
+	const [debounced, setDebounced] = useState(value);
 
----
+	useEffect(() => {
+		const id = setTimeout(() => setDebounced(value), delay);
+		return () => clearTimeout(id);   // 关键：value 变化时取消上一次
+	}, [value, delay]);
 
-## 小结
+	return debounced;
+}
+```
 
-- 自定义 Hook 以 `use` 开头，复用"逻辑"而非 UI。
-- 把 state+effect 收口，组件只消费结果。
-- 注意竞态取消（`cancelled` 标志）与清理。
-- 返回对象比数组更易扩展。
+为什么清理函数是关键：每次 `value` 变化都会重跑 effect，若不清掉上一个 timer，会有多个 timer 同时存在，最后一个触发时用的可能不是最新值——**防抖就退化成"随机延迟"**。
 
----
+用法：
 
-## 练习
+```tsx
+const [q, setQ] = useState("");
+const debouncedQ = useDebouncedValue(q, 300);
+const { data } = useQuery({ queryKey: ["tasks", debouncedQ], queryFn: ... });
+```
 
-1. 写一个 `useLocalStorage(key, initial)`：状态与 localStorage 双向同步。
-2. 写一个 `useDebounce(value, delay)`：返回防抖后的值（结合 useEffect + setTimeout）。
-3. 给 `useFetch` 加一个 `refetch()` 手动刷新方法，扩展返回结构。
+## 返回值设计：对象还是元组
+
+```tsx
+// 元组：像内置 Hook，调用方可重命名，适合 2–3 个值
+function useToggle(init = false): [boolean, () => void] { ... }
+const [open, toggle] = useToggle();
+
+// 对象：字段多、可选字段多时更好，调用方按需取
+function useTaskList(): { items: Task[]; loading: boolean; error: Error | null; reload: () => void } { ... }
+const { items, loading } = useTaskList();
+```
+
+**经验规则**：返回值 ≤ 3 且语义对称（`[value, setter]`）用元组；否则用对象。对象返回时记得别每次新建（会破坏下游 memo），必要时 `useMemo`。
+
+## 闭包陷阱：四种现场
+
+"闭包陷阱（stale closure）"指的是：**函数捕获了某次渲染的变量，而那个变量后来变了，函数里读到的还是旧值。** React 里它不是 bug，是 JS 闭包 + 函数式组件的必然结果。
+
+### 现场 1：effect 里读 state，依赖写成 `[]`
+
+```tsx
+// ❌ 永远打印 0
+const [n, setN] = useState(0);
+useEffect(() => {
+	const id = setInterval(() => console.log(n), 1000);
+	return () => clearInterval(id);
+}, []);
+```
+
+修法 A：把 `n` 加进依赖（但 timer 会每次重建）。
+修法 B：**用函数式更新**，不需要读 `n`。
+修法 C：**用 ref 存最新值**。
+
+```tsx
+// 修法 C 的通用形态
+function useInterval(callback: () => void, delay: number) {
+	const savedCallback = useRef(callback);
+	useEffect(() => { savedCallback.current = callback; }, [callback]);
+
+	useEffect(() => {
+		const id = setInterval(() => savedCallback.current(), delay);
+		return () => clearInterval(id);
+	}, [delay]);   // 只依赖 delay，timer 不重建
+}
+```
+
+这是 Dan Abramov 的经典方案：**把"会变的函数"放进 ref，"不变的调度"留在 effect**。
+
+### 现场 2：事件处理函数里读 state
+
+```tsx
+// ❌ 每次渲染都新建函数，但闭包里是本次渲染的 count —— 这是对的！
+<button onClick={() => alert(count)}>
+
+// 真正的问题在这里：
+useEffect(() => {
+	const onKey = (e: KeyboardEvent) => {
+		if (e.key === "Enter") submit(form);   // form 可能是旧值
+	};
+	window.addEventListener("keydown", onKey);
+	return () => window.removeEventListener("keydown", onKey);
+}, []);   // ← 漏了 form
+```
+
+**事件处理函数里读 state 是安全的**——因为它跟着渲染重建。危险的是"被长期存活的回调捕获"的情况：`addEventListener`、`setTimeout`、WebSocket 回调、第三方库注册的回调。
+
+### 现场 3：`setTimeout` 里连读两次
+
+```tsx
+setCount(count + 1);
+setTimeout(() => setCount(count + 1), 0);  // ❌ 还是同一个 count
+```
+
+两次都基于同一个快照。要累加只能用 `prev => prev + 1`。
+
+### 现场 4：自定义 Hook 暴露了旧函数
+
+```tsx
+// ❌ 消费方拿到的是首次渲染的 inc，内部 n 永远是 0
+function useCounter() {
+	const [n, setN] = useState(0);
+	return { n, inc: () => setN(n + 1) };
+}
+
+// ✅
+function useCounter() {
+	const [n, setN] = useState(0);
+	const inc = useCallback(() => setN(v => v + 1), []);
+	return { n, inc };
+}
+```
+
+**凡是从 Hook 里返回的函数，都要检查它读了哪些 state，并保证读的方式不会过期**（函数式更新 / ref / 正确依赖）。
+
+## effect 还是事件：一个判断标准
+
+```tsx
+// ❌ effect 里监听"用户点了什么"，再用 state 传递
+const [submitted, setSubmitted] = useState(false);
+useEffect(() => { if (submitted) { save(); setSubmitted(false); } }, [submitted]);
+
+// ✅ 直接在事件里做
+function handleSubmit() { save(); }
+```
+
+**effect 是"同步"，事件是"响应"。** 由用户动作引起的事，就在事件处理函数里做完；只有"必须跟着某个 state 变化而持续同步"的事才进 effect。
+
+## 三个实用的自定义 Hook
+
+```tsx
+// 1) 点击外部关闭
+export function useClickOutside<T extends HTMLElement>(onOutside: () => void) {
+	const ref = useRef<T>(null);
+	const cb = useRef(onOutside);
+	useEffect(() => { cb.current = onOutside; }, [onOutside]);
+
+	useEffect(() => {
+		const handler = (e: MouseEvent) => {
+			if (ref.current && !ref.current.contains(e.target as Node)) cb.current();
+		};
+		document.addEventListener("mousedown", handler);
+		return () => document.removeEventListener("mousedown", handler);
+	}, []);
+
+	return ref;
+}
+
+// 2) 本地存储（带 SSR 保护与跨标签同步）
+export function useLocalStorage<T>(key: string, initial: T) {
+	const [value, setValue] = useState<T>(() => {
+		if (typeof window === "undefined") return initial;
+		try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : initial; }
+		catch { return initial; }
+	});
+
+	useEffect(() => {
+		localStorage.setItem(key, JSON.stringify(value));
+	}, [key, value]);
+
+	useEffect(() => {
+		const onStorage = (e: StorageEvent) => {
+			if (e.key === key && e.newValue) setValue(JSON.parse(e.newValue));
+		};
+		window.addEventListener("storage", onStorage);
+		return () => window.removeEventListener("storage", onStorage);
+	}, [key]);
+
+	return [value, setValue] as const;
+}
+
+// 3) 异步请求状态（不想上 Query 时）
+type AsyncState<T> = { data: T | null; loading: boolean; error: Error | null };
+
+export function useAsync<T>(fn: () => Promise<T>, deps: unknown[]): AsyncState<T> {
+	const [state, setState] = useState<AsyncState<T>>({ data: null, loading: true, error: null });
+
+	useEffect(() => {
+		let ignore = false;         // 防止竞态：旧结果回来时丢弃
+		setState(s => ({ ...s, loading: true, error: null }));
+
+		fn().then(
+			data => { if (!ignore) setState({ data, loading: false, error: null }); },
+			error => { if (!ignore) setState({ data: null, loading: false, error }); },
+		);
+
+		return () => { ignore = true; };
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, deps);
+
+	return state;
+}
+```
+
+第三个有个诚实的问题：**手写请求 Hook 最终会变成 Query 的劣化版**（没有缓存、没有去重、没有重试、没有后台刷新）。所以它只适合"一个页面临时拉一次"的场景，正式项目用 09 的方案。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 定时器里读到旧 state | 闭包捕获旧渲染 | 函数式更新 / ref |
+| 返回的函数总是操作旧数据 | 读 state 未收敛 | `useCallback` + 函数式更新 |
+| 两个组件"共用"Hook 但数据不同步 | Hook 不共享状态 | 用 Context / store |
+| 防抖失效、请求乱序 | 清理函数没清 timer / 没处理竞态 | `clearTimeout` + `ignore` 标志 |
+| 依赖数组加不完 | 依赖里有每次新建的对象/函数 | 依赖收敛到原始值，或用 ref |
+| `exhaustive-deps` 一直报警 | 结构有问题，不是 lint 的问题 | 重写 effect 结构，别关规则 |
+
+## 拦路的几道题
+
+1. 写一个 `useInterval(cb, delay)`，要求 `delay` 变化时重建 timer，但 `cb` 变化不重建，且 `cb` 内部总能读到最新 state。
+2. 解释为什么"两个组件调用同一个 `useCounter` 得到的是两份状态"，以及怎么做到真的共享。
+3. 下面这段的 bug 在哪？给出两种修法：
+
+```tsx
+function useSearch() {
+	const [q, setQ] = useState("");
+	const [list, setList] = useState([]);
+	useEffect(() => {
+		const id = setTimeout(async () => {
+			const res = await fetch(`/api/search?q=${q}`);
+			setList(await res.json());
+		}, 300);
+		return () => clearTimeout(id);
+	}, []);   // ← 注意这里
+	return { q, setQ, list };
+}
+```
+
+4. 一个 `useTaskForm` 需要暴露 `submit`，而 `submit` 要用到最新的 `values`。写出不会过期的实现。
+5. 判断：`useEffect(() => { if (saved) toast("已保存") }, [saved])` 该不该存在？
+
+**自检标准**：第 1 题能同时处理"回调最新"和"timer 不重建"；第 5 题能说出"用户动作的结果应该在事件里提示，不该绕道 state 再 effect"。
+
+## 下一步
+
+逻辑复用会了，接下来是**状态该放在哪一层**——08 讲 Context 的边界、服务端状态与客户端状态的分工，这是项目能维护三年的关键。

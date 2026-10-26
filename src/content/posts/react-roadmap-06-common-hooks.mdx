@@ -1,78 +1,264 @@
 ---
-title: '06 · 常用 Hooks'
-published: 2026-09-30T12:00:00+08:00
-description: 'useMemo 缓存计算结果、useCallback 缓存函数、useRef 持有可变引用且不触发重渲染、useContext 跨组件传值。讲清每个 Hook 的适用场景与误用代价。'
-tags: [React, useMemo, useCallback, useRef, useContext]
+title: '06 · 常用 Hooks：useRef / useMemo / useCallback / useReducer / useContext'
+published: 2026-10-02T20:00:00+08:00
+description: 'useRef 的三种用途（DOM、跨渲染存值、命令式 API）、useMemo 与 useCallback 的真实收益与误用、useReducer 什么时候比 useState 好、useContext 的订阅范围，以及 useId 与 useSyncExternalStore。'
+tags: [React, hooks, useRef, useMemo, useCallback, useReducer, useContext]
 category: React学习路线
 draft: false
 ---
 
-## useMemo：缓存昂贵计算
+05 讲了两个基础 Hook，这一篇讲其余常用的六个。每个都回答同一个问题：**它解决什么，什么情况下不该用它。**
 
-```jsx
-const sorted = useMemo(() => bigList.sort(compare), [bigList]);
+## useRef：三个完全不同的用途
+
+```tsx
+const ref = useRef<HTMLInputElement>(null);
 ```
 
-只有 `bigList` 变才重新排序，否则复用上次结果。适合**确实昂贵**的计算——别什么都包，记忆本身有成本。
+**用途 1：拿 DOM 节点**
 
----
+```tsx
+function SearchBox() {
+	const inputRef = useRef<HTMLInputElement>(null);
 
-## useCallback：缓存函数引用
+	useEffect(() => {
+		inputRef.current?.focus();  // 挂载后聚焦
+	}, []);
 
-```jsx
-const handle = useCallback(() => doSomething(a), [a]);
-```
-
-返回稳定的函数引用，传给被 `React.memo` 包裹的子组件时，能避免因父组件重渲染生成新函数而导致子组件无谓重渲染。
-
-> `useMemo`/`useCallback` 都要配合依赖数组；它们**不是**性能银弹，滥用反而慢。
-
----
-
-## useRef：可变盒子
-
-```jsx
-const inputRef = useRef(null);
-// 访问 DOM
-<input ref={inputRef} />;
-inputRef.current.focus();
-
-// 或存跨渲染的可变值（不触发重渲染）
-const timer = useRef();
-```
-
-与 state 区别：`ref.current` 改了**不会触发重渲染**，适合存 DOM 引用、定时器 ID、上一次的值。
-
----
-
-## useContext：跨层传值
-
-避免 props 层层透传（prop drilling）：
-
-```jsx
-const ThemeContext = createContext("light");
-function App() {
-  return <ThemeContext.Provider value="dark"><Toolbar /></ThemeContext.Provider>;
-}
-function Toolbar() {
-  const theme = useContext(ThemeContext); // 直接拿到，不用一层层传
+	return <input ref={inputRef} />;
 }
 ```
 
-注意：context 值变化会让**所有消费组件重渲染**，拆分 context 或结合 `memo` 控制范围。
+注意 `ref.current` 在 Commit 阶段（DOM 已创建）才被赋值，**渲染期读它是 `null`**。
 
----
+**用途 2：跨渲染存一个值，但改它不触发渲染**
 
-## 小结
+这是 `useRef` 最容易低估的用法——它是"渲染之间共享的可变盒子"：
 
-- `useMemo` 缓存计算、`useCallback` 缓存函数，都按依赖、别滥用。
-- `useRef` 存可变值/ DOM 引用，改动不触发渲染。
-- `useContext` 解决 prop drilling，但变化会广播给所有消费者。
+```tsx
+function Stopwatch() {
+	const startRef = useRef<number>(0);
+	const [elapsed, setElapsed] = useState(0);
 
----
+	useEffect(() => {
+		const id = setInterval(() => {
+			setElapsed(Date.now() - startRef.current);
+		}, 100);
+		return () => clearInterval(id);
+	}, []);
 
-## 练习
+	return (
+		<button onClick={() => { startRef.current = Date.now(); }}>
+			{elapsed}ms
+		</button>
+	);
+}
+```
 
-1. 一个列表组件，用 `useMemo` 缓存"根据关键词过滤+排序"的结果。
-2. 用 `useRef` 实现"组件挂载后自动聚焦输入框"。
-3. 写一个 `ThemeContext`，在深层子组件里读取主题值，体会免透传。
+对比 `useState`：
+
+| | `useState` | `useRef` |
+|---|---|---|
+| 值变化 | 触发重渲染 | 不触发 |
+| 渲染期可见的是 | 本次渲染的快照 | 永远是最新值 |
+| 适合存 | UI 要显示的东西 | 定时器 id、上一次的值、DOM 节点、标志位 |
+
+**经典组合**：把"最新值"放进 ref，解决闭包陷阱（07 展开）。
+
+```tsx
+function useLatest<T>(value: T) {
+	const ref = useRef(value);
+	ref.current = value;   // 渲染期赋值（这里是安全的：不读它做渲染决策）
+	return ref;
+}
+```
+
+**用途 3：暴露命令式 API**
+
+```tsx
+export type PlayerHandle = { play: () => void; pause: () => void };
+
+// React 19：ref 就是普通 prop，不需要 forwardRef
+export function Player({ ref }: { ref?: React.Ref<PlayerHandle> }) {
+	useImperativeHandle(ref, () => ({
+		play: () => videoRef.current?.play(),
+		pause: () => videoRef.current?.pause(),
+	}), []);
+	return <video ref={videoRef} />;
+}
+```
+
+**什么时候不该用**：能用 props/state 表达的就别用 ref。ref 里的值不参与渲染，滥用会让"UI 为什么是这个样子"变得无法推导。
+
+## useMemo 与 useCallback：先度量，再优化
+
+```tsx
+const sorted = useMemo(() => items.sort(cmp), [items]);
+const handleClick = useCallback(() => remove(id), [id, remove]);
+```
+
+`useCallback(fn, deps)` 等价于 `useMemo(() => fn, deps)`——**它只做一件事：在依赖不变时返回同一个函数引用**。
+
+### 它有用，只在两种情况下
+
+**情况 1：引用要作为依赖或 props 传给"会因为引用变化而跳过更新"的东西**
+
+```tsx
+// 子组件是 memo 的：函数每次新建 → memo 失效
+const Child = memo(function Child({ onSave }: { onSave: () => void }) { ... });
+
+// ❌ 父组件每次渲染都新建 onSave，Child 白 memo
+<Child onSave={() => save(form)} />
+
+// ✅
+const onSave = useCallback(() => save(form), [form]);
+<Child onSave={onSave} />
+```
+
+**情况 2：这个值要进另一个 Hook 的依赖数组**
+
+```tsx
+const queryKey = useMemo(() => ["tasks", { status, q }], [status, q]);
+useEffect(() => { ... }, [queryKey]);   // 不加 useMemo 会每次都是新数组 → effect 每次跑
+```
+
+### 它没用，在这些情况下
+
+```tsx
+// ❌ 无意义：缓存一个便宜计算，开销比缓存本身还大
+const total = useMemo(() => a + b, [a, b]);
+
+// ❌ 无意义：结果用在 JSX 里，父组件重渲染照样传新 props
+const style = useMemo(() => ({ color: "red" }), []);   // 除非传给 memo 组件
+
+// ❌ 有害：依赖数组写错导致读到旧值
+const rows = useMemo(() => filter(items, keyword), [items]);  // 漏了 keyword
+```
+
+**判断标准**：`useMemo` 的收益 = 省下的计算时间 × 跳过次数，成本 = 每次依赖比较 + 内存。**列表排序 5000 项（几十 ms）值得；`a + b` 不值得。**
+
+真正的性能优化从 Profiler 开始（12），不是从加 `memo` 开始。
+
+## useReducer：状态逻辑复杂时
+
+```tsx
+type State = { items: Task[]; filter: string; draft: string };
+type Action =
+	| { type: "add"; task: Task }
+	| { type: "remove"; id: string }
+	| { type: "setFilter"; filter: string }
+	| { type: "setDraft"; draft: string };
+
+function reducer(state: State, action: Action): State {
+	switch (action.type) {
+		case "add":
+			return { ...state, items: [...state.items, action.task] };
+		case "remove":
+			return { ...state, items: state.items.filter(t => t.id !== action.id) };
+		case "setFilter":
+			return { ...state, filter: action.filter };
+		case "setDraft":
+			return { ...state, draft: action.draft };
+		default:
+			return state;
+	}
+}
+
+function useTasks(initial: Task[]) {
+	const [state, dispatch] = useReducer(reducer, { items: initial, filter: "", draft: "" });
+	return { state, dispatch };
+}
+```
+
+**什么时候用 `useReducer` 而不是 `useState`**：
+
+- 一次交互要改多个字段（"提交成功后清空草稿 + 插入新项 + 关闭弹窗"）；
+- 下一个状态依赖上一个状态的多个部分（`useState` 要写好几次函数式更新）；
+- 想让状态变更**集中、可测**——`reducer` 是纯函数，单测不用渲染组件，这是最大的收益；
+- 状态字段超过 4–5 个，散着放会失控。
+
+**代价**：样板代码多。字段少、逻辑直白时，`useState` 更好。
+
+> `useReducer` 的 `dispatch` 引用是稳定的，可以安心放进依赖数组——这是它相对"一堆 setter"的额外好处。
+
+## useContext：读值，不是状态管理
+
+```tsx
+const ThemeContext = createContext<"light" | "dark">("light");
+
+function Button() {
+	const theme = useContext(ThemeContext);   // 订阅：value 变了就重渲染
+	return <button className={theme} />;
+}
+```
+
+关键点：**Provider 的 `value` 变化时，所有读取该 Context 的组件都会重渲染**，不管它实际用到 value 的哪一部分。
+
+```tsx
+// ❌ 每次 Provider 重渲染都新建对象 → 所有消费者重渲染
+<Ctx.Provider value={{ user, setUser }}>
+
+// ✅ 拆成两个 Context，或 memo 化 value
+const value = useMemo(() => ({ user, setUser }), [user]);
+```
+
+**Context 不是状态管理库**。它只解决"跨层传递"，不解决"更新粒度"和"派生状态"。状态管理的边界在 08 详述。React 19 可以直接写 `<Ctx value={...}>`，不用 `.Provider`。
+
+## 另外三个值得知道的
+
+**`useId`**：生成 SSR 安全的唯一 id，用于 `label`/`aria-describedby` 关联。
+
+```tsx
+const id = useId();
+<label htmlFor={id}>邮箱</label>
+<input id={id} aria-describedby={`${id}-err`} />
+```
+
+别用 `Math.random()` —— 服务端与客户端生成的不一致会导致水合警告。
+
+**`useSyncExternalStore`**：订阅 React 之外的数据源（全局 store、浏览器 API），保证并发渲染下不撕裂。
+
+```tsx
+const width = useSyncExternalStore(
+	(cb) => {
+		window.addEventListener("resize", cb);
+		return () => window.removeEventListener("resize", cb);
+	},
+	() => window.innerWidth,   // 客户端快照
+	() => 1024,                // 服务端快照
+);
+```
+
+**`useTransition` / `useDeferredValue`**：并发特性，13 专门讲。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| `ref.current` 在渲染期是 `null` | ref 在 Commit 才赋值 | 放到 effect 里读，或渲染期别读 |
+| 改了 `ref.current` UI 没变 | ref 不触发渲染 | 该用 state 就用 state |
+| 加了 `useCallback` 还是重渲染 | 依赖里有每次都新建的值（如内联对象） | 依赖收敛到原始值 |
+| `useMemo` 里读到旧值 | 依赖漏了 | 打开 `exhaustive-deps` 检查 |
+| Context 一改全站重渲染 | 单个 Provider 装了大对象 | 拆分 Context，value 用 `useMemo` |
+| `useReducer` 越写越乱 | 该拆 reducer 或该回到 `useState` | 按"一次交互"合并 action |
+| SSR 报水合不一致 | 用了 `Date.now()`/`Math.random()`/`useId` 缺失 | 用 `useId`，或把随机值放到 effect |
+
+## 拦路的几道题
+
+1. 用 `useRef` 实现 `usePrevious(value)`，返回上一次渲染的值。说明为什么不能用 state。
+2. 下面这段 `useCallback` 为什么没起作用？给出修法：
+
+```tsx
+const onSave = useCallback(() => save({ id, name }), [id, name]);
+// 父组件：<Child onSave={onSave} config={{ theme }} />
+```
+
+3. 一个表单有 6 个字段 + 提交状态 + 错误信息，判断该用 `useState` 还是 `useReducer`，并写出 action 设计。
+4. 为什么 Context 的 `value` 要 `useMemo`？如果不做，什么情况下后果最严重？
+5. 写一个 `useWindowWidth()`，要求 SSR 渲染时不报错、并发渲染下不撕裂。
+
+**自检标准**：第 1 题能说出"ref 改值不触发渲染，且下一个渲染期读到的是最新值"；第 4 题能说出"Provider 在频繁更新的父组件里时，所有消费者跟着重渲染"。
+
+## 下一步
+
+基础 Hook 都会用了，下一步是把它们**组装成可复用的逻辑**——07 讲自定义 Hook，同时解决那个反复出现的问题：闭包陷阱。

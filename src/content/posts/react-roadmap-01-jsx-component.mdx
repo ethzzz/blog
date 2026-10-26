@@ -1,96 +1,210 @@
 ---
 title: '01 · JSX 与组件模型'
 published: 2026-09-29T23:00:00+08:00
-description: 'JSX 不是模板语言而是 JS 的语法糖，理解它编译成 React.createElement 的本质；组件是函数、接收 props 返回 UI，单一职责与组合优于继承。'
+description: 'JSX 编译成什么、组件为什么必须是纯函数、props.children 的三种用法、组合优于继承的落地写法，以及"组件拆分"到底按什么拆。'
 tags: [React, JSX, 组件, 组合, createElement]
 category: React学习路线
 draft: false
 ---
 
-import MdxDemoCard from "@components/mdx/MdxDemoCard.astro";
+JSX 看起来像模板语言，其实不是。它是 `React.createElement` 的语法糖，编译后就是一堆函数调用——**理解这一点，后面几乎所有"为什么不能这么写"都能自己推出来**。
 
-## JSX 的本质
-
-新人常把 JSX 当"HTML 模板"。其实它只是语法糖，编译后是普通 JS：
+## JSX 编译成什么
 
 ```jsx
-// 你写的
-const el = <h1 className="title">Hello</h1>;
-// 编译后等价于
-const el = React.createElement("h1", { className: "title" }, "Hello");
+const el = <button className="btn" onClick={fn}>点我</button>;
 ```
 
-所以 JSX 里能写**任意 JS 表达式**（用 `{}` 包裹），它不是字符串也不是 HTML，是"描述 UI 的 JS 对象"。
+Babel/SWC 编译后（新版自动运行时）：
 
----
+```js
+import { jsx as _jsx } from "react/jsx-runtime";
+const el = _jsx("button", {
+	className: "btn",
+	onClick: fn,
+	children: "点我",
+});
+```
+
+三件事必须记住：
+
+1. **标签名不是字符串就是变量**。`<div>` 编译成 `"div"`，`<MyComp>` 编译成 `MyComp`（变量引用）——所以组件名必须大写，小写会被当字符串传给 `createElement`，报"未知标签"。
+2. **`{}` 里是真正的 JS 表达式**，不是模板占位符。所以 `if` 语句不能直接写（语句不是表达式），要用三元或 `&&`。
+3. **`props` 是一个普通对象**，没有任何魔法。你在组件里 `props.children` 拿到的就是父组件传进来的那个值。
+
+### 容易踩的三个语法点
+
+```jsx
+// ❌ 编译错误：if 是语句不是表达式
+<div>{ if (ok) 'yes' }</div>
+
+// ✅ 三元
+<div>{ok ? 'yes' : null}</div>
+
+// ⚠️ 这个坑很经典：count 为 0 时会渲染出 "0"
+<div>{count && <List />}</div>
+
+// ✅ 显式转布尔
+<div>{count > 0 && <List />}</div>
+```
+
+`0 && x` 返回 `0`，而 React 会渲染数字 `0`（只有 `null`/`undefined`/`false`/`true` 不渲染）。这类"渲染出 `0`"的 bug 在列表计数、搜索命中数为 0 时必现。
 
 ## 组件就是函数
 
-React 组件本质：**接收 `props`、返回 UI 描述的函数**。
+```tsx
+type Props = { title: string; children?: React.ReactNode };
 
-```jsx
-function Welcome({ name }) {
-  return <p>你好，{name}</p>;
+function Card({ title, children }: Props) {
+	return (
+		<section>
+			<h2>{title}</h2>
+			{children}
+		</section>
+	);
 }
-// 使用
-<Welcome name="Tom" />
 ```
 
-函数组件没有 `this`、没有生命周期（用 Hooks 代替），简单且易测。Class 组件已是非主流。
+**关键约束：组件必须是纯函数。** 同样的 props 和 state，必须返回同样的 UI。渲染期间不能：
 
----
+- 改外部变量（`let count = 0` 在组件外，渲染时 `count++`）
+- 发请求、写 localStorage、改 document.title
+- 用 `Math.random()` / `Date.now()` 直接决定渲染结果（会导致两棵树不一致）
+
+为什么要求这么严？因为**React 可能多次调用你的组件**：
+
+- 开发环境的 StrictMode 会故意双调用，帮你提前发现不纯；
+- 并发渲染下，渲染可能被中断后重来；
+- 父组件重渲染就会重新调用子组件。
+
+不纯的组件在这些场景下会出双倍请求、双倍副作用、随机数闪烁。**"纯"不是道德要求，是运行时的硬性前提。**
+
+> 副作用不是不能做，是必须放在事件处理函数或 `useEffect` 里——那才是渲染之外的地方。
+
+## props.children：组合的主要入口
+
+`children` 是 React 组合模型的基石，它能让你在不引入继承、不引入配置对象的情况下扩展组件：
+
+```tsx
+// 1) 直接嵌内容
+<Card title="订单">
+	<p>共 3 件</p>
+</Card>
+
+// 2) 用 slot 做具名插槽（本质还是 props，只是值是 JSX）
+<Layout
+	header={<Header />}
+	sidebar={<Nav />}
+>
+	<Main />
+</Layout>
+
+// 3) 函数作为 children（渲染回调，需要时再传数据）
+<MouseTracker>
+	{({ x, y }) => <p>{x}, {y}</p>}
+</MouseTracker>
+```
+
+第二种写法没有 `children` 关键字的特殊性——**`header` 就是一个普通 prop，只是值是 JSX 元素**。想明白这一点，就不需要"插槽"这个概念了。
 
 ## 组合优于继承
 
-React 不鼓励继承，而是用**组合（children / props 插槽）**复用结构：
+React 官方明确不推荐用继承复用 UI。原因：继承耦合的是"实现"，组合耦合的是"接口"，而 UI 的变化方向恰恰是实现。
 
-```jsx
-function Card({ title, children }) {
-  return (
-    <div className="card">
-      <h3>{title}</h3>
-      <div>{children}</div>
-    </div>
-  );
-}
-<Card title="统计"><Chart /></Card>
+```tsx
+// ❌ 继承：Dialog 的所有内部细节都被 AlertDialog 继承，改不动
+class AlertDialog extends Dialog { ... }
+
+// ✅ 组合：行为（弹窗）和内容（警告文案）解耦
+<Dialog open={open} onClose={close} title="确认删除">
+	<p>删除后不可恢复，确定吗？</p>
+	<Button onClick={close}>取消</Button>
+	<Button danger onClick={confirm}>删除</Button>
+</Dialog>
 ```
 
-需要多种变体时，用 `children` 或把组件当 `prop` 传入，比继承灵活得多。
+如果确实需要共享行为逻辑（不是 UI 结构），用**自定义 Hook**——它就是 React 世界里替代"多重继承"的东西（见 07）。
 
----
+## 组件该按什么拆
 
-## 单一职责
+新手按"HTML 结构"拆，老手按"变化的原因"拆。三条可操作的判据：
 
-一个组件只做一件事。当一个组件超过 ~150 行、props 超过 7 个，就该拆。拆出来的小组件更易复用和测试。
+1. **拆出会被复用的**：超过一次使用，或预计会被别的页面用。
+2. **拆出会独立变化的**：列表项和列表容器变化频率不同（一个随数据变，一个随布局变），就该分开。
+3. **拆出能独立测试的**：一段有分支的渲染逻辑，单独成组件后才好写测试。
 
----
+反过来，**不要为了"文件短"而拆**。一个 80 行、只服务一个页面的组件，拆成 5 个文件只会增加跳转成本。判断标准是：*这个组件的 props 是不是多到需要写 3 个 interface 才说得清*——那说明边界画错了。
 
-## 小结
+## 一个完整的组件写法样板
 
-- JSX 是 JS 语法糖，编译成 `createElement`，不是模板。
-- 组件 = 接收 props 返回 UI 的函数，优先函数组件。
-- 用组合（children/插槽）而非继承复用。
-- 单一职责，过大就拆。
+把上面所有规则揉在一起，这是本路线后面所有代码的风格基线：
 
----
+```tsx
+import type { ReactNode } from "react";
 
-## 练习
+type ButtonProps = {
+	variant?: "primary" | "ghost" | "danger";
+	loading?: boolean;
+	children: ReactNode;
+	onClick?: () => void;
+};
 
-1. 不用 JSX，用 `React.createElement` 手写一个 `<ul>` 含两个 `<li>` 的组件。
-2. 写一个 `Modal` 组件，用 `children` 接收弹窗内容、`title` prop 接收标题。
-3. 把一个"又长又多 props"的组件按单一职责拆成 3 个小组件。
+export function Button({
+	variant = "primary",
+	loading = false,
+	children,
+	onClick,
+}: ButtonProps) {
+	return (
+		<button
+			type="button"
+			className={`btn btn-${variant}`}
+			disabled={loading}
+			onClick={onClick}
+		>
+			{loading ? "处理中…" : children}
+		</button>
+	);
+}
+```
 
----
+注意几个细节，都是"生产环境才会疼"的点：
 
-## 附：MDX 实验
+- `type="button"` 必须显式写。不写默认是 `submit`，放进表单里点一下就把表单提交了——这是最经典的"按钮点了页面刷新"。
+- 默认值写在解构里（`variant = "primary"`），不用 `defaultProps`（函数组件已废弃）。
+- 类型用 `type` 而不是 `interface`：`type` 能写联合类型，且不会被声明合并污染。
+- `children: ReactNode` 而不是 `JSX.Element`：后者不接受字符串、数字、`null`。
 
-这篇文章已从 `.md` 切换为 `.mdx`。下面这个卡片不是 Markdown 语法，而是被 MDX 引入并渲染的 Astro 组件：
+## 常见坑
 
-<MdxDemoCard
-	label="MDX：JSX 表达式在构建期求值"
-	expression="{ 6 * 7 }"
-	result={String(6 * 7)}
-/>
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| `Warning: React.jsx: type is invalid` | 组件名小写，或 import 写错（默认导出 vs 具名） | 首字母大写；检查 `import { X }` / `import X` |
+| 页面莫名渲染出一个 `0` | `{count && ...}` 中 count 为 0 | `{count > 0 && ...}` 或 `{!!count && ...}` |
+| 点击按钮页面刷新 | `<button>` 默认 `type="submit"` | 显式 `type="button"` |
+| 组件渲染两次、请求发两次 | StrictMode 双调用；或组件不纯 | 先确认是开发环境，再把副作用挪出渲染期 |
+| 返回相邻两个元素报错 | 多根节点 | 用 Fragment 包裹，或 `<>...</>` |
+| `key` 写在自定义组件里但无效 | key 必须写在**数组元素**上，不能透传 | 在 map 的那一层加 key |
 
-同一份文件里也能直接写 JSX：<span className="font-semibold text-[var(--primary)]">{["MDX", "JSX", "Astro"].join(" + ")}</span>，上面卡片里的 `42` 同样来自表达式而不是手写文本。
+## 拦路的几道题
+
+1. 把 `<div className={styles.box}>{items.length && <List />}</div>` 在 `items` 为空时的输出写出来，并说明为什么。
+2. 写出 `<Modal title="x" open>正文</Modal>` 编译后的 `jsx()` 调用（含 `open` 为 `true`）。
+3. 下面这个组件为什么在 StrictMode 下会打印两次，怎么改才对？
+
+```tsx
+function Bad() {
+	console.log("render");
+	localStorage.setItem("seen", String(Date.now()));
+	return <p>hi</p>;
+}
+```
+
+4. 有一个 `Dialog` 需要支持"标题右侧有操作按钮"和"底部有额外内容"，用组合写出来，不要加 `showActions` 这类布尔 prop。
+5. 判断：把一个大表单拆成 6 个子组件，一定更好维护吗？说出反例。
+
+**自检标准**：第 1 题能说出"渲染出 `0`"；第 3 题能说出"写 localStorage 是副作用，应放进 effect 或用事件触发"，并知道生产环境不会双调用。
+
+## 下一步
+
+组件会写了，接下来是最容易写错的地方：**状态放哪、什么时候该更新**。02 讲"状态归属"，03 讲"什么时候会重渲染"——这两篇是后面所有 bug 的解药。

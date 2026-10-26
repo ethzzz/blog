@@ -1,0 +1,207 @@
+---
+title: '04 · 事件系统与表单基础'
+published: 2026-10-01T20:00:00+08:00
+description: '合成事件与 delegate 到根节点、事件对象不能异步读取的历史与现状、批处理规则、受控输入的光标跳动、表单提交与 preventDefault，以及"输入法合成中"为什么要单独处理。'
+tags: [React, 事件, 表单, 合成事件, 批处理]
+category: React学习路线
+draft: false
+---
+
+事件是 React 里"JS 世界与浏览器世界"的交界。它有几个和原生 DOM 不一样的地方，不了解就会遇到一些很诡异的现象：`e.target` 在 `setTimeout` 里是 `null`（老版本）、`onChange` 在中文输入时乱跳、点一下按钮表单就提交了。
+
+## 合成事件：一层包装
+
+React 不把 `onClick` 直接挂到每个 DOM 节点上，而是**在根容器上挂一次**，靠事件冒泡统一分发（React 17 起挂到 root 容器，之前挂在 `document`）。
+
+```jsx
+<button onClick={handle}>点</button>
+```
+
+实际发生的事：
+
+1. React 在 root 容器注册 `click` 监听；
+2. 点击冒泡到 root，React 找到事件源，沿 React 树构造一条"捕获 → 冒泡"路径；
+3. 依次调用你写在 JSX 上的处理函数，参数是一个 `SyntheticEvent`。
+
+好处：跨浏览器一致、事件对象有统一 API、内存占用低（不需要为每个节点绑定）。
+
+代价（都是真会遇到的）：
+
+- **`e.stopPropagation()` 只拦 React 树**，拦不住同层的原生监听器；
+- **Portal 里的组件，事件仍然会冒泡到 React 树的父级**（不是 DOM 父级）——这是 Portal 弹窗里点内部会触发外层 `onClick` 的原因；
+- **想用原生事件**（如 `passive`、自定义事件）必须 `ref` 加 `addEventListener`。
+
+### `e.persist()` 已经不需要了
+
+React 16 及以前为了复用事件对象，事件回调结束后会把对象"池化回收"，所以在 `setTimeout` 里读 `e.target` 会拿到 `null`，必须 `e.persist()`。**React 17 起取消了池化，`e.persist()` 是空操作**。看到老代码里的 `persist` 可以删掉。
+
+但**"合成事件对象在异步里不一定还有效"这个直觉要留着**——React 19 里 `e.target` 是真实 DOM 引用，节点被卸载后它就是 `null`（因为 DOM 没了），跟池化无关。
+
+## 批处理：一次点击只渲染一次
+
+```jsx
+function handle() {
+	setA(1);
+	setB(2);
+	setC(3);
+	// React 18+ 只渲染一次（自动批处理）
+}
+```
+
+- React 18 之前：只在 React 事件里批处理，`setTimeout`、`Promise.then`、原生事件里**不批处理**（渲染 3 次）。
+- React 18 起：**所有场景自动批处理**（`createRoot` 下）。
+
+想强制"立刻渲染"（几乎不需要），用 `flushSync`——但会破坏并发特性，除非在做测量（如获取 DOM 尺寸后同步更新），否则别用。
+
+**批处理是 02 那条"快照"规则的物理原因**：一次事件里所有 `set` 都在同一个批次里，因此都基于同一份 state 快照。
+
+## 表单：受控输入的两个坑
+
+### 坑 1：光标跳到末尾
+
+```jsx
+// ❌ 每次输入都格式化，光标跳到末尾
+<input
+	value={phone.replace(/\D/g, "")}
+	onChange={e => setPhone(e.target.value)}
+/>
+```
+
+原因：`value` 被"修正"成和输入不一致，React 重置了 DOM 的值 → 光标位置回到末尾。
+
+正确做法：**在 `onChange` 里格式化 state 本身**，让 `value` 与 DOM 始终一致：
+
+```jsx
+<input
+	value={phone}
+	onChange={e => setPhone(e.target.value.replace(/\D/g, "").slice(0, 11))}
+/>
+```
+
+### 坑 2：中文输入法
+
+拼音输入过程中，`onChange` 会拿到拼音字母（如 `nihao`），此时做过滤/校验会打断输入。
+
+```jsx
+const [composing, setComposing] = useState(false);
+
+<input
+	value={text}
+	onCompositionStart={() => setComposing(true)}
+	onCompositionEnd={e => {
+		setComposing(false);
+		setText(e.currentTarget.value);
+	}}
+	onChange={e => { if (!composing) setText(e.target.value); }}
+/>
+```
+
+**搜索框（输入即请求）必须处理这个**，否则中文用户每次打字都会发出一串无意义的拼音请求。这个坑在英文教程里几乎不提，但在中文产品里是必现的。
+
+### 非受控：`defaultValue` + `ref`
+
+```jsx
+const inputRef = useRef<HTMLInputElement>(null);
+
+<form onSubmit={e => {
+	e.preventDefault();
+	console.log(inputRef.current?.value);
+}}>
+	<input ref={inputRef} defaultValue="初始值" name="title" />
+	<button type="submit">保存</button>
+</form>
+```
+
+适用：文件上传（`<input type="file">` 天生非受控）、字段极多的表单（见 10）、集成非 React 库。
+
+## 表单提交
+
+```jsx
+function LoginForm() {
+	const [error, setError] = useState<string | null>(null);
+
+	async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+		e.preventDefault();             // 必须：否则整页刷新（SPA 里等于全部状态丢失）
+		const fd = new FormData(e.currentTarget);
+		const email = String(fd.get("email") ?? "");
+		if (!email.includes("@")) {
+			setError("邮箱格式不对");
+			return;
+		}
+		await login({ email });
+	}
+
+	return (
+		<form onSubmit={handleSubmit} noValidate>
+			<input name="email" type="email" />
+			<button type="submit">登录</button>
+			{error && <p role="alert">{error}</p>}
+		</form>
+	);
+}
+```
+
+三个细节：
+
+- **`e.preventDefault()` 不能忘**。SPA 里表单默认提交会导致页面刷新，所有 state 清空。这是"点了保存然后什么都没了"的第一嫌疑。
+- **`name` 属性 + `FormData`** 是拿到整个表单值的零样板方式，比给每个字段写 `useState` 省事得多。
+- **`role="alert"`** 让屏幕阅读器立即播报错误；`noValidate` 关掉浏览器原生校验气泡，改用你自己的提示（原生气泡不可样式化、且文案随浏览器变）。
+
+## 事件处理函数的三个写法
+
+```jsx
+// 1) 内联箭头：需要传参时最直接，但每次渲染都是新函数（影响 memo，见 12）
+<button onClick={() => remove(id)}>删</button>
+
+// 2) 具名函数：不依赖 props，最省
+function handleClick() { ... }
+<button onClick={handleClick}>
+
+// 3) 柯里化：列表里传参又不想每次新建
+const remove = (id: string) => () => setItems(p => p.filter(x => x.id !== id));
+<button onClick={remove(id)}>删</button>   // 注意：这仍然是每次渲染新建
+```
+
+想在列表里避免函数重建，正确姿势是**把 id 从 DOM 上读**：
+
+```jsx
+<button data-id={item.id} onClick={handleRemove}>删</button>
+// handleRemove 里：const id = (e.currentTarget as HTMLElement).dataset.id
+```
+
+或者用**事件委托**：
+
+```jsx
+<ul onClick={e => {
+	const id = (e.target as HTMLElement).closest("[data-id]")?.getAttribute("data-id");
+	if (id) remove(id);
+}}>
+	{items.map(i => <li key={i.id} data-id={i.id}>{i.name}</li>)}
+</ul>
+```
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+|---|---|---|
+| 点按钮页面刷新 | `<button>` 默认 `type="submit"` | 显式 `type="button"` |
+| 输入中文时请求乱发 | 合成输入未处理 | `compositionstart/end` |
+| 输入时光标跳末尾 | `value` 与 onChange 不同步 | 在 onChange 里格式化 state |
+| Portal 里点击触发外层回调 | React 事件按组件树冒泡 | 内层 `e.stopPropagation()` |
+| `stopPropagation` 拦不住第三方监听 | 它只作用于 React 树 | 用原生 `addEventListener` + 捕获阶段 |
+| `onChange` 不触发（第三方输入） | 原生 value setter 绕过了 React | 用 `ref` + 手动派发 `input` 事件 |
+| `setTimeout` 里渲染了多次 | React 17 及以前不批处理 | 升级到 18+，或用 `flushSync` 前先想清楚 |
+
+## 拦路的几道题
+
+1. 写一个手机号输入框：只能输数字、最多 11 位、不允许光标跳末尾。说明为什么不能在 `value` 上做格式化。
+2. 为什么中文输入法下"输入即搜索"会发出无意义的请求？给出 `compositionstart/end` 的完整实现。
+3. 一个 Portal 弹窗里点了"删除"，外层卡片的 `onClick`（跳转详情）也被触发了。解释原因并给两种修法。
+4. 用 `FormData` 实现一个 5 字段的注册表单，要求提交时校验并把错误显示在对应字段下方。
+5. 判断：`onClick={() => remove(id)}` 在 1000 项列表里，会带来什么性能影响？（提示：和 `memo` 有关）
+
+**自检标准**：第 1 题能说出"value 被改写成和 DOM 不一致时，React 会重置 DOM 值、光标回末尾"；第 5 题能说出"每次渲染新建函数 → 子组件 memo 失效"。
+
+## 下一步
+
+事件和表单是"输入"，接下来是"记忆"——05 讲 Hooks 的基础，重点是 `useEffect` 到底在同步什么，以及为什么依赖数组是新手重灾区。

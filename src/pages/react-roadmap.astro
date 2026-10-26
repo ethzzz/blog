@@ -33,7 +33,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 	<div class="onload-animation">
 		<div class="mb-8">
 			<h1 class="text-3xl font-bold text-90 mb-2">React 实战</h1>
-			<p class="text-75 text-lg">从组件思想到工程化落地，一套能打的 React 体系 · 共 {sortedPosts.length} 篇</p>
+			<p class="text-75 text-lg">从渲染机制到能交付，一套能落地的 React 体系 · 共 {sortedPosts.length} 篇</p>
 		</div>
 
 		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
@@ -108,7 +108,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 
 		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
 			<p class="font-medium mb-1">💡 学习建议</p>
-			<p>先吃透"单向数据流 + 状态自上而下"的心智模型，再学 Hooks。useEffect 的依赖数组是新手重灾区，务必理解"它什么时候跑"。状态管理别一上来就 Redux，小项目 Context 或 Zustand 足够。性能优化是"先度量再优化"，别无脑 memo。</p>
+			<p>按三层读，不要顺读：<strong>L1（01–05）</strong> 讲渲染机制与状态归属，是后面所有"为什么"的地基，务必动手；<strong>L2（06–11）</strong> 讲复用与数据——07 的闭包陷阱、08 的状态归属、09 的数据缓存收益最大；<strong>L3（12–16）</strong> 讲交付——12 先学看 Profiler 再谈优化，14 决定线上会不会白屏。13 的并发特性与 15 的测试可以最后补。17 是毕业项目，建议留一整块时间做完。</p>
 		</div>
 
 		<div class="mt-4 flex flex-wrap gap-4 text-sm">
