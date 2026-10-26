@@ -154,3 +154,14 @@ src/auth/
 2. 实现 refresh token：签发时存 Redis（`SET refresh:{userId} <token> EX 604800`），退出登录时删除，观察"改密码后旧 refresh 失效"。
 3. 用 `@RequirePermission` 实现"作者只能删自己的文章 + 管理员能删任何文章"，拆分清楚 RBAC 层和业务层各自负责什么。
 4. 给登录接口单独配 5 次/分钟限流，然后用脚本连发请求验证 429 响应。
+
+
+## 验收清单
+
+- [ ] 密码用 bcrypt/argon2 哈希，cost 参数说得清为什么选这个值
+- [ ] 会话或 JWT 有过期与轮换，登出后服务端能失效旧凭据
+- [ ] cookie 是 `httpOnly` + `Secure` + `SameSite`
+- [ ] 每个写接口都校验身份与数据归属（不只是"登录了"）
+- [ ] 限流按 IP 与用户两个维度，登录接口更严
+- [ ] 能各举一个 SQL 注入、路径穿越、SSRF 的防护点（参数化、白名单、出网限制）
+- [ ] 敏感字段（密码、token、cookie）不进日志

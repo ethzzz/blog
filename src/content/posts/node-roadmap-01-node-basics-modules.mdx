@@ -179,3 +179,14 @@ console.log(`共 ${total} 行`);
 2. 写一个脚本：遍历目录，找出所有大于 1MB 的文件并列出（提示：`stat` 的 `size` 字节，除 1024 换算）。
 3. 写一个 CommonJS 文件验证"值拷贝"：导出 `let count = 0` 的模块，在另一个文件里 require 两次并自增，观察值是否共享。再用 ESM 复现，对比 live binding。
 4. 给 `package.json` 加一个 `clean` script，删除 `dist` 目录（`node -e "fs.rmSync('dist',{recursive:true})"`），并验证 `preclean` 钩子会先执行。
+
+
+## 验收清单
+
+- [ ] 能说出 `package.json` 里 `type: "module"` 的作用，以及不设它时 `import` 会报什么错
+- [ ] 用 ESM 和 CJS 各写过一个可运行脚本，并知道同一包里混用时的限制（`require` 不能加载 ESM 的顶层 await）
+- [ ] 用 `import.meta.dirname`（或 `fileURLToPath`）拿过当前文件目录，不再靠 `process.cwd()`
+- [ ] 读过 `.env`，且密钥没有硬编码进代码
+- [ ] 给 `unhandledRejection` 与 `uncaughtException` 挂了日志，进程不会静默退出
+- [ ] 用 `node --watch` 起过热更新，知道它和生产进程的区别
+- [ ] 用过 `structuredClone`，并知道它不能拷贝函数与类实例

@@ -148,3 +148,14 @@ VS Code 里 `.vscode/launch.json` 配 `"type": "node", "request": "attach", "por
 2. 写"创建文章"的 e2e 测试，包含未登录 401、恶意字段被剥离、成功创建三用例。
 3. 在 Service 里埋一个 `console.log` 轮次的递归死循环，用 VS Code 断点而不是读代码的方式找到根因。
 4. 配置 GitHub Actions：PR 触发 lint + 单测 + e2e（用 services 起临时 MySQL），体验一次"测试红了的提交"。
+
+
+## 验收清单
+
+- [ ] 业务纯函数有单测，覆盖率集中在核心逻辑而不是配置文件
+- [ ] E2E 覆盖"登录 → 写入 → 查询"这条主链路
+- [ ] 测试用独立数据库或事务回滚，不污染开发数据
+- [ ] 会用 `node --inspect` + Chrome DevTools 打断点调试
+- [ ] 抓过一次 CPU profile（`--prof` 或 clinic）并定位到热点函数
+- [ ] CI 里跑 lint + 测试，红了不能合
+- [ ] 有一条"线上事故回归"的用例

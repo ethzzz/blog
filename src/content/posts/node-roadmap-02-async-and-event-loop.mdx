@@ -158,3 +158,14 @@ worker.on('message', (sum) => console.log('结果:', sum));
 2. 把你项目里某处串行 `await` 改成 `Promise.all`，用 `console.time` 对比耗时。
 3. 写脚本对比 `readFile` 和 `createReadStream` 读取一个 100MB 文件时的内存占用（`process.memoryUsage().heapUsed`），亲眼看一次差距。
 4. 写一个 worker 计算 `fib(40)`，主线程同时响应 HTTP 请求，验证主线程是否仍然流畅。
+
+
+## 验收清单
+
+- [ ] 能画出事件循环一轮的顺序（timers → pending → poll → check → close），并说清微任务在哪清空
+- [ ] 能解释 `await` 之后的代码为什么在微任务里执行
+- [ ] 用 `setTimeout(fn, 0)` 与 `setImmediate` 写过对照实验，能解释输出顺序
+- [ ] 写过一段同步阻塞代码，实测它把并发请求卡住了多少毫秒
+- [ ] 用 `AbortController` 取消过一个真实请求（含超时）
+- [ ] 用 `worker_threads` 跑过 CPU 密集任务，主线程仍然响应
+- [ ] 知道 `Promise.all` 与 `allSettled` 各自适合什么场景

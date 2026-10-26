@@ -170,3 +170,14 @@ export class AllExceptionsFilter implements ExceptionFilter {
 2. 开启 `whitelist: true`，在 body 里塞 `role: "admin"` 创建文章，确认响应里没有该字段且没进 Service。
 3. 实现 BizException 和全局 Filter，抛一个业务错误，验证响应带 code 和 traceId。
 4. 用 curl 不带任何前端直接打你的接口，把你传出的所有 400/422 响应收集成"错误响应文档"——这就是给前端同事的对接文档。
+
+
+## 验收清单
+
+- [ ] 所有 DTO 都有校验，未知字段被剥离（`whitelist: true`）
+- [ ] 错误响应体结构统一：`statusCode` / `message` / `errors` / `requestId`
+- [ ] 4xx 与 5xx 分开：业务拒绝不打 error 级日志、不触发告警
+- [ ] 字段级错误能定位到具体字段（前端能直接映射到输入框）
+- [ ] 全局异常过滤器兜住未捕获错误，且不把堆栈返回给客户端
+- [ ] 输入有长度与大小上限（防超长字符串与深嵌套 JSON）
+- [ ] 有一次"故意让接口报 500"的验证，确认响应体与日志都符合预期
