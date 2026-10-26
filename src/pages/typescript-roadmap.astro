@@ -34,7 +34,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 		<!-- 页面标题 -->
 		<div class="mb-8">
 			<h1 class="text-3xl font-bold text-90 mb-2">TypeScript 从零基础到精通</h1>
-			<p class="text-75 text-lg">从类型注解到类型体操，系统掌握 TS · 共 {sortedPosts.length} 篇</p>
+			<p class="text-75 text-lg">从类型注解到类型安全，系统掌握 TS · 共 {sortedPosts.length} 篇</p>
 		</div>
 
 		<!-- 项目信息卡片 -->
@@ -49,7 +49,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 					<div class="flex flex-wrap gap-2 text-xs">
 						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">类型系统</span>
 						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">泛型</span>
-						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">类型体操</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">运行时校验</span>
 						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">tsconfig</span>
 						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">React</span>
 						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Vue</span>
@@ -143,7 +143,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 		<!-- 底部说明 -->
 		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
 			<p class="font-medium mb-1">💡 学习建议</p>
-			<p>按阶段顺序阅读，每篇结束把代码在本地敲一遍并跑通（<code>tsc</code> 或 <code>ts-node</code>）。基础篇(01-06)务必动手，类型系统一旦建立直觉后续会非常顺；类型体操篇(09)偏进阶，初学可先略读；工程化篇(13)与框架集成篇(14)建议结合你的实际项目边学边用。已经熟悉的部分可直接当速查表。最后的 15 毕业项目建议留出一整块时间做完——它会把你前面学到的零散知识串成一件能拿出手的作品。</p>
+			<p>按三层推进，别按编号死读：<strong>L1（01–05）</strong>打地基，每篇都动手敲，类型系统一旦有直觉后面会顺很多；<strong>L2（06–11）</strong>是从"会写"到"写对"的分水岭，其中 <code>08 判别联合</code> 与 <code>11 运行时校验</code> 收益最大，<code>09 条件类型</code> 初学可先略读；<strong>L3（12–16）</strong>结合你的真实项目用——<code>13 JS 迁移</code> 适合存量项目，<code>14 类型检查性能</code> 在你开始嫌 <code>tsc</code> 慢时读。最后的 <strong>17 毕业项目</strong>建议留一整块时间做完，它会把你学到的零散知识串成一个能发布的东西。</p>
 		</div>
 
 		<!-- 项目链接 -->
