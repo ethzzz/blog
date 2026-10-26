@@ -1,82 +1,203 @@
 ---
 title: '09 · 函数式与高阶函数'
-published: 2026-09-29T19:00:00+08:00
-description: '函数式编程在 JS 中的落地：一等公民函数、纯函数、高阶函数、map/filter/reduce 的链式用法、柯里化与函数组合，以及为什么函数式让代码更易测试。'
-tags: [JavaScript, 函数式, 高阶函数, 纯函数, 柯里化]
+published: 2026-10-26T18:00:00+08:00
+description: '纯函数为什么好测、柯里化与偏应用的区别、compose 的方向、不可变更新的三种做法，以及 map+filter 链式调用的性能陷阱和用高阶函数写 debounce/memoize。'
+tags: [JavaScript, 函数式, 高阶函数, 柯里化, 不可变]
 category: JavaScript学习路线
 draft: false
 ---
 
-## 函数是一等公民
-
-JS 里函数可以像值一样：赋值、传参、返回。基于这个特性衍生出**高阶函数**（接收或返回函数的函数）和**纯函数**（相同输入永远相同输出、无副作用）。
-
----
-
-## 数组三件套
+## 纯函数：同一个输入永远同一个输出，且不改外部
 
 ```js
-const nums = [1, 2, 3, 4, 5];
-const result = nums
-  .filter(n => n % 2 === 1)   // [1,3,5]
-  .map(n => n * n)            // [1,9,25]
-  .reduce((sum, n) => sum + n, 0); // 35
+// ✅ 纯：只依赖参数，只返回结果
+const add = (a, b) => a + b;
+
+// ❌ 不纯：读了外部变量
+let base = 1;
+const addBase = (a) => a + base;
+
+// ❌ 不纯：改了参数（副作用）
+const pushItem = (arr, x) => { arr.push(x); return arr; };
 ```
 
-`map/filter/reduce` 不修改原数组（纯），链式表达数据流转，比 `for` 循环更声明式、更易读。
+纯函数的价值不在"优雅"，在**可测试与可推演**：不用 mock、不用担心调用顺序、可以随意缓存。
+
+实践中不必追求 100% 纯——**把副作用（请求、DOM、存储）挤到边界，核心逻辑保持纯**，这一条就能让测试成本降一个量级。
 
 ---
 
-## 柯里化
+## 高阶函数：接收或返回函数
 
-把多参函数转成"每次吃一个参数"的链式函数：
+`map` / `filter` / `reduce` 本身就是高阶函数（接收函数）。自己写高阶函数的三个典型：
 
 ```js
-const add = a => b => a + b;
-add(2)(3); // 5
-// 实战：预置配置
-const log = prefix => msg => console.log(`[${prefix}] ${msg}`);
-const logError = log("ERROR");
-logError("fail"); // [ERROR] fail
+// 1. once：只执行一次
+const once = (fn) => {
+  let called = false;
+  let result;
+  return (...args) => {
+    if (!called) { called = true; result = fn(...args); }
+    return result;
+  };
+};
+
+// 2. memoize：缓存结果（注意：只适合纯函数）
+const memoize = (fn) => {
+  const cache = new Map();
+  return (...args) => {
+    const key = JSON.stringify(args);      // 简单场景够用；复杂参数要用自定义 key
+    if (cache.has(key)) return cache.get(key);
+    const v = fn(...args);
+    cache.set(key, v);
+    return v;
+  };
+};
+
+// 3. throttle：固定频率执行
+const throttle = (fn, wait = 200) => {
+  let last = 0;
+  return (...args) => {
+    const now = Date.now();
+    if (now - last >= wait) { last = now; fn(...args); }
+  };
+};
 ```
+
+`memoize` 的坑：**参数是对象时 `JSON.stringify` 顺序不稳定**，且大对象开销高。生产里用"第一个参数做 key"或显式传 key 更稳。
 
 ---
 
-## 函数组合
-
-把小函数拼成处理管道：
+## 柯里化 vs 偏应用
 
 ```js
-const compose = (...fns) => x => fns.reduceRight((v, fn) => fn(v), x);
-const trim = s => s.trim();
-const upper = s => s.toUpperCase();
-const process = compose(upper, trim);
-process("  hi  "); // "HI"
+// 柯里化：把一个多参函数变成"一次一个参数"的链
+const curry = (fn) => {
+  const arity = fn.length;
+  return function inner(...args) {
+    return args.length >= arity ? fn(...args) : (...rest) => inner(...args, ...rest);
+  };
+};
+
+const add3 = curry((a, b, c) => a + b + c);
+add3(1)(2)(3);      // 6
+add3(1, 2)(3);      // 6
+add3(1, 2, 3);      // 6
+
+// 偏应用：先固定部分参数，得到一个新函数（不要求一次一个）
+const partial = (fn, ...preset) => (...rest) => fn(...preset, ...rest);
+const withBase = partial(fetchJson, '/api');   // 固定 base
+```
+
+实际用途主要是**配置化**：把"变化的部分"参数化，把"稳定的部分"固化。
+
+```js
+// 例：统一的请求封装
+const request = curry((base, method, path, body) => fetch(base + path, { method, body }));
+const apiRequest = request('/api');
+const get = apiRequest('GET');
+const post = apiRequest('POST');
 ```
 
 ---
 
-## 为什么函数式好
+## 组合：`compose` 与 `pipe`
 
-- **纯函数可测**：不依赖外部状态，给定输入断言输出即可。
-- **无副作用**：并发、缓存、推理都更安全。
-- **声明式**：关注"做什么"而非"怎么做"。
+```js
+const compose = (...fns) => (x) => fns.reduceRight((v, f) => f(v), x);  // 右 → 左（数学写法）
+const pipe = (...fns) => (x) => fns.reduce((v, f) => f(v), x);          // 左 → 右（可读性好）
 
-> 现实里不必极端函数式，但多用 `map/filter/reduce`、少改原数据，代码质量立竿见影。
+const normalize = pipe(trim, toLowerCase, removeSpaces);
+normalize('  Hello World ');   // 'helloworld'
+```
+
+记忆：**`compose` 从右往左（f(g(x))），`pipe` 从左往右（x → f → g）**。业务里 `pipe` 更好读。
 
 ---
 
-## 小结
+## 不可变更新：三种做法
 
-- 函数是一等公民 → 高阶函数是基础。
-- `map/filter/reduce` 链式处理数组，声明式且纯。
-- 柯里化做参数预置，组合做管道。
-- 纯函数提升可测试性与可维护性。
+```js
+// 1. 展开（浅）
+const next = { ...state, user: { ...state.user, name: 'a' } };
+
+// 2. 数组方法（不改原数组）
+const added = [...list, item];
+const removed = list.filter((x) => x.id !== id);
+const updated = list.map((x) => (x.id === id ? { ...x, done: true } : x));
+
+// 3. 深拷贝
+const clone = structuredClone(state);        // 原生，支持 Map/Set/Date
+const clone2 = JSON.parse(JSON.stringify(state));  // ❌ 丢 Date/undefined/函数，且不支持循环引用
+```
+
+`JSON.parse(JSON.stringify(x))` 的四个坑：`Date` 变字符串、`undefined`/函数被丢、`NaN`/`Infinity` 变 `null`、循环引用直接抛错。**新代码用 `structuredClone`。**
+
+`Immer` 的价值：让你"用可变写法产生不可变结果"（`produce`），代价是多一层库与 Proxy 开销。
+
+---
+
+## 性能陷阱：链式调用与 reduce 展开
+
+```js
+// ❌ 遍历三次 + 三个中间数组
+const result = list
+  .filter((x) => x.active)
+  .map((x) => x.name)
+  .slice(0, 10);
+
+// ✅ 一次遍历（数据量大时差距明显）
+const result2 = [];
+for (const x of list) {
+  if (!x.active) continue;
+  result2.push(x.name);
+  if (result2.length === 10) break;
+}
+```
+
+```js
+// ❌ O(n²)：每次展开都复制整个对象
+const acc = items.reduce((o, it) => ({ ...o, [it.id]: it }), {});
+
+// ✅ O(n)：原地写（这是新建对象，不算修改入参）
+const map = items.reduce((o, it) => { o[it.id] = it; return o; }, {});
+// 或直接用 Object.fromEntries
+const map2 = Object.fromEntries(items.map((it) => [it.id, it]));
+```
+
+判断标准：**数据量 < 1 千时随便写；上万条时链式风格要改成一次遍历。**
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `memoize` 结果错乱 | 参数是对象且 key 不稳定 | 自定义 key 或用第一个参数 |
+| reduce 里展开对象，几万条卡死 | 每次迭代复制整个累积对象 | 原地赋值或 `Object.fromEntries` |
+| 改数组后原数组也变了 | 用了 `sort/splice/push` | 先 `[...arr]` 或用 `toSorted`（新 API） |
+| 深拷贝丢 Date | 用了 JSON 序列化 | `structuredClone` |
+| 组合函数调试困难 | 匿名函数链 | 每步命名，或拆成变量 |
+| 纯函数里发请求 | 副作用混入 | 把副作用推到边界层 |
+
+---
+
+## 验收清单
+
+- [ ] 能写出 `once` / `memoize` / `throttle` 三个高阶函数
+- [ ] 能说清柯里化与偏应用的区别，并各举一例
+- [ ] 能说清 `compose` 与 `pipe` 的方向差异
+- [ ] 不可变更新用 `structuredClone`，没有用 JSON 深拷贝
+- [ ] 知道链式调用会多次遍历，大数据量时改一次遍历
+- [ ] 项目里 reduce 没有"每次展开累积对象"的写法
 
 ---
 
 ## 练习
 
-1. 用 `reduce` 实现 `map` 和 `filter`（即 `myMap`/`myFilter`）。
-2. 写一个 `curry(fn)` 把普通多参函数转成柯里化版本。
-3. 把一段"先过滤空值、再转数字、再求和"的命令式代码改成 `reduce` 链式。
+1. **写 memoize 并踩坑**：先用 `JSON.stringify` 做 key，传两个属性顺序不同的对象，观察缓存未命中。  
+   *自检*：能说明"为什么对象做 key 需要规范化"。
+2. **对比遍历次数**：10 万条数据分别用 `filter+map+slice` 与单次 `for` 实现，测耗时。  
+   *自检*：能给出两个数字，并解释中间数组的分配成本。
+3. **修一个 reduce O(n²)**：把展开式 reduce 改成原地赋值，从 10 万条数据看耗时变化。  
+   *自检*：能说明"每次展开都是 O(n) 复制"。

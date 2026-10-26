@@ -31,6 +31,11 @@ export default defineConfig({
 			"/blog/posts/typescript-roadmap-16-framework-integration/",
 		"/posts/typescript-roadmap-15-project-type-safe-sdk/":
 			"/blog/posts/typescript-roadmap-17-project-type-safe-sdk/",
+		// JavaScript（2026-10-26）：按教学顺序重排 03/04/06/07（执行上下文与 this 提到闭包之前）
+		"/posts/js-roadmap-03-prototype-chain/": "/blog/posts/js-roadmap-06-prototype-chain/",
+		"/posts/js-roadmap-04-inheritance/": "/blog/posts/js-roadmap-07-inheritance/",
+		"/posts/js-roadmap-06-this-binding/": "/blog/posts/js-roadmap-04-this-binding/",
+		"/posts/js-roadmap-07-execution-context/": "/blog/posts/js-roadmap-03-execution-context/",
 	},
 	// 混合渲染（hybrid）：整站仍是静态产物（默认 prerender=true），
 	// 只有 src/pages/solutions/ 下的两个页面显式 `export const prerender = false`。

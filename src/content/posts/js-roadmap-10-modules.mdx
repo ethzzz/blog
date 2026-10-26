@@ -1,74 +1,231 @@
 ---
 title: '10 · 模块化'
-published: 2026-09-29T20:00:00+08:00
-description: 'JS 模块化的演进：IIFE、CommonJS（Node）、ES Module（浏览器/现代标准），循环依赖在两种规范下的不同表现，以及 ESM 的静态特性带来的 tree-shaking 优势。'
-tags: [JavaScript, 模块化, CommonJS, ESM, 循环依赖]
+published: 2026-10-26T18:30:00+08:00
+description: 'CJS 与 ESM 的运行时差异（值拷贝 vs 活绑定）、循环依赖到底会拿到什么、模块为什么只执行一次、动态 import 与代码分割，以及浏览器与 Node 的模块差别。'
+tags: [JavaScript, 模块化, ESM, CJS, 循环依赖]
 category: JavaScript学习路线
 draft: false
 ---
 
-## 没有模块的日子
+## 两种模块，两种求值模型
 
-早期用全局变量 + IIFE 避免污染，但依赖关系全靠人工排序 `<script>` 标签，大型项目一团乱。于是有了两套主流方案。
+| | CommonJS（CJS） | ES Modules（ESM） |
+| --- | --- | --- |
+| 语法 | `require` / `module.exports` | `import` / `export` |
+| 求值时机 | **运行时**（执行到才加载） | **静态解析**（先建图再执行） |
+| 导出 | 值的**拷贝**（快照） | **活绑定**（引用） |
+| 顶层 await | 不支持 | 支持 |
+| 循环依赖 | 拿到未完成的 `exports`（常是 `undefined`） | 可能报 TDZ 错误，也可能正常（取决于访问时机） |
+| Tree-shaking | 基本无效 | 有效（前提见下） |
+
+**为什么这个差别重要**：ESM 的静态特性让构建工具能在**不执行代码**的情况下分析依赖，这才是 tree-shaking 与 code splitting 的前提。
 
 ---
 
-## CommonJS（Node 默认）
+## 活绑定 vs 值拷贝（最容易出错的一处）
 
 ```js
-// math.js
-exports.add = (a, b) => a + b;
-// main.js
-const { add } = require("./math");
+// counter.mjs（ESM）
+export let count = 0;
+export const inc = () => { count++; };
 ```
-
-特点：**同步加载、运行时解析**，`require` 返回的是值的拷贝（对基本类型）/ 引用（对对象）。它适合服务端，但浏览器需打包器转换。
-
----
-
-## ES Module（现代标准）
 
 ```js
-// math.js
-export const add = (a, b) => a + b;
-export default function() {};
-// main.js
-import foo, { add } from "./math.js";
+import { count, inc } from './counter.mjs';
+inc();
+console.log(count);      // 1 —— 活绑定，能看到变化
 ```
 
-特点：**静态结构**（`import`/`export` 在顶层、编译期可知），支持浏览器原生、可被打包器 **tree-shaking** 剔除未用代码。注意 ESM 里 `import` 是**活绑定**（引用），改了源会反映到导入方。
+CJS 版本：
+
+```js
+// counter.cjs
+let count = 0;
+module.exports = { count, inc: () => { count++; } };
+```
+
+```js
+const { count, inc } = require('./counter.cjs');
+inc();
+console.log(count);      // 0 —— 拿到的是快照
+// 只有 require('./counter.cjs').count 才能读到最新值
+```
+
+这条差异解释了大量"为什么我改了模块里的变量，外部没变"的问题。
 
 ---
 
-## 循环依赖的坑
+## 循环依赖：两个模块互相 import 会发生什么
 
 ```js
 // a.js
-import { b } from "./b.js";
-export const a = b + 1;
+import { b } from './b.js';
+export const a = 'a';
+console.log('a 看到 b:', b);      // ❌ ReferenceError（TDZ）
+
 // b.js
-import { a } from "./a.js";
-export const b = a + 1;
+import { a } from './a.js';
+export const b = 'b';
+console.log('b 看到 a:', a);      // ✅ 此时 a 还没初始化 → 但这行先执行，实际也会报 TDZ
 ```
 
-- **CommonJS**：返回**部分加载**的对象（可能拿到 `undefined`），顺序敏感，易踩。
-- **ESM**：因是活绑定，最终能解析出正确值（但逻辑上仍是坏设计）。
+ESM 的处理：**先建立模块图，再按依赖顺序执行**。谁先执行取决于入口的引用顺序。
 
-> 结论：循环依赖是代码异味，重构拆公共模块比纠结规范更治本。
+**最安全的原则**：循环依赖里只使用**函数**（调用时求值），不要使用**顶层常量**（求值时立刻读）。因为函数体执行时，对方的模块通常已经初始化完了。
+
+```js
+// ✅ 安全：延迟到调用时取值
+import { getA } from './a.js';
+export function useA() { return getA(); }
+```
 
 ---
 
-## 小结
+## 模块只执行一次（这既是特性也是坑）
 
-- CommonJS：Node 传统，运行时、值拷贝、循环依赖易出 bug。
-- ESM：标准、静态、活绑定、支持 tree-shaking。
-- 新项目一律 ESM；写库时注意两种规范的 `import/require` 互操作。
-- 循环依赖靠重构解决，不是靠规范。
+```js
+// config.js
+console.log('config 初始化');
+export const config = loadConfig();
+```
+
+无论被 import 多少次，`config 初始化` 只打印一次。**所以模块天然是单例**——这也是状态管理、连接池能放在模块顶层的原因。
+
+"只执行一次"带来的坑：**测试之间共享状态**。
+
+```js
+// store.js
+export const store = { count: 0 };   // 测试之间共享
+```
+
+每个测试都改它，就会互相污染。修法：导出工厂函数，测试里每次新建。
+
+```js
+export const createStore = () => ({ count: 0 });
+```
+
+---
+
+## 动态 import：按需加载
+
+```js
+// 静态：打进首屏 chunk
+import { heavy } from './heavy.js';
+
+// 动态：返回 Promise，单独成 chunk
+const { heavy } = await import('./heavy.js');
+
+// 条件加载
+if (needChart) {
+  const { renderChart } = await import('./chart.js');
+  renderChart(data);
+}
+```
+
+三个实际用途：
+
+1. **首屏瘦身**：图表、编辑器、地图这类大依赖按需加载；
+2. **多语言**：``import(`./i18n/${locale}.js`)``；
+3. **降级**：`import('modern-api').catch(() => import('polyfill'))`。
+
+⚠️ **动态 import 的路径必须能被静态分析**（`./i18n/${locale}.js` 是允许的，因为能推导出目录范围；完全拼接的字符串会导致打包器把所有文件都打进来或直接失败）。
+
+---
+
+## tree-shaking 的运行时前提
+
+```json
+// package.json（你发布的库）
+{ "sideEffects": false }
+```
+
+```js
+// ❌ 顶层有副作用：打包器不敢删
+import './polyfill.js';
+
+// ✅ 只有被用到的导出才会保留
+export function used() {}
+export function unused() {}     // 会被删掉
+```
+
+三条前提（详见[工程化 02 篇](/blog/posts/engineering-roadmap-02-bundling-principle/)）：ESM 语法、`sideEffects` 声明正确、导入可静态分析。
+
+---
+
+## 浏览器的 ESM
+
+```html
+<script type="module" src="/main.js"></script>
+```
+
+要点：
+
+- 默认延迟执行（等价 `defer`），且**只在 `http(s)` 下可用**（`file://` 会因 CORS 失败）；
+- 每个模块只会请求一次（浏览器自己维护模块图）；
+- 必须带扩展名或完整路径（浏览器不做 Node 的目录查找）；
+- 裸导入 `import x from 'lodash'` 在浏览器里**不解析**，要靠 import maps 或打包器。
+
+---
+
+## Node 的模块系统
+
+```jsonc
+// package.json —— 双格式包的写法
+{
+  "type": "module",              // .js 默认按 ESM 解释
+  "main": "./dist/index.cjs",    // 老工具兜底
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  }
+}
+```
+
+```js
+// ESM 里没有 __dirname / require
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// 真需要 require：用 createRequire
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+```
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 改了模块里的变量外部没变 | CJS 值拷贝 | 改用函数读取，或换 ESM |
+| 循环依赖拿到 `undefined` | 模块还没执行完 | 只用函数、避免顶层常量互相引用 |
+| 测试之间状态串了 | 模块单例 | 导出工厂函数 |
+| 浏览器报裸导入失败 | 没有 import maps / 未打包 | 用打包器或 import maps |
+| `require is not defined` | ESM 环境 | `createRequire` 或改 `import` |
+| 库摇不掉 | `sideEffects` 没声明/CJS | 配 `sideEffects: false`，提供 ESM 入口 |
+
+---
+
+## 验收清单
+
+- [ ] 能说清 CJS 与 ESM 在"求值时机"与"导出绑定"上的差别
+- [ ] 能解释循环依赖为什么会拿到 `undefined`，并给出安全写法
+- [ ] 知道模块只执行一次，且测试里要用工厂函数避免共享状态
+- [ ] 会用动态 `import` 做按需加载，且路径可被静态分析
+- [ ] 知道浏览器 ESM 与 Node ESM 的三处差别（扩展名、裸导入、`__dirname`）
+- [ ] 发布的库有 `exports` 双入口 + `sideEffects` 声明
 
 ---
 
 ## 练习
 
-1. 把一段 CommonJS 代码改写成 ESM，注意加文件扩展名（NodeNext 要求）。
-2. 构造一个 CommonJS 循环依赖，观察取到 `undefined` 的现象。
-3. 解释为什么 ESM 能做 tree-shaking 而 CommonJS 很难。
+1. **验证活绑定**：写一个 ESM 模块导出 `let count` 与自增函数，在引用方打印。再改 CJS 版本对比。  
+   *自检*：能解释两次结果不同的根本原因。
+2. **复现循环依赖**：两个模块互相 import 并在顶层使用对方常量，观察 TDZ 报错；改成函数调用后正常。  
+   *自检*：能说出"为什么函数安全"。
+3. **做一次动态加载**：把一个大依赖改成 `await import()`，用 Network 确认它变成了独立 chunk 且首屏不加载。  
+   *自检*：能指出 chunk 文件名与触发时机。

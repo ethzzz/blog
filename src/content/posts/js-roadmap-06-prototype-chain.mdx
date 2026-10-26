@@ -1,0 +1,201 @@
+---
+title: '06 · 原型与原型链'
+published: 2026-10-26T16:30:00+08:00
+description: 'prototype / __proto__ / constructor 三者的关系、属性查找到底怎么走、手写 instanceof、Object.create(null) 的用途，以及原型污染这种真实攻击面。'
+tags: [JavaScript, 原型, 原型链, instanceof, 原型污染]
+category: JavaScript学习路线
+draft: false
+---
+
+## 三个名字，一图说清
+
+```js
+function Foo() {}
+const f = new Foo();
+
+f.__proto__ === Foo.prototype     // true —— 实例的"原型指针"
+Foo.prototype.constructor === Foo  // true —— 原型指回构造函数
+Object.getPrototypeOf(f) === Foo.prototype  // 同上，标准写法
+```
+
+```text
+f ──__proto__──► Foo.prototype ──__proto__──► Object.prototype ──__proto__──► null
+                        ▲
+                        │ .prototype
+                       Foo（函数对象本身还有自己的 __proto__ → Function.prototype）
+```
+
+三条记忆要点：
+
+1. **只有函数有 `prototype` 属性**（它是"给实例用的原型对象"）；
+2. **每个对象都有 `__proto__`**（内部 `[[Prototype]]`，标准 API 是 `Object.getPrototypeOf`）；
+3. `prototype.constructor` 默认指回函数本身（可被覆盖，不要依赖它做判断）。
+
+---
+
+## 属性查找：先自己，再原型链
+
+```js
+function Foo() { this.a = 1; }
+Foo.prototype.b = 2;
+
+const f = new Foo();
+f.a;        // 1  —— 自有属性
+f.b;        // 2  —— 原型上的
+f.c;        // undefined —— 整条链都没有
+```
+
+查找规则：**自身属性 → 原型 → 原型的原型 → … → null**。
+
+两个实际推论：
+
+- **原型上的方法是共享的**（所有实例指向同一个函数，省内存）；
+- **原型链越长，查找越慢**（尤其是 miss 时要把整条链走完）。深层继承会影响热路径性能。
+
+```js
+// 判断属性是"自有"还是"继承"
+Object.hasOwn(f, 'a');      // true
+Object.hasOwn(f, 'b');      // false
+```
+
+`in` 会查整条链（`'b' in f` 为 `true`），这也是 `for...in` 会遍历到继承属性的原因——**遍历对象用 `Object.keys`/`entries`，别用 `for...in`**。
+
+---
+
+## 手写 `instanceof`
+
+原理：沿实例的原型链往上找，看能否命中构造函数的 `prototype`。
+
+```js
+function myInstanceof(obj, Ctor) {
+  if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
+  let proto = Object.getPrototypeOf(obj);
+  while (proto) {
+    if (proto === Ctor.prototype) return true;
+    proto = Object.getPrototypeOf(proto);
+  }
+  return false;
+}
+```
+
+手写一遍就明白两个坑：
+
+1. **`Object.create(null)` 的对象没有原型链**，`instanceof Object` 是 `false`；
+2. **跨 iframe/realm 会失效**——不同窗口的 `Array.prototype` 不是同一个对象，所以要用 `Array.isArray`（它检查内部标记，不看原型）。
+
+---
+
+## `Object.create(null)`：干净字典
+
+```js
+const dict = Object.create(null);
+dict.__proto__ = 'x';        // 只是一个普通属性，不会改原型
+Object.getPrototypeOf(dict); // null
+```
+
+用途：**做纯字典**。避免 "键名撞上 `toString`/`constructor`" 这类问题：
+
+```js
+const bad = {};
+bad['toString'];             // 拿到函数（继承来的），不是 undefined
+const good = Object.create(null);
+good['toString'];            // undefined ✅
+```
+
+现代替代：直接用 `Map`（键可以是任意类型，还不受原型污染）。
+
+---
+
+## 原型污染：一个真实的安全问题
+
+```js
+// 攻击者提交了这样的 JSON
+// { "__proto__": { "isAdmin": true } }
+
+function merge(target, source) {
+  for (const key in source) {
+    if (typeof source[key] === 'object') {
+      target[key] ??= {};
+      merge(target[key], source[key]);      // ❌ 没过滤 __proto__
+    } else {
+      target[key] = source[key];
+    }
+  }
+}
+merge({}, JSON.parse(payload));
+({}).isAdmin;   // true —— 所有对象都被"污染"了
+```
+
+防护：
+
+```js
+const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
+function safeMerge(target, source) {
+  for (const [k, v] of Object.entries(source)) {
+    if (FORBIDDEN.has(k)) continue;
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      target[k] = safeMerge(target[k] ?? {}, v);
+    } else {
+      target[k] = v;
+    }
+  }
+  return target;
+}
+```
+
+或者干脆用 `Object.assign`/`structuredClone`/`Map`，别自己写递归 merge。历史上 lodash 的 `merge`、jQuery 的 `extend` 都出过这类 CVE。
+
+---
+
+## `class` 与原型的关系
+
+```js
+class A { m() {} }
+// 等价于
+function A() {}
+A.prototype.m = function () {};
+
+typeof A;                    // 'function'
+Object.getPrototypeOf(A.prototype) === Object.prototype;  // true
+```
+
+`class` 只是原型的语法糖，但有三个硬差别：
+
+1. **不能当函数调用**（`A()` 报 TypeError）；
+2. **方法不可枚举**（`Object.keys(A.prototype)` 是 `[]`）；
+3. **默认严格模式**。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 改一个实例的属性影响了别的实例 | 属性挂在原型上（对象/数组） | 在构造函数里赋值，别放原型 |
+| `for...in` 遍历到多余属性 | 会走原型链 | 用 `Object.keys` |
+| `instanceof` 跨 iframe 失效 | 不同 realm 的构造函数不同 | 用 `Array.isArray` 等专用判断 |
+| `obj.toString` 判断出错 | 继承来的方法 | `Object.hasOwn`，或 `Object.create(null)` |
+| 合并 JSON 后全局对象多了属性 | 原型污染 | 过滤 `__proto__`/`constructor` |
+| 原型链太深导致慢 | 查找要走完整条链 | 减少继承层级，必要时扁平化 |
+
+---
+
+## 验收清单
+
+- [ ] 能画出 `实例 → 构造函数.prototype → Object.prototype → null` 的关系图
+- [ ] 能说清 `prototype` 与 `__proto__` 的区别
+- [ ] 能手写 `instanceof` 并解释跨 realm 为什么会失效
+- [ ] 知道 `Object.create(null)` / `Map` 在字典场景的用途
+- [ ] 能识别并防御原型污染（至少知道要过滤哪三个键）
+- [ ] 知道 `class` 与原型的关系，以及三个硬差别
+
+---
+
+## 练习
+
+1. **手写 instanceof**：实现后测试普通对象、`Object.create(null)` 对象、跨 iframe 数组三种输入。  
+   *自检*：能解释后两种为什么结果"不符合直觉"。
+2. **复现原型污染**：用上面那个 `merge` 喂 `{"__proto__":{"isAdmin":true}}`，验证 `({}).isAdmin`。  
+   *自检*：能说出防护的两个位置（过滤键 + 用 `Object.entries` 而非 `for...in`）。
+3. **观察原型共享**：在原型上放一个数组，`new` 两个实例后 push，看另一个是否被影响。  
+   *自检*：能说明"原型上的引用类型是共享的"，以及正确写法。

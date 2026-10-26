@@ -1,70 +1,228 @@
 ---
 title: '08 · 事件循环与异步'
-published: 2026-09-29T18:00:00+08:00
-description: 'JavaScript 异步的核心：调用栈、Web APIs、宏任务与微任务队列、事件循环调度顺序，Promise/async-await 的本质，以及一道经典输出题彻底讲清执行顺序。'
-tags: [JavaScript, 事件循环, 宏任务, 微任务, async]
+published: 2026-10-26T17:30:00+08:00
+description: '宏任务与微任务的分界、每轮循环的真实顺序、setTimeout 0 为什么不是 0ms、async/await 在队列里怎么排，以及"await 之后 DOM 为什么还没更新"。'
+tags: [JavaScript, 事件循环, 微任务, Promise, async]
 category: JavaScript学习路线
 draft: false
 ---
 
-## 异步为什么需要事件循环
+## 一张图定生死
 
-JS 单线程，若同步等网络/I/O 会卡死页面。于是浏览器把耗时操作（定时器、网络、DOM 事件）交给**其他线程（Web APIs）**处理，完成后把回调**排队**，等调用栈空了再执行——这套调度机制就是**事件循环（Event Loop）**。
-
----
-
-## 两个队列：宏任务 vs 微任务
-
-- **宏任务（macrotask）**：`setTimeout` / `setInterval` / `setImmediate` / I/O / UI 渲染。
-- **微任务（microtask）**：`Promise.then/catch/finally` / `queueMicrotask` / `MutationObserver`。
-
-**调度规则**：每次调用栈清空后，先**把当前所有微任务清空**，再取**一个**宏任务执行，如此往复。
-
----
-
-## 经典题：输出顺序
-
-```js
-console.log("1");              // 同步
-setTimeout(() => console.log("2"), 0); // 宏任务
-Promise.resolve().then(() => console.log("3")); // 微任务
-console.log("4");              // 同步
-// 输出：1 4 3 2
+```text
+┌──────────────────────── 一轮事件循环 ────────────────────────┐
+│ 1. 取出一个宏任务执行（script / setTimeout / 事件回调 / I/O） │
+│ 2. 执行期间产生的微任务全部执行完（Promise.then / queueMicrotask / MutationObserver）│
+│ 3. 如果需要，执行渲染（样式 → 布局 → 绘制）                  │
+│ 4. 取下一个宏任务…                                          │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-解析：同步先跑 → `1`、`4`；栈空 → 清空微任务 → `3`；再取宏任务 → `2`。
+三条关键结论，所有顺序题都由它们推出：
+
+1. **微任务在"当前宏任务结束后"立刻清空**，不等下一个宏任务；
+2. **微任务里再产生的微任务，仍在同一轮里执行完**（可能饿死渲染）；
+3. **渲染发生在微任务清空之后**，所以"改了状态但 DOM 还没变"是正常的。
 
 ---
 
-## async/await 的本质
-
-`async` 函数返回 `Promise`；`await` 后面跟着的"同步部分"像 `then` 回调一样变成微任务：
+## 经典顺序题，逐行拆
 
 ```js
-async function run() {
-  console.log("a");
-  await null;        // 之后的代码等价于 .then(...)
-  console.log("b");
+console.log('1');
+
+setTimeout(() => console.log('2'), 0);
+
+Promise.resolve().then(() => console.log('3'));
+
+queueMicrotask(() => console.log('4'));
+
+console.log('5');
+```
+
+输出：`1 5 3 4 2`。
+
+拆解：
+
+- 同步代码先跑完 → `1`、`5`；
+- 当前宏任务结束，清空微任务队列（按入队顺序）→ `then` 的 `3`、`queueMicrotask` 的 `4`；
+- 进入下一轮，取宏任务 → `2`。
+
+---
+
+## `setTimeout(fn, 0)` 到底多久
+
+规范里 `0` 会被当作 `4ms`（嵌套超过 5 层后强制最小 4ms）。实际延迟取决于：
+
+- 当前宏任务与微任务的执行时长；
+- 浏览器是否在做渲染/垃圾回收；
+- 后台标签页会被节流（可能几十秒）。
+
+```js
+// 想"尽快执行但让出主线程"：用 0 可以，但别指望精确
+// 想"下一帧执行"：用 requestAnimationFrame
+// 想"空闲时执行"：用 requestIdleCallback
+```
+
+所以 `setTimeout(fn, 0)` 的真实语义是"**排到下一个宏任务**"，不是"立即"。
+
+---
+
+## `async/await` 在队列里怎么排
+
+```js
+async function a() {
+  console.log('a1');
+  await null;                 // 让出一次（相当于 then 的回调）
+  console.log('a2');
 }
-run();
-console.log("c");
-// 输出：a c b
+
+console.log('s1');
+a();
+console.log('s2');
 ```
 
-`await` 让"后面的代码"让出执行权，等微任务阶段再继续。
+输出：`s1 a1 s2 a2`。
+
+原因：`await` 之后的代码**被放进微任务队列**。`await null` 相当于 `Promise.resolve(null).then(...)`。
+
+两道易错题：
+
+```js
+// 题 1
+async function f() {
+  console.log('f1');
+  await g();        // g 是 async，返回 promise
+  console.log('f2');
+}
+async function g() { console.log('g'); }
+f();
+console.log('end');
+// 输出：f1 g end f2
+```
+
+```js
+// 题 2：微任务里产生微任务，仍在同一轮
+Promise.resolve().then(() => {
+  console.log('A');
+  Promise.resolve().then(() => console.log('B'));
+});
+setTimeout(() => console.log('C'), 0);
+// 输出：A B C  （B 在渲染前就被执行了）
+```
 
 ---
 
-## 小结
+## "await 之后 DOM 还没更新"是怎么回事
 
-- 单线程 + Web APIs + 事件循环 = JS 不阻塞的秘诀。
-- 微任务优先于宏任务；每次清空所有微任务再取一个宏任务。
-- `async/await` 是 Promise 的语法糖，`await` 之后进微任务队列。
+```js
+const [list, setList] = useState([]);
+
+async function load() {
+  const data = await fetchList();
+  setList(data);
+  console.log(document.querySelectorAll('.item').length);   // 旧的！
+}
+```
+
+因为 React 的更新是异步调度（可能批量、可能并发），`setList` 之后 DOM 还没变。要拿"渲染后"的状态：
+
+```js
+useEffect(() => {
+  console.log(document.querySelectorAll('.item').length);   // ✅ 这次渲染之后
+}, [list]);
+```
+
+纯 JS 里同理：改了样式要等下一帧才上屏，需要 `requestAnimationFrame` 之后再读。
+
+---
+
+## 微任务会饿死渲染
+
+```js
+function loop() {
+  Promise.resolve().then(loop);   // ❌ 无限微任务
+}
+loop();   // 页面直接卡死，连渲染机会都没有
+```
+
+因为微任务队列不清空就不进入渲染。**长任务用宏任务切片，不要用微任务递归**：
+
+```js
+// ✅ 每轮让出一次，给渲染留机会
+function chunk(tasks, handle) {
+  let i = 0;
+  const run = () => {
+    const end = Math.min(i + 200, tasks.length);
+    for (; i < end; i++) handle(tasks[i]);
+    if (i < tasks.length) setTimeout(run, 0);   // 宏任务切片
+  };
+  run();
+}
+```
+
+---
+
+## 渲染相关的三个 API
+
+| API | 时机 | 用途 |
+| --- | --- | --- |
+| `requestAnimationFrame` | 下一帧渲染前 | 动画、读布局前的批量读 |
+| `requestIdleCallback` | 浏览器空闲时 | 埋点上报、非关键初始化 |
+| `queueMicrotask` | 当前宏任务后立刻 | 需要在渲染前完成的收尾逻辑 |
+
+```js
+// 典型用法：先写样式，下一帧读结果
+el.style.transform = 'translateX(100px)';
+requestAnimationFrame(() => {
+  console.log(getComputedStyle(el).transform);   // 已生效
+});
+```
+
+---
+
+## Node 的差异（只记差别）
+
+| | 浏览器 | Node |
+| --- | --- | --- |
+| 宏任务队列 | 一个 | **多个阶段**（timers / poll / check / close） |
+| `process.nextTick` | 无 | 比微任务**更优先** |
+| 渲染 | 每轮可能渲染 | 无渲染 |
+| `setImmediate` | 无 | check 阶段执行 |
+
+日常写业务代码不用记这些，但**看到 `nextTick` 与 `Promise.then` 混用**时要小心：`nextTick` 先执行。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 顺序题猜错 | 把微任务当成下一轮 | 记住"当前宏任务结束立刻清空微任务" |
+| `setTimeout(0)` 很久才执行 | 前面有长任务/微任务 | 用 rAF 或切片 |
+| 页面卡死但没网络请求 | 微任务无限递归 | 改宏任务切片 |
+| `await` 之后读 DOM 是旧值 | 渲染还没发生 | 在 `useEffect`/`rAF` 里读 |
+| 后台标签页定时器不执行 | 浏览器节流 | 改用 `visibilitychange` + 补偿 |
+| Node 里顺序和浏览器不同 | `nextTick` 优先级更高 | 混用时显式改结构 |
+
+---
+
+## 验收清单
+
+- [ ] 能画出"宏任务 → 微任务清空 → 渲染"的一轮循环
+- [ ] 能正确预测 `setTimeout` + `Promise` + `await` 混排的输出
+- [ ] 知道微任务可能饿死渲染，并用宏任务切片解决
+- [ ] 能解释"改状态后 DOM 还没更新"，并知道在哪读才是新的
+- [ ] 知道 `rAF` / `requestIdleCallback` / `queueMicrotask` 的时机差别
+- [ ] 知道 Node 的 `nextTick` 比微任务更优先
 
 ---
 
 ## 练习
 
-1. 写出下面输出并解释：`console.log('A'); setTimeout(()=>console.log('B'),0); Promise.resolve().then(()=>console.log('C')); console.log('D')`。
-2. 用"宏/微任务"规则解释为什么 `await` 后面的代码总是在当前同步栈之后执行。
-3. 写一个会"饿死"宏任务的代码（微任务里不断塞微任务），说明危害。
+1. **预测五连**：写一段含 `setTimeout`、`Promise.then`、`queueMicrotask`、`await` 的代码，先写答案再跑。  
+   *自检*：每个输出都能指出它来自哪个队列。
+2. **制造微任务饿死**：用 `Promise.resolve().then(loop)` 递归 1 秒后停止，观察页面是否卡住；改成 `setTimeout` 切片对比。  
+   *自检*：能说明"渲染要等微任务清空"。
+3. **验证渲染时机**：改一个元素的宽度后立刻读 `offsetWidth`（强制同步，能读到新值）与在 `rAF` 里读，比较差异。  
+   *自检*：能解释"强制同步布局"与"正常渲染"的区别。

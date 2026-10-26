@@ -1,0 +1,181 @@
+---
+title: '03 · 执行上下文与调用栈'
+published: 2026-10-26T15:00:00+08:00
+description: '执行上下文里到底有什么、函数调用时栈怎么变、为什么 try/catch 抓不到 setTimeout 里的错、错误栈怎么读，以及异步代码为什么会"栈断裂"。'
+tags: [JavaScript, 执行上下文, 调用栈, 错误栈, 异步]
+category: JavaScript学习路线
+draft: false
+---
+
+## 执行上下文：三样东西
+
+每次进入一个函数（或全局/模块代码），都会创建一个**执行上下文**，里面装：
+
+| 内容 | 作用 |
+| --- | --- |
+| **词法环境** | `let/const` 声明的绑定（含 TDZ 状态） |
+| **变量环境** | `var` 声明与函数声明 |
+| **this 绑定** | 这次调用里 `this` 指向谁（04 篇） |
+
+创建分两步：**先创建（提升声明、确定 this）→ 再执行（逐行跑代码）**。这两步是理解"提升"与"暂时性死区"的关键——声明在创建阶段就登记了，值在执行阶段才赋。
+
+---
+
+## 调用栈：函数进出的那张表
+
+```js
+function a() { b(); }
+function b() { c(); }
+function c() { console.log(new Error('here').stack); }
+a();
+```
+
+栈的变化：
+
+```text
+a() 入栈 → b() 入栈 → c() 入栈
+打印时栈顶是 c，下面是 b、a、全局
+c 出栈 → b 出栈 → a 出栈
+```
+
+打印出的 `stack` 就是这张表的快照：
+
+```text
+Error: here
+    at c (file.js:3:21)
+    at b (file.js:2:14)
+    at a (file.js:1:14)
+    at file.js:6:1
+```
+
+**读栈的顺序：从上往下 = 从内到外**（栈顶是出错处，最下面是入口）。
+
+栈是有限的：递归太深会 `RangeError: Maximum call stack size exceeded`（Chrome 大约 1 万层，取决于帧大小）。递归要有终止条件，或者改成迭代/手动栈。
+
+---
+
+## 异步为什么会"栈断裂"
+
+```js
+function outer() {
+  setTimeout(() => {
+    throw new Error('异步错误');
+  }, 0);
+}
+
+try {
+  outer();
+} catch (e) {
+  console.log('抓不到我');     // ❌ 永远不会执行
+}
+```
+
+原因：`setTimeout` 只是**注册了一个回调**，`outer()` 立刻返回。等回调真正执行时，`outer` 早已出栈，`try/catch` 所在的那次执行已经结束了。
+
+**这不是 try/catch 的 bug，是执行模型的必然。** 同理：
+
+```js
+try {
+  Promise.reject(new Error('x'));   // ❌ 抓不到
+} catch (e) {}
+```
+
+Promise 的拒绝走的是微任务队列（08 篇），必须用 `.catch()`：
+
+```js
+// ✅ 三种正确写法
+await fetchData().catch(handle);            // 1
+fetchData().then(ok, handle);               // 2
+try { await fetchData(); } catch (e) {}     // 3（因为 await 把错误"带回"同步流程）
+```
+
+`await` 能配合 `try/catch`，是因为它把异步结果**重新纳入当前函数的执行流**——这也是 `async/await` 相比 `.then` 的最大进步之一。
+
+---
+
+## 错误栈怎么读
+
+```text
+TypeError: Cannot read properties of undefined (reading 'name')
+    at renderUser (UserCard.jsx:24:18)
+    at UserList (UserList.jsx:41:12)        ← 谁调用的
+    at commitRoot (react-dom.js:1:23456)    ← 框架内部，忽略
+```
+
+三步：
+
+1. **第一行是错误类型与消息**（`Cannot read ... reading 'name'` 说明某个对象是 undefined）；
+2. **第一个业务帧**（跳过 `react-dom`/`node_modules`）就是出错点；
+3. 往下看是调用链，用来判断"数据是从哪传进来的"。
+
+生产环境栈是压缩过的（`a.js:1:12345`），要靠 sourcemap 还原（见[工程化 14 篇](/blog/posts/engineering-roadmap-14-observability/)的 sourcemap 上传）。
+
+---
+
+## 异步错误的三种捕获方式
+
+| 场景 | 捕获方式 |
+| --- | --- |
+| 同步代码 | `try/catch` |
+| Promise 链 | `.catch()` 或 `try { await } catch` |
+| 未处理的拒绝 | `window.addEventListener('unhandledrejection')` |
+| 全局同步错误 | `window.addEventListener('error')` |
+
+```js
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('未处理的 Promise 拒绝', e.reason);
+  e.preventDefault();          // 阻止默认的控制台报错
+});
+
+window.addEventListener('error', (e) => {
+  console.error('全局错误', e.error ?? e.message);
+});
+```
+
+这两个监听是**线上监控的地基**，但它们是"最后一道网"，不能替代业务里的 `catch`。
+
+---
+
+## 一个有用的调试技巧：`console.trace`
+
+```js
+function whoCalledMe() {
+  console.trace('谁调我');   // 直接打印当前调用栈，不用构造 Error
+}
+```
+
+在"这个函数被谁反复调用"的问题上比断点更快。配合 Chrome 的 **Call Stack 面板**（Sources → 右侧）与 **Async 勾选**，能看到异步链（跨 `await`/`setTimeout` 的调用关系）。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `try/catch` 抓不到定时器/回调里的错 | 回调在另一个执行上下文里跑 | 在回调内部自己 try/catch |
+| 未处理拒绝导致进程退出（Node） | rejection 没有 catch | 全局兜底 + 业务 catch |
+| 递归爆栈 | 缺终止条件/深度太大 | 改迭代或尾递归改写 |
+| 栈里全是 `node_modules` | 框架内部帧 | 找第一个业务帧 |
+| 生产环境栈不可读 | 代码压缩 | 上传 sourcemap |
+
+---
+
+## 验收清单
+
+- [ ] 能说出执行上下文里包含的三样东西
+- [ ] 能解释"创建阶段 vs 执行阶段"，并用它解释提升与 TDZ
+- [ ] 能解释为什么 `try/catch` 抓不到 `setTimeout` 里的错
+- [ ] 知道 `await` 为什么能让 `try/catch` 生效
+- [ ] 能从一段错误栈里指出"第一个业务帧"
+- [ ] 项目里注册了 `error` 与 `unhandledrejection` 全局兜底
+
+---
+
+## 练习
+
+1. **打印三层栈**：写 `a → b → c` 三层调用，在 `c` 里 `console.trace()`，确认输出顺序与栈一致。  
+   *自检*：能指出"栈顶是最内层"。
+2. **复现捕获失败**：用 `setTimeout(() => { throw new Error('x') })` 包在 `try/catch` 里，确认抓不到；再改成在回调内部 `try/catch`。  
+   *自检*：能说明"两次执行分属不同的执行上下文"。
+3. **爆一次栈**：写一个无终止条件的递归，记录报错信息与大致深度。  
+   *自检*：能说出错误类型是 `RangeError`，并给出改迭代的思路。

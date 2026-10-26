@@ -1,0 +1,195 @@
+---
+title: '07 · 继承的演进：从原型到 class'
+published: 2026-10-26T17:00:00+08:00
+description: '原型链继承为什么会共享引用、构造函数继承解决了什么又缺了什么、寄生组合为什么是最优解，以及 class extends 与 super 到底做了什么。'
+tags: [JavaScript, 继承, class, super, 组合]
+category: JavaScript学习路线
+draft: false
+---
+
+## 五个版本的演进，每个都在修上一个的 bug
+
+### 版本 1：原型链继承
+
+```js
+function Parent() { this.tags = ['a']; }
+Parent.prototype.say = function () {};
+
+function Child() {}
+Child.prototype = new Parent();      // 让 Child 的实例能访问 Parent 的成员
+Child.prototype.constructor = Child;
+```
+
+**致命缺陷**：`this.tags` 在 `Parent` 实例上创建了一次，被所有 `Child` 实例**共享**：
+
+```js
+const c1 = new Child();
+const c2 = new Child();
+c1.tags.push('b');
+console.log(c2.tags);   // ['a', 'b'] ← 串了
+```
+
+同时**无法给 `Parent` 传参**。
+
+### 版本 2：构造函数继承（借用父类）
+
+```js
+function Child(...args) {
+  Parent.call(this, ...args);   // ✅ 每个实例有独立属性，且能传参
+}
+```
+
+**缺陷**：只复制了实例属性，**父类原型上的方法继承不到**。
+
+### 版本 3：组合继承（最常用的"看起来能跑"）
+
+```js
+function Child(...args) {
+  Parent.call(this, ...args);      // 属性独立
+}
+Child.prototype = new Parent();     // 方法能继承
+Child.prototype.constructor = Child;
+```
+
+**缺陷**：`new Parent()` 执行了**两次**（一次在原型链上、一次在构造函数里），父类构造函数有副作用时会重复执行。
+
+### 版本 4：寄生组合（最优解）
+
+```js
+function Child(...args) {
+  Parent.call(this, ...args);
+}
+Child.prototype = Object.create(Parent.prototype);   // ✅ 不执行父类构造函数
+Child.prototype.constructor = Child;
+```
+
+这是所有"继承工具函数"的标准写法：
+
+```js
+function inherit(Child, Parent) {
+  Child.prototype = Object.create(Parent.prototype, {
+    constructor: { value: Child, writable: true, configurable: true },
+  });
+  Object.setPrototypeOf(Child, Parent);   // 让 Child 能访问 Parent 的静态方法
+}
+```
+
+### 版本 5：`class extends`
+
+```js
+class Parent {
+  constructor(name) { this.name = name; }
+  say() { return this.name; }
+}
+
+class Child extends Parent {
+  constructor(name, age) {
+    super(name);           // 必须先调用，才能用 this
+    this.age = age;
+  }
+  say() {
+    return `${super.say()} (${this.age})`;
+  }
+}
+```
+
+`class` 就是版本 4 的语法糖，但多了三条约束：
+
+1. **`super()` 必须先调用**（否则 `this` 未初始化，直接报错）；
+2. **方法不可枚举**、不可当函数调用；
+3. **默认严格模式**。
+
+`super` 的两个用法完全不同：
+
+- `super(...)` → 调用父类构造函数（只能在 constructor 里）；
+- `super.method()` → 调用父类原型上的方法（`this` 仍是子类实例）。
+
+---
+
+## 继承 vs 组合：前端更常见的是组合
+
+```js
+// ❌ 为了复用一行 log 建继承链
+class Base { log() {} }
+class Api extends Base {}
+class GithubApi extends Api {}
+
+// ✅ 能力做成独立对象注入
+const logger = { log: (m) => console.log(m) };
+class GithubApi {
+  constructor(deps) { this.logger = deps.logger; }
+}
+```
+
+判断标准：**"is-a" 用继承，"has-a / can-do" 用组合**。
+
+前端业务里 90% 的场景是组合，原因很实在：
+
+- JS 只有单继承，用继承表达多能力会逼你建一个"上帝基类"；
+- 继承是**编译期绑定**，组合能在运行时替换（测试时注入 mock 更方便）；
+- 深继承会让原型链查找变慢、改基类时影响面不可控。
+
+真正适合继承的场景：框架基类（`React.Component`）、有明确"是一种"关系的领域模型、工具库的异常体系（`class HttpError extends Error`）。
+
+---
+
+## 一个实用的取舍表
+
+| 需求 | 方案 |
+| --- | --- |
+| 复用方法实现 | 组合（注入）或工具函数 |
+| 表达"是一种" | `extends` |
+| 多能力组合 | `mixin`（函数式混入）或组合 |
+| 需要 `instanceof` 判断 | 用 `class extends`（原型链要正确） |
+| 只是共享常量 | 模块导出，别用继承 |
+
+`mixin` 的最小实现：
+
+```js
+const withRetry = (Base) => class extends Base {
+  async retry(fn, times = 3) {
+    let err;
+    for (let i = 0; i < times; i++) {
+      try { return await fn(); } catch (e) { err = e; }
+    }
+    throw err;
+  }
+};
+
+class Client extends withRetry(BaseClient) {}
+```
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 改一个实例的数组，别的实例也变了 | 原型链继承共享引用 | 寄生组合 + 构造函数里赋值 |
+| `super()` 前访问 `this` 报错 | class 的规定 | 先 `super()` |
+| 父类构造函数执行了两次 | 组合继承的经典缺陷 | 用 `Object.create(Parent.prototype)` |
+| `instanceof` 判断失败 | 原型链没接好（忘了设 constructor 或用了 `Object.create(null)`） | 用 `inherit` 工具函数统一处理 |
+| 改基类导致一堆子类出问题 | 继承耦合 | 改组合，或加一层适配 |
+| 混入后方法被覆盖 | mixin 顺序问题 | 明确顺序，后混入的覆盖前面的 |
+
+---
+
+## 验收清单
+
+- [ ] 能说出原型链继承的两个缺陷（共享引用、不能传参）
+- [ ] 能手写寄生组合继承（含 `constructor` 修正）
+- [ ] 能解释 `class extends` 与寄生组合的等价关系
+- [ ] 知道 `super()` 与 `super.method()` 的区别
+- [ ] 项目里没有为了"复用一行代码"建的继承链
+- [ ] 能判断一个场景该用继承还是组合
+
+---
+
+## 练习
+
+1. **复现共享引用 bug**：用原型链继承写两个实例，一个 push 数组，观察另一个。  
+   *自检*：能指出"数组在父类实例上只创建了一次"。
+2. **实现 inherit 工具**：写一个 `inherit(Child, Parent)`，并验证 `instanceof`、静态方法继承、`constructor` 正确。  
+   *自检*：三个断言全过才算完成。
+3. **把继承改成组合**：拿一段三层继承的代码，改成"注入能力对象"，比较改动量与可测性。  
+   *自检*：能说出"组合后测试可以注入 mock，继承做不到"。

@@ -1,87 +1,178 @@
 ---
 title: '01 · 变量、作用域与提升'
-published: 2026-09-29T11:00:00+08:00
-description: '搞懂 var/let/const 的作用域差异、变量提升与 TDZ（暂时性死区）、作用域链如何逐级查找，以及块级作用域为什么是现代 JS 的默认选择。'
-tags: [JavaScript, 作用域, 变量提升, TDZ, let]
+published: 2026-10-26T14:00:00+08:00
+description: '词法作用域到底怎么找变量、var/let/const 的三层差别（块级 + 暂时性死区 + 全局对象属性）、函数声明与表达式提升不同，以及循环里 var 那个经典陷阱的真正原因。'
+tags: [JavaScript, 作用域, 提升, 暂时性死区, 块级作用域]
 category: JavaScript学习路线
 draft: false
 ---
 
-## 一个让我加班的 bug
+## 作用域是"写在哪"，不是"谁调用我"
 
-早年写循环绑定事件，用的是 `var`：
+JS 用**词法作用域**（静态作用域）：变量在哪查找，由**代码书写位置**决定，与调用者无关。
 
 ```js
-for (var i = 0; i < 3; i++) {
-  setTimeout(() => console.log(i), 0);
+const a = 'outer';
+
+function foo() {
+  console.log(a);      // outer —— 看书写位置，不看谁调用
 }
-// 输出：3 3 3（不是 0 1 2）
+
+function bar() {
+  const a = 'inner';
+  foo();               // 仍然是 outer
+}
+bar();
 ```
 
-因为 `var` 是**函数作用域**，`i` 在整个函数里只有一个，循环结束时已是 3。改成 `let` 立刻正常——因为 `let` 是**块级作用域**，每次迭代都有独立的 `i`。这就是作用域差异最直观的代价。
+对比动态作用域的语言（bash、早期 Lisp），`foo` 会打印 `inner`。**JS 不是**——这一条决定了闭包的行为（05 篇）。
+
+查找路径：当前作用域 → 外层 → … → 全局。找不到就是 `ReferenceError`（不是 `undefined`）。
 
 ---
 
-## 三种声明的作用域
+## var / let / const 的三层差别
 
-| 声明 | 作用域 | 提升 | 重复声明 | 暂死区 |
-| --- | --- | --- | --- | --- |
-| `var` | 函数作用域 | 提升并初始化为 `undefined` | 允许 | 无 |
-| `let` | 块级作用域 | 提升但不初始化 | 不允许 | 有（TDZ） |
-| `const` | 块级作用域 | 同上 | 不允许 | 有（且不可改绑定） |
+| | `var` | `let` | `const` |
+| --- | --- | --- | --- |
+| 作用域 | **函数作用域** | 块级 | 块级 |
+| 提升 | 提升并初始化为 `undefined` | 提升但**不初始化**（TDZ） | 同 let |
+| 重复声明 | 允许 | 报错 | 报错 |
+| 是否挂到 `window` | **是**（全局 `var`） | 否 | 否 |
+| 可重新赋值 | 是 | 是 | 否（引用不可变，内容可变） |
 
----
-
-## 变量提升与 TDZ
-
-`var` 会被"提升"到函数顶部并初始化为 `undefined`：
+### 暂时性死区（TDZ）
 
 ```js
-console.log(a); // undefined（不报错）
+console.log(x);   // ❌ ReferenceError: Cannot access 'x' before initialization
+let x = 1;
+```
+
+`let/const` 的变量在**进入作用域时已存在**，但处于"未初始化"状态，访问就报错。这比 `var` 的 `undefined` 好——它能让你立刻发现"用在了声明之前"。
+
+注意 TDZ 是**按位置**生效的：
+
+```js
+let y = 1;
+{
+  console.log(y);   // ❌ 报错：块内声明了 let y，所以在块内 y 从块开始就处于 TDZ
+  let y = 2;
+}
+```
+
+### 全局 `var` 会污染 `window`
+
+```js
 var a = 1;
-```
-
-`let/const` 也提升，但**在声明前访问会抛 `ReferenceError`**，这段区域叫**暂时性死区（TDZ）**：
-
-```js
-console.log(b); // ReferenceError: Cannot access 'b' before initialization
 let b = 2;
+console.log(window.a, window.b);   // 1, undefined
 ```
 
-> 经验：永远在作用域顶部声明、使用前声明，TDZ 就不会咬人。
+在浏览器里这是真实的污染（会覆盖同名全局属性），模块作用域里不存在这个问题。**这也是"用 `let/const`"最实际的理由之一。**
 
 ---
 
-## 作用域链
-
-JavaScript 通过**词法作用域**（代码写在哪里决定）形成作用域链。查找变量时，从当前作用域向外层逐级找，直到全局：
+## 提升：函数声明和函数表达式不一样
 
 ```js
-const x = 1;
-function outer() {
-  const y = 2;
-  function inner() {
-    console.log(x, y); // 1 2（沿作用域链向上找到）
-  }
-  inner();
+foo();            // ✅ 能跑（函数声明整体提升，含函数体）
+function foo() { console.log('decl'); }
+
+bar();            // ❌ TypeError: bar is not a function
+var bar = function () { console.log('expr'); };
+```
+
+`var bar` 提升的是变量名（值为 `undefined`），`bar()` 等于 `undefined()`，所以是 **TypeError** 而不是 ReferenceError。错误类型能帮你定位问题性质。
+
+`const fn = () => {}` 同理，而且更糟：TDZ 会直接抛 ReferenceError。
+
+---
+
+## 循环里 var 的经典陷阱
+
+```js
+// ❌ 三个回调都打印 3
+for (var i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i));
+}
+
+// ✅ let 每轮新建绑定
+for (let i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i));   // 0 1 2
 }
 ```
 
-> 关键：**作用域在定义时确定，不在调用时**。这是闭包能"记住"外部变量的根因（下篇细讲）。
+为什么 `var` 是 3：**只有一个 `i`**（函数作用域），循环结束时它是 3，回调在之后执行，读到的自然是 3。
+
+`let` 的行为等价于：
+
+```js
+for (let i = 0; i < 3; i++) {
+  let _i = i;             // 每轮新建一个块级绑定
+  setTimeout(() => console.log(_i));
+}
+```
+
+这也是"闭包捕获的是变量而不是值"的直接体现（05 篇展开）。
 
 ---
 
-## 小结
+## 作用域的四种形态（顺便认全）
 
-- 默认用 `const`，需要重新赋值时用 `let`，**别用 `var`**。
-- 块级作用域（if/for 的 `{}`）让变量范围更小、更安全。
-- TDZ 是 `let/const` 的安全机制，触发说明你用了"还没初始化的变量"。
-- 作用域链沿词法作用域向上查找，且"定义时定死"。
+```js
+// 1) 函数作用域
+function f() { var x = 1; }
+
+// 2) 块级作用域（let/const）
+if (true) { let y = 1; }
+
+// 3) 模块作用域（每个文件一个独立作用域，顶层不是全局）
+//    —— 这是现代代码里最常用的一种，也是"不再需要 IIFE"的原因
+
+// 4) 全局作用域（浏览器里是 window，Node 里是 globalThis）
+```
+
+老代码里常见的 IIFE 就是"在没有模块的年代造一个作用域"：
+
+```js
+(function () {
+  var privateVar = 1;     // 外部拿不到
+})();
+```
+
+现在直接用模块就够了——**别在新代码里写 IIFE 造作用域**。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 循环里回调都拿到最后一个值 | `var` 函数作用域 | 改 `let`，或用 `forEach` 的形参 |
+| `Cannot access 'x' before initialization` | TDZ | 把声明提前；或确认是否重复声明了同名 `let` |
+| 函数调用报 `not a function` | `var` 提升为 `undefined` | 用函数声明，或把调用放到赋值之后 |
+| 全局变量互相覆盖 | `var` 挂到 `window` | 用 `let/const` 或模块 |
+| `if` 块里声明的变量外面拿不到 | `let` 块级作用域 | 把声明提到外层 |
+| for 循环里 `const` 报错 | 每次迭代要重新赋值 | 循环变量用 `let`，或改用 `for...of` |
+
+---
+
+## 验收清单
+
+- [ ] 能解释"词法作用域"与调用者的无关性，并举一个例子
+- [ ] 能说清 `var` 与 `let` 在提升上的差别（`undefined` vs TDZ）
+- [ ] 知道全局 `var` 会挂到 `window`，并说明为什么要避免
+- [ ] 能解释循环里 `var` 的陷阱，并写出 `let` 版本
+- [ ] 遇到 `ReferenceError` 与 `TypeError` 能判断是"未声明"还是"值不对"
+- [ ] 新代码里没有 IIFE 造作用域（用模块代替）
 
 ---
 
 ## 练习
 
-1. 用 `let` 改写上面的 `for` 循环，解释为什么现在输出 `0 1 2`。
-2. 写一个函数，内部用 `var` 声明后在声明前 `console.log`，观察输出；换成 `let` 再看。
-3. 解释：为什么在 `if (true) { let z = 1 }` 之后访问 `z` 会报错？
+1. **预测输出**：写一段"外层 `let a`、内层块再 `let a` 并在声明前打印"的代码，先猜再跑。  
+   *自检*：能解释 TDZ 是"进入块就开始"而不是"到声明那一行才开始"。
+2. **改造一段老代码**：把项目里一个用 `var` 的循环回调改成 `let`，再用 `var` + IIFE 复现旧行为，对比两者。  
+   *自检*：能说出 IIFE 为什么也能修好（它给每轮造了独立作用域）。
+3. **制造一次隐式全局污染**：在非严格模式下写 `x = 1`（不声明），看 `window.x` 是否存在；再加 `'use strict'` 观察报错。  
+   *自检*：能说明"模块默认是严格模式"，所以这种 bug 在模块里不会出现。

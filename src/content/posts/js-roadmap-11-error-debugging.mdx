@@ -1,90 +1,206 @@
 ---
 title: '11 · 错误处理与调试'
-published: 2026-09-29T21:00:00+08:00
-description: 'JS 的错误类型体系、try/catch/finally 的正确用法、throw 自定义错误、Error 边界与异步错误捕获（Promise/await），以及用 DevTools 定位问题的实战方法。'
-tags: [JavaScript, 错误处理, try-catch, 调试, DevTools]
+published: 2026-10-26T19:00:00+08:00
+description: '三类错误各怎么捕获、自定义 Error 与 cause 的正确用法、Promise 拒绝链怎么不吞错、业务错误与程序错误要分开，以及条件断点、XHR 断点、blackbox 这些真正省时间的调试手段。'
+tags: [JavaScript, 错误处理, 调试, Error, 断点]
 category: JavaScript学习路线
 draft: false
 ---
 
-## 错误也是代码的一部分
+## 先分清三类错误
 
-早年我习惯"能跑就行"，结果线上一个未捕获异常整页白屏。错误处理的本质：**在预期会失败的地方，给程序一条退路**。
+| 类型 | 例子 | 捕获方式 |
+| --- | --- | --- |
+| **同步错误** | `undefined.foo`、`JSON.parse('{')` | `try/catch` |
+| **异步错误** | `fetch` 失败、`setTimeout` 回调抛错 | `.catch()` / 回调内 `try` |
+| **资源错误** | `<img>` 404、`<script>` 加载失败 | `window.addEventListener('error', h, true)`（捕获阶段） |
+
+第二类最容易漏：**没有 `await` 的 rejected promise 不会抛到 `try/catch`**，只会变成 `unhandledrejection`（03 篇讲过原因）。
+
+```js
+// ❌ 吞掉错误
+try {
+  fetchData();           // 没有 await
+} catch (e) { /* 永远不执行 */ }
+
+// ✅
+try {
+  await fetchData();
+} catch (e) { /* 能抓到 */ }
+```
 
 ---
 
-## 错误类型
+## 自定义 Error：让错误可判断
 
-- `Error`：基类，自定义错误继承它。
-- `TypeError`：类型不对（如 `null.foo`）。
-- `ReferenceError`：访问未声明变量。
-- `RangeError`：数值越界（如递归爆栈）。
-- `SyntaxError`：解析阶段就报错（不会被 try/catch 捕获）。
+```js
+class ApiError extends Error {
+  constructor(message, { code, status, cause, retryable = false } = {}) {
+    super(message, { cause });        // ES2022 支持 cause，保留原始错误
+    this.name = 'ApiError';
+    this.code = code;                 // 业务错误码
+    this.status = status;             // HTTP 状态
+    this.retryable = retryable;       // 是否可重试
+  }
+}
+```
 
----
-
-## try/catch/finally
+`cause` 的价值：**错误链**。
 
 ```js
 try {
-  const data = JSON.parse(input); // 可能抛 SyntaxError
-} catch (e) {
-  if (e instanceof SyntaxError) {
-    console.error("格式错误", e.message);
-  } else {
-    throw e; // 不认识的往上抛
-  }
-} finally {
-  cleanup(); // 无论成功失败都执行（关闭连接、释放资源）
+  await fetch(url);
+} catch (err) {
+  throw new ApiError('获取数据失败', { code: 'FETCH_FAILED', cause: err });
 }
+// 打印时能看到 "Caused by: TypeError: Failed to fetch"
 ```
 
-> `catch` 里别吞掉错误——至少打日志，或重新 `throw`。静默失败最可怕。
+没有 `cause` 就会丢掉底层原因，线上只能看到"获取数据失败"，无法判断是断网还是 DNS 问题。
 
 ---
 
-## 异步错误捕获
+## 别吞错误：三种"看似处理了其实没有"
 
 ```js
-// Promise
-fetch(url).then(r => r.json()).catch(err => handle(err));
+// 1. 空 catch
+try { doSomething(); } catch (e) {}
 
-// async/await：用 try/catch 包住
+// 2. catch 里只 console.log（线上没人看）
+try { doSomething(); } catch (e) { console.log(e); }
+
+// 3. catch 后返回 undefined，调用方以为成功
+async function load() {
+  try { return await api.get(); } catch { return; }   // ❌ 调用方分不清"空"与"失败"
+}
+```
+
+正确做法：**要么恢复（重试/降级），要么向上抛（让上层决定），要么上报（监控 + 用户提示）**。三者至少做一个。
+
+```js
 async function load() {
   try {
-    const r = await fetch(url);
-    return await r.json();
-  } catch (e) {
-    report(e);
-    throw e;
+    return await api.get();
+  } catch (err) {
+    reportError(err);                      // 上报
+    throw new ApiError('加载失败', { cause: err });   // 向上抛
   }
 }
 ```
 
-注意：`window.onerror` / `unhandledrejection` 可兜住全局未捕获错误，用于监控上报。
+---
+
+## 业务错误 vs 程序错误：不要混
+
+| | 业务错误（预期内） | 程序错误（bug） |
+| --- | --- | --- |
+| 例子 | 余额不足、未登录、校验失败 | `undefined.foo`、类型不对 |
+| 处理 | 提示用户、走对应分支 | 上报 + 兜底 UI |
+| 是否上报 | 一般不上报（或按频率采样） | **必须上报** |
+
+```js
+// 业务错误：用返回值表达，不用 throw，避免和 bug 混在一起
+const r = await pay(order);
+if (!r.ok) {
+  showToast(r.reason);       // '余额不足'
+  return;
+}
+
+// 程序错误：让它抛，交给 ErrorBoundary / 全局兜底
+```
+
+把"余额不足"也用 `throw` 表达的项目，最后会变成"catch 里判断 message 字符串"——这是最难维护的写法。
 
 ---
 
-## 调试实战
+## Promise 拒绝链
 
-- **断点**：Sources 面板在可疑行点断点，看调用栈和变量。
-- **条件断点**：右键断点加条件，只在特定值时停。
-- **console 技巧**：`console.table` 看数组、`console.dir` 看对象结构。
-- **Network**：看请求状态、响应、Timing 定位慢请求。
+```js
+fetchData()
+  .then(parse)
+  .then(save)
+  .catch((err) => {
+    // 这里能抓到上面任意一步的错误
+    if (isRetryable(err)) return retry();
+    throw err;                       // 不处理就继续抛
+  })
+  .finally(() => hideLoading());     // 无论成功失败都执行
+```
+
+三个要点：
+
+1. **`.catch` 放在链尾**能兜住前面所有步骤；
+2. **`.then(onOk, onErr)` 的第二个回调只处理该步之前**的错误，不能兜住自己内部抛的；
+3. **`.finally` 不接收参数**，也不能改变结果（除非抛错）。
+
+`Promise.allSettled` 用于"部分失败也要结果"：
+
+```js
+const results = await Promise.allSettled(urls.map(fetchJson));
+const ok = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+```
 
 ---
 
-## 小结
+## 调试：几个真正省时间的手段
 
-- 错误分类型，自定义错误继承 `Error`。
-- `catch` 别吞错，要么处理要么重抛；`finally` 做清理。
-- 异步用 `.catch` / `try-catch` 包 `await`；全局兜底用 `onerror` / `unhandledrejection`。
-- 调试靠断点 + 调用栈 + Network，比 `console.log` 高效。
+### 1. 条件断点
+
+在 Sources 里右键行号 → Add conditional breakpoint，写 `id === 'x123'`。比"打断点 + 反复继续"快十倍。
+
+### 2. XHR/Fetch 断点
+
+Sources → XHR/fetch Breakpoints → 输入 URL 片段，请求发出时自动停在调用栈。定位"这个接口是谁调的"最有效。
+
+### 3. Blackbox（忽略库代码）
+
+Sources → 右键 `node_modules` 文件 → Blackbox script。之后单步调试不会跳进框架内部。
+
+### 4. `console` 的组合拳
+
+```js
+console.table(list.map((x) => ({ id: x.id, name: x.name })));   // 表格看列表
+console.group('loadTask');                                       // 分组
+console.time('render'); render(); console.timeEnd('render');     // 计时
+console.count('render');                                         // 数调用次数
+console.trace('who');                                            // 打印调用栈
+```
+
+### 5. 复现线上错误
+
+拿到 `release` 与 sourcemap 后，在本地用同样的数据打断点；没有 sourcemap 就只能猜。**这也是为什么生产要生成 `hidden` sourcemap 并上传**（见[工程化 14 篇](/blog/posts/engineering-roadmap-14-observability/)）。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 线上只有"加载失败"没有细节 | 重抛时丢了 cause | `new Error(msg, { cause })` |
+| 用户说"点了没反应"但没报错 | 错误被空 catch 吞了 | 去掉空 catch，至少上报 |
+| `catch` 里拿不到原始错误 | 用了 `catch (e)` 但只取 message | 保留整个 error 对象上报 |
+| 断点停不下来 | 代码被压缩/走了别的分支 | 用条件断点或 XHR 断点 |
+| 单步总跳进框架 | 没 blackbox | 把 node_modules 加入忽略 |
+| 资源 404 监控不到 | `error` 监听没开捕获 | 第三个参数传 `true` |
+
+---
+
+## 验收清单
+
+- [ ] 三类错误（同步/异步/资源）都有对应的捕获手段
+- [ ] 自定义错误带了 `code` / `status` / `cause` / `retryable`
+- [ ] 代码里没有空 `catch`，也没有"catch 只 console"的写法
+- [ ] 业务错误用返回值表达，不和程序 bug 混在一起
+- [ ] 会用条件断点、XHR 断点、blackbox
+- [ ] 生产有 sourcemap 能还原栈（定位过一次真实线上错误）
 
 ---
 
 ## 练习
 
-1. 写 `parseSafe(json, fallback)`，解析失败返回 fallback 并打印错误类型。
-2. 用 `async/await` + `try/catch` 改写一段 `.then().catch()` 链式。
-3. 给页面加 `window.addEventListener('unhandledrejection', ...)` 上报未捕获 Promise 错误。
+1. **造一条错误链**：底层 `fetch` 失败 → 包成 `ApiError` 带 `cause` → 上层再包一层，打印看整条链。  
+   *自检*：能说出"没有 cause 时会丢哪一层信息"。
+2. **抓一次吞错**：把某个 `try/catch` 改成空 catch，观察"点了没反应"的效果；再改成上报+重抛。  
+   *自检*：能说明"静默失败"为什么比报错更难查。
+3. **用 XHR 断点找调用方**：对一个轮询接口下断点，从调用栈找到启动轮询的组件与清理点。  
+   *自检*：能指出"没清理"会造成的泄漏位置。

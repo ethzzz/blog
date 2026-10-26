@@ -1,0 +1,222 @@
+---
+title: '04 · this 的四种绑定'
+published: 2026-10-26T15:30:00+08:00
+description: '四条绑定规则与优先级、箭头函数为什么没有自己的 this、三种"this 丢了"的现场、bind/call/apply 的差别，以及类方法、事件回调、setTimeout 里 this 到底是谁。'
+tags: [JavaScript, this, 箭头函数, bind, 调用栈]
+category: JavaScript学习路线
+draft: false
+---
+
+## 一句话结论
+
+`this` **不由函数定义决定，而由调用方式决定**（箭头函数除外）。
+
+```js
+function show() { console.log(this); }
+
+const obj = { show };
+obj.show();      // this = obj（作为方法调用）
+const f = obj.show;
+f();             // this = undefined（严格模式）/ window（非严格）
+```
+
+同一个函数，两种调用方式，`this` 完全不同。
+
+---
+
+## 四条规则与优先级
+
+### 1. 默认绑定（独立调用）
+
+```js
+function f() { console.log(this); }
+f();                    // 严格模式 undefined；非严格 window/globalThis
+```
+
+模块代码默认是严格模式，所以拿到 `undefined`——这也是"`this` 报 undefined"最常见的原因。
+
+### 2. 隐式绑定（作为对象方法调用）
+
+```js
+const user = {
+  name: 'a',
+  greet() { console.log(this.name); },
+};
+user.greet();           // 'a' —— this 是 user
+```
+
+只看**调用点左边是谁**，不看函数在哪定义。链式调用只取最后一层：
+
+```js
+const a = { b: { name: 'inner', greet() { console.log(this.name); } } };
+a.b.greet();            // 'inner'
+```
+
+### 3. 显式绑定（call / apply / bind）
+
+```js
+f.call(ctx, 1, 2);      // 立即调用，参数逐个传
+f.apply(ctx, [1, 2]);   // 立即调用，参数数组
+const g = f.bind(ctx);  // 返回新函数，永久绑定
+g();                    // this 永远是 ctx
+```
+
+`bind` 的绑定**不会被后续 `call` 覆盖**：
+
+```js
+const bound = f.bind({ a: 1 });
+bound.call({ a: 2 });   // this 仍是 { a: 1 }
+```
+
+### 4. new 绑定
+
+`new f()` 时，`this` 是一个**新创建的对象**（原型指向 `f.prototype`），优先级最高。
+
+### 优先级
+
+```text
+new  >  bind（显式）  >  隐式（obj.fn()）  >  默认（fn()）
+```
+
+⚠️ 一个例外：**箭头函数不参与这套规则**，它的 `this` 在定义时就固定了（见下）。
+
+---
+
+## 箭头函数：没有自己的 this
+
+```js
+const obj = {
+  name: 'a',
+  // ❌ 箭头函数没有自己的 this，取的是外层（模块作用域）的 this
+  greet: () => console.log(this.name),   // undefined
+
+  // ✅ 方法用普通函数
+  greet2() { console.log(this.name); },  // 'a'
+
+  // ✅ 回调里用箭头，继承外层的 this —— 这才是箭头函数的主场
+  greetAll() {
+    return ['x', 'y'].map(() => this.name);   // this 是 obj
+  },
+};
+```
+
+结论：**"方法"用普通函数，"回调"用箭头函数**。反过来是最常见的错误。
+
+---
+
+## 三种"this 丢了"的现场
+
+### 现场 1：方法被解构或赋值
+
+```js
+const { greet } = user;
+greet();                 // this = undefined
+
+// 修法
+const greet = user.greet.bind(user);
+```
+
+### 现场 2：作为回调传递
+
+```js
+// ❌ setTimeout 用默认绑定调用
+setTimeout(obj.greet, 100);
+
+// ✅ 绑定
+setTimeout(obj.greet.bind(obj), 100);
+// ✅ 或用箭头包一层
+setTimeout(() => obj.greet(), 100);
+```
+
+React 类组件时代的 `onClick={this.handleClick.bind(this)}` 就是这个问题的产物。
+
+### 现场 3：事件监听器
+
+```js
+// ❌ handler 里的 this 是元素本身（不是组件实例）
+el.addEventListener('click', obj.handle);
+
+// ✅ 需要对象就用箭头/绑定
+el.addEventListener('click', () => obj.handle());
+```
+
+DOM 事件监听有个特例：**普通函数的 `this` 是绑定元素**（这是 `addEventListener` 的规定），所以 `this` 不为 undefined，但也不是你想要的对象。
+
+---
+
+## call / apply / bind 手写一遍
+
+```js
+// 手写 call
+Function.prototype.myCall = function (ctx, ...args) {
+  ctx = ctx ?? globalThis;
+  const key = Symbol('fn');          // 用 Symbol 避免覆盖已有属性
+  ctx[key] = this;                   // 把自己临时挂到 ctx 上
+  const result = ctx[key](...args);  // 变成隐式绑定调用
+  delete ctx[key];
+  return result;
+};
+
+// 手写 bind（支持 new 场景要额外处理原型，这里给最小实现）
+Function.prototype.myBind = function (ctx, ...args) {
+  const fn = this;
+  return function (...rest) {
+    return fn.apply(ctx, [...args, ...rest]);
+  };
+};
+```
+
+手写的意义：**验证你理解"this 是调用时决定的"**——所有技巧都是"把函数挂到目标对象上再调用"。
+
+---
+
+## 类的 this
+
+```js
+class Counter {
+  count = 0;
+
+  // ❌ 普通方法：被解构或当回调时丢 this
+  inc() { this.count++; }
+
+  // ✅ 箭头函数属性：this 在实例化时绑定，天然可传递
+  incArrow = () => { this.count++; };
+}
+```
+
+代价：箭头函数属性**每个实例一份**（不进原型），实例多时内存更高。取舍：只给"需要当回调传出去"的方法用箭头。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `this` 是 `undefined` | 独立调用 + 严格模式 | 用 `.bind`、箭头包装，或改成对象方法调用 |
+| 对象方法用箭头函数拿不到自身属性 | 箭头无自己的 this | 方法改普通函数 |
+| `setTimeout` 里 this 不对 | 默认绑定 | `.bind` 或箭头 |
+| 事件回调里 this 是元素 | `addEventListener` 规定 | 需要对象就用箭头 |
+| `bind` 后再 `call` 无效 | bind 优先级更高 | 这是预期行为 |
+| 类方法传给子组件就丢 this | 解构/传递 | 箭头函数属性或 bind |
+
+---
+
+## 验收清单
+
+- [ ] 能说出四条绑定规则与优先级顺序
+- [ ] 能解释"方法用普通函数、回调用箭头函数"的原因
+- [ ] 能手写 `call` 与 `bind` 的最小实现
+- [ ] 能列出三种"this 丢失"的现场并给出修法
+- [ ] 知道类里的箭头函数属性的代价（每实例一份）
+- [ ] 项目里没有"对象方法写成箭头函数"的错误
+
+---
+
+## 练习
+
+1. **四连预测**：同一个函数分别用 `f()`、`obj.f()`、`f.call(x)`、`new f()` 调用，先猜 `this` 再验证。  
+   *自检*：能说出"new 优先级最高"的原因（它先创建对象再决定 this）。
+2. **手写 bind 并通过测试**：实现 `myBind` 后，验证"绑定后再 call 不改变 this"。  
+   *自检*：能解释为什么 `bind` 的绑定是"永久"的（返回的是包装函数，内部固定用 `apply`）。
+3. **修一次回调丢 this**：把一个类方法直接传给 `setTimeout`，观察报错；用 `bind` 与箭头两种方式修好。  
+   *自检*：能说明两种修法的差别（bind 生成新函数 vs 箭头捕获外层 this）。

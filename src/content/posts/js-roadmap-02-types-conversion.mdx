@@ -1,76 +1,183 @@
 ---
 title: '02 · 数据类型与隐式转换'
-published: 2026-09-29T12:00:00+08:00
-description: 'JS 的原始类型与引用类型区别、== 与 === 的隐式转换陷阱、typeof/instanceof 的边界，以及"为什么我总用 ==="。'
-tags: [JavaScript, 数据类型, 隐式转换, 相等性, typeof]
+published: 2026-10-26T14:30:00+08:00
+description: 'typeof 的四个坑、== 的转换表怎么背得有道理、ToPrimitive 的调用顺序、为什么 [1,2,3].map(parseInt) 得到 NaN，以及 Object.is 与 === 的差别。'
+tags: [JavaScript, 类型, 隐式转换, 相等比较, ToPrimitive]
 category: JavaScript学习路线
 draft: false
 ---
 
-## 一次线上事故的源头
+## 七个原始类型 + 一个对象
 
 ```js
-if (user.permission == "admin") { ... }
+// 原始类型（值语义，不可变）
+string, number, boolean, null, undefined, symbol, bigint
+
+// 引用类型
+object（含数组、函数、Date、Map…）
 ```
 
-某天 `user.permission` 是数字 `0`，`0 == "admin"` 竟然是 `false`——但另一个分支 `1 == "1"` 又是 `true`。隐式转换让相等性判断变得不可预测。**结论先给：`==` 允许类型转换，`===` 不转换、更可控。无特殊理由一律 `===`。**
-
----
-
-## 原始类型 vs 引用类型
-
-- 原始类型：`string / number / boolean / null / undefined / symbol / bigint`，**按值存储**，比较的是"值"。
-- 引用类型：`object`（含数组、函数、日期等），**按引用存储**，变量存的是内存地址。
+关键差别：**原始类型赋值是复制值，对象赋值是复制引用**。
 
 ```js
-const a = { x: 1 };
+let a = { n: 1 };
 const b = a;
-b.x = 2;
-console.log(a.x); // 2（a、b 指向同一对象）
+b.n = 2;
+console.log(a.n);   // 2 —— 同一个对象
 ```
-
-这也是为什么比较两个对象要用深比较或 `JSON.stringify`，而非 `==`/`===`（后者比的是引用）。
 
 ---
 
-## == 的隐式转换规则（记住几条就够）
-
-`==` 在类型不同时会尝试转换，规则复杂且反直觉：
+## `typeof` 的四个坑
 
 ```js
-[] == false      // true（[] 转成 ''，再转成 0）
-[] == ![]       // true（![] 是 false，[] 转 0，false 转 0）
-'0' == false    // true
-null == undefined // true（唯一一对 == 相等但不 === 的情况）
-NaN == NaN      // false（NaN 不等于任何值，用 Number.isNaN 判）
+typeof undefined      // "undefined"  ✅
+typeof null           // "object"     ❌ 历史遗留 bug（32 位时代类型标记）
+typeof []             // "object"     ❌ 数组识别不了
+typeof function(){}   // "function"   ✅（唯一能区分函数的）
+typeof NaN            // "number"     ❌ NaN 也是 number
+typeof 1n             // "bigint"
 ```
 
-> 看到这些就明白：`===` 才是"我真的想比较"。
+正确的判断方式：
+
+```js
+Array.isArray([]);                 // 判数组
+x === null;                        // 判 null（只能用 ===）
+Number.isNaN(x);                   // 判 NaN（别用全局 isNaN，它会先转数字）
+```
+
+`isNaN('abc')` 返回 `true`（因为先 `Number('abc')` → NaN），`Number.isNaN('abc')` 返回 `false`（不转换）。**线上判断数字一定要用后者。**
 
 ---
 
-## 类型判断
+## `==` 的转换规则：记住三条就够
 
-| 需求 | 写法 | 注意 |
+`==` 在类型不同时会转换，规则可以压缩成三条：
+
+1. **`null == undefined` 为 `true`，且它们不等于任何其它值**；
+2. **数字与字符串比较 → 字符串转数字**；
+3. **布尔值先转数字**（`true → 1`，`false → 0`），再回到第 1/2 条；
+4. 对象与原始值比较 → 对象走 `ToPrimitive`。
+
+```js
+null == undefined        // true
+null == 0                // false ← 反直觉，但很有用
+'' == 0                  // true
+'0' == false             // true
+[] == false              // true  （[] → '' → 0）
+[] == ![]                // true  （右边 ![] 是 false → 0；左边 [] → '' → 0）
+({}) == '[object Object]' // true
+```
+
+这张表不是为了背，而是为了**知道哪里会出事**：
+
+| 场景 | 风险 | 建议 |
 | --- | --- | --- |
-| 原始类型 | `typeof x` | `typeof null` 返回 `"object"`（历史 bug） |
-| 引用类型 | `x instanceof Ctor` | 跨 iframe/多全局环境会失效 |
-| 数组 | `Array.isArray(x)` | 最可靠 |
-| 安全判断 | `Object.prototype.toString.call(x)` | 返回 `[object Array]` 等 |
+| 表单值比较 | `'0' == false` 为 true | 统一转数字后比较 |
+| 接口字段判空 | `0 == ''` 为 true | 用 `===` 或显式判 `null/undefined` |
+| 数组/对象比较 | 触发 `ToPrimitive` | 别用 `==` 比对象 |
+
+**唯一推荐的 `==` 用法**：`x == null` 同时判 `null` 和 `undefined`（这是社区共识，ESLint 也允许 `eqeqeq` 的 null 例外）。
 
 ---
 
-## 小结
+## `+` 是加还是拼？看有没有字符串
 
-- 引用类型比的是引用，不是内容。
-- `==` 会隐式转换，易出 bug；默认 `===`。
-- `typeof null` 是 `"object"`，判空用 `x === null`。
-- 数组用 `Array.isArray`，跨环境类型判断用 `toString.call`。
+```js
+1 + 2            // 3
+1 + '2'          // '12'
+'1' + 2          // '12'
+1 + 2 + '3'      // '33'  ← 先算 1+2=3，再拼
+'1' + 2 + 3      // '123'
+[] + {}          // '[object Object]'
+```
+
+规则：**只要有一边是字符串（或能被转成字符串的对象），就拼接**。其它算术运算符（`- * /`）只会做数字转换：
+
+```js
+'6' - 1     // 5
+'6' * '2'   // 12
+'6' + 1     // '61' ← 只有 + 有拼接歧义
+```
+
+真实事故：求和时把 `reduce` 的初始值写成 `''` 而不是 `0`，结果得到 `"0123456789"`。
+
+---
+
+## `ToPrimitive`：对象怎么变成原始值
+
+对象参与比较/运算时，会按顺序尝试：
+
+1. `Symbol.toPrimitive`（如果有）
+2. `valueOf()`
+3. `toString()`
+
+```js
+const obj = {
+  valueOf() { return 42; },
+  toString() { return 'obj'; },
+};
+obj + 1;        // 43  ← valueOf 先
+`${obj}`;       // 'obj' ← 字符串上下文优先 toString
+```
+
+这个机制能解释很多"诡异"：
+
+```js
+[1, 2, 3].map(parseInt);
+// → [1, NaN, NaN]
+```
+
+原因：`map` 传三个参数 `(value, index, array)`，而 `parseInt(value, radix)` 的第二个参数是**进制**。所以实际调用是 `parseInt(1, 0)`、`parseInt(2, 1)`、`parseInt(3, 2)`——radix 为 1 和 2 时非法/无法表示，返回 NaN。
+
+修法：`[1,2,3].map((v) => parseInt(v, 10))` 或 `map(Number)`。
+
+---
+
+## `Object.is` 与 `===`
+
+```js
+NaN === NaN          // false
+Object.is(NaN, NaN)  // true
+
++0 === -0            // true
+Object.is(+0, -0)    // false
+```
+
+`Object.is` 只在这两种边界上不同。React 的依赖比较用的就是 `Object.is`——**这就是为什么 `NaN` 作为依赖不会导致重复执行，而 `-0`/`+0` 会被视为不同**。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `typeof null` 是 object | 历史 bug | 用 `x === null` |
+| `isNaN('abc')` 为 true | 全局 isNaN 先转数字 | 用 `Number.isNaN` |
+| 求和得到字符串 | 初始值是 `''` 或有一边是字符串 | 初始值给 `0`，显式 `Number()` |
+| `'0' == false` 为 true | 布尔先转数字 | 用 `===` |
+| 对象比较永远 false | 比的是引用 | 深比较或比关键字段 |
+| `[1,2,3].map(parseInt)` 出 NaN | 第二个参数是 radix | 用箭头函数包装 |
+
+---
+
+## 验收清单
+
+- [ ] 能说出 `typeof` 的四个坑，并知道正确替代
+- [ ] 能解释 `null == undefined` 为 true 但 `null == 0` 为 false
+- [ ] 能说出唯一推荐的 `==` 用法（`x == null`）
+- [ ] 能解释 `[1,2,3].map(parseInt)` 为什么得到 NaN
+- [ ] 知道 `Object.is` 与 `===` 的两处差别，并知道 React 用它比较依赖
+- [ ] 项目里没有用 `==` 比较业务值（除 `== null`）
 
 ---
 
 ## 练习
 
-1. 预测并验证：`[] == 0`、`' ' == 0`、`null === undefined` 的结果。
-2. 写函数 `isPlainObject(x)`，用 `toString.call` 判断是否为普通对象 `{}`。
-3. 解释为什么 `NaN !== NaN`，以及如何正确判断一个值是不是 `NaN`。
+1. **预测四连**：先猜再跑 `[] == false`、`[] == ![]`、`null == 0`、`'0' == false`。  
+   *自检*：能对每个结果给出转换链（如 `[] → '' → 0`）。
+2. **修一个求和 bug**：写一个 `reduce` 求数组和，故意写 `''` 作为初始值，观察结果；再改成 `0`。  
+   *自检*：能说明"为什么只有 `+` 会出现这种问题"。
+3. **复现 `map(parseInt)`**：打印 `map` 传入的三个参数，确认 `parseInt` 收到的第二个值是索引。  
+   *自检*：能说出 radix 为 0/1/2 时分别发生了什么。

@@ -108,7 +108,7 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 
 		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
 			<p class="font-medium mb-1">💡 学习建议</p>
-			<p>JS 的"怪"大多有底层原因：作用域、闭包、原型链、事件循环四块是地基，务必动手跑代码观察现象。异步与事件循环是面试与实战高发区，建议画调用栈+任务队列的图来理解。遇到"为什么输出是这样"先别记结论，去 DevTools 里打断点看执行顺序。</p>
+			<p>按三层推进：<strong>L1（01–05）</strong>是地基，作用域 → 执行上下文 → this → 闭包要连着读，跳过执行上下文会让后面全变口诀；<strong>L2（06–09）</strong>讲对象与异步，<code>08 事件循环</code> 是一篇顶十篇的重点（所有异步顺序题都出自这里）；<strong>L3（10–11）</strong>是工程表达，写库/工具前必读模块化。全程动手跑代码观察现象，别记结论；遇到"为什么输出是这样"，去 DevTools 打断点看执行顺序。最后的 <strong>12 毕业项目</strong>手写 5 个核心库并配 12 个断言，写完才算真懂。</p>
 		</div>
 
 		<div class="mt-4 flex flex-wrap gap-4 text-sm">

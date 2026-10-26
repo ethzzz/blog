@@ -1,82 +1,191 @@
 ---
 title: '05 · 闭包'
-published: 2026-09-29T15:00:00+08:00
-description: '闭包是函数与其词法作用域的组合。讲清闭包的形成、为什么能"记住"外部变量、经典面试题（循环+var）、以及在模块封装与防抖节流中的真实应用。'
-tags: [JavaScript, 闭包, 词法作用域, 模块封装, 防抖]
+published: 2026-10-26T16:00:00+08:00
+description: '闭包 = 函数 + 它记住的词法环境：三个真实用途、为什么它能做出私有状态、什么时候会泄漏大对象、循环经典题的两种解法，以及闭包与垃圾回收的关系。'
+tags: [JavaScript, 闭包, 作用域, 内存泄漏, 高阶函数]
 category: JavaScript学习路线
 draft: false
 ---
 
-## 当年最懵的概念
+## 定义要精确：闭包不是"函数里套函数"
 
-面试被问"什么是闭包"，我背了定义却答不出"它解决什么问题"。后来才懂：**闭包让函数能访问定义时所在的作用域，即使那个作用域已执行完**。
+闭包 = **函数 + 它被创建时所在的作用域**。任何函数只要引用了外层变量，就形成了闭包——**哪怕没有嵌套函数**。
+
+```js
+const counter = (() => {
+  let n = 0;                       // 被闭包"记住"
+  return {
+    inc: () => ++n,
+    get: () => n,
+  };
+})();
+
+counter.inc();
+counter.inc();
+counter.get();     // 2 —— n 没被销毁
+```
+
+`n` 在 IIFE 执行结束后本该消失，但因为返回的两个函数引用了它，**它被保留在内存里**。这就是闭包的全部魔法。
 
 ---
 
-## 形成条件
+## 三个真实用途
+
+### 1. 私有状态（模块模式）
 
 ```js
-function outer() {
-  const count = 0;
-  return function inner() {
-    count++;
-    return count;
+function createStore(initial) {
+  let state = initial;              // 外部无法直接改
+  const listeners = new Set();
+
+  return {
+    get: () => state,
+    set(next) {
+      state = typeof next === 'function' ? next(state) : next;
+      listeners.forEach((l) => l(state));
+    },
+    subscribe(l) {
+      listeners.add(l);
+      return () => listeners.delete(l);   // 返回取消订阅，防止泄漏
+    },
   };
 }
-const fn = outer();
-fn(); // 1
-fn(); // 2
 ```
 
-`inner` 被返回后，`outer` 的作用域本该销毁，但因为 `inner` 还在引用 `count`，**这块作用域被保留**——这就是闭包。`count` 活在闭包里，成为"私有变量"。
+这是 Redux/Zustand 内部的基本形态：**状态藏在闭包里，只能通过方法访问**。
 
----
-
-## 经典坑：循环 + var
-
-回顾 01 篇的例子，用闭包修复：
+### 2. 防抖 / 节流（保存计时器）
 
 ```js
-for (var i = 0; i < 3; i++) {
-  ((j) => setTimeout(() => console.log(j), 0))(i); // 0 1 2
-}
-// 或现代写法：直接用 let（块级作用域天然隔离）
-for (let i = 0; i < 3; i++) setTimeout(() => console.log(i), 0);
-```
-
-`let` 的方案本质也是每轮迭代形成独立作用域（类闭包），所以最推荐。
-
----
-
-## 真实应用
-
-- **模块封装**：IIFE / 模块返回的对象方法构成闭包，隐藏私有状态（早期的"模块模式"）。
-- **防抖/节流**：闭包保存定时器 ID 和上一次时间。
-- **函数工厂**：根据参数"定制"返回的函数。
-
-```js
-function debounce(fn, delay) {
-  let timer;
+function debounce(fn, wait = 300) {
+  let timer = null;                  // 每次调用共享同一个 timer
   return (...args) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), delay);
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn(...args);
+    }, wait);
   };
 }
 ```
 
+没有闭包就无法在多次调用之间保留 `timer`——这是"闭包存状态"的典型。
+
+### 3. 一次性初始化（缓存）
+
+```js
+const getConfig = (() => {
+  let cache;
+  return () => (cache ??= loadConfig());   // 只加载一次
+})();
+```
+
 ---
 
-## 小结
+## 闭包与内存：什么时候会泄漏
 
-- 闭包 = 函数 + 其词法作用域；能"记住"外部变量。
-- 它是模块私有化、高阶函数的基础。
-- 循环问题用 `let` 或 IIFE 解决。
-- 闭包持有变量会**延长生命周期**，注意避免不必要的内存占用。
+关键概念是**可达性**：只要还能从根（全局、当前调用栈）访问到，就不会被回收。
+
+```js
+function attach() {
+  const hugeData = new Array(1e6).fill('x');   // 约 8MB
+  return () => {
+    return hugeData.length;      // ⚠️ 只用了 length，但整个数组被记住
+  };
+}
+const fn = attach();
+```
+
+`fn` 活着，`hugeData` 就活着。修法：**只保留需要的那部分**。
+
+```js
+function attach() {
+  const hugeData = new Array(1e6).fill('x');
+  const len = hugeData.length;    // ✅ 只闭包住长度
+  return () => len;
+}
+```
+
+（现代引擎有"变量级别"的优化，理论上可能只保留用到的变量，但**不要依赖它**——不同引擎/不同代码形态表现不一致。）
+
+另外两类常见泄漏：
+
+```js
+// 1) 未取消的订阅
+useEffect(() => {
+  store.subscribe(update);        // ❌ 没有返回取消函数
+}, []);
+
+// 2) 未清理的定时器，且回调引用了大对象
+useEffect(() => {
+  const id = setInterval(() => render(bigList), 1000);   // ❌ 没 clear
+  return () => clearInterval(id);
+}, []);
+```
+
+---
+
+## 循环经典题：两种解法
+
+```js
+// ❌ 都是 3
+for (var i = 0; i < 3; i++) setTimeout(() => console.log(i));
+
+// ✅ 解法 1：let 的块级绑定（推荐）
+for (let i = 0; i < 3; i++) setTimeout(() => console.log(i));
+
+// ✅ 解法 2：IIFE 造独立作用域（老代码常见）
+for (var i = 0; i < 3; i++) {
+  (function (j) {
+    setTimeout(() => console.log(j));
+  })(i);
+}
+```
+
+本质：**闭包捕获的是"变量"，不是"值"**。要拿到每轮的值，就得每轮有一个新变量。
+
+---
+
+## 闭包不是"内存泄漏"，但会延长生命周期
+
+| 说法 | 准确性 |
+| --- | --- |
+| "闭包会导致内存泄漏" | ❌ 不准确。闭包只是让变量活得更久 |
+| "闭包持有大对象会导致泄漏" | ✅ 准确 |
+| "全局存了闭包返回的函数，永不释放" | ✅ 这是真泄漏 |
+
+判断方法：**Heap snapshot 里看 retained size**，找那些"本该消失却还在"的闭包作用域。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 循环回调都拿最后一个值 | 闭包捕获变量而非值 | `let` 或 IIFE |
+| 内存阶梯上升 | 订阅/定时器没清理，闭包一直持有 | 返回取消函数并调用 |
+| 组件卸载后还在更新状态 | 异步回调闭包住旧 setState | 用 `AbortController` 或标记 `mounted` |
+| 以为闭包只存在于嵌套函数 | 定义不准确 | 任何引用外层变量的函数都是闭包 |
+| 为了"省内存"到处手动置 null | 过度优化 | 保证可达性正确即可 |
+
+---
+
+## 验收清单
+
+- [ ] 能给出闭包的准确定义（函数 + 词法环境）
+- [ ] 能写出一个用闭包做私有状态的 store
+- [ ] 能用闭包实现 debounce，并解释"为什么必须用闭包"
+- [ ] 能解释"闭包捕获变量而不是值"，并用两种方式修循环题
+- [ ] 知道什么情况下闭包会造成泄漏，能给出修法
+- [ ] 会用 Heap snapshot 的 retained size 判断是否泄漏
 
 ---
 
 ## 练习
 
-1. 用闭包实现一个 `createCounter()`，每次调用返回自增后的值。
-2. 写一个 `once(fn)`，让函数只执行一次（闭包保存标志位）。
-3. 解释为什么下面返回 5 个 5，如何用 `let` 改成 0-4：`for (var i=0;i<5;i++){ setTimeout(()=>console.log(i),0); }`。
+1. **写一个带取消的订阅**：`subscribe` 返回 `unsubscribe`，在组件卸载时调用，用 snapshot 验证监听器数量不增长。  
+   *自检*：能说明"不返回取消函数"为什么会泄漏。
+2. **优化一个大对象闭包**：写一个闭包住 8MB 数组但只用 `length` 的函数，改成只捕获 `length`，对比内存。  
+   *自检*：能给出两个内存数字，并说明"可达性"决定回收。
+3. **循环题两解**：分别用 `let` 与 IIFE 修同一个循环，观察输出都是 0/1/2，并解释两者等价的原因。  
+   *自检*：能说出"IIFE 的形参就是那个每轮新建的变量"。
