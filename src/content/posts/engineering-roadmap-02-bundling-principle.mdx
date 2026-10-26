@@ -1,63 +1,227 @@
 ---
 title: '02 · 模块化与打包原理'
 published: 2026-09-30T20:00:00+08:00
-description: '打包器到底在做什么：从入口出发构建依赖图、转译、合并、拆分 chunk。理解 ESM/CJS 互操作、Tree-shaking 的前置条件、以及 source map 如何把压缩代码映射回源码。'
+description: 'ESM 与 CJS 的本质差异与互操作坑，打包器如何构建依赖图并产出 chunk，tree-shaking 生效的五个条件，code splitting 的三种切法，以及 sourcemap 怎么选。'
 tags: [前端工程化, 打包, 依赖图, tree-shaking, sourcemap]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## 浏览器不认识你的工程
+## 为什么先学原理，再学工具
 
-你写的是 `import`/`export`、TS、JSX，浏览器只认"一个或少数几个 JS 文件"。**打包器（bundler）就是把分散的模块，变成浏览器能直接跑的产物**。
+Webpack 和 Vite 的配置项加起来有几百个，但**核心流程只有四步**：解析入口 → 构建依赖图 → 转换模块 → 生成 chunk。把这四步想清楚，配置项就不再是"抄来的咒语"，而是"我在第几步做了什么"。
 
----
-
-## 打包四步
-
-1. **构建依赖图**：从入口文件出发，递归解析所有 `import`，形成"谁依赖谁"的图。
-2. **转译**：用 Babel/esbuild 把 TS/JSX/新语法转成目标 JS。
-3. **合并**：把模块拼接成 bundle（处理作用域、导出绑定）。
-4. **拆分与优化**：按路由/动态 `import` 拆成多个 chunk，做压缩、tree-shaking。
+这篇讲的是所有打包器共享的底层模型。03（Webpack）和 04（Vite）只是同一套模型的不同实现策略。
 
 ---
 
-## Tree-shaking 的前提
+## 一、ESM 与 CJS：不是新旧，是两种求值模型
 
-"摇掉"没被用到的导出，靠的是 **ESM 的静态结构**（编译期可知导入导出）：
+| | ESM（`import`/`export`） | CJS（`require`/`module.exports`） |
+| --- | --- | --- |
+| 求值时机 | **静态解析**，先建立依赖关系再执行 | **运行时**，执行到 `require` 才去加载 |
+| 依赖是否可分析 | 是（构建期就知道导入什么） | 否（可以是 `require(someVar)`） |
+| 导出绑定 | **活绑定**（值变了导入方也能看到新值） | 值的拷贝（`module.exports` 是对象属性） |
+| 顶层 await | 支持 | 不支持 |
+| 循环依赖 | 靠活绑定能部分工作 | 容易拿到 `undefined` |
+| 加载 | 异步 | 同步 |
 
-```js
-// math.js
-export const add = () => {};
-export const unused = () => {}; // 没被 import → 被摇掉
+这条"静态 vs 运行时"的差异，**直接决定 tree-shaking 能不能做**：只有在打包期就能确定"谁导入了什么"，才能安全地把没用到的代码删掉。
+
+### 互操作的四类坑（实战必踩）
+
+1. **默认导出被包了一层**
+   CJS 模块 `module.exports = fn`，在 ESM 里 `import fn from 'x'` 拿到的是 `fn`，但 `import * as ns from 'x'` 里的 `ns.default` 才是它。打包器会插 `__esModule` 标记来兼容，混用久了必然乱。
+
+2. **`require` 不能同步加载 ESM**
+   `require('some-esm')` 在 Node 里会抛错（Node 22 起有实验性 `require(esm)`，但浏览器打包场景仍按兼容层处理）。反过来 ESM 可以 `import` CJS。
+
+3. **活绑定 vs 值拷贝**
+   ```js
+   // counter.cjs
+   let count = 0;
+   module.exports = { count, inc: () => count++ };
+   ```
+   引入方 `const { count } = require('./counter.cjs')` 永远是 0——拿到的是快照，不是变量。
+
+4. **同一模块被解析成两份**
+   一个包同时提供 `main`（CJS）和 `module`/`exports`（ESM），如果一部分依赖走 CJS 入口、一部分走 ESM 入口，打出来就是**两份代码 + 两份模块级状态**。React 的 "Invalid hook call" 有一半是这么来的。
+
+> 实践建议：**新代码全用 ESM**；引入 CJS 包时只在入口处 `import` 一次，别在不同文件混用 `require`。
+
+### `exports` 字段：现代包的入口声明
+
+```json
+{
+  "name": "my-lib",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./utils": {
+      "types": "./dist/utils.d.ts",
+      "import": "./dist/utils.mjs"
+    }
+  }
+}
 ```
 
-前提：用 ESM（`import/export`），且打包器开启 `mode: production`。**CommonJS 因运行时才知依赖，无法静态分析，摇不掉**。
+有 `exports` 后，**没列出的路径一律不可访问**（比 `main` + 文件系统查找更严格）。这是好设计：包的内部实现不再被外部随手 import。
 
 ---
 
-## ESM 与 CJS 互操作
+## 二、打包器的四步流程
 
-打包器要处理两种模块规范的混用：把 CJS 的 `module.exports` 包成 ESM 可消费的接口。这也是为什么"只 import CJS 的具名导出有时会失败"——CJS 本质是单个 `exports` 对象。
+```text
+entry（入口）
+  → resolve（解析：node_modules 查找、别名、扩展名补全）
+  → load（加载源码）
+  → transform（loader / plugin：TS→JS、CSS 提取、资源处理）
+  → 构建依赖图（每个模块的 imports 变成图的边）
+  → chunk 划分（入口切分 / 动态 import / 手动分组）
+  → 优化（tree-shaking、压缩、scope hoisting）
+  → emit（写文件 + sourcemap）
+```
+
+**依赖图**是整个体系的核心：每个节点是一个模块，边是 import 关系。所有"优化"本质上都是**在这张图上做取舍**：
+
+- 删节点 = tree-shaking（删没用到的导出）
+- 拆子图 = code splitting（把一部分子图单独成 chunk）
+- 合并子图 = vendor chunk（把同类的第三方包合并，减少请求数）
+
+### 解析顺序（`import 'foo'` 怎么找到文件）
+
+```text
+1. 是否核心模块（node:fs）
+2. 是否绝对/相对路径 → 补扩展名 .js/.ts/.jsx...，或读目录的 package.json main/exports
+3. 是否路径别名（@/ → src/，tsconfig paths 或打包器 alias）
+4. node_modules 逐层向上查找
+5. 命中的包按其 exports/main/module 字段选入口
+```
+
+排错口诀：**找不到模块，先看第 3 步（别名），再看第 5 步（包的 exports 是否暴露了那个路径）**。
 
 ---
 
-## Source Map
+## 三、Tree-shaking：五个条件缺一不可
 
-压缩后的代码只剩 `a,b,c`，报错堆栈看不懂。**source map** 记录"压缩代码位置 ↔ 源码位置"的映射，让 DevTools 能把错误指回你写的 `.ts` 行。生产环境也建议保留（或单独上传到错误监控），否则线上报错无法定位。
+很多人以为"用 ESM 就能 tree-shake"，结果打了 800KB 进去。真正的条件是：
+
+1. **必须是 ESM**：依赖是 CJS 就基本没戏（打包器无法静态判断导出）。
+2. **包的 `sideEffects` 声明正确**：
+   ```json
+   { "sideEffects": false }
+   ```
+   如果你的包有副作用（比如 `import './polyfill'` 会改全局），却声明 `false`，**副作用会被误删**；反之不声明，打包器只能保守保留。
+   ```json
+   { "sideEffects": ["*.css", "./src/register.ts"] }
+   ```
+3. **导入是可静态分析的**：`import { a } from 'x'` 可以；`import * as x` 后动态取属性、`require` 拼字符串都不行。
+4. **没有"顶层副作用污染"**：模块顶层执行了 `window.x = 1`、注册了全局监听，打包器就不敢删。
+5. **压缩器能做 DCE（死代码消除）**：产物要经过 terser/esbuild 的 minify，未使用的导出和分支才会被真正删掉。
+
+```js
+// ❌ 这一行会让整个 lodash 进来（CJS + 无法静态分析）
+import _ from 'lodash';
+_.chunk(list, 3);
+
+// ✅ 按路径导入
+import chunk from 'lodash/chunk';
+```
+
+验证手法：`npx source-map-explorer dist/assets/*.js`（详见 09 篇），直接看哪个模块占了最大面积。
 
 ---
 
-## 小结
+## 四、Code splitting：三种切法
 
-- 打包器 = 依赖图 + 转译 + 合并 + 拆分。
-- Tree-shaking 依赖 ESM 静态结构，CJS 摇不掉。
-- source map 是定位压缩后代码错误的生命线。
+| 切法 | 做法 | 适用 |
+| --- | --- | --- |
+| **入口切分** | 多个 `entry` | MPA、独立后台 |
+| **动态导入** | `import('./heavy')` | 路由级、弹窗/编辑器等交互后加载 |
+| **手动分组** | `manualChunks` / `splitVendorChunkPlugin` | 把稳定的第三方包拆出来，利用长缓存 |
+
+```js
+// 路由级动态导入（React Router / Vue Router 都支持）
+const Detail = lazy(() => import('./pages/Detail'));
+
+// Vite：把大而稳定的依赖单独成 chunk
+export default {
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom'],
+          charts: ['echarts'],
+        },
+      },
+    },
+  },
+};
+```
+
+取舍原则：
+
+- **拆得太碎**：HTTP/1.1 下请求数变多，反而慢；HTTP/2 下影响小，但仍有解析开销。
+- **拆得太粗**：改一行业务代码，整个 vendor chunk 的 hash 变化，用户缓存全失效。
+- 经验值：单 chunk ≤ 250KB（未压缩），首屏关键路径 ≤ 3 个 JS 请求。
+
+---
+
+## 五、Sourcemap：选错类型等于白做
+
+| 类型 | 体积 | 能定位到 | 用在哪 |
+| --- | --- | --- | --- |
+| `false` | 0 | 不能 | 绝不要（线上报错你就瞎了） |
+| `source-map` | 最大 | 原始行列 | 生产环境上传给监控平台（不外发） |
+| `hidden-source-map` | 大 | 原始行列 | **生产推荐**：生成 map，但不在产物里留引用注释 |
+| `inline` | 更大（base64 进 JS） | 原始行列 | 只用于库开发调试 |
+| `cheap-module-source-map` | 小 | 到行不到列 | 开发环境（快） |
+| `eval-*` | 小 | 到行 | 开发环境热更新最快，但报错栈里全是 eval |
+
+生产推荐组合：
+
+```js
+// Vite
+export default { build: { sourcemap: 'hidden' } };
+// 然后把 dist/**/*.map 上传到 Sentry/自建平台，不随 CDN 发布
+```
+
+> 记住一条：**sourcemap 不上 CDN**。它包含完整源码，等于把源码公开了。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 打包后体积没降 | 依赖是 CJS，或 `sideEffects` 没声明 | 换 ESM 版本；给包加 `sideEffects: false` |
+| 删掉 `sideEffects` 后样式丢了 | 把有副作用的 CSS 导入标记成无副作用 | 用数组形式列出 `*.css` |
+| 生产报错指到 `chunk-xxx.js:1:12345` | 没生成 sourcemap 或没上传 | `hidden` 生成 + 上传监控平台 |
+| 本地 dev 正常，打包后 `undefined` | CJS/ESM 混用导致双份模块或活绑定误解 | 统一 ESM；检查 `exports` 字段 |
+| 改一行，缓存全失效 | 第三方包和业务代码打进同一个 chunk | `manualChunks` 拆 vendor |
+| `Cannot find module '@/xxx'` | 别名只配了 tsconfig，没配打包器 | 两边都配（Vite 的 `resolve.alias`、Webpack 的 `resolve.alias`） |
+
+---
+
+## 验收清单
+
+- [ ] 能用一句话说清 ESM 和 CJS 的本质差别，并举例说明"活绑定"
+- [ ] 知道自己项目里哪些依赖是 CJS，它们是否影响了 tree-shaking
+- [ ] 能在浏览器 Network 面板指出首屏加载了哪几个 chunk，各多大
+- [ ] 项目里的 `sideEffects` 声明与实际副作用一致
+- [ ] 生产环境生成了 sourcemap 且**没有**随产物公开发布
+- [ ] 能解释"为什么改一行业务代码不该让 vendor chunk 的 hash 变化"
 
 ---
 
 ## 练习
 
-1. 用 `npx esbuild` 打包一个含未使用导出的 ESM 文件（production 模式），对比打包前后体积，验证 tree-shaking。
-2. 故意制造一个线上报错，用 source map 在 DevTools 里定位回源码行。
-3. 解释为什么 `import { a } from "cjs-lib"` 可能拿不到具名导出。
+1. **验证 tree-shaking**：写 `import _ from 'lodash'` 只用 `chunk()`，构建后看产物大小；再改成 `import chunk from 'lodash/chunk'`，对比两次体积差。
+   *自检*：能给出两个具体数字，并说明差异来自"整包引入 vs 单函数 + 其依赖"。
+2. **制造一次双份模块**：在同一个项目里，一处用 `require('some-lib')`、一处用 `import ... from 'some-lib'`，构建后搜索该库的特征字符串出现次数。
+   *自检*：能说明为什么会打两份、以及为什么这会导致"状态不同步"。
+3. **拆 vendor**：给项目加 `manualChunks` 把 react 单独拆出，改一行业务代码后重新构建，对比 chunk 文件名 hash 变化。
+   *自检*：业务 chunk hash 变、vendor hash 不变，能解释"长缓存"的原理。

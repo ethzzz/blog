@@ -1,7 +1,7 @@
 ---
-title: '01 · 包管理器'
+title: '01 · 包管理器与依赖治理'
 published: 2026-09-30T19:00:00+08:00
-description: 'npm / yarn / pnpm 的差异与选型，lockfile 为什么必须提交，语义化版本（^ ~ *）的陷阱，依赖类型 dependencies/devDependencies/peerDependencies 的正确划分。'
+description: 'npm / yarn / pnpm 的安装策略差异，lockfile 为什么是团队生命线，语义化版本与 pin 的取舍，四类依赖的正确划分，以及 audit / overrides / dedupe 这套依赖治理手法。'
 tags: [前端工程化, npm, pnpm, lockfile, 语义化版本]
 category: 前端工程化学习路线
 draft: false
@@ -9,63 +9,184 @@ draft: false
 
 ## 一次"只在我机器上能跑"的事故
 
-新人没提交 `package-lock.json`，别人 `npm install` 装到了 `lodash` 的一个小版本更新，某个 API 行为变了，本地正常、CI 红。根因：**没有 lockfile，依赖树不可复现**。
+新人提交代码时漏了 `package-lock.json`。第二天别人 `npm install`，装到 `lodash` 的一个新 patch，某个边界行为变了：本地正常，CI 红，白屏。
+
+排查花了两天。根因不是代码，是**依赖树不可复现**。这件事之后我们定了一条规矩：**锁不到版本的东西，不算代码**。
 
 ---
 
-## 三大包管理器
+## 包管理器到底干了三件事
 
-| 工具 | 特点 | 适用 |
+很多人把它当成"下载器"，其实它做的是：
+
+1. **解析依赖图**：把 `package.json` 里的版本范围，结合所有传递依赖的约束，解出一棵确定的树（这是 NP 难问题，最后靠 SAT 求解/回溯）。
+2. **决定 `node_modules` 布局**：扁平还是嵌套、硬链接还是复制——这决定了你会不会遇到"幽灵依赖"。
+3. **维护 lockfile**：把解出来的树记下来，供下次原样重放。
+
+理解第 2 点是理解 pnpm 的关键。
+
+### 三种布局
+
+| 方案 | 布局 | 后果 |
 | --- | --- | --- |
-| `npm` | 自带、最稳 | 通用 |
-| `yarn` | 早期快、workspace 支持 | 老项目 |
-| `pnpm` | 硬链接+内容寻址，**省磁盘、严格**（不扁平化 node_modules） | 现代项目/Monorepo 首选 |
+| **npm（v3+）/ yarn v1** | 尽量扁平，冲突时嵌套 | 省空间，但**幽灵依赖**：没声明的包也能 `import` 到，因为被提升到顶层 |
+| **pnpm** | `node_modules/.pnpm` 里内容寻址存一份，顶层只放符号链接 | 严格：只有声明过的依赖才可见；磁盘占用小（同一版本全局一份） |
+| **yarn PnP** | 不要 `node_modules`，靠 `.pnp.cjs` 映射 | 最严格最快，但生态兼容成本高，工具链要适配 |
 
-`pnpm` 的"非扁平" node_modules 能**杜绝幽灵依赖**（没声明却能被 import），这是它最大的工程价值。
+### 选型
+
+| 维度 | npm | yarn 1 | pnpm |
+| --- | --- | --- | --- |
+| 安装速度 | 中 | 中 | **快**（硬链接复用） |
+| 磁盘 | 大 | 大 | **小**（跨项目共享 store） |
+| 严格性 | 松（幽灵依赖） | 松 | **严** |
+| Monorepo | workspace 够用 | workspace 老牌 | **workspace 最顺**（见 11 篇） |
+| 生态兼容 | 最好 | 好 | 好（少数包要 `node-linker=hoisted`） |
+
+> 结论：**新项目直接 pnpm**，老项目别为了换而换。团队最重要的是"统一"，不是"最潮"。
 
 ---
 
-## lockfile 必须提交
+## lockfile：团队的生命线
 
-- `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` 锁定了**精确版本与依赖树**。
-- 提交它 → 所有人、CI 装到完全一致的结果，**可复现构建**。
-- 装依赖用 `npm ci`（基于 lock 干净安装），比 `npm install` 更快更严格，CI 必用。
+lockfile 记录的是**完整依赖树 + 每个包的精确版本 + 完整性哈希（integrity）**。
 
----
-
-## 版本号语义
-
-```json
-"lodash": "^1.2.3"  // 允许 1.x.x 中 >=1.2.3（不含 2.0.0）
-"react": "~18.2.0"  // 允许 18.2.x
-"vue": "*"          // 任意版本（危险，别用）
+```bash
+# 有 lockfile 的正确装法（CI / 部署必用）
+npm ci                      # 严格按 lock 装，lock 与 package.json 不一致直接报错
+pnpm install --frozen-lockfile
+yarn install --frozen-lockfile
 ```
 
-`^` 只升 minor/patch，major 不升——这是"不破坏兼容性"的约定。但即使是 `^`，lockfile 仍应锁死，避免意外。
+`npm ci` 和 `npm install` 的区别值得背下来：
+
+| | `npm install` | `npm ci` |
+| --- | --- | --- |
+| 读 package.json 的版本范围 | 会 | 不会，只读 lock |
+| 会不会改 lockfile | **会**（可能悄悄升级） | 不会，不一致就报错 |
+| 装之前清 `node_modules` | 不清 | **清空重装** |
+| 速度 | 慢 | 快 |
+| 用在哪 | 本地开发加包 | CI、部署、任何需要可复现的地方 |
+
+### lockfile 冲突怎么解（实战）
+
+两个人同时加依赖，`pnpm-lock.yaml` 必冲突。**不要手工合并**，正确做法：
+
+```bash
+git checkout --theirs pnpm-lock.yaml   # 随便取一份
+pnpm install                            # 让工具按合并后的 package.json 重算
+git add pnpm-lock.yaml
+```
+
+`package.json` 的冲突要人工看清楚（保留双方新增的依赖），lockfile 交给工具重生成。
 
 ---
 
-## 依赖类型
+## 版本号：`^`、`~` 到底放开多少
 
-- **dependencies**：运行时需要（如 React、lodash）。
-- **devDependencies**：仅开发/构建需要（如 vite、eslint、typescript）。
-- **peerDependencies**："宿主项目应提供"的（如插件声明它需要的 React 版本，避免重复打包）。
+```json
+{
+  "lodash": "^4.17.21",   // >=4.17.21 <5.0.0   放开 minor + patch
+  "react": "~18.2.0",     // >=18.2.0 <18.3.0   只放开 patch
+  "vue": "3.4.21",        // 精确锁定
+  "axios": "*"            // 任意版本（等于放弃控制，别用）
+}
+```
 
-分错类型会导致：生产包过大，或 peer 冲突。
+- **`^` 是默认也是最合理的**：minor 按语义化版本约定不应破坏 API。
+- **`~` 适合**：对 patch 也敏感的基础库（如某些编译工具）。
+- **精确版本适合**：构建工具链（`vite`、`typescript`、`eslint`）——它们的 minor 经常带行为变化，团队构建结果必须一致。
+- 无论写什么，**lockfile 都会锁死实际版本**；`^` 影响的是"有人删了 lock 重新装"或"`npm update` 时"的结果。
+
+> 有个反直觉的点：`^` 并不危险，**没有 lockfile 才危险**。
 
 ---
 
-## 小结
+## 四类依赖，放错就是事故
 
-- 选型现代项目优先 `pnpm`（省空间、防幽灵依赖）。
-- **lockfile 必提交**，CI 用 `npm ci` / `pnpm install --frozen-lockfile`。
-- 版本用 `^`/`~`，别用 `*`；lockfile 兜底精确性。
-- 依赖按 运行/开发/peer 三类正确划分。
+| 字段 | 含义 | 放错的后果 |
+| --- | --- | --- |
+| `dependencies` | 运行时真正需要 | 把构建工具放这里 → 生产镜像/产物变大 |
+| `devDependencies` | 只在开发、构建、测试时需要 | 把运行时库放这里 → 生产构建时找不到模块 |
+| `peerDependencies` | "由宿主项目提供"，我不打包 | 漏写 → 出现两份 React，hooks 报错 |
+| `optionalDependencies` | 装失败也能继续（平台相关二进制） | 放错 → CI 在别的平台直接挂 |
+
+`peerDependencies` 最容易踩。你写一个组件库，`react` 必须放 peer：
+
+```json
+{
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": false }
+  }
+}
+```
+
+如果写成 `dependencies`，用户项目里就会出现**两份 React**，表现是：`Invalid hook call` 或 context 读不到。
+
+---
+
+## 依赖治理：装进来只是开始
+
+```bash
+# 1) 安全审计（CI 里跑，出现 high/critical 就红）
+pnpm audit --audit-level high
+
+# 2) 找出没用到的依赖
+npx depcheck
+
+# 3) 强制统一传递依赖的版本（解决同一个包多副本）
+# package.json
+{
+  "pnpm": {
+    "overrides": { "lodash": "4.17.21" }
+  }
+}
+# npm 用 "overrides"，yarn 用 "resolutions"
+```
+
+什么时候该用 `overrides`：
+
+- 某个传递依赖有已知漏洞，上游还没发新版；
+- 同一个包在树里有 3 个版本，加起来 400KB（先确认不会破坏兼容）；
+- 修复 `peerDependencies` 冲突。
+
+什么时候**不该**用：只是为了"看着整齐"。override 是止血带，不是常规操作，用一次记一笔，等上游修好就删。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| CI 与本地装出不同版本 | 没提交 lockfile，或 CI 用了 `npm install` | 提交 lockfile；CI 用 `npm ci` / `--frozen-lockfile` |
+| `Cannot find module 'xxx'` 但 package.json 里有 | 幽灵依赖被移除后暴露真实缺失（换 pnpm 时常见） | 把真正用到的包显式声明 |
+| 换 pnpm 后某个包报错 | 它依赖了被提升的传递依赖 | 临时 `node-linker=hoisted`，长期应修包或提 issue |
+| 两份 React / Invalid hook call | 组件库把 react 放进了 `dependencies` | 改成 `peerDependencies` |
+| `npm ci` 报 lock 不同步 | 有人手改了 package.json 没重装 | 本地 `pnpm install` 重新生成 lock 再提交 |
+| 安装越来越慢 | store 在机械盘 / 网络问题 / 无缓存 | `pnpm config set store-dir` 到 SSD；CI 缓存 store |
+
+---
+
+## 验收清单（做到这些算过）
+
+- [ ] 仓库里有且只有一个 lockfile，且已入库
+- [ ] 删掉 `node_modules` 后 `pnpm install --frozen-lockfile` 能装成功
+- [ ] CI 用的是 `ci` / `--frozen-lockfile`，不是 `install`
+- [ ] 能说清你的项目里哪 3 个包应该用精确版本、为什么
+- [ ] 组件库/插件类项目里，`react`/`vue` 在 `peerDependencies` 而非 `dependencies`
+- [ ] `pnpm audit` 没有 high/critical（或每条都有处置记录）
+- [ ] `npx depcheck` 报出的未使用依赖已被清理
 
 ---
 
 ## 练习
 
-1. 初始化一个 pnpm 项目，观察 `node_modules/.pnpm` 结构，解释"硬链接+非扁平"如何防幽灵依赖。
-2. 删掉 lockfile 重新 `install`，对比 `package.json` 与 lock 的版本差异。
-3. 把一个依赖从 devDependencies 误放进 dependencies，说明对生产构建体积的影响。
+1. **观察布局差异**：同一个项目分别用 npm 和 pnpm 安装，对比 `node_modules` 顶层目录数量与 `du -sh` 结果，写出 pnpm 少在哪。
+   *自检*：能指出 `.pnpm` 目录里是内容寻址的实体，顶层只是符号链接。
+2. **制造一次 lockfile 事故**：删掉 lockfile，把某个 `^` 依赖的版本改到上一个 minor，`install` 后对比 `node_modules/<pkg>/package.json` 的 `version`。
+   *自检*：能说明"没有 lock 时 `^` 会把 minor 拉满"。
+3. **修一个幽灵依赖**：在 npm 项目里 `import` 一个没在 `package.json` 声明的传递依赖，跑通；然后改用 pnpm 安装，观察报错，并把该依赖显式声明。
+   *自检*：能解释"扁平化提升"和"为什么 pnpm 不允许"。

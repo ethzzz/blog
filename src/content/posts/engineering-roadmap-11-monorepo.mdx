@@ -1,68 +1,199 @@
 ---
 title: '11 · Monorepo 实战'
-published: 2026-09-31T13:00:00+08:00
-description: 'Monorepo 把多个关联包/应用放在一个仓库统一管理：pnpm workspace 做依赖提升与过滤，Turborepo 做任务编排与远程缓存。讲清它解决什么、又带来什么，以及"小团队该不该上"。'
+published: 2026-10-01T13:00:00+08:00
+description: 'pnpm workspace + Turborepo 的落地配置：workspace 协议与依赖提升、任务管线与本地/远程缓存、增量构建与 affected 过滤、changesets 发版，以及它带来的五个真实痛点。'
 tags: [前端工程化, Monorepo, pnpm-workspace, Turborepo, 任务编排]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## 多仓库的痛
+## 先判断该不该上
 
-公司有 `ui-lib`、`utils`、`web-app`、`admin` 四个包，分散四个仓库：改了 `utils` 的 API，要发版 → 另三个仓库逐个升级 → 版本对不齐，一天耗在"对齐版本"。**Monorepo 让它们在同一仓库、共享一份代码、原子化改动**。
+Monorepo 解决的是**"多个包之间有强关联，但分散在多个仓库"**带来的摩擦：
+
+| 多仓（multi-repo）的痛 | Monorepo 的解法 |
+| --- | --- |
+| 改一个组件库，要发版 → 升级 3 个业务仓 → 联调 | 改完直接 `pnpm build`，业务包引的是源码 |
+| 公共配置（tsconfig/eslint）复制 5 份，改一处忘四处 | 抽成 `packages/config`，统一引用 |
+| 依赖版本漂移（这个仓 React 18.2，那个 18.3） | 根 `pnpm.overrides` 统一收敛 |
+| 跨包重构无法一次提交、一次回滚 | 一个 PR 完成，原子性 |
+
+代价（下面会展开）：**工具链复杂度上升、CI 需要缓存编排、权限粒度变粗**。
+
+> 判断标准：**有 3 个以上包共享代码，且每周至少跨包改动一次**，才值得。5 人以内的团队通常不需要。
 
 ---
 
-## pnpm workspace：依赖与过滤
+## 目录结构
 
-`pnpm-workspace.yaml` 声明包含哪些包：
-
-```yaml
-packages:
-  - "packages/*"
-  - "apps/*"
+```text
+my-repo/
+├── pnpm-workspace.yaml
+├── package.json              # 根：只放 devDependencies 与脚本
+├── turbo.json
+├── tsconfig.base.json
+├── apps/
+│   ├── web/                  # 业务应用（可部署）
+│   └── admin/
+└── packages/
+    ├── ui/                   # 组件库（被引用）
+    ├── utils/                # 工具函数
+    └── config/               # eslint / tsconfig / tailwind 共享配置
 ```
 
-- **依赖提升**：公共依赖只在根装一份，各包共享，磁盘与安装速度双优。
-- **跨包引用**：`packages/utils` 可直接被 `apps/web` 以 workspace 协议引用，改了立刻生效，无需发版。
-- **过滤执行**：`pnpm --filter web... build` 只构建 `web` 及其依赖。
+规则：**`apps/*` 可部署，`packages/*` 只被引用**。这条界线划清，依赖方向就不会乱（apps 可以依赖 packages，反之不行）。
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# pnpm 9+ 的依赖版本目录：所有包共用同一版本
+catalog:
+  react: ^18.3.1
+  typescript: ^5.6.0
+```
+
+```json
+// apps/web/package.json —— 用 catalog 与 workspace 协议
+{
+  "dependencies": {
+    "react": "catalog:",
+    "@my/ui": "workspace:*",
+    "@my/utils": "workspace:*"
+  }
+}
+```
+
+- **`workspace:*`**：永远指向仓库内的版本，**发布时会自动替换成真实版本号**（这点很关键，见下面 changesets）。
+- **`catalog:`**：一处定义、处处引用，根治"版本漂移"。
 
 ---
 
 ## Turborepo：任务编排 + 缓存
 
 ```json
-// turbo.json
+// turbo.json（Turborepo 2.x 用 tasks，1.x 用 pipeline）
 {
-  "pipeline": {
-    "build": { "dependsOn": ["^build"], "outputs": ["dist/**"] }
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],        // 先构建依赖包（^ 表示上游）
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "lint": { "dependsOn": [] },
+    "typecheck": { "dependsOn": ["^build"] },
+    "test": { "dependsOn": ["build"], "outputs": ["coverage/**"] },
+    "dev": { "cache": false, "persistent": true }
   }
 }
 ```
 
-- `^build` 表示"先构建我依赖的包"。
-- **缓存**：任务输入（源码、配置）不变就直接复用上次产物（本地 + 远程缓存），CI 大幅提速。
-- 只跑受影响的包，无关包跳过。
+```bash
+pnpm turbo run build              # 按依赖顺序构建所有包，命中缓存的直接跳过
+pnpm turbo run build --filter=web...   # 只构建 web 及其依赖
+pnpm turbo run test --filter=...[HEAD^1]  # 只跑受本次改动影响的包
+```
+
+`outputs` 写对是缓存生效的前提：**Turborepo 缓存的是"任务 + 输入哈希 + 输出目录"**，`outputs` 没声明 `dist/**`，第二次构建就必然重跑。
+
+### 缓存命中率是唯一的 KPI
+
+```bash
+pnpm turbo run build --dry=json | jq '.tasks[] | {task, cache}'
+```
+
+典型收益（真实项目量级）：
+
+| 场景 | 无缓存 | 有本地缓存 | 有远程缓存（CI） |
+| --- | --- | --- | --- |
+| 全量构建 8 个包 | 4m20s | 25s | 18s |
+| 改一个包的 PR CI | 4m20s | 40s | **35s** |
+
+远程缓存（Vercel Remote Cache / 自建 `turborepo-remote-cache`）的价值在 CI：**同一份代码在 5 个 PR 里只构建一次**。
 
 ---
 
-## 收益与代价
+## 发版：changesets
 
-收益：原子改动跨包、统一工具链、共享类型、一致规范。
-代价：**仓库变大、CI 更复杂、需要工具约束**（否则所有人改同一 repo 易冲突）。小团队（&lt;5 人、包间耦合低）往往用多仓库 + 清晰的发版流程更轻。
+```bash
+pnpm add -Dw @changesets/cli && pnpm changeset init
+pnpm changeset          # 交互式选择要发的包与版本级别，生成 md 文件
+pnpm changeset version  # 按 md 文件提升版本号 + 生成 CHANGELOG
+pnpm changeset publish  # 发布到 npm，并把 workspace:* 替换成真实版本
+```
+
+工作流：**每个改动了 `packages/*` 的 PR 必须附带一个 changeset 文件**（CI 里可检查）。好处：
+
+- 版本号由改动意图决定（patch/minor/major），不是拍脑袋；
+- CHANGELOG 自动生成，用户能看懂"这次改了什么"；
+- 内部依赖的版本联动自动处理。
 
 ---
 
-## 小结
+## 五个真实痛点
 
-- Monorepo 解决"多关联包版本对齐、原子改动"的协作痛。
-- pnpm workspace 管依赖与过滤；Turborepo 管任务编排与缓存。
-- 适合中大型、包耦合高的团队；小团队先评估是否过度。
+### 1. 幽灵依赖在 workspace 里更隐蔽
+
+`apps/web` 用了 `lodash` 但没声明，是从 `packages/utils` 提升上来的——本地能跑，单独部署就崩。pnpm 的严格布局能拦住大部分，但 **workspace 内部的提升仍会造成假象**。
+
+对策：CI 里对每个 app 单独 `pnpm --filter=web install --frozen-lockfile && build`。
+
+### 2. 跨包类型
+
+`apps/web` 引 `@my/ui`，类型来自 `packages/ui/dist/index.d.ts`——**必须先构建 ui 才能有类型**。这导致：
+
+```json
+{ "typecheck": { "dependsOn": ["^build"] } }   // 少了这条，CI 里必红
+```
+
+或者用 TS 的 project references（`composite: true`），让类型直接来自源码，省掉构建步骤。
+
+### 3. CI 变慢（如果没有编排）
+
+8 个包 × 各自 `install + build`，没有缓存就是 8 倍时间。**Monorepo 的 CI 必须配 turbo + 远程缓存**，否则会从"多仓各跑各的"退化成"一个巨大的串行任务"。
+
+### 4. 权限粒度
+
+一个仓库意味着所有人能看到所有代码。有外包/多团队隔离需求时，Monorepo 是个真问题（代码所有者可以用 `CODEOWNERS` 缓解，但不能真正隔离）。
+
+### 5. 循环依赖
+
+`ui` 依赖 `utils`，`utils` 又从 `ui` 引一个类型——pnpm 能装，但构建顺序无解。**用 `pnpm why` + 依赖图检查（`madge` / `dependency-cruiser`）在 CI 里拦住。**
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 改了 `packages/ui`，`apps/web` 没变 | 没用 `workspace:*`，或 `dev` 没监听上游 | 用 `workspace:*`；`turbo run dev` 会并行监听 |
+| CI 缓存从不命中 | `outputs` 没声明，或哈希输入含时间戳/随机值 | 补 `outputs`；不要在构建里写时间戳到产物 |
+| `pnpm install` 报 lockfile 不同步 | 有人直接改子包 package.json | 根目录 `pnpm install` 重新生成 |
+| 发布后 `workspace:*` 残留 | 用了 `pnpm publish` 但没走 changesets 的替换 | 用 `changeset publish` |
+| 单包构建报找不到依赖的类型 | 上游没 build | `dependsOn: ["^build"]` 或 project references |
+| 全量 install 越来越慢 | 所有包依赖都装到根，无法按需 | 分 workspace、避免根目录堆依赖 |
+
+---
+
+## 验收清单
+
+- [ ] 能列出"为什么必须 Monorepo"的三条具体理由（而非"流行"）
+- [ ] `apps/*` 与 `packages/*` 的依赖方向单向（apps → packages）
+- [ ] 内部依赖全部用 `workspace:*`，公共版本用 `catalog:`
+- [ ] `turbo.json` 的 `outputs` 与实际产物一致，缓存命中率能从日志确认
+- [ ] CI 里"只构建受影响包"（`--filter=...[HEAD^1]`）已生效
+- [ ] 发版走 changesets，CHANGELOG 自动生成
+- [ ] 有循环依赖检查（`dependency-cruiser` 或 `madge`）在 CI 里
 
 ---
 
 ## 练习
 
-1. 用 pnpm workspace 建 `packages/utils` 和 `apps/web`，让 web 引用 utils 的 workspace 版本。
-2. 配 `turbo.json` 的 `build` pipeline，体验 `dependsOn: ["^build"]` 的依赖顺序。
-3. 列出你团队"是否该上 Monorepo"的判定项，给出结论与理由。
+1. **量出缓存收益**：两个包的项目，连续跑两次 `turbo run build`，对比总耗时与 `FULL TURBO` 提示。
+   *自检*：第二次应显示 `cache hit, replaying logs`，耗时降到 1/5 以内。
+2. **制造一次幽灵依赖**：在 `apps/web` 里 import 一个只存在于 `packages/utils` 的依赖，本地跑通；然后单独 `--filter=web build`，看是否失败。
+   *自检*：能解释"提升（hoisting）"与"独立构建"的差别。
+3. **跑一次 changesets 流程**：改一个包 → `pnpm changeset` → `pnpm changeset version`，检查 `package.json` 版本与 CHANGELOG。
+   *自检*：能说出 `workspace:*` 在 publish 时被替换成什么值。

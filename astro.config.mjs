@@ -15,6 +15,14 @@ export default defineConfig({
 	site: "https://haolo.cloud",
 	base: "/blog",
 	trailingSlash: "always",
+	// 旧链接兜底：前端工程化模块重排后，毕业项目从 12 挪到 15（2026-10-26）。
+	// 保留跳转页，避免外部书签/RSS 里的旧地址 404。
+	// ⚠️ value 必须手写 `/blog` 前缀：Astro 不会把 base 自动加到 redirect 目标上，
+	//    而 key 不能带前缀（否则产物会落到 dist/client/blog/blog/...）。
+	redirects: {
+		"/posts/engineering-roadmap-12-project-delivery-gates/":
+			"/blog/posts/engineering-roadmap-15-project-delivery-gates/",
+	},
 	// 混合渲染（hybrid）：整站仍是静态产物（默认 prerender=true），
 	// 只有 src/pages/solutions/ 下的两个页面显式 `export const prerender = false`。
 	// 为什么必须这样：解答内容改由数据库（Notelab 的 /api/practice/public/**）供给，

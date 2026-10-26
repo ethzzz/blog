@@ -1,0 +1,220 @@
+---
+title: '13 · 环境配置与发布回滚'
+published: 2026-10-26T10:00:00+08:00
+description: '一份产物跑多环境：构建期注入与运行期读取的取舍，产物哈希与缓存策略，releases/<sha> + 软链的原子发布，秒级回滚，以及灰度与功能开关的落地写法。'
+tags: [前端工程化, 发布, 回滚, 环境变量, 灰度, nginx]
+category: 前端工程化学习路线
+draft: false
+---
+
+## "改个接口地址要重新构建"——这是设计缺陷
+
+很多项目把 API 地址写进构建：
+
+```ts
+const base = import.meta.env.VITE_API_BASE;   // 构建时被文本替换，写死在 JS 里
+```
+
+后果：预发和生产的产物**不一样**，所以"预发验证过的包"不能直接上生产。你以为在测最终产物，其实测的是另一个包。
+
+**工程化的做法：同一份产物，跑在任何环境。**
+
+---
+
+## 构建期注入 vs 运行期读取
+
+| | 构建期注入（`VITE_*`） | 运行期读取（`config.js` / 接口） |
+| --- | --- | --- |
+| 时机 | 打包时文本替换 | 浏览器启动时读取 |
+| 一份产物多环境 | ❌ | ✅ |
+| 能放敏感值 | ❌（谁都能在 JS 里搜到） | ⚠️ 仍不建议（前端无秘密） |
+| 复杂度 | 低 | 中（要处理加载顺序） |
+| 适合 | 编译期常量（功能开关默认值、构建号） | 环境相关的运行时配置（API 域名、埋点 key、CDN 前缀） |
+
+### 运行期配置的标准写法
+
+```html
+<!-- public/config.js —— 由部署脚本按环境生成，不参与打包 -->
+<script>
+  window.__APP_CONFIG__ = {
+    apiBase: 'https://api.example.com',
+    env: 'production',
+    sentryDsn: '',
+  };
+</script>
+<script type="module" src="/assets/index-abc123.js"></script>
+```
+
+```ts
+// src/config.ts
+type AppConfig = { apiBase: string; env: 'dev' | 'staging' | 'prod'; sentryDsn?: string };
+
+export const config: AppConfig =
+  (window as unknown as { __APP_CONFIG__?: AppConfig }).__APP_CONFIG__ ?? {
+    apiBase: 'http://localhost:8001',
+    env: 'dev',
+  };
+```
+
+发布脚本按环境写入 `config.js`：
+
+```bash
+# ops/release.sh 片段
+cat > "$TARGET/config.js" <<EOF
+window.__APP_CONFIG__ = {
+  apiBase: "${API_BASE}",
+  env: "${APP_ENV}",
+  sentryDsn: "${SENTRY_DSN}",
+};
+EOF
+```
+
+两个要点：
+
+1. **`config.js` 不能带哈希、必须 no-cache**（否则用户拿到旧配置）；
+2. **`config.js` 要在主 bundle 之前加载**（普通 `<script>` 即可，阻塞但极小）。
+
+> 前端没有秘密：任何进浏览器的值都能被看到。真正的密钥只能放服务端，前端只拿"短期令牌"。
+
+---
+
+## 产物哈希与缓存：一次配对错，全站变慢或全站失效
+
+| 文件 | 缓存策略 | 原因 |
+| --- | --- | --- |
+| `index.html` | `no-cache`（每次协商） | 它是"版本指针"，缓存住就永远拿不到新资源 |
+| `assets/*.[hash].js/css` | `immutable, max-age=31536000` | 内容变则名变，可以永久缓存 |
+| `config.js` | `no-cache` | 环境配置，随时可能改 |
+| 图片/字体（带 hash） | 同 assets | 同上 |
+
+```nginx
+location / {
+  try_files $uri $uri/ /index.html;
+}
+location = /index.html { add_header Cache-Control "no-cache"; }
+location = /config.js  { add_header Cache-Control "no-cache"; }
+location ~* \.[0-9a-f]{8}\.(js|css|woff2|png|jpg|svg)$ {
+  add_header Cache-Control "public, max-age=31536000, immutable";
+}
+location /assets/ {
+  add_header Cache-Control "public, max-age=31536000, immutable";
+}
+```
+
+**最常见的事故**：`index.html` 也被缓存了 → 用户拿到旧 HTML，引用的旧 hash 文件已被清理 → 白屏。所以"部署时清理旧产物"和"index.html 不缓存"必须同时成立。
+
+---
+
+## 原子发布：软链切换
+
+不要 `rsync` 覆盖正在用的目录——覆盖过程中用户会拿到新旧混合的资源（这正是白屏的另一个来源）。
+
+```bash
+#!/usr/bin/env bash
+# ops/release.sh <sha>
+set -euo pipefail
+
+APP=/srv/app
+SHA="${1:?need commit sha}"
+TARGET="$APP/releases/$SHA"
+
+# 1. 构建到独立目录（幂等：同 sha 重复执行结果一致）
+mkdir -p "$TARGET"
+tar -xzf /tmp/dist.tar.gz -C "$TARGET"
+cat > "$TARGET/config.js" <<EOF
+window.__APP_CONFIG__ = { apiBase: "${API_BASE}", env: "${APP_ENV}" };
+EOF
+
+# 2. 冒烟：起一个临时静态服务验证首页 200
+( cd "$TARGET" && python3 -m http.server 18080 >/dev/null 2>&1 & echo $! > /tmp/smoke.pid )
+sleep 1
+curl -fsS http://127.0.0.1:18080/ >/dev/null || { kill "$(cat /tmp/smoke.pid)"; echo "smoke failed"; exit 1; }
+kill "$(cat /tmp/smoke.pid)"
+
+# 3. 原子切换（软链是原子的）
+ln -sfn "$TARGET" "$APP/current.new"
+mv -Tf "$APP/current.new" "$APP/current"
+
+# 4. 只保留最近 5 个版本
+ls -1dt "$APP"/releases/* | tail -n +6 | xargs -r rm -rf
+
+echo "released $SHA"
+```
+
+nginx 指向软链即可：
+
+```nginx
+root /srv/app/current;
+```
+
+### 回滚 = 一条命令
+
+```bash
+ln -sfn /srv/app/releases/<上一个 sha> /srv/app/current.new
+mv -Tf /srv/app/current.new /srv/app/current
+```
+
+**耗时 < 1 秒**，因为产物还在。这就是"原子发布"真正的价值：不是发布快，而是**回滚快**。
+
+> 前提：后端接口必须向前兼容（老前端能配新后端）。否则回滚前端会 500——**接口删字段必须分两步：先停止使用，再删除**。
+
+---
+
+## 灰度与功能开关
+
+| 手段 | 粒度 | 适用 |
+| --- | --- | --- |
+| CDN/nginx 按比例分流 | 用户级（按 IP/cookie） | 大版本或架构改动 |
+| 前端功能开关（Feature Flag） | 功能级 | 新功能上线、A/B |
+| 后端开关 | 数据级 | 与前端无关的业务逻辑 |
+
+功能开关的最小实现（不引入平台）：
+
+```ts
+// src/flags.ts —— 从 config.js 或接口读取，支持本地覆盖
+const flags = (window as unknown as { __APP_CONFIG__?: { flags?: Record<string, boolean> } })
+  .__APP_CONFIG__?.flags ?? {};
+
+export const isOn = (key: string) => flags[key] ?? false;
+```
+
+```tsx
+{isOn('new_task_list') ? <NewTaskList /> : <LegacyTaskList />}
+```
+
+纪律：**每个开关都要有下线计划**（写进 issue，带日期）。开关长期不删，代码里会长出一堆互斥分支，最后没人敢动——这比不做开关更糟。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 发布后白屏，控制台 404 静态资源 | 旧产物被清理 + `index.html` 被缓存 | `index.html` no-cache；产物保留 ≥ 2 个版本 |
+| 预发正常，生产接口错 | 用了 `VITE_*` 构建期注入，两套产物 | 改运行期 `config.js` |
+| 改了配置不生效 | `config.js` 被 CDN 缓存 | `no-cache` + 部署时带版本参数 |
+| 回滚后仍报错 | 后端已删字段，老前端不认识新响应 | 接口向前兼容；删除字段分两步 |
+| 发布时用户报错 | `rsync` 边传边覆盖 | 原子发布（releases + 软链） |
+| 开关打开后没反应 | 开关读取早于 `config.js` 加载 | `config.js` 用阻塞脚本放在入口前 |
+
+---
+
+## 验收清单
+
+- [ ] 同一份构建产物能在预发与生产运行（配置来自 `config.js` 或接口）
+- [ ] `index.html` 与 `config.js` 是 `no-cache`，带 hash 的资源是 `immutable`
+- [ ] 发布是"新目录 + 软链切换"，不存在边传边覆盖
+- [ ] 回滚能在 1 分钟内完成，并且**演练过一次**
+- [ ] 线上保留最近 3–5 个版本的产物
+- [ ] 每个功能开关都有负责人与下线日期
+
+---
+
+## 练习
+
+1. **做一次"一份产物两环境"**：把 API 地址从 `VITE_*` 挪到 `config.js`，用同一个 `dist` 分别在本地起两个不同配置的静态服务。
+   *自检*：两次构建产物 hash 完全一致，只有 `config.js` 不同。
+2. **演练一次回滚**：用软链方案部署 v1、v2，然后手动切回 v1，记录耗时。
+   *自检*：耗时 < 5 秒，且回滚后页面功能正常（说明产物没被清理）。
+3. **制造一次缓存事故**：把 `index.html` 设成 `max-age=3600` 并删掉旧产物，用浏览器强刷前访问一次。
+   *自检*：能复现"HTML 是旧的、引用的 JS 404"的白屏，并说明修复组合（no-cache + 保留旧版本）。

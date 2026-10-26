@@ -1,62 +1,210 @@
 ---
 title: '10 · 微前端'
-published: 2026-09-31T12:00:00+08:00
-description: '微前端解决"多个团队、多个技术栈、独立部署却同屏运行"的问题。讲清核心思路（基座+子应用、运行时集成）、主流方案（qiankun/Module Federation）的取舍，以及它带来的复杂度代价。'
+published: 2026-10-01T12:00:00+08:00
+description: '微前端是组织问题的技术解：iframe / qiankun 沙箱 / Module Federation 三种集成方式的取舍，CSS 与 JS 隔离的三道难题，通信设计，以及"什么情况下不该上"的清单。'
 tags: [前端工程化, 微前端, qiankun, ModuleFederation, 架构]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## 什么时候才需要它
+## 先说结论：微前端不是技术选型，是组织选型
 
-一个中台里，订单团队用 Vue、风控团队用 React，却要合成一个后台；各团队要**独立开发、独立部署、互不阻塞**。这就是微前端的场景——把"巨石应用"拆成可独立交付的"子应用"。
+它会带来的好处，全都是**组织级**的：
 
-> 如果只是单团队单技术栈，微前端是**过度设计**，反而引入一堆通信/样式隔离/版本协调的复杂度。
+- 5 个团队能在同一个页面并行发版，互不阻塞；
+- 老 Angular 系统能一块块换成 React，不用整体重写；
+- 某个子应用崩了，不至于整页白屏。
+
+代价也全是**技术级**的：路由冲突、样式污染、重复依赖、调试困难、构建链路变长。**团队没到那个规模，上微前端等于给自己造债。**
+
+判断标准（满足两条以上才考虑）：
+
+- 3 个以上团队需要改同一个页面，发版互相阻塞；
+- 存在无法短期统一的技术栈（老系统迁移期）；
+- 单体仓库构建已经超过 10 分钟，而团队又无法拆仓。
 
 ---
 
-## 核心思路：运行时集成
+## 三种集成方式
 
-与"构建时把代码拼一起"不同，微前端在**运行时**把子应用挂到基座的容器里：
+| 方案 | 集成时机 | 隔离性 | 独立部署 | 主要代价 |
+| --- | --- | --- | --- | --- |
+| **iframe** | 运行时（浏览器原生） | **最强**（完全隔离） | 天然支持 | 弹窗/路由/白屏体验差，通信只能 postMessage |
+| **qiankun / single-spa** | 运行时（JS 加载 + 沙箱） | 中（需沙箱补） | 支持 | 需要基座、样式与全局污染需处理 |
+| **Module Federation** | 构建时声明，运行时加载远程模块 | 弱（共享同一全局环境） | 支持 | 版本与依赖共享复杂，调试链路长 |
 
+### iframe：被低估的方案
+
+如果子应用是"独立功能块"（报表、监控大盘、第三方嵌入），iframe 的隔离性是其他方案做不到的：CSS、JS、`localStorage`、cookie 全隔离。
+
+它的真实缺点集中在体验层：弹窗被限制在 iframe 内、路由与浏览器地址栏不同步、高度自适应麻烦、首屏有白屏过程。**能用 iframe 解决的，别上微前端框架。**
+
+### qiankun：sandbox + 生命周期
+
+```ts
+// 基座（主应用）
+import { registerMicroApps, start } from 'qiankun';
+
+registerMicroApps([
+  {
+    name: 'order',
+    entry: '//order.example.com/',
+    container: '#subapp',
+    activeRule: '/order',
+    props: { token: () => store.getState().token },   // 通信：传函数而非值
+  },
+]);
+
+start({ sandbox: { strictStyleIsolation: true } });    // Shadow DOM 样式隔离
 ```
-基座（主应用）
- ├─ 路由 /app/order  → 加载 Order 子应用（独立部署的 JS）
- ├─ 路由 /app/risk   → 加载 Risk 子应用（另一技术栈）
+
+子应用导出生命周期：
+
+```ts
+// 子应用入口
+export async function bootstrap() {}
+export async function mount(props) {
+  props.onGlobalStateChange((state) => { /* ... */ });
+  ReactDOM.createRoot(root).render(<App basename="/order" />);
+}
+export async function unmount(props) {
+  ReactDOM.unmountComponentAtNode(root);
+}
 ```
 
-子应用各自构建、各自部署，基座按路由决定加载谁。
+要点：
+
+- **`activeRule` 与子应用 `basename` 必须一致**，否则路由双重前缀；
+- `strictStyleIsolation: true` 用 Shadow DOM，隔离彻底但**弹窗挂到 body 会跑到 Shadow 外**（很多 UI 库默认 portal 到 body）；
+- 子应用要支持**独立运行**（`npm run dev` 单独起），否则开发调试极其痛苦。这是最容易被忽略的硬要求。
+
+### Module Federation：共享模块，而非隔离页面
+
+```js
+// 远程应用（remote）vite/webpack 侧
+new ModuleFederationPlugin({
+  name: 'shop',
+  filename: 'remoteEntry.js',
+  exposes: { './ProductCard': './src/ProductCard.tsx' },
+  shared: { react: { singleton: true }, 'react-dom': { singleton: true } },
+});
+```
+
+```js
+// 宿主（host）
+new ModuleFederationPlugin({
+  remotes: { shop: 'shop@https://shop.example.com/remoteEntry.js' },
+  shared: { react: { singleton: true } },
+});
+```
+
+```tsx
+const ProductCard = React.lazy(() => import('shop/ProductCard'));
+```
+
+它的思路完全不同：**不是"嵌入一个应用"，而是"跨应用共享模块"**。适合：多个独立部署的应用要复用组件/工具，又不想发 npm 包。
+
+`shared: { singleton: true }` 是命门：不设它，React 会加载两份，hooks 直接报 `Invalid hook call`。
 
 ---
 
-## 主流方案
+## 三道隔离难题
 
-- **qiankun（基于 single-spa）**：国内中台常用，提供 JS 沙箱（隔离全局变量）、样式隔离、应用间通信。开箱即用但偏重。
-- **Module Federation（Webpack 5）**：在**构建期**声明"哪些模块由谁提供"，运行时直接共享依赖，免重复加载。适合同技术栈的模块级复用，更轻。
-- **Web Components / iframe**：iframe 隔离最彻底但通信难、体验割裂；Web Components 标准但生态弱。
+### 1. CSS 隔离
+
+| 手段 | 隔离度 | 副作用 |
+| --- | --- | --- |
+| 命名空间前缀（`.order-app .btn`） | 弱 | 需要构建期改造，漏网之鱼常见 |
+| CSS Modules / scoped | 中 | 只保护自己的样式，挡不住全局样式污染 |
+| Shadow DOM | 强 | 弹窗/DOM 查询/第三方库兼容问题 |
+| iframe | 最强 | 体验代价 |
+
+实践建议：**前缀 + 子应用内不使用全局选择器（`body`、`*`）**，比 Shadow DOM 更实用。
+
+### 2. JS 全局污染
+
+qiankun 用 Proxy 沙箱拦截 `window` 的读写，但拦不住：
+
+- `document.addEventListener` 注册的全局监听（卸载要手动清）；
+- 定时器（`setInterval` 泄漏，子应用切走后还在打接口）；
+- 修改原型链（`Array.prototype.xxx`）；
+- CSS-in-JS 注入的 `<style>` 标签。
+
+**子应用的 `unmount` 必须做好清理**，这是微前端最常见的线上问题来源。
+
+### 3. 路由冲突
+
+- 基座负责顶层路由（`/order/*` → 子应用）；
+- 子应用内部用 `basename`；
+- 子应用**不要**操作 `history.pushState` 到基座外。
 
 ---
 
-## 必须面对的代价
+## 通信设计：三条原则
 
-- **样式隔离**：子应用 CSS 互相污染（用 scoped/Shadow DOM/命名空间）。
-- **JS 沙箱**：全局变量冲突（qiankun 用 proxy 沙箱）。
-- **依赖重复**：每个子应用都带一份 React，体积翻倍（Module Federation 可缓解）。
-- **通信与调试**：跨应用状态同步、错误监控定位变复杂。
+1. **单向**：基座下发给子应用（如 token、用户信息、主题），子应用通过事件上报，不要互相直接调用内部方法。
+2. **传函数不传值**：`props: { getToken: () => token }`，传值会导致子应用拿到过期快照。
+3. **共享状态用独立 store，不要共享实例**：微前端的意义是独立部署，共享一个 Redux 实例等于把两者重新耦合。
+
+```ts
+// 基座初始化全局状态
+import { initGlobalState } from 'qiankun';
+const actions = initGlobalState({ user: null, theme: 'light' });
+actions.onGlobalStateChange((state, prev) => { /* 基座自己也要监听 */ });
+// 子应用内：props.onGlobalStateChange + props.setGlobalState
+```
 
 ---
 
-## 小结
+## 性能代价（很多人没算过）
 
-- 微前端解决"多团队独立部署、同屏运行"，非单团队标配。
-- 思路：基座 + 运行时集成子应用。
-- qiankun 重但开箱全，Module Federation 轻但偏同栈。
-- 它带来沙箱/样式/依赖/通信的真实复杂度，上之前算清收益。
+| 问题 | 原因 | 处理 |
+| --- | --- | --- |
+| 首屏变慢 | 多个 `remoteEntry.js` + 各自 runtime | 预加载（`prefetch`）、共享依赖 |
+| 重复依赖 | 每个子应用都打一份 React/lodash | MF 的 `shared` 或 externals + CDN |
+| 切换闪烁 | 子应用样式/字体按需加载 | 关键样式预加载，容器给最小高度 |
+| 内存增长 | 子应用卸载未清理 | 生命周期清理 + 长驻页面监控 |
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 子应用路由 404 | `activeRule` 与 `basename` 不一致 | 两者统一；子应用支持独立运行 |
+| 弹窗位置错乱 / 被遮挡 | Shadow DOM 隔离 + portal 到 body | 关掉 strict 隔离，改用前缀方案 |
+| `Invalid hook call` | React 被打了两份 | MF `shared.singleton`，或 externals |
+| 切走子应用后接口还在请求 | 定时器/监听未清理 | `unmount` 里清 timer、removeEventListener |
+| 生产环境加载 remote 失败 | 跨域 / 路径写死 localhost | remoteEntry 用同域或配 CORS，环境变量注入 |
+| 微前端后构建时间翻倍 | 每个子应用独立全量构建 | 共享构建缓存（turbo，见 11 篇） |
+
+---
+
+## 什么时候不该用（清单）
+
+- 只有 1–2 个团队改同一个页面 → 用**目录分层 + 代码分割**就够；
+- 只是想"技术栈升级" → 用**渐进式重构**（新页面用新栈，老页面逐步替换）；
+- 只是想让"构建快" → 用 **Monorepo + 构建缓存**（11 篇），比微前端简单一个量级；
+- 团队没有统一的部署与监控能力 → 微前端会把"独立部署"的痛苦放大 5 倍。
+
+---
+
+## 验收清单
+
+- [ ] 能说清你的场景为什么**必须**微前端（而不是分层/分割能解决）
+- [ ] 能列出你选的方案在"CSS / JS / 路由"三方面的隔离手段
+- [ ] 子应用可以独立 `dev` 运行、独立部署
+- [ ] 子应用 `unmount` 清理了定时器、全局监听、注入的 style
+- [ ] 共享依赖（React）只有一份，能在产物里验证
+- [ ] 有一次"子应用崩了但主应用还能用"的故障演练记录
 
 ---
 
 ## 练习
 
-1. 列出你所在团队"是否真需要微前端"的判断清单（团队数、技术栈数、部署独立性）。
-2. 对比 qiankun 与 Module Federation 在你的场景下的优劣。
-3. 设计一个子应用间通信方案（全局 store vs 自定义事件），说明取舍。
+1. **对比隔离效果**：用 qiankun 起两个子应用，其中一个写 `* { box-sizing: content-box }`，观察另一个子应用是否受影响；再开 `strictStyleIsolation` 对比。
+   *自检*：能解释"为什么 Shadow DOM 能挡住，而前缀方案挡不住全局选择器"。
+2. **制造 React 双份**：MF 里去掉 `shared`，两个应用各自 import React，观察报错。
+   *自检*：能说出错误信息关键词（`Invalid hook call` / `two copies of React`）与根本原因。
+3. **写一份"不上微前端"的替代方案**：针对你手上的真实项目，用路由级代码分割 + 目录分层实现"两个团队不阻塞"，估算改造工作量。
+   *自检*：能对比两套方案的人月成本与长期维护成本。

@@ -1,76 +1,222 @@
 ---
 title: '03 · Webpack 核心'
 published: 2026-09-30T21:00:00+08:00
-description: 'Webpack 的核心概念：entry/output/loader/plugin，loader 如何把非 JS 资源转成模块，plugin 在生命周期钩子上扩展能力，以及拆包（code splitting）与常见优化配置。'
+description: '从零配一份能上生产的 Webpack 5 配置：loader 与 plugin 的职责边界、执行顺序为什么反着来、splitChunks 怎么切、持久化缓存怎么开，以及它相对 Vite 还值得用的场景。'
 tags: [前端工程化, Webpack, loader, plugin, code-splitting]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## Webpack 的心智模型
+## 什么时候还该用 Webpack
 
-Webpack 把一切（JS、CSS、图片）都当**模块**，核心是四件套：
+新项目我会选 Vite。但 Webpack 仍然值得学，原因很实在：
 
-- **entry**：从哪开始构建依赖图。
-- **output**：产物输出到哪。
-- **loader**："某种文件 → JS 模块"的转换器（如 `css-loader`、`ts-loader`、`babel-loader`）。
-- **plugin**：在编译生命周期钩子上做更重的活（压缩、生成 HTML、提取 CSS）。
+- **存量项目**：大量企业项目、组件库、微前端基座还是 Webpack 5；
+- **控制力**：复杂 loader 链、精细的 chunk 编排、老浏览器兼容，Webpack 更成熟；
+- **面试与排障**：构建慢、内存爆、产物错，懂原理才能改配置而不是乱试。
+
+这篇给你一份**能直接跑生产的配置**，而不是概念罗列。
+
+---
+
+## 四个核心概念，一句话各自说清
+
+| 概念 | 作用 | 类比 |
+| --- | --- | --- |
+| `entry` | 依赖图的起点 | 从哪进这座城 |
+| `output` | 产物落盘规则 | 出城后东西放哪、叫什么名 |
+| `loader` | **把非 JS 文件变成模块**（一对一转换） | 城门安检：ts→js、css→js |
+| `plugin` | **在生命周期钩子上做全局操作**（一对多/全局） | 城市管理局：抽 CSS、生成 HTML、压缩 |
+
+记住这条边界：**能"转单个文件"用 loader，需要"知道全局/等所有产物"用 plugin**。
+
+### loader 为什么从右往左执行
 
 ```js
+{ test: /\.scss$/, use: ['style-loader', 'css-loader', 'sass-loader'] }
+```
+
+执行顺序：`sass-loader` → `css-loader` → `style-loader`。
+
+原因：数据流是**管道**，源文件先要变成 CSS 字符串（sass），再变成 JS 模块（css-loader 处理 `@import`/`url()`），最后注入 DOM（style-loader）。写反了就会拿到"还没编译的 scss 文本"，报语法错。
+
+> 口诀：**配置数组从右往左跑，等于处理流程从左往右流。**
+
+---
+
+## 一份能上生产的配置
+
+```js
+// webpack.config.js —— Webpack 5
+const path = require('node:path');
+const HtmlWebpackPlugin = require('html-webpack-plugin');
+const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+const CssMinimizerPlugin = require('css-minimizer-webpack-plugin');
+
+const isProd = process.env.NODE_ENV === 'production';
+
 module.exports = {
-  entry: "./src/index.js",
-  output: { path: "dist", filename: "[name].[contenthash].js" },
-  module: {
-    rules: [{ test: /\.tsx?$/, use: "babel-loader" }],
+  mode: isProd ? 'production' : 'development',
+  entry: './src/main.tsx',
+  devtool: isProd ? 'hidden-source-map' : 'eval-cheap-module-source-map',
+
+  output: {
+    path: path.resolve(__dirname, 'dist'),
+    filename: isProd ? 'js/[name].[contenthash:8].js' : 'js/[name].js',
+    chunkFilename: isProd ? 'js/[name].[contenthash:8].chunk.js' : 'js/[name].chunk.js',
+    // 每次构建前清空 dist（避免旧产物残留）
+    clean: true,
+    publicPath: '/',
   },
-  plugins: [new HtmlWebpackPlugin()],
+
+  resolve: {
+    extensions: ['.tsx', '.ts', '.jsx', '.js'],
+    alias: { '@': path.resolve(__dirname, 'src') },
+  },
+
+  module: {
+    rules: [
+      {
+        test: /\.[jt]sx?$/,
+        exclude: /node_modules/,
+        use: {
+          loader: 'esbuild-loader', // 比 babel-loader 快一个量级；需要老浏览器再换 babel
+          options: { target: 'es2020', loader: 'tsx' },
+        },
+      },
+      {
+        test: /\.css$/,
+        use: [isProd ? MiniCssExtractPlugin.loader : 'style-loader', 'css-loader', 'postcss-loader'],
+      },
+      {
+        test: /\.(png|jpe?g|svg|webp)$/,
+        type: 'asset',                 // < 8KB 自动转 base64，> 8KB 落文件
+        parser: { dataUrlCondition: { maxSize: 8 * 1024 } },
+        generator: { filename: 'img/[name].[contenthash:8][ext]' },
+      },
+    ],
+  },
+
+  plugins: [
+    new HtmlWebpackPlugin({ template: './public/index.html' }),
+    isProd && new MiniCssExtractPlugin({ filename: 'css/[name].[contenthash:8].css' }),
+  ].filter(Boolean),
+
+  optimization: {
+    minimize: isProd,
+    minimizer: ['...', new CssMinimizerPlugin()],
+    // 持久化缓存：二次构建能快 5-10 倍（Webpack 5 最重要的性能开关）
+    moduleIds: 'deterministic',
+    chunkIds: 'deterministic',
+    splitChunks: {
+      chunks: 'all',
+      cacheGroups: {
+        react: {
+          test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+          name: 'react',
+          priority: 30,
+        },
+        vendor: {
+          test: /[\\/]node_modules[\\/]/,
+          name: 'vendor',
+          priority: 10,
+          minSize: 30_000,
+        },
+      },
+    },
+    runtimeChunk: 'single', // 把 runtime 单独抽出来，业务 chunk 的 hash 更稳
+  },
+
+  // 关键：文件系统缓存（默认在 node_modules/.cache/webpack）
+  cache: { type: 'filesystem' },
+
+  stats: 'errors-warnings',
 };
 ```
 
----
+配套 `package.json`：
 
-## loader vs plugin
-
-- **loader** 是"文件级"转换，一对一（一个资源进，一个模块出）。链条从右到左执行。
-- **plugin** 是"生命周期级"扩展，能访问整个编译对象，做代码分割、资源注入、报表等。
-
-简记：改**文件内容**用 loader，改**构建过程/产物**用 plugin。
-
----
-
-## code splitting 拆包
-
-```js
-// 动态 import 自动拆成独立 chunk
-button.onclick = () => import("./heavy").then(m => m.run());
-// 或配置
-optimization: { splitChunks: { chunks: "all" } } // 提取公共依赖
+```json
+{
+  "scripts": {
+    "dev": "webpack serve --hot",
+    "build": "cross-env NODE_ENV=production webpack",
+    "analyze": "cross-env NODE_ENV=production webpack --profile --json > stats.json && source-map-explorer 'dist/js/*.js'"
+  }
+}
 ```
 
-拆包让首屏只加载必要代码，公共库单独缓存，是性能优化的基础。
+三个容易被忽略、但直接决定线上表现的点：
+
+1. **`contenthash`**：内容变才改名 → 用户缓存命中率高。用 `[hash]` 会让所有文件一起失效。
+2. **`runtimeChunk: 'single'`**：runtime（模块映射表）单独出文件，否则每次构建都会污染业务 chunk 的 hash。
+3. **`cache.type = filesystem`**：不加这个，中型项目热构建要 30–60 秒；加了通常 3–8 秒。
 
 ---
 
-## 常见优化
+## HMR 为什么有时候不生效
 
-- `mode: "production"` 自动开启压缩、tree-shaking。
-- `contenthash` 文件名：内容不变则文件名不变，最大化浏览器缓存。
-- `cache` 目录缓存：二次构建大幅提速。
-- 用 `webpack-bundle-analyzer` 看谁占了体积。
+```js
+// webpack.config.js
+devServer: {
+  hot: true,
+  port: 8080,
+  historyApiFallback: true,      // SPA 路由刷新 404 的解药
+  client: { overlay: { errors: true, warnings: false } },
+  proxy: { '/api': { target: 'http://localhost:8001', changeOrigin: true } },
+}
+```
+
+HMR 不生效的常见原因，按出现频率排：
+
+1. 组件没被 `module.hot.accept` 关联（React 需 `react-refresh` + `@pmmmwh/react-refresh-webpack-plugin`）；
+2. `devtool` 用了 `eval` 系列，但代码在 `node_modules` 里被排除在热更新之外；
+3. 直接把整个 `store` 或工具函数模块导出成常量，热更新后引用还是旧的；
+4. `style-loader` 换成了 `MiniCssExtractPlugin.loader`（生产模式），CSS 改动会触发整页刷新。
 
 ---
 
-## 小结
+## 常见坑
 
-- 四件套：entry/output/loader/plugin。
-- loader 转文件，plugin 扩流程。
-- 动态 import + splitChunks 做拆包优化首屏。
-- `contenthash` 文件名利于长缓存。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 构建内存爆（`JavaScript heap out of memory`） | 一次性处理太多模块 / sourcemap 过大 | `NODE_OPTIONS=--max-old-space-size=4096`；生产用 `hidden-source-map` |
+| 二次构建还是慢 | 没开 `cache.type: filesystem` | 开缓存，并保证 `cache.buildDependencies` 指向配置文件 |
+| CSS 里 `url()` 图片 404 | `publicPath` 与实际部署路径不符 | 对齐 `output.publicPath` 与 nginx 子路径 |
+| 循环依赖导致某模块为 `undefined` | CJS 循环引用 + 立即取值 | 改成函数内延迟取用；或用 ESM 活绑定 |
+| 打包产物里有 2 份 React | 某依赖把 react 放进了 `dependencies` | `resolve.alias` 指向单份 + 提 issue |
+| 改了 `tsconfig` 的 paths 但构建报找不到 | Webpack 不读 tsconfig 的 paths | 在 `resolve.alias` 里同步一份（或用 `tsconfig-paths-webpack-plugin`） |
+
+---
+
+## Webpack vs Vite：怎么选
+
+| 维度 | Webpack 5 | Vite |
+| --- | --- | --- |
+| 开发启动 | 全量打包，项目越大越慢（几秒到几十秒） | 按需编译，通常 < 1s |
+| 生产构建 | 成熟、可精细控制 | Rollup，配置更少，产物通常更小 |
+| 生态 | 极全（各类 loader/plugin） | 插件接口新，个别老 loader 无替代 |
+| 老浏览器（IE11） | 支持（配 babel + polyfill） | 不再支持 |
+| 适合 | 存量项目、复杂定制、需要极致控制 | 新项目、现代浏览器、开发体验优先 |
+
+---
+
+## 验收清单
+
+- [ ] 能从零写出 `entry/output/loader/plugin/splitChunks`，并解释每个字段
+- [ ] 知道 loader 为什么从右往左执行，能举一个写反就报错的例子
+- [ ] 项目开启了 `cache.type = 'filesystem'`，二次构建明显变快（给出前后耗时）
+- [ ] 产物文件名带 `contenthash`，改业务代码不会让 vendor chunk 变名
+- [ ] 生产用 `hidden-source-map`，且 `.map` 没随 CDN 发布
+- [ ] 能用 `source-map-explorer` 指出体积最大的 3 个模块
 
 ---
 
 ## 练习
 
-1. 手写一个最小 webpack 配置，把 TS 入口打包成 dist 下的 hash 命名文件。
-2. 配置 `splitChunks: { chunks: "all" }`，观察公共依赖是否被提取到独立 chunk。
-3. 用 `webpack-bundle-analyzer` 找出体积最大的模块，想办法减小。
+1. **从零手配**：不用 CRA/Vue CLI，用 Webpack 5 配一个 TS + CSS + 图片 + 代码分割的项目，产出一个 `dist` 能直接 `npx serve` 打开。
+   *自检*：产物里 JS/CSS/图片分目录且有 hash；改一行代码后只有对应业务 chunk 变名。
+2. **量化缓存收益**：删掉/打开 `cache: { type: 'filesystem' }`，各跑两次 `build`，记录耗时。
+   *自检*：能说清"冷启动 vs 热构建"差在哪（模块解析结果与转译结果被复用）。
+3. **制造 loader 顺序错误**：把 `['style-loader','css-loader','sass-loader']` 改成 `['sass-loader','css-loader','style-loader']`，看报错信息。
+   *自检*：能解释报错来自"把 scss 语法当成 JS 解析"。

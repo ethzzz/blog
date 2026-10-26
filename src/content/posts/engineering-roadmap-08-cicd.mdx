@@ -1,62 +1,216 @@
 ---
-title: '08 · CI/CD 基础'
-published: 2026-09-31T10:00:00+08:00
-description: 'CI/CD 把"构建+测试+部署"自动化：每次 push 自动跑 lint、类型检查、测试、构建、发布。讲清流水线阶段划分、缓存加速、以及"构建失败就别上线"这条铁律。'
-tags: [前端工程化, CI, CD, 流水线, 自动化部署]
+title: '08 · CI/CD 实战'
+published: 2026-10-01T10:00:00+08:00
+description: '一条真正能用的 GitHub Actions 流水线：lint / typecheck / test / build 并行与依赖、pnpm 缓存怎么配才命中、artifact 与产物校验、只在主干发布、以及"构建失败绝不上线"的落地写法。'
+tags: [前端工程化, CI, CD, GitHub, Actions, 流水线]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## 手动上线的代价
+## 手动上线的代价，以及 CI 真正买的是什么
 
-早年我手动 `build` 完 `scp` 到服务器，漏了一步、装错依赖，线上就挂。CI/CD 的价值：**把这套流程变成"提交即触发、机器严格执行"**，人不再是关键路径。
+早年我 `build` 完手动 `scp` 到服务器。有次漏了 `npm ci`，把本地 `node_modules` 一起传上去，线上跑的是我机器上的依赖树；第二天别人发版，依赖一装就白屏。
+
+CI 的价值不是"自动化"三个字，而是两件很具体的事：
+
+1. **把"环境"变成声明的**：干净容器 + lockfile + 固定 Node 版本 → 构建结果可复现；
+2. **把"检查"变成不可绕过的**：本地 hook 能被 `--no-verify` 跳过，CI 不能。
 
 ---
 
-## 一条典型流水线
+## 一条完整可用的工作流
 
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支的新推送取消上一次（省 runner 时间，也避免旧提交覆盖新产物）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # ---------- 快检查：几十秒内给反馈 ----------
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm                      # 自动缓存 pnpm store
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm exec eslint . --max-warnings=0
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+  # ---------- 测试：与 quality 并行 ----------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec vitest run --coverage
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  # ---------- 构建：必须等前面都过 ----------
+  build:
+    needs: [quality, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+
+      # 产物体积预算：超标直接失败（详见 09 篇）
+      - run: pnpm exec size-limit
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
+
+  # ---------- 发布：只在 main，且构建产物已就绪 ----------
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production          # 可在此配审批人/密钥
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+
+      - name: 发布到服务器（原子替换 + 回滚点）
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /srv/app
+            ./ops/release.sh "${{ github.sha }}"
 ```
-push / PR
- └─ CI（持续集成）
-     ├─ install（带缓存）
-     ├─ lint            ┐
-     ├─ typecheck       ├─ 任一失败即红，阻断合并
-     ├─ test            ┘
-     └─ build           ┐
-                         ├─ 产物存为 artifact
- └─ CD（持续交付/部署）
-     └─ 部署到预发/生产（仅主干通过 CI 后）
+
+几个设计点值得单独说：
+
+- **`quality` 与 `test` 并行**：lint 通常 20 秒、测试 2 分钟，串行就白白多等 2 分钟；`build` 用 `needs` 汇合。
+- **`--frozen-lockfile`**：lock 与 `package.json` 不一致时**直接失败**，而不是悄悄改依赖——这是"可复现"的守门人。
+- **`cancel-in-progress: true`**：连推三次，只跑最后一次。注意：**如果发布动作不可重入，这个开关要谨慎**（见下面"坑"里的真实案例）。
+- **`environment: production`**：配合 GitHub 的 Environment Secrets 与 required reviewers，可以让"发布"需要人工点一下。
+
+---
+
+## 缓存：不命中等于没配
+
+`actions/setup-node` 的 `cache: pnpm` 只缓存 **store**（依赖包），不缓存构建产物。判断是否命中，看日志里有没有 `Cache restored from key: ...`。
+
+自建缓存时要让 key 与 lockfile 绑定：
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.pnpm-store
+      node_modules/.vite
+    key: ${{ runner.os }}-build-${{ hashFiles('pnpm-lock.yaml') }}
+    restore-keys: ${{ runner.os }}-build-
 ```
 
----
-
-## 阶段划分原则
-
-- **快反馈优先**：lint/typecheck 放最前，几秒到一分钟出结果，别等 10 分钟构建完才告诉你格式错了。
-- **失败即止**：任一步红，后续不跑，省算力也快止损。
-- **缓存**：依赖（`node_modules`）、构建缓存命中能省大量时间。
+`restore-keys` 是"部分命中"的兜底：lock 变了也能复用旧缓存的大部分内容（依赖通常只增不减）。
 
 ---
 
-## 关键纪律
+## 只在主干发布，且发布要可重入
 
-- **构建失败绝不上线**：这是自动化里最不能妥协的一条。本博客的 `deploy.sh` 就遵循"先 `git pull --ff-only` → 构建 → 部署"，构建不过不部署。
-- **CD 只在受保护分支触发**：feature 分支只跑 CI，主干合并才部署。
-- **环境一致性**：CI 用和本地一致的工具版本（通过 lockfile + 容器/指定 node 版本）。
+```yaml
+if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+```
+
+PR 只跑检查，不发布。这条如果写错（漏了 `event_name`），`pull_request` 事件也会触发一次发布——**这是最经典的事故写法**。
+
+发布脚本本身要满足两条：
+
+1. **幂等**：同一个 commit 跑两次，结果一样（不追加、不重复建目录）；
+2. **有回滚点**：每次发布前保留上一版，失败自动回滚（详见 13 篇）。
 
 ---
 
-## 小结
+## 一个真实案例：本博客踩过的坑
 
-- CI/CD = 提交即自动构建/测试/部署，移除人这个不稳定因素。
-- 流水线：install → lint/typecheck/test → build → deploy。
-- 快反馈前置、失败即止、依赖缓存。
-- 铁律：构建失败不上线。
+这个博客的流水线最初是"runner 构建 → scp 产物到服务器 → 覆盖目录"。踩了三个坑，值得当反面教材：
+
+1. **`concurrency` 没配**：连推两次，旧 run 后完成，把新产物盖掉了——线上回退了 10 分钟。后来加了 `cancel-in-progress: false` 并在发布脚本里用 `flock` 串行化（发布不可重入时，**取消正在进行的发布比等它完成更危险**）。
+2. **scp 的 `dist/*` 把 `dist` 目录本身也拷过去**：站点变成 `/var/www/blog/dist/`，线上 404，而 CI 是绿的（验证步骤只查了根路径）。后来验证改成"非 200 就 `exit 1`"。
+3. **ssh 步骤偶发整步失败**：服务器 `sshd` 默认 `maxstartups 10:30:100`，被扫描时随机丢连接。放宽到 `30:50:100` 后恢复。**部署失败要先看 sshd 日志，别急着怀疑代码。**
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 构建偶发失败，重跑就好 | 缓存污染 / 依赖安装并行冲突 | 清缓存重跑；确认 `--frozen-lockfile` |
+| PR 触发了发布 | `if` 条件漏了 `event_name` | 加 `github.event_name == 'push'` |
+| 缓存一直 miss | key 里含 `github.sha` | key 只包含 lock 哈希与 OS |
+| 发布后线上版本倒退 | 多个 run 并发，旧的覆盖新的 | `concurrency` + 发布脚本 `flock` |
+| Secrets 用不了 / 报未定义 | 环境级 secret 在 job 里没声明 `environment` | job 上加 `environment: production` |
+| 本地能构建、CI 崩 | Node/包管理器版本不一致 | 固定 `NODE_VERSION`，用 `pnpm/action-setup` 指定版本 |
+| 构建产物越传越大 | artifact 里包含了 `node_modules` | `path` 只写 `dist`，`retention-days` 设短 |
+
+---
+
+## 验收清单
+
+- [ ] PR 只跑检查，不发布；主干 push 才发布
+- [ ] `quality` / `test` 并行，`build` 用 `needs` 汇合
+- [ ] 装依赖用 `--frozen-lockfile`，Node 版本固定
+- [ ] 缓存 key 与 lockfile 绑定，日志里能看到 `Cache restored`
+- [ ] 构建失败时**不会**执行发布（`needs` 链路正确）
+- [ ] 发布动作具备幂等性，且能一句话说清"怎么回滚"
+- [ ] 全流程从 push 到上线 ≤ 5 分钟（超过就该查缓存与并行度）
 
 ---
 
 ## 练习
 
-1. 画一张你项目的 CI 流程图，标注哪步失败会阻断合并。
-2. 给流水线加"构建耗时"监控，识别最慢阶段能否缓存加速。
-3. 解释为什么 lint 应排在 build 之前而非之后。
+1. **测一次缓存收益**：同一工作流，先在 `setup-node` 里去掉 `cache: pnpm` 跑一次，再加回跑一次，对比耗时。
+   *自检*：能说出两次差在"依赖下载"而不是"构建"。
+2. **制造一次并发事故**：快速连推两次，观察两个 run 的执行顺序与最终线上版本；再加 `concurrency` 修复。
+   *自检*：能说明"后完成的 run 覆盖先完成的"为什么会让线上倒退。
+3. **给发布加上人工闸门**：用 GitHub Environment 的 required reviewers，让 `deploy` job 需要点击批准。
+   *自检*：能在 Actions 页面看到 "Waiting for approval" 状态，并说明它防的是什么（误合并、误发布）。

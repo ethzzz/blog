@@ -1,74 +1,238 @@
 ---
 title: '06 · 代码规范（ESLint / Prettier / Stylelint）'
 published: 2026-09-30T23:30:00+08:00
-description: 'ESLint 查"代码问题"（潜在 bug、坏味道），Prettier 管"格式美观"，两者职责分离如何避免冲突；Stylelint 管 CSS；以及一套能落地的团队规范配置。'
+description: 'ESLint 查代码问题、Prettier 管格式、Stylelint 管样式，三者职责不能混。给出 ESLint 9 flat config 与 Prettier 的分工模板、存量代码的分级治理策略，以及如何让编辑器和 CI 用同一份配置。'
 tags: [前端工程化, ESLint, Prettier, Stylelint, 代码规范]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## 规范不是束缚，是"别再为风格吵架"
+## 规范的真正价值：砍掉 review 里的噪音
 
-团队里最无意义的消耗就是评审时争论"该不该加分号、缩进几格"。规范把这些问题**自动化**：机器统一格式，人只评审逻辑。
+没人会因为"引号用单还是双"离职，但每个 PR 都会为此争论两句。规范的作用只有一个：**把这些不值得讨论的事交给机器，让人只讨论逻辑**。
+
+所以配置的目标不是"最严格"，而是**规则稳定、误报少、执行成本低**。三条里缺一条，团队就会绕过它。
 
 ---
 
-## ESLint：查问题，不是管格式
+## 三个工具的边界（混了就互相打架）
 
-ESLint 通过规则检查**代码正确性**：未声明变量、用了 `var`、no-fallthrough、潜在的内存泄漏等。
+| 工具 | 管什么 | 不管什么 |
+| --- | --- | --- |
+| **ESLint** | 潜在 bug、坏味道、导入顺序、hooks 依赖、`no-unused-vars` | 不动格式（缩进、引号、换行） |
+| **Prettier** | 纯格式（缩进、引号、行宽、尾逗号） | 不理解代码语义，不管你写得好不好 |
+| **Stylelint** | CSS/SCSS 的语法、重复选择器、未知属性 | 不管 JS |
+
+**必须先立这条规矩**：格式问题全归 Prettier，ESLint 里的格式类规则全部关掉，否则两个工具会互相改对方的结果（保存一次变一次，最典型的"保存后还是红的"）。
+
+现代做法：ESLint 用 `eslint-config-prettier` 一次性关掉所有冲突规则。
+
+---
+
+## ESLint 9：flat config 模板
+
+ESLint 9 默认用 `eslint.config.js`（扁平配置），`.eslintrc` 已废弃。
 
 ```js
-// .eslintrc
+// eslint.config.js
+import js from '@eslint/js';
+import tseslint from 'typescript-eslint';
+import react from 'eslint-plugin-react';
+import reactHooks from 'eslint-plugin-react-hooks';
+import prettier from 'eslint-config-prettier';
+
+export default tseslint.config(
+  // 忽略产物与依赖（不要用 .eslintignore，已废弃）
+  { ignores: ['dist/**', 'node_modules/**', 'coverage/**'] },
+
+  js.configs.recommended,
+  ...tseslint.configs.recommendedTypeChecked,
+
+  {
+    files: ['**/*.{ts,tsx}'],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,        // 让类型感知规则生效（比 project: [...] 简单）
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    plugins: { react, 'react-hooks': reactHooks },
+    rules: {
+      // 类型感知里最值钱的几条
+      '@typescript-eslint/no-floating-promises': 'error',   // 忘了 await
+      '@typescript-eslint/no-misused-promises': 'error',     // async 传给了同步回调
+      '@typescript-eslint/await-thenable': 'error',
+      '@typescript-eslint/no-unnecessary-condition': 'warn',
+      // 未使用变量：允许下划线开头（约定为"故意忽略"）
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      // hooks 依赖：误报多，先 warn
+      'react-hooks/exhaustive-deps': 'warn',
+      // 明确禁止的偷懒写法
+      'no-console': ['warn', { allow: ['warn', 'error'] }],
+    },
+  },
+
+  // 必须放最后：关掉与 Prettier 冲突的规则
+  prettier,
+);
+```
+
+```json
+// package.json
 {
-  "extends": ["eslint:recommended", "plugin:@typescript-eslint/recommended"],
-  "rules": { "no-var": "error", "no-unused-vars": "warn" }
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  }
 }
 ```
 
-配合 `@typescript-eslint`，TS 项目能查到类型相关坏味道（如 `any` 滥用、不必要的非空断言）。
+`recommendedTypeChecked` 需要类型信息，跑起来比纯语法检查慢 2–3 倍，但能抓到的 bug 是高一个量级的——**`no-floating-promises` 这一条就值回票价**（没有 await 的 Promise 拒绝会变成 unhandled rejection，线上表现为"操作偶发没生效"）。
 
 ---
 
-## Prettier：只管格式
+## Prettier：只做格式，配置越少越好
 
-Prettier 不关心逻辑，只统一**排版**：换行、引号、尾逗号、缩进。它和 ESLint 有重叠（如引号规则），所以**关掉 ESLint 里所有格式类规则**，交给 Prettier，避免打架。
+```json
+// .prettierrc.json
+{
+  "semi": true,
+  "singleQuote": true,
+  "printWidth": 100,
+  "trailingComma": "all",
+  "arrowParens": "always"
+}
+```
+
+```text
+# .prettierignore
+dist
+coverage
+pnpm-lock.yaml
+```
+
+三条经验：
+
+1. **配置项不要多**：团队吵得最凶的 `semi`、`singleQuote` 定下来就别再动，改一次全仓库 diff。
+2. **`printWidth` 决定 review 的舒适度**：100 比默认 80 更适合现代宽屏。
+3. **Prettier 不格式化 Markdown 表格**（会打乱对齐），需要的话用 `prettier-plugin-*` 或干脆排除。
+
+---
+
+## Stylelint：CSS 的 lint
 
 ```js
-// .prettierrc
-{ "semi": true, "singleQuote": true, "printWidth": 80 }
+// stylelint.config.js
+export default {
+  extends: ['stylelint-config-standard', 'stylelint-config-recommended-vue'],
+  rules: {
+    'selector-class-pattern': null,          // 允许 BEM 之外的命名
+    'no-descending-specificity': null,       // 与 Tailwind 工具类冲突，关掉
+    'declaration-block-no-redundant-longhand-properties': true,
+  },
+  ignoreFiles: ['dist/**', 'node_modules/**'],
+};
 ```
 
+Tailwind 项目要额外装 `stylelint-config-tailwindcss`，否则 `@apply`、`@tailwind` 会报"未知 at-rule"。
+
 ---
 
-## Stylelint：CSS 的健康检查
+## 存量代码怎么治（这是真正难的部分）
 
-```css
-/* 规则：禁止无效颜色、要求简写顺序等 */
-a { color: #FFF; }
+在一个 5 万行的老项目里开 `recommendedTypeChecked`，你会得到 3000 个错误，然后团队当天就把 lint 关掉了。正确姿势是**分级 + 增量**：
+
+### 第一步：只让改动过的文件受约束
+
+```bash
+# 只检查本次改动涉及的文件
+git diff --name-only --diff-filter=ACMR origin/main...HEAD \
+  | grep -E '\.(ts|tsx|js|jsx)$' \
+  | xargs -r npx eslint
 ```
 
-`stylelint-config-standard` 提供一套合理默认，管住 CSS/SCSS 的常见错误。
+这条命令直接就是 07 篇 `lint-staged` 的雏形——**新代码必须干净，老代码慢慢还债**。
+
+### 第二步：错误降级成警告，先上 CI 但不阻断
+
+```js
+rules: { '@typescript-eslint/no-explicit-any': 'warn' }
+```
+
+先让数字可见（每周看 warning 总数在降），再考虑变 error。
+
+### 第三步：按目录逐步变 error
+
+```js
+{
+  files: ['src/features/new-*/**'],
+  rules: { '@typescript-eslint/no-explicit-any': 'error' },
+}
+```
+
+新模块用严格规则，老模块维持，半年后老模块自然被替换掉。
+
+### 第四步（可选）：给存量加 `eslint-disable` 基线
+
+```bash
+# 一次性给现存问题打上 disable 注释，之后新增一个就红
+npx eslint . --fix-type directive
+```
+
+> 关键认知：**规范的敌人不是"规则不严"，而是"一次上太严导致全员绕过"**。
 
 ---
 
-## 落地清单
+## 编辑器与 CI 必须是同一份配置
 
-- ESLint 查逻辑问题，`prettier` 管格式，两者用 `eslint-config-prettier` 关掉冲突规则。
-- 编辑器保存时自动 fix（format on save）。
-- 提交前用 Git Hooks 跑 lint（下篇讲），CI 再卡一道。
+最常见的分裂：本地 IDE 插件用的是自己的内置规则，CI 用的是仓库配置 → 本地全绿、CI 全红。
+
+- VS Code 装 `ESLint` / `Prettier` 扩展，并在 `.vscode/settings.json` 里指定：
+
+```json
+{
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": { "source.fixAll.eslint": "explicit" },
+  "eslint.useFlatConfig": true
+}
+```
+
+- 把 `.vscode/settings.json` 和 `.vscode/extensions.json`（推荐扩展）一起入库——**新人 clone 下来就是一致的开发环境**，这比写文档有效。
 
 ---
 
-## 小结
+## 常见坑
 
-- ESLint = 代码正确性；Prettier = 格式美观；Stylelint = CSS 规范。
-- ESLint 的格式规则全交给 Prettier，避免冲突。
-- 规范自动化后，评审聚焦逻辑而非风格。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 保存后文件一直在变 | ESLint 格式规则与 Prettier 冲突 | 装 `eslint-config-prettier` 并放最后 |
+| ESLint 报"找不到 tsconfig" | `projectService` 的 `tsconfigRootDir` 没设，或文件不在 include 里 | 配 `tsconfigRootDir`；确认文件被 tsconfig 覆盖 |
+| lint 跑一次要 60 秒 | 用了类型感知规则但没开缓存 | `eslint . --cache`（本地；CI 不缓存） |
+| CI 里 lint 全红但本地绿 | 版本不一致 | 锁版本（`eslint`、`typescript` 都精确版本） |
+| `@apply` 报未知 at-rule | Stylelint 不认 Tailwind 指令 | 加 `stylelint-config-tailwindcss` |
+| 忽略某个文件不生效 | ESLint 9 不再读 `.eslintignore` | 写进 `eslint.config.js` 的 `ignores` |
+
+---
+
+## 验收清单
+
+- [ ] 仓库里有 `eslint.config.js`（flat config），且 `prettier` 配置在数组最后
+- [ ] 格式问题全部由 Prettier 负责，ESLint 里没有格式类规则
+- [ ] `npm run lint` 与 IDE 保存时的行为一致（同一份配置）
+- [ ] 开启了至少 3 条类型感知规则（`no-floating-promises` 是底线）
+- [ ] 有"只检查改动文件"的入口（为 07 篇的 lint-staged 做准备）
+- [ ] 显式 `any` 的数量有统计，每一处都有理由
 
 ---
 
 ## 练习
 
-1. 给项目配 ESLint + Prettier，并加 `eslint-config-prettier` 关闭冲突规则。
-2. 故意写一个 `var x = 1` 和未使用变量，运行 lint 看报错级别（error/warn）。
-3. 在编辑器里开启 format on save，体验保存即统一格式。
+1. **制造一次工具打架**：在配置里加回 `semi: ['error','always']`（ESLint）同时 Prettier 设 `"semi": false`，保存同一个文件两次，观察两次结果是否不同。
+   *自检*：能解释"两个工具都在改同一处格式"导致的振荡。
+2. **给老项目做增量治理**：在一个有几百个 lint 错误的项目里，只对 `git diff` 出的文件跑 lint，并把它写成脚本。
+   *自检*：脚本能对空输入安全退出（`xargs -r`），且不误伤未改动文件。
+3. **验证类型感知规则的价值**：写一个 `async function save() {}` 并调用时不加 `await`，确认 ESLint 报 `no-floating-promises`。
+   *自检*：能说明"没 await 的失败会变成 unhandled rejection，线上表现为静默失败"。

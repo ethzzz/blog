@@ -1,73 +1,210 @@
 ---
-title: '07 · Git Hooks 与质量门禁'
+title: '07 · Git Hooks 与提交规范'
 published: 2026-09-30T23:45:00+08:00
-description: '为什么靠"自觉"跑 lint 会失败：用 Husky 在 pre-commit 自动触发检查，lint-staged 只对暂存文件检查，配合 eslint/prettier 实现"提交即格式化、带问题提交不进场"。'
+description: '用 husky + lint-staged 把检查挂在提交流程上：只查暂存文件（大仓库也能 1 秒内出结果），commitlint 让提交信息可被机器解析，pre-push 放什么、不放什么，以及 CI 里为什么必须再跑一遍。'
 tags: [前端工程化, Husky, lint-staged, GitHooks, 质量门禁]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## 自觉是不可靠的
+## 靠"自觉"跑 lint，一定会失败
 
-规范配好了，但有人忘了跑 lint 就提交，CI 才报错，来回返工。**把检查移到"提交动作那一刻"**——提交前自动跑，过不了就不让提交。
+规范写成文档的那天起就开始腐烂。因为**检查动作发生在"人记得的时候"**，而人一定会忘——尤其是赶工期的时候。
+
+Hook 的逻辑很简单：**把检查绑在你本来就要做的动作上**（commit / push），不给你"忘"的机会。
 
 ---
 
-## Husky：钩子管家
-
-Husky 让你方便地往 Git 生命周期挂脚本：
+## husky 9：三步接上
 
 ```bash
-npx husky init
-# 在 .husky/pre-commit 写入：
-npx lint-staged
+pnpm add -D husky lint-staged @commitlint/cli @commitlint/config-conventional
+pnpm exec husky init          # 生成 .husky/pre-commit 并写入 prepare 脚本
 ```
 
-`pre-commit` 在 `git commit` 执行前触发。如果脚本退出码非 0，提交被中止。
+`package.json` 里会自动加 `"prepare": "husky"`——这意味着 **clone 后第一次 `install` 就自动装好 hook**，不需要任何人手动执行（这是 husky 相比手工写 `.git/hooks` 的核心价值：`.git` 目录不进版本库）。
 
 ---
 
-## lint-staged：只查改动的文件
+## pre-commit：只查你改的东西
 
-全量 lint 在大项目很慢。lint-staged 只对你**本次暂存（staged）的文件**跑检查，速度快、且只格式化你改的：
+如果 `pre-commit` 跑全量 lint，一个中型仓库每次提交要等 30 秒以上，人就会开始 `--no-verify`。
 
-```js
-// .lintstagedrc
+`lint-staged` 解决的就是这个：**只把暂存区（staged）的文件喂给工具**。
+
+```json
+// package.json
 {
-  "*.{ts,tsx,js}": ["eslint --fix", "prettier --write"],
-  "*.css": ["stylelint --fix", "prettier --write"]
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx}": ["eslint --fix --max-warnings=0", "prettier --write"],
+    "*.{css,scss}": ["stylelint --fix", "prettier --write"],
+    "*.{json,md,yml,yaml}": ["prettier --write"]
+  }
 }
 ```
 
-`--fix` 顺便自动修格式问题（如补分号、改引号），提交进来的代码永远是干净的。
+```bash
+# .husky/pre-commit
+pnpm exec lint-staged
+```
+
+三个细节决定成败：
+
+1. **`--max-warnings=0`**：只报 error 不报 warning 的配置下，warning 会无限堆积；这条让新代码零 warning。
+2. **`--fix` 后再 `git add`**：`lint-staged` 默认会把 fix 后的结果重新 add（不要自己写 `git add`，容易把无关文件带进去）。
+3. **顺序：先 lint 后 format**：lint 的修复可能改动格式，format 放最后才能保证终态稳定。
 
 ---
 
-## 完整防线
+## commit-msg：让提交信息变成数据
 
-```
-开发者写代码
-  → git commit（Husky pre-commit 触发 lint-staged：格式化+检查）
-      ├─ 有问题 → 自动 fix 或报错，提交中止，开发者改完重提
-      └─ 通过 → 提交成功
-  → push → CI 再跑一遍（lint + typecheck + test + build）
+```bash
+# .husky/commit-msg
+pnpm exec commitlint --edit "$1"
 ```
 
-本地钩子是第一道，CI 是兜底（有人绕过钩子也能卡住）。
+```js
+// commitlint.config.js
+export default {
+  extends: ['@commitlint/config-conventional'],
+  rules: {
+    'scope-enum': [2, 'always', ['ui', 'api', 'build', 'deps', 'docs', 'ci', 'core']],
+    'subject-case': [0],          // 中文标题不受大小写限制
+    'header-max-length': [2, 'always', 100],
+  },
+};
+```
+
+格式与收益：
+
+```text
+<type>(<scope>): <subject>
+feat(auth): 支持手机号验证码登录
+fix(api): 修复分页参数透传丢失
+chore(deps): 升级 vite 到 5.4
+```
+
+机器可读带来的回报（都是自动的）：
+
+- **changelog**：`conventional-changelog` / `changesets` 直接按 type 分类生成；
+- **semver 判定**：`feat` → minor，`fix` → patch，`BREAKING CHANGE` → major；
+- **发布说明**：不用人肉从 200 个提交里挑"这次改了什么"。
+
+> 这一条对团队的价值被严重低估：**提交信息是唯一"免费"的变更档案**，写坏了半年后没人知道某行为什么改。
 
 ---
 
-## 小结
+## pre-push：放什么，不放什么
 
-- 靠自觉跑 lint 必漏，检查要绑到 `pre-commit`。
-- Husky 挂钩子，lint-staged 只查暂存文件、快且精准。
-- `--fix` 自动格式化，进仓库即干净。
-- 本地钩子 + CI 双重防线，质量不靠人。
+| 放在 pre-commit | 放在 pre-push | 不要放 |
+| --- | --- | --- |
+| lint（暂存文件） | `tsc --noEmit`（全量类型检查） | E2E（太慢，交 CI） |
+| format | 单元测试（跑得快的那部分） | 构建（本地构建 ≠ CI 构建） |
+| commitlint（commit-msg） | — | 任何需要网络的检查 |
+
+```bash
+# .husky/pre-push
+pnpm exec tsc --noEmit
+pnpm exec vitest run --changed        # 只跑受影响的测试
+```
+
+`vitest run --changed` 依赖 git 改动分析，能把 3 分钟的测试压到 10 秒——**这是"愿不愿意保留这个 hook"的关键**。
+
+---
+
+## 允许跳过，但要留下痕迹
+
+Hook 一定会被绕过（紧急修线上、工具本身坏了）。管理方式不是禁止，而是：
+
+- **`--no-verify` 只允许在 hotfix 分支使用**，PR 模板里有一栏"是否使用了 --no-verify，原因"；
+- **CI 里必须再跑一遍同样的检查**——因为 hook 是本地行为，绕过的成本为零；
+
+```yaml
+# CI 里这三步与本地 hook 一一对应，不可省
+- run: pnpm exec eslint . --max-warnings=0
+- run: pnpm exec tsc --noEmit
+- run: pnpm exec vitest run --coverage
+```
+
+**核心原则：本地 hook 是为了"快反馈"，CI 才是"真门禁"。** 只做前者等于没有门禁。
+
+---
+
+## 提交粒度：一条规矩
+
+**一个提交只做一件事，且能独立回滚。**
+
+反例（真实见过）：
+
+```text
+fix: 修了一些问题        ← 改了 14 个文件，混了 3 个需求 + 2 个格式全量
+```
+
+后果：线上出问题要回滚，你分不清回滚的是哪个改动，只能整块回退，把别人的功能一起干掉。
+
+正例：`feat(task): 新增列表筛选` / `refactor(task): 抽出 queryKey 工厂` / `test(task): 补筛选的用例`——三个提交，每个都能单独回滚、单独 review。
+
+---
+
+## 分支模型：小团队够用的那一种
+
+| 模型 | 适用 | 成本 |
+| --- | --- | --- |
+| **Trunk-based**（主干开发 + 短分支） | 大部分团队，尤其是持续部署 | 需要功能开关配合 |
+| Git Flow（develop/release/hotfix） | 有固定发版周期的传统团队 | 分支多，合并成本高 |
+| Release 分支 + 主干 | 移动端/H5 有灰度需求 | 中等 |
+
+关键不是选哪个模型，而是**分支生命周期 ≤ 3 天**。超过一周的分支，合并冲突的成本会指数上升。
+
+PR 模板（`.github/pull_request_template.md`）值得花 10 分钟写：
+
+```markdown
+## 改了什么
+<!-- 一句话 -->
+
+## 为什么
+<!-- 关联 issue -->
+
+## 怎么验证
+- [ ] 本地跑过 `pnpm typecheck && pnpm test`
+- [ ] 手动验证路径：___
+
+## 风险与回滚
+- 影响范围：
+- 回滚方式：
+```
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 新同事 clone 后 hook 不生效 | 没跑 `prepare`（用了 `--ignore-scripts`） | 手动 `pnpm exec husky`；CI 不依赖 hook |
+| 提交变慢到 30 秒 | pre-commit 跑了全量 lint / 全量测试 | 换 `lint-staged`；测试用 `--changed` |
+| Windows 下 hook 报找不到命令 | `.husky/*` 缺执行权限或用了 POSIX 语法 | `git update-index --chmod=+x`；脚本用 `pnpm exec` 而非裸命令 |
+| `--no-verify` 成了习惯 | 检查太慢或误报太多 | 先修误报，再谈纪律 |
+| commitlint 拦住了 merge commit | 合并信息不符合规范 | `git merge --no-ff -m "chore: merge ..."` 或对 merge 放行 |
+| 提交后 CI 还是红 | 本地只查了 staged，CI 查全量（含历史遗留） | 预期行为；用 06 篇的增量治理逐步清 |
+
+---
+
+## 验收清单
+
+- [ ] `git clone && pnpm install` 后 hook 自动生效（无需任何手工步骤）
+- [ ] pre-commit 只检查暂存文件，提交耗时 < 2 秒
+- [ ] 故意写一个 lint 错误，`git commit` 被拦住且提示具体文件行号
+- [ ] 提交信息不合规范时被 commit-msg 拦住
+- [ ] CI 里跑的是与本地**同样**的检查（lint / typecheck / test）
+- [ ] PR 模板包含"怎么验证"和"回滚方式"
 
 ---
 
 ## 练习
 
-1. 给项目加 Husky + lint-staged，提交一个格式乱的文件，观察被自动 fix。
-2. 故意提交一个 ESLint 报 error 的代码，确认提交被中止。
-3. 解释为什么 CI 还要再跑一遍 lint（钩子可被 `--no-verify` 跳过）。
+1. **量化 lint-staged 的收益**：在一个有 200+ 文件的仓库，分别跑 `eslint .` 和 `lint-staged`（改 1 个文件），记录耗时。
+   *自检*：能解释"检查范围从全量降到 1 个文件"是唯一原因（不是工具更快）。
+2. **制造一次绕过**：用 `git commit --no-verify` 提交一个带错误的文件，观察 CI 是否拦住。
+   *自检*：能说清"hook 是本地便利，CI 才是门禁"的分工。
+3. **写一条能自动生成的 changelog**：用 conventional commits 提交 3 次（feat/fix/chore），跑 `npx conventional-changelog -p angular -i CHANGELOG.md -s`，看生成结果。
+   *自检*：能说明为什么 `chore` 不该出现在用户可见的 changelog 里。

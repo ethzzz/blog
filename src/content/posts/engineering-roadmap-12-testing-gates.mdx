@@ -1,0 +1,270 @@
+---
+title: '12 · 测试与质量门禁'
+published: 2026-10-26T09:00:00+08:00
+description: '测试不是"写不写"的问题，而是"哪一层测什么、测到什么程度"：Vitest 单测、组件交互测试、MSW 拦网络、Playwright 只测主干，以及覆盖率门禁怎么设才不会被当成摆设。'
+tags: [前端工程化, 测试, Vitest, Playwright, 覆盖率, MSW]
+category: 前端工程化学习路线
+draft: false
+---
+
+## 先破除两个极端
+
+**极端一：什么都测。** 给一个只有 `return a + b` 的工具函数写 6 个用例，覆盖率 100%，线上照样炸——因为炸的是"接口返回格式变了"。
+
+**极端二：不写测试。** 每次改动靠手点，回归靠运气，周五不敢发版。
+
+真相在中间：**测试的价值 = 它能拦住的那类 bug 的损失 × 发生概率 − 维护成本**。所以先问"我最近三个月线上出的事故是什么类型"，再决定测什么。
+
+---
+
+## 测试的四层，各管一段
+
+| 层 | 测什么 | 工具 | 数量级 | 运行时间 |
+| --- | --- | --- | --- | --- |
+| **单元** | 纯函数、状态机、格式化、校验 | Vitest | 多（几十~几百） | < 5s |
+| **组件/集成** | 交互行为、条件渲染、表单校验 | Vitest + Testing Library + jsdom | 中（十几~几十） | < 30s |
+| **接口契约** | 前端对后端的假设（字段、错误码） | MSW（模拟）或真实后端 smoke | 少 | < 10s |
+| **E2E** | 用户主流程（登录→下单→支付） | Playwright | **极少（3–5 条）** | 1–3min |
+
+一条硬规矩：**E2E 只测"挂了就是灾难"的主干流程**。E2E 写多了必然 flaky，flaky 的测试比没有测试更糟——团队会学会"红了先重跑"。
+
+---
+
+## Vitest：单测与组件测试
+
+```bash
+pnpm add -D vitest @testing-library/react @testing-library/user-event jsdom @vitest/coverage-v8
+```
+
+```ts
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./test/setup.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'lcov'],
+      // 只统计业务代码，别把配置/类型文件算进来
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/**/*.d.ts', 'src/main.tsx'],
+    },
+  },
+});
+```
+
+### 单测：只测"有分支的东西"
+
+```ts
+// src/lib/pagination.ts
+export function toPageParams(input: URLSearchParams, maxPage: number) {
+  const page = Number(input.get('page') ?? 1);
+  if (!Number.isFinite(page) || page < 1) return { page: 1, limit: 20 };
+  return { page: Math.min(page, maxPage), limit: 20 };
+}
+```
+
+```ts
+// src/lib/pagination.test.ts
+import { describe, expect, it } from 'vitest';
+import { toPageParams } from './pagination';
+
+describe('toPageParams', () => {
+  it.each([
+    ['空参数', '', 1],
+    ['非法字符串', 'page=abc', 1],
+    ['负数', 'page=-3', 1],
+    ['超出上限', 'page=999', 50],
+    ['正常', 'page=3', 3],
+  ])('%s → page=%s 应为 %i', (_label, qs, expected) => {
+    expect(toPageParams(new URLSearchParams(qs), 50).page).toBe(expected);
+  });
+});
+```
+
+`it.each` 是表驱动写法：**把边界条件写成数据，而不是复制粘贴 5 个 it**。上面这 5 条里，`page=abc` 和 `page=-3` 就是我线上真踩过的（后端返回 400）。
+
+### 组件测试：测行为，不测实现
+
+```tsx
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { expect, it } from 'vitest';
+import { LoginForm } from './LoginForm';
+
+it('空提交时提示错误，焦点落到第一个错误字段', async () => {
+  const user = userEvent.setup();
+  render(<LoginForm onSubmit={() => {}} />);
+
+  await user.click(screen.getByRole('button', { name: '登录' }));
+
+  expect(screen.getByText('请输入手机号')).toBeInTheDocument();
+  // 断言"焦点在手机号输入框"——这是真实用户能感知的行为
+  expect(screen.getByLabelText('手机号')).toHaveFocus();
+});
+```
+
+三条纪律：
+
+1. **用 `getByRole` / `getByLabelText`，不用 `getByTestId`**：前者顺便验证了可访问性；
+2. **断言用户可见的结果**，不要断言"state 里 isError === true"（那是实现细节，重构就断）；
+3. **`userEvent` 而不是 `fireEvent`**：前者会模拟真实的点击/输入时序（focus、blur、输入法），能抓到 `fireEvent` 抓不到的 bug。
+
+---
+
+## MSW：把网络变成可控输入
+
+前端 bug 有一半是"后端返回了预期之外的数据"。MSW 在 Service Worker 层拦截请求，**不改业务代码**就能模拟：
+
+```ts
+// test/msw.ts
+import { http, HttpResponse } from 'msw';
+import { setupServer } from 'msw/node';
+
+export const handlers = [
+  http.get('/api/tasks', ({ request }) => {
+    const url = new URL(request.url);
+    if (url.searchParams.get('status') === 'boom') {
+      return HttpResponse.json({ message: '服务端出错' }, { status: 500 });
+    }
+    return HttpResponse.json({ items: [{ id: 't1', title: '写测试' }], total: 1, hasNext: false });
+  }),
+];
+
+export const server = setupServer(...handlers);
+```
+
+```ts
+// test/setup.ts
+import { afterAll, afterEach, beforeAll } from 'vitest';
+import { server } from './msw';
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+```
+
+`onUnhandledRequest: 'error'` 很关键：**任何没被 mock 的请求都报错**，逼你把"这个页面到底依赖哪些接口"列清楚。
+
+也可以用它测异常路径：
+
+```ts
+it('后端 500 时展示可重试的错误态', async () => {
+  server.use(http.get('/api/tasks', () => HttpResponse.json({}, { status: 500 })));
+  render(<TaskList />);
+  expect(await screen.findByText('加载失败')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
+});
+```
+
+**错误态、空态、加载态** 是组件测试最该覆盖的三件事——它们恰是手点时最容易漏的。
+
+---
+
+## 覆盖率门禁：设"改动"而不是"全局"
+
+全局 80% 是反模式：老项目有 3 万行没测，为了达标要么写一堆废测试，要么改 `exclude` 骗自己。
+
+正确做法：**对本次改动的文件要求覆盖率**。
+
+```yaml
+# CI 里（Vitest 支持 --changed）
+- run: pnpm exec vitest run --changed --coverage
+```
+
+或者用 `coverage.thresholds.perFile` + 只对 `src/features/**` 生效：
+
+```ts
+coverage: {
+  thresholds: {
+    perFile: true,
+    lines: 70,
+    functions: 70,
+    branches: 60,
+  },
+}
+```
+
+再配一条团队纪律：**修 bug 必须先写一个能复现的测试**（红 → 修 → 绿）。这条比任何覆盖率数字都有效——它保证"同一个 bug 不会回来两次"。
+
+---
+
+## Playwright：只写 3–5 条
+
+```ts
+// e2e/checkout.spec.ts
+import { expect, test } from '@playwright/test';
+
+test('从列表进入详情并提交表单', async ({ page }) => {
+  await page.goto('/tasks');
+  await page.getByRole('link', { name: '写测试' }).click();
+
+  await expect(page).toHaveURL(/\/tasks\/t1$/);
+  await page.getByLabel('标题').fill('改过的标题');
+  await page.getByRole('button', { name: '保存' }).click();
+
+  await expect(page.getByText('保存成功')).toBeVisible();
+});
+```
+
+```ts
+// playwright.config.ts
+export default defineConfig({
+  retries: process.env.CI ? 1 : 0,     // 只重试 1 次，禁止靠重试掩盖 flaky
+  use: { baseURL: 'http://localhost:4173', trace: 'on-first-retry' },
+  webServer: { command: 'pnpm preview', port: 4173, reuseExistingServer: !process.env.CI },
+});
+```
+
+跑之前必须 `build + preview`（**测生产产物，不测 dev server**）——dev 与 build 的行为差异（压缩、tree-shaking、环境变量替换）才是线上事故的高发区。
+
+---
+
+## flaky 治理：不许"重跑就算过"
+
+| 症状 | 常见根因 | 处理 |
+| --- | --- | --- |
+| 偶发超时 | 固定 `waitForTimeout` | 改成断言等待（`expect(...).toBeVisible()` 自带重试） |
+| 偶发元素找不到 | 动画未结束 / 异步渲染 | 用 `findBy*`（带轮询）而非 `getBy*` |
+| CI 挂本地过 | 时区 / 语言 / 视口差异 | 固定 `timezoneId`、`locale`、`viewport` |
+| 数据依赖顺序 | 测试间共享状态 | 每个用例独立 seed/cleanup |
+
+纪律：**同一个测试一周内 flaky 两次，直接标记 `test.fixme` 并建 issue**，不许留在主干上让所有人习惯性重跑。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 组件测试报 `not wrapped in act(...)` | 异步更新没被等待 | 用 `await screen.findBy...` 或 `await waitFor(...)` |
+| 测试里 `fetch` 真的发请求了 | MSW 没启动或被 `resetHandlers` 清掉 | 检查 `setupFiles` 与 handler 注册顺序 |
+| 覆盖率很高但线上照样崩 | 测的都是纯函数，接口契约没测 | 补 MSW 契约测试 + 1 条 E2E 主干 |
+| CI 测试慢到 10 分钟 | 单元和 E2E 混在一起跑 | 拆 job：单测 < 1min 先跑，E2E 后跑 |
+| 测试改动频繁 | 断言了实现细节（内部 state、class 名） | 改成断言用户可见文本/角色 |
+
+---
+
+## 验收清单
+
+- [ ] 有 `test` 脚本，本地 5 秒内跑完单测
+- [ ] 关键工具函数（分页、校验、格式化）有表驱动用例，含边界值
+- [ ] 至少 3 个组件覆盖了 loading / empty / error 三态
+- [ ] 用 MSW 模拟后端，且 `onUnhandledRequest: 'error'`
+- [ ] 覆盖率门禁针对"改动文件"，而不是全项目一刀切
+- [ ] 有 3–5 条 E2E 覆盖主干，跑的是 `preview`（生产产物）
+- [ ] 团队约定：修 bug 先写复现测试
+
+---
+
+## 练习
+
+1. **给一个函数补边界用例**：找你自己项目里的日期/金额格式化函数，用 `it.each` 补 5 条边界（空、非法、负数、超大、时区）。
+   *自检*：至少能写出 1 条当前实现会挂的用例。
+2. **测出三态**：给一个列表组件写 3 个用例（加载中、空、接口 500），全部用 MSW 控制。
+   *自检*：能说明"为什么这三个状态最值得测"（手点时最容易漏）。
+3. **制造一次 flaky**：把一个 `await screen.findByText(...)` 换成 `getByText(...)` 并在前面加 `setTimeout` 0ms，观察偶发失败。
+   *自检*：能解释 `findBy*` 的轮询机制，以及为什么它比 `sleep` 可靠。

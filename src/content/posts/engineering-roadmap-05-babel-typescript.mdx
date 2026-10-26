@@ -1,64 +1,217 @@
 ---
-title: '05 · Babel 与 TypeScript 编译'
+title: '05 · TypeScript 工程化'
 published: 2026-09-30T23:00:00+08:00
-description: 'Babel 的定位（语法降级，不类型检查）与 preset 机制，TypeScript 的两种编译路径（tsc 做类型检查、esbuild/babel 只转译），以及"类型检查"与"转译"必须分离的工程常识。'
-tags: [前端工程化, Babel, TypeScript, 转译, tsc]
+description: '转译与类型检查为什么必须分离，tsconfig 里真正影响你的六个开关，strict 家族报错怎么修，paths 别名如何与打包器对齐，以及把类型检查做成 CI 门禁。'
+tags: [前端工程化, TypeScript, tsconfig, 类型检查, Babel]
 category: 前端工程化学习路线
 draft: false
 ---
 
-## Babel 做什么、不做什么
+## 一个普遍的误解：`tsc` 在帮你打包
 
-Babel 只做一件事：**把新语法转成旧语法**（语法降级），让老浏览器能跑。它**不做类型检查**——`const x: number` 里的 `: number` 被它直接丢掉，但类型错误它发现不了。
+不是。TypeScript 在工程里有**两个完全独立的角色**：
 
-```js
-// .babelrc
-{ "presets": ["@babel/preset-env", "@babel/preset-react", "@babel/preset-typescript"] }
-```
+| 角色 | 谁来做 | 何时做 |
+| --- | --- | --- |
+| **转译**（删类型、降语法） | esbuild / swc / babel / tsc | 每次构建、每次热更新 |
+| **类型检查**（语义分析） | `tsc --noEmit` | 编辑器实时 + CI 一次 |
 
-`preset-env` 按目标浏览器决定降级到什么程度；`preset-typescript` 只剥离类型注解。
+现代构建工具**只转译不检查**（esbuild 删类型是纯字符串操作，快但不懂类型）。所以：
+
+> **如果你只在 `vite build` 里跑 TS，你的类型错误从来没被检查过。**
+
+这是团队里最常见的"假类型安全"——写完代码一把绿，其实全靠 IDE 插件的灯。
 
 ---
 
-## TypeScript 的两条路径
+## 正确的分工
 
-| 路径 | 谁负责 | 类型检查 | 转译速度 |
+```json
+// package.json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",   // 类型检查 + 构建，两个都必须过
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+```ts
+// babel / esbuild 配置里只需要"删类型"，不要让它做检查
+// vite 默认用 esbuild 转译，什么都不用配
+```
+
+CI 里单独跑一次 `typecheck`（见 08 篇），这样报错能归因到"类型"而不是"构建失败"。
+
+---
+
+## tsconfig：真正影响你的六个开关
+
+```jsonc
+{
+  "compilerOptions": {
+    // 1. 目标语法：决定产物里有没有可选链、async 等
+    "target": "ES2020",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+
+    // 2. 模块解析：现代打包项目用 bundler，Node 项目用 node16/nodenext
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+
+    // 3. 严格模式：一次打开，长期收益最大
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+
+    // 4. 语法的"可被单独转译"保证（esbuild/swc 必需）
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+
+    // 5. 路径别名（必须和打包器 alias 一致）
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] },
+
+    // 6. 跳过第三方库的类型检查（否则慢到不可用）
+    "skipLibCheck": true,
+
+    "noEmit": true
+  },
+  "include": ["src"]
+}
+```
+
+逐条说最容易被忽略的三个：
+
+### `moduleResolution: "bundler"`
+
+Vite/Webpack 项目用它。它允许你写 `import x from './x'`（无扩展名），也支持读 `exports` 字段。如果你写成 `"node"`，会突然冒出一堆"找不到模块"；写成 `"node16"`，则必须带 `.js` 扩展名（Node 原生 ESM 的规矩）。
+
+### `verbatimModuleSyntax: true`
+
+强制你区分"类型导入"和"值导入"：
+
+```ts
+// ❌ 混在一起：打包器分不清这个 import 是不是只在类型层存在
+import { User } from './types';
+
+// ✅ 明确告诉工具"这只是类型，转译时删掉"
+import type { User } from './types';
+```
+
+好处：产物里不会残留只用于类型的 import（否则可能触发意外的模块求值/循环依赖）。
+
+### `noUncheckedIndexedAccess: true`
+
+```ts
+const arr = [1, 2, 3];
+const first = arr[0];       // 类型从 number 变成 number | undefined
+first.toFixed(2);           // ❌ 报错，必须处理 undefined
+```
+
+这一条会让存量代码冒出一堆错，但**它是真 bug 的照妖镜**：数组越界、字典取不到 key，线上崩的大头都在这。
+
+---
+
+## strict 家族的错怎么修（而不是关掉）
+
+| 报错 | 真实含义 | 正确修法 | 错误修法 |
 | --- | --- | --- | --- |
-| `tsc` | TypeScript 官方 | ✅ 做 | 慢 |
-| `esbuild` / `babel` | 转译器 | ❌ 不做 | 极快 |
+| `Parameter 'x' implicitly has an 'any' type` | 函数入参没类型 | 补类型或用泛型 | 关 `noImplicitAny` |
+| `Object is possibly 'undefined'` | 可能取空 | `if (!x) return` / 可选链 + 默认值 | 加 `!`（非空断言） |
+| `Property 'a' does not exist on type 'A'` | 字段缺失 | 补接口 / 用判别联合 | `as any` |
+| `Type 'string' is not assignable to type 'number'` | 类型不匹配 | 在边界处转换（`Number(x)`） | `as unknown as number` |
+| `Index signature for type 'string' is missing` | 对象形状不明确 | `Record<string, T>` | 索引签名写 `any` |
 
----
+用 `!` 和 `as any` 不是绝对不能，但要**当成 TODO**：
 
-## 关键工程常识：检查与转译分离
-
-最佳实践（现代前端标配）：
-
-```bash
-vite build          # 用 esbuild/rollup 转译，极快，不检查类型
-tsc --noEmit        # 单独跑类型检查，不参与打包
+```ts
+// 明确标注：这里假设后端一定返回该字段，接口契约变更时会炸
+const name = data!.user!.name; // TODO: 等后端补 OpenAPI 后改成运行时校验
 ```
 
-**绝不让打包器既转译又类型检查**——前者要快，后者要严，职责分开各取所长。CI 里 `tsc --noEmit` 失败就阻断合并。
+更工程化的做法是在**边界做运行时校验**（zod / valibot），让类型从校验推导出来：
+
+```ts
+import { z } from 'zod';
+
+const UserSchema = z.object({ id: z.string(), name: z.string() });
+type User = z.infer<typeof UserSchema>;       // 类型从 schema 推导，永不失配
+
+const user = UserSchema.parse(await res.json());  // 运行时真的校验了
+```
 
 ---
 
-## 为什么不是"用 tsc 打包"
+## 别名：一处配置，三处同步
 
-`tsc` 只转译+检查，**不会**做打包（处理 CSS/图片/拆包都不行）。所以类型项目里，tsc 负责"编译期把关"，Vite/webpack 负责"产物构建"，两者协作而非互相替代。
+`@/xxx` 这类别名要同时存在于三个地方，少一个就报错：
+
+| 位置 | 作用 |
+| --- | --- |
+| `tsconfig.json` 的 `paths` | 编辑器与 `tsc` 认它 |
+| `vite.config.ts` 的 `resolve.alias` | 构建认它 |
+| `vitest.config.ts` / `jest.config` | 测试认它（Vitest 可直接 merge vite 配置） |
+
+```ts
+// vite.config.ts
+resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } }
+```
+
+> 症状对照：**编辑器有红线、构建正常** → 多半是打包器别名没配；**编辑器正常、构建报找不到** → 是 tsconfig 没配。
 
 ---
 
-## 小结
+## 给库生成类型声明
 
-- Babel 只降级语法，不检查类型。
-- `tsc` 检查类型但慢；`esbuild`/`babel` 转译快但不管类型。
-- 工程上分离：打包器转译、独立 `tsc --noEmit` 做类型门禁。
-- tsc 不打包，构建交给 Vite/Rollup。
+```jsonc
+// 库项目的 tsconfig.build.json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,          // 产出 .d.ts
+    "declarationMap": true,       // 让"跳转到定义"能回到源码
+    "emitDeclarationOnly": true,  // 只产出类型，JS 交给打包器
+    "outDir": "dist"
+  }
+}
+```
+
+配 `package.json` 的 `types` / `exports.types`，否则用户装你的包没有类型提示——这是库作者最容易漏的一步。
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| CI 绿，一运行就崩（undefined） | 只转译没检查 | `build` 前加 `tsc --noEmit` |
+| `tsc` 一跑要 3 分钟 | 没开 `skipLibCheck` / 没增量 | 开 `skipLibCheck` + `incremental: true` |
+| 报"找不到模块，或缺少类型声明" | 没装 `@types/xxx`，或 `types` 字段限制了 | 装类型包；检查 `types` 数组 |
+| 循环依赖导致运行时 `undefined` | `import type` 没加，模块被真实求值 | 开 `verbatimModuleSyntax`，类型全用 `import type` |
+| 本地类型对、线上错 | 前后端契约变了 | 边界加 zod 校验 |
+| `d.ts` 发布了但用户没提示 | `package.json` 没指 `types` | 补 `types` + `exports.types` |
+
+---
+
+## 验收清单
+
+- [ ] `package.json` 的 build 脚本里包含类型检查（`tsc --noEmit`）
+- [ ] CI 有独立的 `typecheck` 步骤，失败能定位到类型而不是构建
+- [ ] `strict` 是 `true`，且项目里 `as any` / `!` 的数量有统计（能列出每处原因）
+- [ ] `@/*` 别名在 tsconfig、打包器、测试配置三处一致
+- [ ] 所有"只用于类型"的导入都写了 `import type`
+- [ ] 外部数据入口（API 响应、localStorage、URL 参数）有运行时校验
 
 ---
 
 ## 练习
 
-1. 用 `tsc --noEmit` 跑一个故意写了类型错误的文件，看报错；再用 esbuild 转译同一文件，观察类型错误被忽略但编译通过。
-2. 在一个 Vite 项目里配置 npm script：`"typecheck": "tsc --noEmit"`，并在 CI 步骤里调用。
-3. 解释 `preset-typescript` 为什么能"剥离类型却不检查"。
+1. **证明"构建不检查类型"**：写一个明显的类型错误（`const n: number = 'abc'`），跑 `vite build` 看是否通过；再加 `tsc --noEmit` 看是否报错。
+   *自检*：能解释 esbuild 为什么不做类型检查（纯转译、不做语义分析、追求速度）。
+2. **打开严格索引检查**：给项目开 `noUncheckedIndexedAccess`，统计新增报错数量，挑 3 个真实修复。
+   *自检*：能说明其中至少一个是潜在线上 bug，而不是"类型洁癖"。
+3. **给一个 API 加运行时校验**：用 zod 定义响应 schema，替换掉原来的 `as User` 断言。
+   *自检*：故意让接口返回缺字段的数据，观察是在解析处报错（好）还是在渲染深处崩（坏）。

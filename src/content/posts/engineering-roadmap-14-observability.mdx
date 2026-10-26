@@ -1,0 +1,239 @@
+---
+title: '14 · 前端监控与可观测性'
+published: 2026-10-26T11:00:00+08:00
+description: '线上出问题时你在靠用户投诉吗：错误采集的四类入口、sourcemap 上传与版本对齐、Core Web Vitals 的 RUM 上报、埋点命名规范、告警阈值，以及别把用户输入采上来这条隐私红线。'
+tags: [前端工程化, 监控, 可观测性, Sentry, WebVitals, 告警]
+category: 前端工程化学习路线
+draft: false
+---
+
+## 用户的报障方式：不报
+
+线上 500 的时候，**97% 的用户直接关页面**，只有极少数会在客服留言，还通常是"你们网站坏了"，没有 URL、没有时间、没有操作路径。
+
+所以可观测性要回答四个问题，缺一个就等于没监控：
+
+1. **有没有错**（错误率）
+2. **错在哪**（文件、行、调用栈、发生版本）
+3. **影响谁**（哪些用户、什么设备、什么网络）
+4. **什么时候开始的**（对应哪次发布）
+
+---
+
+## 一、错误采集：四个入口缺一不可
+
+```ts
+// src/monitor/errors.ts
+import { reportError } from './reporter';
+
+// 1. 同步运行时错误
+window.addEventListener('error', (e) => {
+  // 资源加载失败（img/script/link）也走这里，但没有 error 对象
+  const target = e.target as HTMLElement | null;
+  if (target && 'src' in target) {
+    reportError({
+      type: 'resource',
+      message: `资源加载失败: ${(target as HTMLImageElement).src}`,
+      tag: target.tagName,
+    });
+    return;
+  }
+  reportError({ type: 'runtime', message: e.message, stack: e.error?.stack });
+});
+
+// 2. 未处理的 Promise 拒绝（最容易被忽略，占线上错误的 30%+）
+window.addEventListener('unhandledrejection', (e) => {
+  const reason = e.reason;
+  reportError({
+    type: 'unhandledrejection',
+    message: typeof reason === 'string' ? reason : (reason?.message ?? 'unknown'),
+    stack: reason?.stack,
+  });
+});
+
+// 3. React 渲染错误（ErrorBoundary 兜住，但要顺手上报）
+class Boundary extends React.Component<{ children: React.ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    reportError({ type: 'react', message: error.message, stack: error.stack, extra: info.componentStack });
+  }
+  render() { return this.state.failed ? <ErrorFallback /> : this.props.children; }
+}
+
+// 4. 接口错误（在统一的请求层拦截，不要散落各处）
+```
+
+`window.addEventListener('error', handler, true)` 要用**捕获阶段**才能收到资源加载错误——这是最常见的"资源 404 监控不到"的原因。
+
+### 上报要带"面包屑"
+
+**只看堆栈查不出问题**。真正有用的是"用户做了什么导致它"：
+
+```ts
+// 维护一个环形缓冲，记录最近 20 个动作
+const breadcrumbs: Array<{ t: number; type: string; data: unknown }> = [];
+
+export function addBreadcrumb(type: string, data: unknown) {
+  breadcrumbs.push({ t: Date.now(), type, data });
+  if (breadcrumbs.length > 20) breadcrumbs.shift();
+}
+
+// 路由变化、点击关键按钮、发起的接口，都记一条
+```
+
+上报时把 `breadcrumbs` 一起带上。**没有面包屑的错误报告，90% 只能靠猜。**
+
+---
+
+## 二、sourcemap：能不能定位到行，全看这一步
+
+生产产物是压缩过的，`chunk-abc.js:1:48213` 毫无意义。两个前提：
+
+1. 构建时生成 map（**`hidden`**，不随产物公开）：
+   ```ts
+   build: { sourcemap: 'hidden' }
+   ```
+2. CI 里把 map 上传到监控平台，并带上**版本号**：
+
+```yaml
+- name: 上传 sourcemap
+  run: npx @sentry/cli sourcemaps upload --release "${{ github.sha }}" dist
+```
+
+版本号必须与实际发布版本一致（用 commit sha 最稳）。**版本对不上 = map 白传**，报告的堆栈会退化成"未知文件"。
+
+⚠️ 不要把 `.map` 当静态资源发布到 CDN——它包含完整源码，等于开源。
+
+---
+
+## 三、性能：Core Web Vitals 上报
+
+```bash
+pnpm add web-vitals
+```
+
+```ts
+// src/monitor/vitals.ts
+import { onCLS, onINP, onLCP, onTTFB, type Metric } from 'web-vitals';
+
+function send(metric: Metric) {
+  // 用 sendBeacon：页面关闭也能发出去，不阻塞卸载
+  navigator.sendBeacon(
+    '/api/rum',
+    JSON.stringify({
+      name: metric.name,        // LCP / INP / CLS / TTFB
+      value: metric.value,
+      rating: metric.rating,    // good / needs-improvement / poor
+      id: metric.id,
+      navType: performance.getEntriesByType('navigation')[0]?.type,
+    }),
+  );
+}
+
+onLCP(send);
+onINP(send);
+onCLS(send);
+onTTFB(send);
+```
+
+三条实践：
+
+1. **用 `sendBeacon`**，不要 `fetch`——页面关闭时 fetch 会被取消；
+2. **区分 `navType`**（`navigate` / `reload` / `back_forward`）：回退缓存页面的 LCP 会异常好，混在一起看会误判；
+3. **看 P75 而不是均值**：均值被大量 fast 用户稀释，P75 才是"四分之三用户"的真实体验。
+
+---
+
+## 四、埋点：命名规范比工具重要
+
+一个乱命名的事件系统，三个月后没人看得懂。最小规范：
+
+```ts
+// evt_<对象>_<动作>，全小写蛇形
+track('evt_task_create', { source: 'list_page', has_template: false });
+```
+
+规则：
+
+- **动词用过去式/名词化**（`create` 而不是 `clicked_create_button`）——记录"发生了什么"，而不是"点了什么"；
+- **属性值必须可枚举**（`source: 'list_page' | 'detail_page'`），不要塞自由文本；
+- **不上报 PII**：手机号、邮箱、身份证、地址、聊天内容——一律不采。合规问题比数据缺失严重得多。
+
+```ts
+// 统一入口，天然防止乱传
+export function track(event: string, props: Record<string, string | number | boolean> = {}) {
+  navigator.sendBeacon('/api/track', JSON.stringify({ event, props, ts: Date.now() }));
+}
+```
+
+---
+
+## 五、告警：只看"错误率"不够
+
+| 告警项 | 阈值示例 | 为什么 |
+| --- | --- | --- |
+| JS 错误率 | 5 分钟内错误数 / PV > 1% | 抓大面积故障 |
+| **新错误类型** | 首次出现的 fingerprint | 发布引入的新 bug，最该立刻知道 |
+| 错误数突增 | 环比上小时 +200% | 抓慢启动的问题 |
+| LCP P75 | 连续 3 个 5 分钟窗口 > 2.5s | 抓性能回退 |
+| 接口 5xx | 单接口错误率 > 2% | 抓后端故障 |
+
+**新错误类型告警**是最值钱的一条：它把"发布后 10 分钟发现"变成常态。
+
+配套概念：
+
+- **SLO**：例如"99.9% 的请求不受 JS 错误影响"，即每月允许约 43 分钟不达标；
+- **错误预算**：SLO 用光了就冻结发布，先修稳定性。小团队不用上完整体系，但**心里要有这条线**。
+
+---
+
+## 六、隐私红线（先定，别事后补）
+
+- 不采集**用户输入内容**（输入框、搜索词、聊天、密码——包括"脱敏后的片段"）；
+- 不采集完整 URL 的 query（可能带手机号）；上报前做白名单清洗；
+- Cookie / localStorage 里的 token 一律不打进日志；
+- 采集前给用户知情渠道（隐私政策），至少做到"可关闭"。
+
+```ts
+// 上报前统一清洗
+function sanitize(url: string) {
+  return url.split('?')[0];          // 丢掉 query
+}
+```
+
+---
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 报错堆栈全是 `chunk-xxx.js:1:12345` | 没上传 sourcemap 或版本号不匹配 | `hidden` + CI 上传 + release 与 sha 对齐 |
+| 资源 404 监控不到 | `error` 监听没开捕获阶段 | `addEventListener('error', h, true)` |
+| Promise 报错漏采 | 只监听了 `error` | 补 `unhandledrejection` |
+| 性能数据量太大 | 每个指标每个用户都全量上报 | 采样（10%）+ 只报 P75 相关维度 |
+| 告警天天响没人看 | 阈值太敏感 / 没有分级 | 分 P0/P1，P1 只进日报 |
+| 埋点数据没法分析 | 事件名随手起 | 统一 `evt_object_action` + 枚举属性 |
+
+---
+
+## 验收清单
+
+- [ ] 四类错误入口（runtime / resource / rejection / React）全部接上
+- [ ] 错误上报带 `release` 版本号与面包屑
+- [ ] sourcemap 在 CI 上传，且能还原到具体源码行（验证过一次）
+- [ ] LCP / INP / CLS 有 RUM 数据，看的是 P75
+- [ ] 有"新错误类型"告警，能在发布后 10 分钟内触发
+- [ ] 埋点命名有规范，属性值可枚举
+- [ ] 采集内容里没有用户输入与 query 参数
+
+---
+
+## 练习
+
+1. **验证 sourcemap 还原**：故意在代码里 `throw new Error('test')`，发布后看监控平台能否定位到文件名与行号。
+   *自检*：能指出"未上传 map"时报告长什么样（`chunk-xxx.js:1:xxxxx`）。
+2. **抓一次未处理拒绝**：写 `Promise.reject(new Error('boom'))` 不 catch，确认上报成功。
+   *自检*：能解释为什么 `try/catch` 抓不到（异步执行栈已断开）。
+3. **设计一条告警**：给"新错误类型"配告警，并说明为什么它比"错误率"更早发现问题。
+   *自检*：能给出一个"错误率没超标但新错误在涨"的场景（小流量灰度）。
