@@ -186,3 +186,13 @@ function flatten(arr: unknown[], depth = Infinity): unknown[] {
 2. 默写 myCall 和 myBind，用 `new myBind(...)` 验证 new 优先级。
 3. 写 `myInstanceof([], Array)` 和 `myInstanceof('a', String)`，解释后者为什么 false。
 4. 手写 EventEmitter，实现 `once` 后用 `off` 注销 once 注册的回调。
+
+## 验收清单
+
+- [ ] `deepClone` 能处理循环引用（`WeakMap`）、Date/RegExp/Map/Set，函数按引用拷贝
+- [ ] 手写 `call` / `apply` / `bind`，且 `bind` 支持"new 调用时 this 失效"的规则
+- [ ] 手写 `instanceof`，能说清它沿原型链查找、以及跨 realm 失效的原因
+- [ ] 柯里化与偏应用各写一个，能说清区别
+- [ ] 数组扁平化能手写递归版与迭代版（栈），并知道 `flat(Infinity)` 的取舍
+- [ ] 手写 `new`：创建对象、连原型、执行构造函数、处理返回值
+- [ ] 每道题都从空文件默写过，而不是复制粘贴
