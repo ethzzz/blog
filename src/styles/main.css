@@ -191,3 +191,73 @@
         animation-duration: 2.4s;
     }
 }
+/* 文章页「本系列」目录：同一 category 的文章，构建期按 slug 序号排序
+   （src/utils/series-utils.ts）。用原生 <details>，无 JS，swup 客户端路由安全。 */
+.series-panel {
+    @apply rounded-[var(--radius-large)] bg-[var(--card-bg)] overflow-hidden transition;
+}
+.series-panel > summary {
+    @apply flex cursor-pointer select-none list-none items-center justify-between gap-3
+        px-5 py-4 transition;
+}
+.series-panel > summary::-webkit-details-marker {
+    display: none;
+}
+.series-panel > summary::marker {
+    content: "";
+}
+.series-panel > summary:hover {
+    @apply rounded-[var(--radius-large)] bg-[var(--btn-plain-bg-hover)];
+}
+.series-panel[open] > summary {
+    @apply rounded-t-[var(--radius-large)];
+}
+.series-panel-title {
+    @apply flex items-center gap-2 font-bold text-90;
+}
+.series-panel-icon {
+    @apply text-[1.25rem] text-[var(--primary)];
+}
+.series-panel-meta {
+    @apply mt-0.5 text-sm text-50;
+}
+.series-panel-chevron {
+    @apply shrink-0 text-[1.5rem] text-black/30 transition-transform dark:text-white/30;
+}
+.series-panel[open] .series-panel-chevron {
+    transform: rotate(180deg);
+}
+.series-list {
+    @apply m-0 max-h-[21rem] list-none overflow-y-auto border-t border-dashed
+        border-[var(--line-color)] px-2.5 py-2;
+}
+.series-item {
+    @apply flex items-center gap-3 rounded-lg px-2.5 py-2 text-sm text-75 transition;
+}
+.series-item:hover {
+    @apply bg-[var(--btn-plain-bg-hover)] text-90;
+}
+.series-item[data-current="true"] {
+    @apply bg-[var(--btn-regular-bg)] font-bold text-[var(--btn-content)];
+}
+.series-item-index {
+    @apply w-7 shrink-0 rounded-md bg-black/5 py-0.5 text-center font-mono text-xs text-black/45
+        dark:bg-white/10 dark:text-white/45;
+}
+.series-item[data-current="true"] .series-item-index {
+    @apply bg-white/25 text-[var(--btn-content)] dark:bg-black/20;
+}
+.series-item-title {
+    @apply min-w-0 flex-1 truncate;
+}
+.series-item-badge {
+    @apply shrink-0 rounded-full bg-[var(--primary)] px-2 py-0.5 text-[0.6875rem] font-bold
+        text-white dark:text-black/75;
+}
+.series-overview-link {
+    @apply flex items-center justify-center gap-1.5 border-t border-dashed
+        border-[var(--line-color)] py-3 text-sm font-bold text-[var(--primary)] transition;
+}
+.series-overview-link:hover {
+    @apply opacity-80;
+}

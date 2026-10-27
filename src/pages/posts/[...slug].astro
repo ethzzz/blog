@@ -6,6 +6,7 @@ import I18nKey from "@i18n/i18nKey";
 import { i18n } from "@i18n/translation";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { getSortedPosts } from "@utils/content-utils";
+import { buildSeriesBySlug } from "@utils/series-utils";
 import { getDir, getPostUrlBySlug } from "@utils/url-utils";
 import { Icon } from "astro-icon/components";
 import { licenseConfig } from "src/config";
@@ -16,13 +17,14 @@ import { formatDateToYYYYMMDD } from "../../utils/date-utils";
 
 export async function getStaticPaths() {
 	const blogEntries = await getSortedPosts();
+	const seriesBySlug = buildSeriesBySlug(blogEntries);
 	return blogEntries.map((entry) => ({
 		params: { slug: entry.slug },
-		props: { entry },
+		props: { entry, series: seriesBySlug.get(entry.slug) ?? null },
 	}));
 }
 
-const { entry } = Astro.props;
+const { entry, series } = Astro.props;
 const { Content, headings } = await entry.render();
 
 const { remarkPluginFrontmatter } = await entry.render();
@@ -132,6 +134,49 @@ const jsonLd = {
 
         </div>
     </div>
+
+    <!-- 本系列目录：同一 category 的文章，构建期排序（slug 序号优先）。
+         用原生 <details>，无 JS，swup 客户端路由下也能正常工作。 -->
+    {series && series.items.length > 1 &&
+        <details class="series-panel card-base card-shadow mb-4 onload-animation" data-series>
+            <summary class="series-panel-summary">
+                <div class="series-panel-heading">
+                    <div class="series-panel-title">
+                        <Icon name="material-symbols:library-books-outline-rounded" class="series-panel-icon"></Icon>
+                        本系列目录
+                    </div>
+                    <div class="series-panel-meta">
+                        {series.name} · 共 {series.items.length} 篇 · 当前第 {series.currentIndex + 1} 篇
+                    </div>
+                </div>
+                <Icon name="material-symbols:keyboard-arrow-down-rounded" class="series-panel-chevron"></Icon>
+            </summary>
+            <ol class="series-list">
+                {series.items.map((item, index) => (
+                    <li>
+                        <a
+                            href={getPostUrlBySlug(item.slug)}
+                            class="series-item"
+                            data-current={index === series.currentIndex ? "true" : undefined}
+                            aria-current={index === series.currentIndex ? "page" : undefined}
+                        >
+                            <span class="series-item-index">{item.order ?? index + 1}</span>
+                            <span class="series-item-title">{item.label}</span>
+                            {index === series.currentIndex &&
+                                <span class="series-item-badge">当前</span>
+                            }
+                        </a>
+                    </li>
+                ))}
+            </ol>
+            {series.roadmapUrl &&
+                <a href={series.roadmapUrl} class="series-overview-link">
+                    查看路线总览
+                    <Icon name="material-symbols:arrow-forward-rounded" class="text-[1rem]"></Icon>
+                </a>
+            }
+        </details>
+    }
 
     <div class="flex flex-col md:flex-row justify-between mb-4 gap-4 overflow-hidden w-full">
         <a href={entry.data.nextSlug ? getPostUrlBySlug(entry.data.nextSlug) : "#"}

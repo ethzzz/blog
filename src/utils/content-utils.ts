@@ -1,6 +1,7 @@
 import { type CollectionEntry, getCollection } from "astro:content";
 import I18nKey from "@i18n/i18nKey";
 import { i18n } from "@i18n/translation";
+import { buildSeriesBySlug } from "@utils/series-utils";
 import { getCategoryUrl } from "@utils/url-utils.ts";
 
 // // Retrieve posts and sort them by publication date
@@ -20,6 +21,7 @@ async function getRawSortedPosts() {
 export async function getSortedPosts() {
 	const sorted = await getRawSortedPosts();
 
+	// 1) 全站顺序兜底：单篇分类（随笔等）没有"系列"概念，仍要能上下翻
 	for (let i = 1; i < sorted.length; i++) {
 		sorted[i].data.nextSlug = sorted[i - 1].slug;
 		sorted[i].data.nextTitle = sorted[i - 1].data.title;
@@ -27,6 +29,19 @@ export async function getSortedPosts() {
 	for (let i = 0; i < sorted.length - 1; i++) {
 		sorted[i].data.prevSlug = sorted[i + 1].slug;
 		sorted[i].data.prevTitle = sorted[i + 1].data.title;
+	}
+
+	// 2) 系列顺序覆盖：同一 category 内按 slug 序号排，只在系列≥2 篇时生效。
+	//    否则「React 路线」的下一篇会跳到「前端工程化」，读者莫名其妙。
+	const seriesBySlug = buildSeriesBySlug(sorted);
+	for (const entry of sorted) {
+		const series = seriesBySlug.get(entry.slug);
+		if (!series || series.items.length < 2) continue;
+
+		entry.data.prevSlug = series.prev?.slug ?? "";
+		entry.data.prevTitle = series.prev?.title ?? "";
+		entry.data.nextSlug = series.next?.slug ?? "";
+		entry.data.nextTitle = series.next?.title ?? "";
 	}
 
 	return sorted;

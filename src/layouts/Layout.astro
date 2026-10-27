@@ -666,4 +666,25 @@ if (window.swup) {
 } else {
 	document.addEventListener("swup:enable", setup)
 }
+
+/* 「本系列」目录（文章页底部的 <details>）：展开时把当前篇目滚进可视区。
+   列表本身可滚动（.series-list），当前项折叠起来后用户看不见，所以打开时定位一次。
+   block: 'nearest' 只滚动最内层的可滚动容器，不会带着页面一起跳。 */
+function setupSeriesPanel() {
+	document.querySelectorAll<HTMLDetailsElement>("details[data-series]").forEach((panel) => {
+		if (panel.dataset.seriesBound) return
+		panel.dataset.seriesBound = "1"
+		panel.addEventListener("toggle", () => {
+			if (!panel.open) return
+			panel.querySelector("[data-current='true']")?.scrollIntoView({ block: "nearest" })
+		})
+	})
+}
+
+if (window.swup) {
+	setupSeriesPanel()
+	window.swup.hooks.on("page:view", () => setupSeriesPanel())
+} else {
+	document.addEventListener("swup:enable", () => setupSeriesPanel())
+}
 </script>
