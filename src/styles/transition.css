@@ -24,6 +24,11 @@ html.is-animating .transition-swup-fade {
     animation: 300ms fade-in-up;
     animation-fill-mode: forwards;
 }
+/* 门控：见 Layout.astro <head> 里的脚本。OverlayScrollbars 初始化会摘挂 <body> 子树，
+   运行中的入场动画会被取消重放；初始化完成前不建动画，放行时再一次性创建。 */
+html.onload-anim-gate .onload-animation {
+    animation: none;
+}
 #navbar {
     animation-delay: 0ms
 }

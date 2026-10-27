@@ -149,28 +149,22 @@ const bannerOffset =
 
 		<link rel="alternate" type="application/rss+xml" title={profileConfig.name} href={`${Astro.site}rss.xml`}/>
 
-		<!-- 防止首屏入场动画播两次。
-		     现象：直接打开页面时，#navbar 等带 .onload-animation 的元素，其 fade-in-up
-		     会在第一次播到约 80% 时被重启一次（客户端水合/初始化期间样式重算所致），
-		     肉眼可见"淡入两次"。
-		     注意：这段必须放在 head 里同步执行（is:inline），普通 module script 要到
-		     DOMContentLoaded 才跑，会错过第一次动画（实测首次动画早于脚本约 220ms）。 -->
+		<!-- 首屏入场动画要等 OverlayScrollbars 初始化完再放行。
+		     原因：initCustomScrollbar() 初始化时会把 <body> 的子节点整体摘下再插回，
+		     已经在跑的 .onload-animation 因此被取消，下次样式重算时从头重放 ——
+		     肉眼就是「页面重新渲染了一遍 / 淡入两次」。
+		     所以初始化完成前不建动画（规则见 styles/transition.css 的 onload-anim-gate），
+		     由 initCustomScrollbar() 在 DOM 搬完后放行。
+		     必须放在 head 里同步执行（is:inline）：普通 module script 要到 DOMContentLoaded 才跑，
+		     那时动画早已开始（实测首屏动画约 350ms 起，脚本约 450ms 才执行）。
+		     兜底：客户端脚本异常时按定时器放行，避免整页卡在 opacity:0。 -->
 		<script is:inline>
 			(function () {
-				var played = typeof WeakSet === 'function' ? new WeakSet() : null;
-				document.addEventListener('animationstart', function (e) {
-					var el = e.target;
-					if (!el || el.nodeType !== 1) return;
-					if (!el.classList || !el.classList.contains('onload-animation')) return;
-					if (!played) return;
-					if (played.has(el)) {
-						// 同一元素第二次开始：直接落到终态，避免看到重播
-						el.style.animation = 'none';
-						el.style.opacity = '1';
-						return;
-					}
-					played.add(el);
-				}, true);
+				var html = document.documentElement;
+				html.classList.add('onload-anim-gate');
+				setTimeout(function () {
+					html.classList.remove('onload-anim-gate');
+				}, 1500);
 			})();
 		</script>
 	</head>
@@ -359,6 +353,12 @@ function initCustomScrollbar() {
 		},
 	});
 
+	// 上面这步会搬动 <body> 的子树，首屏入场动画要等搬完再创建（规则与门控见 head）。
+	// 排到下一帧放行：初始化内部的收尾也可能排在同帧的 rAF 里，这样能排在它后面。
+	requestAnimationFrame(() => {
+		document.documentElement.classList.remove('onload-anim-gate');
+	});
+
 	const katexElements = document.querySelectorAll('.katex-display') as NodeListOf<HTMLElement>;
 
 	const katexObserverOptions = {
@@ -458,8 +458,17 @@ const setup = () => {
 		}
 	})
 	window.swup.hooks.on('content:replace', initCustomScrollbar)
-	window.swup.hooks.on('visit:start', (visit: {to: {url: string}}) => {
-		// change banner height immediately when a link is clicked
+	// swup 默认顺序是「先淡出 → 再等新页面 HTML」。而 /solutions/ 是 SSR（每次现取，
+	// 实测 0.25~0.6s），等待期间内容早已淡到 opacity 0，整页只剩背景，
+	// 看起来就是「点练习先闪一下白屏 / 布局像塌了」。
+	// wait 只调整顺序、不改总耗时：点击后旧页保持原样等 HTML，到手了再开始淡出。
+	window.swup.hooks.on('visit:start', (visit: {animation: {wait: boolean}}) => {
+		visit.animation.wait = true
+	});
+	// ⚠️ 必须用 before：swup 里"普通"handler 会排在 hook 的默认实现之后执行，
+	// 用 on 注册的话这段会等到新页面都渲染完了才跑。
+	window.swup.hooks.before('visit:transition', (visit: {to: {url: string}}) => {
+		// change banner height right before the fade-out
 		const bodyElement = document.querySelector('body')
 		if (pathsEqual(visit.to.url, url('/'))) {
 			bodyElement!.classList.add('lg:is-home');
