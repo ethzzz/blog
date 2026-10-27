@@ -66,6 +66,13 @@ events {
 }
 ```
 
+**追问链：**
+
+- **「为什么 Nginx 单线程能扛几万并发，Apache prefork 不行？」**
+  答：Apache prefork 是「一个连接一个进程」，1 万个连接就是 1 万个进程，进程切换和内存开销把机器压垮。Nginx 是**事件驱动 + 非阻塞 I/O（epoll）**：一个 Worker 线程通过 epoll 同时监听几万个连接的 fd，谁有事件就处理谁，空闲连接几乎零成本。这就是 Reactor 模式，和浏览器的事件循环是同一个思想。
+- **「Master 和 Worker 各干什么？reload 时发生了什么？」**
+  答：Master 读配置、管理 Worker、处理信号；Worker 处理请求。`nginx -s reload` 时 Master 会 fork 出**新 Worker 加载新配置**，旧 Worker 处理完存量请求后退出——所以 reload 不中断服务。这也是线上改配置要先 `nginx -t` 再 reload 的原因：配置错了新 Worker 起不来，但旧 Worker 还在服务，不会立刻挂。
+
 ---
 
 ## 静态资源服务
@@ -176,6 +183,46 @@ server {
 # root：拼接完整路径 root + location
 # alias：替换 location 部分
 ```
+
+**alias 的经典坑（面试答出来是强加分项）：**
+
+```nginx
+# 坑：alias 以 / 结尾，location 也必须以 / 结尾，否则解析路径错位
+location /blog/ {
+    alias /var/www/blog/dist/;   # ✅ 两边都带斜杠，正常
+}
+
+location /blog {
+    alias /var/www/blog/dist;    # ⚠️ 请求 /blogapp 会被解析成
+                                 #    /var/www/blog/distapp，路径穿越风险
+}
+
+# root 写法没有这个问题，但资源路径 = root + 完整 URI
+# /blog/index.html -> /var/www/blog/dist/blog/index.html（注意多了 /blog）
+```
+
+**追问链：**
+
+- **「location 的匹配优先级是什么？」⭐⭐⭐ 必考**
+  答：记住这个顺序——
+
+  ```
+  1. =        精确匹配（命中立即停止）          最高
+  2. ^~       前缀匹配（命中后不再查正则）
+  3. ~ / ~*   正则匹配（区分/不区分大小写，按出现顺序取第一个命中的）
+  4. 普通前缀  /xxx（命中后若后面有正则还会被正则覆盖）
+  ```
+
+  ```nginx
+  location = /login      { ... }  # 只匹配 /login 本身
+  location ^~ /static/   { ... }  # 匹配 /static/ 开头，跳过正则检查
+  location ~* \.(png|jpg)$ { ... } # 正则：图片走这里
+  location /api/         { ... }  # 普通前缀
+  ```
+
+  实战意义：静态资源目录**务必用 `^~`**，否则一个后写的图片正则会把它抢走——「我配了 expires 却没生效」九成是这个原因。
+- **「try_files 的最后一个参数和前面的有什么区别？」**
+  答：前面的参数是**内部重定向到文件**，最后一个参数是**URI 重写**（内部跳转），会重新走一遍 location 匹配。所以 `/index.html` 要写完整 URI 而不是文件系统路径；如果最后一参数是 `=404` 就直接返回 404 状态码。
 
 ---
 
@@ -438,6 +485,13 @@ map $http_x_version $backend {
 }
 ```
 
+**追问链：**
+
+- **「X-Forwarded-For 能伪造吗？」⭐⭐⭐**
+  答：能。XFF 是请求头，客户端可以直接带一个假的。正确的信任模型是：**只信任自己链路上每层代理追加的 IP**。`$proxy_add_x_forwarded_for` 是「沿用客户端带来的 + 追加当前直连 IP」，所以取值要**从右往左数第 N 个**（N = 内部可信代理层数），而不是取第一个。直接拿第一个 IP 做限流/风控，攻击者一秒就能绕过。
+- **「Nginx 上怎么针对 IP 限流？」**
+  答：`limit_req_zone`（漏桶）与 `limit_conn_zone`（并发连接数）。注意 zone 的 key 用 `$binary_remote_addr` 而不是 `$remote_addr`（省内存），burst 参数控制突发容忍，`nodelay` 决定超出的请求是排队还是直接放行——限流被拒默认返回 503，可用 `limit_req_status 429` 改成更语义化的状态码。
+
 ---
 
 ## 常用命令
@@ -465,6 +519,36 @@ tail -f /var/log/nginx/error.log
 # 查看连接状态
 netstat -anp | grep nginx
 ```
+
+---
+---
+
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 配了 expires 但静态资源没生效 | location 正则覆盖了 `^~` 前缀，请求走了别的块 | 静态目录用 `^~` 或把正则块合并 |
+| history 路由刷新 404 | 没有 `try_files ... /index.html` 兜底 | SPA 必配 try_files |
+| alias 子路径 404 或路径穿越 | alias 与 location 斜杠不匹配 | 两边斜杠保持一致；不确定就用 root |
+| 反向代理后端拿到的都是 127.0.0.1 | 没传 X-Real-IP / XFF，或后端取错了位置 | proxy_set_header 三件套 + 后端从右往左取可信 IP |
+| WebSocket 连接几秒就断 | 默认 proxy_read_timeout 60s | `proxy_read_timeout 86400` + 心跳保活 |
+| 上传大文件 413 | `client_max_body_size` 默认 1m | 按业务调大，注意代理链每一层都要调 |
+| reload 后配置没生效 | 只改了文件没 reload，或 `nginx -t` 报错被忽略 | 改配置后必跑 `nginx -t` 再 `nginx -s reload` |
+| Gzip 开了但 JS 还是没压缩 | `gzip_types` 没包含 `application/javascript`，或响应走了代理缓冲 | 补类型；确认 `gzip_vary on` 兼容 CDN |
+| 图片等二进制被压缩损坏 | gzip_types 里加了 image 类型（svg 除外） | 只压缩文本类资源 |
+
+## 自测清单（能答上 8 条算过关）
+
+1. location 六种写法的匹配优先级？`^~` 的实际作用是什么？
+2. `try_files` 最后一个参数和前面参数的本质区别？
+3. `proxy_pass` 末尾带不带斜杠的转发差异，各举一个 URL？
+4. X-Forwarded-For 为什么不可信？正确的取值方式？
+5. reload 的内部过程是什么？为什么它不中断服务？
+6. 负载均衡四种策略各自的适用场景？ip_hash 的缺点？
+7. 带 hash 的静态资源和 HTML 的缓存策略为什么必须不同？
+8. WebSocket 反向代理需要哪三个关键配置？
+9. 413 状态码的常见根因和修复？
+10. 一致性哈希解决 ip_hash 的什么问题？Nginx 原生支持吗？
 
 ---
 
