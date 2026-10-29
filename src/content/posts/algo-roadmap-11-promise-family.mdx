@@ -1,183 +1,269 @@
 ---
 title: '11 · 手写 Promise 全家桶'
 published: 2026-10-13T20:00:00+08:00
-description: '手写 Promise 全家桶：符合规范的 then 链与状态机、all/race/allSettled/any、并发限制器，手写题天花板详解。'
+description: '手写 Promise：完整可运行的状态机与 then 链、thenable 吸收与错误穿透、all/race/allSettled/any 的边界、并发限制器与 retry，附微任务执行顺序题。'
 tags: [手写题, Promise, 异步编程, JavaScript]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 手写 Promise 是手写题的天花板，区分度也最高。**状态机、then 链、thenable 处理、静态方法**四关要能讲能写。
+> 手写 Promise 是手写题天花板，区分度最高。**状态机、then 链、thenable、静态方法**四关要能讲能写。这篇的代码是可以整段跑通的，不是伪代码。
 
 ---
 
-## 1. 状态机与订阅模型
+## 1. 状态机与订阅
 
 Promise 本质是三状态状态机：`pending → fulfilled` 或 `pending → rejected`，**一旦变更不可逆**。
 
 ```ts
 class MyPromise<T> {
-  state: "pending" | "fulfilled" | "rejected" = "pending";
-  value!: T;
-  reason!: unknown;
-  private cbs: Array<() => void> = [];        // pending 期间的订阅者
+  private state: 'pending' | 'fulfilled' | 'rejected' = 'pending';
+  private value?: T;
+  private reason?: unknown;
+  private cbs: Array<() => void> = []; // pending 期间的订阅者
 
   constructor(
-    executor: (resolve: (v: T | PromiseLike<T>) => void, reject: (r: unknown) => void) => void,
+    executor: (
+      resolve: (v: T | PromiseLike<T>) => void,
+      reject: (r: unknown) => void,
+    ) => void,
   ) {
     const resolve = (v: T | PromiseLike<T>): void => {
-      if (this.state !== "pending") return;   // 状态不可逆
-      this.state = "fulfilled";
+      if (this.state !== 'pending') return; // 状态不可逆
+      this.state = 'fulfilled';
       this.value = v as T;
-      this.cbs.forEach((cb) => cb());         // 发布给等待者
+      this.flush();
     };
+
     const reject = (r: unknown): void => {
-      if (this.state !== "pending") return;
-      this.state = "rejected";
+      if (this.state !== 'pending') return;
+      this.state = 'rejected';
       this.reason = r;
-      this.cbs.forEach((cb) => cb());
+      this.flush();
     };
-    executor(resolve, reject);
+
+    try {
+      executor(resolve, reject);
+    } catch (e) {
+      reject(e); // executor 同步抛错也要转成 reject
+    }
+  }
+
+  private flush() {
+    const cbs = this.cbs;
+    this.cbs = [];
+    cbs.forEach((cb) => cb());
   }
 }
 ```
 
-逐行讲：状态不可逆靠 `state !== "pending"` 守卫；`resolve` 异步调用时 then 回调还没注册，所以要**回调数组**存起来、状态变更时统一发布——"resolve 晚于 then 调用怎么办"答的就是这个发布订阅。`executor` 同步抛错也要转成 reject。
+为什么需要 `cbs` 数组：`then` 可能在 `resolve` 之前就注册了（异步 resolve 的常见情况）。状态变更时统一发布，**这就是 Promise 的发布订阅模型**。
 
 ---
 
-## 2. then 链：手写题的主战场
+## 2. then 链：主战场
 
-then 的核心难点：**返回一个新 Promise**，回调返回值要被"吸收"（返回 Promise 时等它 settle）；回调抛错由链上后续 onRejected 接住；`onFulfilled` 缺省给"值穿透"、`onRejected` 缺省给"抛错"，所以 `.then()` 跳层后错误仍能被末尾 catch。
+四个必须处理的问题：
+
+1. **返回新 Promise**，不是 `this`；
+2. **回调在微任务里执行**（原生行为，用 `queueMicrotask` 模拟）；
+3. **回调抛错**要变成新 Promise 的 reject；
+4. **缺省回调**：`onFulfilled` 缺省是值穿透，`onRejected` 缺省是继续抛错（所以 `.then().then().catch()` 能接住最初的错误）。
 
 ```ts
-then(
-  onFulfilled?: (v: T) => unknown,            // 返回值可以是普通值或 Promise
-  onRejected?: (r: unknown) => unknown,
-): MyPromise {
-  const f = onFulfilled ?? ((v: T) => v);     // 值穿透
+then<R1 = T, R2 = never>(
+  onFulfilled?: ((v: T) => R1 | PromiseLike<R1>) | null,
+  onRejected?: ((r: unknown) => R2 | PromiseLike<R2>) | null,
+): MyPromise<R1 | R2> {
+  const f = onFulfilled ?? ((v: T) => v as unknown as R1);
   const r = onRejected ?? ((e: unknown) => { throw e; });
 
-  const p2 = new MyPromise((resolve, reject) => {
-    // 统一执行器：微任务模拟异步，try/catch 接住回调抛错
-    const exec = (handler: (v: unknown) => unknown, val: unknown) =>
+  const p2 = new MyPromise<R1 | R2>((resolve, reject) => {
+    const exec = (handler: (x: unknown) => unknown, input: unknown) => {
       queueMicrotask(() => {
         try {
-          resolvePromise(p2, handler(val), resolve, reject);
+          resolvePromise(p2, handler(input), resolve, reject);
         } catch (e) {
           reject(e);
         }
       });
+    };
 
-    if (this.state === "fulfilled") exec(f, this.value);
-    else if (this.state === "rejected") exec(r, this.reason);
-    else this.cbs.push(() => exec(f, this.value), () => exec(r, this.reason));
+    if (this.state === 'fulfilled') exec(f as (x: unknown) => unknown, this.value);
+    else if (this.state === 'rejected') exec(r as (x: unknown) => unknown, this.reason);
+    else {
+      this.cbs.push(
+        () => exec(f as (x: unknown) => unknown, this.value),
+        () => exec(r as (x: unknown) => unknown, this.reason),
+      );
+    }
   });
+
   return p2;
 }
 ```
 
-**resolvePromise：处理 thenable 的核心**（拉开差距的地方，规范还要求检测 `result === p2` 防循环引用）：
+### 2.1 resolvePromise：吸收 thenable
 
 ```ts
 function resolvePromise(
-  p2: MyPromise, result: unknown,
-  resolve: (v: unknown) => void, reject: (r: unknown) => void,
+  p2: MyPromise<unknown>,
+  result: unknown,
+  resolve: (v: unknown) => void,
+  reject: (r: unknown) => void,
 ): void {
+  if (result === p2) {
+    reject(new TypeError('Chaining cycle detected'));
+    return;
+  }
+
   if (result instanceof MyPromise) {
-    result.then(resolve, reject);              // 自家 Promise：透传
+    result.then(resolve, reject);
     return;
   }
-  // 异类 thenable：有 then 方法即可
-  if (result && typeof (result as PromiseLike<unknown>).then === "function") {
-    try {
-      (result as PromiseLike<unknown>).then(resolve, reject);
-    } catch (e) {
-      reject(e);
+
+  if (result !== null && (typeof result === 'object' || typeof result === 'function')) {
+    const then = (result as { then?: unknown }).then;
+    if (typeof then === 'function') {
+      let called = false;
+      try {
+        (then as (res: (v: unknown) => void, rej: (r: unknown) => void) => void).call(
+          result,
+          (v) => { if (!called) { called = true; resolvePromise(p2, v, resolve, reject); } },
+          (r) => { if (!called) { called = true; reject(r); } },
+        );
+      } catch (e) {
+        if (!called) reject(e);
+      }
+      return;
     }
-    return;
   }
-  resolve(result);                             // 普通值直接交付
+
+  resolve(result);
 }
 ```
 
+三个规范细节：
+
+- **`result === p2` 要拒绝**（循环引用）；
+- **`called` 标记**：thenable 可能既调 resolve 又调 reject，只认第一次；
+- **嵌套 thenable** 要递归吸收，不能直接 `resolve(thenable)`。
+
+### 2.2 补齐 catch / finally / 静态 resolve
+
+```ts
+catch<R = never>(onRejected?: (r: unknown) => R | PromiseLike<R>) {
+  return this.then(null, onRejected);
+}
+
+finally(cb?: () => void) {
+  return this.then(
+    (v) => { cb?.(); return v; },
+    (e) => { cb?.(); throw e; },
+  );
+}
+
+static resolve<T>(v: T | PromiseLike<T>): MyPromise<T> {
+  if (v instanceof MyPromise) return v;
+  return new MyPromise<T>((resolve) => resolve(v));
+}
+
+static reject<T = never>(r: unknown): MyPromise<T> {
+  return new MyPromise<T>((_, reject) => reject(r));
+}
+```
+
+`finally` 的两个细节：**不改变值**（成功透传原值，失败继续抛），**如果回调抛错则覆盖原结果**。这也是原生 `finally` 的行为。
+
 ---
 
-## 3. 静态方法：all / race / allSettled / any
-
-四个方法一套模板：**计数器 + 按下标保序**，差异只在"何时 resolve/reject"。
+## 3. 四个静态方法：计数器 + 下标保序
 
 ```ts
 static all<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<T[]> {
   return new MyPromise((resolve, reject) => {
     const list = [...promises];
-    const results: T[] = new Array(list.length);
+    if (list.length === 0) return resolve([]); // 空数组立即成功
+
+    const results = new Array<T>(list.length);
     let count = 0;
     list.forEach((p, i) => {
       MyPromise.resolve(p).then((v) => {
-        results[i] = v;                        // 按下标存，与输入顺序一致
+        results[i] = v; // 按下标存，顺序与输入一致
         if (++count === list.length) resolve(results);
-      }, reject);
+      }, reject);       // 任一失败立即失败
     });
   });
 }
 
-// race 最简单：对每个 promise 挂 resolve/reject，第一个 settle 的获胜
-// for (const p of list) MyPromise.resolve(p).then(resolve, reject);
-
-// allSettled：与 all 同构，但失败也收进 results，全部 settle 后 resolve
-static allSettled<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<unknown[]> {
-  return new MyPromise((resolve) => {
-    const list = [...promises];
-    const results = new Array(list.length);
-    let count = 0;
-    const done = () => { if (++count === list.length) resolve(results); };
-    list.forEach((p, i) =>
-      MyPromise.resolve(p).then(
-        (v) => { results[i] = { status: "fulfilled", value: v }; done(); },
-        (r) => { results[i] = { status: "rejected", reason: r }; done(); },
-      ),
-    );
+static race<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<T> {
+  return new MyPromise((resolve, reject) => {
+    for (const p of promises) MyPromise.resolve(p).then(resolve, reject);
   });
 }
 
-// any：一个成功即 resolve，全败才 reject AggregateError
+static allSettled<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<unknown[]> {
+  return new MyPromise((resolve) => {
+    const list = [...promises];
+    if (list.length === 0) return resolve([]);
+
+    const results = new Array(list.length);
+    let count = 0;
+    const done = () => { if (++count === list.length) resolve(results); };
+
+    list.forEach((p, i) => {
+      MyPromise.resolve(p).then(
+        (v) => { results[i] = { status: 'fulfilled', value: v }; done(); },
+        (r) => { results[i] = { status: 'rejected', reason: r }; done(); },
+      );
+    });
+  });
+}
+
 static any<T>(promises: Iterable<T | PromiseLike<T>>): MyPromise<T> {
   return new MyPromise((resolve, reject) => {
     const list = [...promises];
-    const errors: unknown[] = new Array(list.length);
+    const errors = new Array(list.length);
     let count = 0;
+
     list.forEach((p, i) => {
       MyPromise.resolve(p).then(resolve, (r) => {
         errors[i] = r;
-        if (++count === list.length)
-          reject(new AggregateError(errors, "All promises were rejected"));
+        if (++count === list.length) {
+          reject(new AggregateError(errors, 'All promises were rejected'));
+        }
       });
     });
   });
 }
 ```
 
-细节分：`results[i] = v` 按下标存保证**结果顺序与输入一致**；`MyPromise.resolve(p)` 把非 Promise 值也包一层；空输入要特判。四兄弟一句话：**all 全成才成、一败即败；race 谁快听谁的；allSettled 全给结果不抛错；any 一成即成、全败抛 AggregateError**。
+一句话记住四兄弟：
+
+| 方法 | 成功条件 | 失败条件 | 空数组 |
+| --- | --- | --- | --- |
+| `all` | 全部成功 | 任一失败 | 立即成功 `[]` |
+| `race` | 第一个 settle（成功或失败） | 同左 | **永远 pending** |
+| `allSettled` | 全部 settle | 从不失败 | 立即成功 `[]` |
+| `any` | 任一成功 | 全部失败（AggregateError） | 立即失败 |
 
 ---
 
-## 4. 并发限制器：promiseLimit
-
-**手写并发限制**（最多同时跑 N 个请求）是压轴题：
+## 4. 并发限制器与 retry
 
 ```ts
 async function promiseLimit<T>(
-  tasks: Array<() => Promise<T>>, limit: number,
+  tasks: Array<() => Promise<T>>,
+  limit: number,
 ): Promise<T[]> {
-  const results: T[] = new Array(tasks.length);
-  let next = 0;                                // 共享的任务游标
+  const results = new Array<T>(tasks.length);
+  let next = 0;
 
-  async function worker() {                    // N 个工人抢任务
+  async function worker() {
     while (next < tasks.length) {
       const i = next++;
-      results[i] = await tasks[i]();           // 领到下标后执行
+      results[i] = await tasks[i]();
     }
   }
 
@@ -188,30 +274,105 @@ async function promiseLimit<T>(
 }
 ```
 
-逐行讲：起 `min(limit, tasks.length)` 个 worker，每个从共享游标 `next` 领任务、`await` 完成再领下一个；`next++` 在单线程事件循环里不会竞争。追问"怎么加超时"：用 `Promise.race([task(), timeout(ms)])` 包一层。
+`next++` 在单线程事件循环里不会竞争；结果按下标写回，所以**返回顺序与输入一致**，与完成顺序无关。
+
+```ts
+// 失败重试：指数退避
+function retry<T>(fn: () => Promise<T>, times: number, delay = 0): Promise<T> {
+  return fn().catch((err) => {
+    if (times <= 1) throw err;
+    return new Promise((r) => setTimeout(r, delay)).then(() =>
+      retry(fn, times - 1, delay ? delay * 2 : 0),
+    );
+  });
+}
+```
+
+追问"怎么给单个任务加超时"：
+
+```ts
+const withTimeout = <T>(p: Promise<T>, ms: number) =>
+  Promise.race([
+    p,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), ms)),
+  ]);
+```
 
 ---
 
-## 小结
+## 5. 微任务执行顺序：必考题
+
+```js
+console.log('1');
+setTimeout(() => console.log('2'));
+Promise.resolve()
+  .then(() => console.log('3'))
+  .then(() => console.log('4'));
+queueMicrotask(() => console.log('5'));
+console.log('6');
+```
+
+输出：**1 → 6 → 3 → 5 → 4 → 2**。
+
+解释：同步代码先跑（1、6）；然后清空微任务队列：`then(3)` 入队、`queueMicrotask(5)` 入队、3 执行时把 4 入队，所以顺序是 3、5、4；最后才是宏任务 2。
+
+`async/await` 的对应关系：
+
+```js
+async function f() {
+  console.log('a');
+  await 1;           // await 之后的代码 = 微任务
+  console.log('b');
+}
+f();
+console.log('c');
+// a c b
+```
+
+---
+
+## 6. 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| then 里 `resolve` 的 Promise 没被等 | 没实现 thenable 吸收 | `resolvePromise` 递归处理 |
+| 错误被吞掉 | `onRejected` 缺省写成了空函数 | 缺省要 `throw e` |
+| `.then()` 后拿不到值 | 返回的是 `this` | 必须返回新 Promise |
+| 状态被改两次 | 没做 pending 守卫 | 每次变更前判状态 |
+| executor 抛错变 unhandled | 没 try/catch | 包一层转 reject |
+| 循环引用死循环 | 没判 `result === p2` | 直接 reject TypeError |
+| `race([])` 卡死 | 以为是 resolve | 空数组本就是永远 pending |
+| `any([])` 行为错 | 没处理空数组 | 应立即 reject AggregateError |
+| thenable 回调被调用两次 | 没 `called` 标记 | 只认第一次 |
+
+---
+
+## 7. 小结
 
 - 状态机三状态不可逆；pending 期间用回调数组实现发布订阅。
-- then：返回新 Promise、回调 try/catch、resolvePromise 吸收 thenable、缺省回调值穿透。
-- 四个静态方法 = 计数器 + 下标保序；并发限制器 = N 个 worker 抢共享游标。
+- then：返回新 Promise + 微任务执行 + try/catch + 缺省穿透 + thenable 吸收。
+- 四静态方法 = 计数器 + 下标保序，差异在"何时算失败"。
+- 并发限制器 = N 个 worker 抢共享游标；retry = 递归 + 退避。
+- 微任务先于宏任务，`await` 之后的代码是微任务。
 
 ---
 
-## 练习
+## 8. 练习
 
-1. 默写状态机 + 基础 then（含 resolvePromise），跑通返回 Promise 的 then 链。
-2. 默写 Promise.all 并验证结果保序；再写 `Promise.retry(fn, times)` 失败自动重试。
-3. 用 promiseLimit 包 10 个模拟请求，limit 为 3，打印并发数验证峰值不超 3。
+1. 默写状态机 + then（含 `resolvePromise`），跑通"then 返回 Promise"的链。
+2. 验证错误穿透：`p.then().then().catch(e => ...)` 能接住最初的错误。
+3. 默写 `Promise.all`，用三个不同延迟的请求验证结果保序。
+4. 写 `retry(fn, 3)`，让前两次失败、第三次成功。
+5. 用 `promiseLimit` 包 10 个模拟请求、limit 为 3，打印并发峰值。
+6. 不看答案，写出第 5 节两道题的正确输出并解释。
 
-## 验收清单
+## 9. 验收清单
 
 - [ ] 手写 `Promise.all`：保序、任一 reject 立即 reject、空数组立即 resolve
-- [ ] 能手写 `allSettled`、`race`、`any`，并说清四者的失败语义差别
-- [ ] 能实现 then 链的核心（返回新 promise、thenable 处理、错误穿透）
-- [ ] 能写并发控制器 `asyncPool(limit, tasks)`：控制并发、保序返回、异常传播
-- [ ] 知道微任务与宏任务的执行顺序，能预测一段 `Promise` + `setTimeout` 代码的输出
-- [ ] 脱稿默写 `Promise.all` 两次都对
-- [ ] 能说出"手写版与原生在边界上的差异"（比如 then 里抛错的传播）
+- [ ] 能手写 `allSettled`、`race`、`any`，并说清四者的失败语义与空数组行为
+- [ ] 能实现 then 链的核心（返回新 promise、thenable 处理、错误穿透、循环引用检测）
+- [ ] 能写并发控制器 `promiseLimit`：控制并发、保序返回、异常传播
+- [ ] 知道微任务与宏任务的执行顺序，能预测 `Promise` + `setTimeout` + `await` 的输出
+- [ ] 能实现 `finally`，并说清它"不改变值"的语义
+- [ ] 能说出"手写版与原生在边界上的差异"（比如 thenable 多次调用、微任务实现）

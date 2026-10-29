@@ -1,92 +1,118 @@
 ---
 title: '04 · 栈与单调栈'
 published: 2026-10-13T13:00:00+08:00
-description: '栈与单调栈高频题：有效括号、下一个更大元素、每日温度、滑动窗口最大值，匹配类与等待类问题的万能解法。'
+description: '栈与单调栈高频题：有效括号的空栈细节、下一个更大元素、每日温度、接雨水的两种解法、柱状图最大矩形的哨兵技巧、滑动窗口最大值的单调队列，以及递归改显式栈。'
 tags: [算法, 栈, 单调栈, LeetCode]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 栈解决的问题有一个共同气质：**最近的相关性**——最近打开的括号要最先闭合，最近入栈的元素最先被消费。识别出"最近匹配"四个字，这题基本就是栈。
+> 栈解决的问题有一个共同气质：**最近的相关性**——最近打开的括号要最先闭合，最近入栈的元素最先被消费。识别出"最近匹配"或"下一个更大/更小"，这题基本就是栈。
 
 ---
 
-## 1. 栈的基本盘：匹配类问题
+## 1. 栈的基本盘
 
-JS 里用数组模拟栈足够面试用：`push` 入栈、`pop` 出栈、`stack[stack.length - 1]` 看栈顶。
+JS 用数组模拟栈就够了：
 
-**套路模板**：遇到"需要配对/嵌套"的符号序列，左符号入栈，右符号来时检查栈顶是否匹配。
+```ts
+const stack: number[] = [];
+stack.push(1);              // 入栈
+const top = stack[stack.length - 1]; // 看栈顶
+stack.pop();                // 出栈
+```
 
-例题：**有效的括号**（第 02 篇给过字符串视角，这里补全栈视角的两个易错点）：
+`push`/`pop` 均摊 O(1)。**不要用 `shift`/`unshift` 当栈**——它们是 O(n)。
+
+---
+
+## 2. 匹配类：括号与相邻消除
 
 ```ts
 function isValid(s: string): boolean {
-  const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  const pairs: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
   const stack: string[] = [];
+
   for (const ch of s) {
-    if (ch === "(" || ch === "[" || ch === "{") {
+    if (ch === '(' || ch === '[' || ch === '{') {
       stack.push(ch);
     } else {
-      // 易错点 1：栈为空时 pop 返回 undefined，!= 比较恰好得到 false，逻辑仍正确
       if (stack.pop() !== pairs[ch]) return false;
     }
   }
-  // 易错点 2：结尾必须栈空，"(((" 这种漏网之鱼靠这一行拦截
   return stack.length === 0;
 }
 ```
 
-**变体：最长有效括号**（32 题，难度陡增但值得会）：求最长的连续有效括号子串长度。用栈存下标，栈底永远放"最后一个未匹配位置"当哨兵：
+两个必须能解释的细节：
+
+1. **栈为空时来右括号**：`pop()` 返回 `undefined`，与 `pairs[ch]` 不相等，于是返回 false。逻辑正确，但你要能说出"这是靠 `undefined !== '('` 兜住的"。
+2. **结尾必须检查栈空**：`"((("` 只匹配不收尾会被误判。
+
+### 2.1 相邻重复消除（1047）
 
 ```ts
-function longestValidParentheses(s: string): number {
-  let ans = 0;
-  const stack: number[] = [-1];        // 哨兵：最后未匹配的下标
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === "(") {
-      stack.push(i);
-    } else {
-      stack.pop();
-      if (stack.length === 0) {
-        stack.push(i);                 // 新的未匹配起点
-      } else {
-        ans = Math.max(ans, i - stack[stack.length - 1]);
-      }
-    }
+function removeDuplicates(s: string): string {
+  const stack: string[] = [];
+  for (const ch of s) {
+    if (stack[stack.length - 1] === ch) stack.pop(); // 消掉一对
+    else stack.push(ch);
   }
-  return ans;
+  return stack.join('');
 }
 ```
 
-逐行讲：每次右括号弹栈后，如果栈空了说明这个右括号是"断点"，把自己压进去当哨兵；否则当前有效长度 = 当前下标 − 栈顶（断点）。长度用下标差算，这是栈题里很漂亮的技巧。
+栈在这里的作用是"消除后可能产生新的相邻重复"——`"abba"` 消掉 `bb` 后 `aa` 又要消。**用栈自动处理这种连锁反应**，比反复扫字符串优雅得多。
 
 ---
 
-## 2. 单调栈：为每个元素找"下一个更大"
+## 3. 单调栈：为每个元素找"下一个更大"
 
-**套路模板**：单调栈维护一个"从栈底到栈顶递减"的栈。新元素入栈前，把所有比它小的元素弹出来——**被弹出时，就找到了它们的"下一个更大元素"**。
+**识别信号**：题目问"下一个更大/更小""还要等几天""左边第一个比它矮的"。
+
+**模板（从左往右）**：
 
 ```ts
-// 通用模板：对每个元素求右侧第一个更大的元素的下标
 function nextGreater(nums: number[]): number[] {
   const ans = new Array(nums.length).fill(-1);
-  const stack: number[] = [];          // 存下标，对应的值从底到顶递减
+  const stack: number[] = []; // 存下标，对应值从底到顶递减
+
   for (let i = 0; i < nums.length; i++) {
     while (stack.length && nums[i] > nums[stack[stack.length - 1]]) {
-      const idx = stack.pop()!;        // nums[i] 就是它的"下一个更大"
-      ans[idx] = i;
+      const idx = stack.pop()!;
+      ans[idx] = i; // nums[i] 就是它的"下一个更大"
     }
     stack.push(i);
   }
-  // 栈里剩下的元素，右侧没有更大的，保持 -1
   return ans;
 }
 ```
 
-逐行讲：栈里存下标而不是值（因为答案要写回位置）。当前元素比栈顶大时，栈顶的"等待"结束了。每个元素最多入栈一次、出栈一次，总操作 2n 次，所以是 O(n)——**看到"每个元素进出栈最多一次"就能报 O(n)**，这是复杂度追问的标准答案。
+三个要点：
 
-例题：**每日温度**。求每天还要等几天才有更高温。
+- **栈里存下标**，因为答案要写回原位置；
+- **弹出时机**：新元素比栈顶大，栈顶的"等待"结束；
+- **复杂度**：每个元素入栈一次、出栈一次，总操作 2n → **O(n)**。这是复杂度追问的标准答案。
+
+**反向写法**（从右往左，适合"右侧第一个更大"直接写）：
+
+```ts
+function nextGreaterFromRight(nums: number[]): number[] {
+  const ans = new Array(nums.length).fill(-1);
+  const stack: number[] = [];
+  for (let i = nums.length - 1; i >= 0; i--) {
+    while (stack.length && nums[stack[stack.length - 1]] <= nums[i]) stack.pop();
+    ans[i] = stack.length ? stack[stack.length - 1] : -1;
+    stack.push(i);
+  }
+  return ans;
+}
+```
+
+两种写法结果一致，选一种背熟即可；面试要求"换个方向"时能临场改出来。
+
+### 3.1 每日温度
 
 ```ts
 function dailyTemperatures(temps: number[]): number[] {
@@ -95,7 +121,7 @@ function dailyTemperatures(temps: number[]): number[] {
   for (let i = 0; i < temps.length; i++) {
     while (stack.length && temps[i] > temps[stack[stack.length - 1]]) {
       const idx = stack.pop()!;
-      ans[idx] = i - idx;              // 和模板唯一的区别：存天数差
+      ans[idx] = i - idx; // 与模板唯一区别：存距离
     }
     stack.push(i);
   }
@@ -103,73 +129,262 @@ function dailyTemperatures(temps: number[]): number[] {
 }
 ```
 
-和通用模板只差一行——答案从"下标"变成"距离"。**单调栈的变体题 90% 只改这一行**，所以模板必须背熟。
+**单调栈的变体 90% 只改"答案怎么写"这一行**，模板必须熟到能默写。
 
----
-
-## 3. 滑动窗口最大值：单调队列登场
-
-**239 题**是单调栈的近亲——单调队列（双向队列）：
+### 3.2 下一个更大元素 I（跨数组 + 哈希映射）
 
 ```ts
-function maxSlidingWindow(nums: number[], k: number): number[] {
-  const ans: number[] = [];
-  const dq: number[] = [];             // 存下标，对应的值单调递减
-  for (let i = 0; i < nums.length; i++) {
-    // 1. 队尾弹出所有比当前小的——它们再也不可能当最大值
-    while (dq.length && nums[i] >= nums[dq[dq.length - 1]]) dq.pop();
-    dq.push(i);
-    // 2. 队头过期（滑出窗口）就弹出
-    if (dq[0] <= i - k) dq.shift();
-    // 3. 窗口成型后，队头就是最大值
-    if (i >= k - 1) ans.push(nums[dq[0]]);
+function nextGreaterElement(nums1: number[], nums2: number[]): number[] {
+  const next = new Map<number, number>(); // 值 → 下一个更大值
+  const stack: number[] = [];
+
+  for (const x of nums2) {
+    while (stack.length && x > stack[stack.length - 1]) {
+      next.set(stack.pop()!, x);
+    }
+    stack.push(x);
+  }
+
+  return nums1.map((x) => next.get(x) ?? -1);
+}
+```
+
+两件事叠在一起：先用单调栈算出 `nums2` 里每个元素的下一个更大，再用 Map 做 O(1) 查询。**"单调栈 + 哈希"是这类题的标准组合。**
+
+### 3.3 接雨水：两种解法都要会
+
+**解法一：单调栈**（按"行"算水）
+
+```ts
+function trap(height: number[]): number {
+  const stack: number[] = [];
+  let ans = 0;
+
+  for (let i = 0; i < height.length; i++) {
+    while (stack.length && height[i] > height[stack[stack.length - 1]]) {
+      const mid = stack.pop()!;          // 凹槽底部
+      if (!stack.length) break;          // 左边没有墙，接不住
+      const left = stack[stack.length - 1];
+      const h = Math.min(height[left], height[i]) - height[mid]; // 水高
+      ans += h * (i - left - 1);         // 水高 × 宽度
+    }
+    stack.push(i);
   }
   return ans;
 }
 ```
 
-逐行讲：队列里存下标且对应值递减，队头永远是当前窗口最大值。关键洞察在第一步：**比当前元素小的老元素，在当前元素出窗前必然先被更小的位置淘汰，不可能再成为答案**——所以可以放心弹出。这一步的"不可能再当最大值"论证，是面试官最爱追问的点，务必能说出口。
+**解法二：双指针**（按"列"算水，O(1) 空间）
 
-用数组 `shift` 是 O(n)，但每个元素最多进出一次，均摊仍是 O(n)；追求极致可以手写环形队列或用头尾双栈，面试口头说明即可。
+```ts
+function trapTwoPointers(height: number[]): number {
+  let l = 0;
+  let r = height.length - 1;
+  let leftMax = 0;
+  let rightMax = 0;
+  let ans = 0;
+
+  while (l < r) {
+    if (height[l] < height[r]) {
+      leftMax = Math.max(leftMax, height[l]);
+      ans += leftMax - height[l];
+      l++;
+    } else {
+      rightMax = Math.max(rightMax, height[r]);
+      ans += rightMax - height[r];
+      r--;
+    }
+  }
+  return ans;
+}
+```
+
+双指针的直觉：**较矮的一侧，其水位由该侧已知的最大值决定**，因为另一侧一定有一堵不低于它的墙。能把这个"为什么可以确定"讲清楚，比写出代码更重要。
 
 ---
 
-## 4. 栈在前端场景题里的真身
+## 4. 柱状图中最大的矩形：哨兵技巧
 
-栈不只是刷题工具，前端场景题也爱考：
+这题是单调栈的"终局形态"，也是验收清单里必答的一道：
 
-**历史记录回退**：浏览器的后退就是两个栈（后退栈 + 前进栈），push 新页面清空前进栈。
+```ts
+function largestRectangleArea(heights: number[]): number {
+  const h = [0, ...heights, 0]; // 两端补 0：省掉边界特判
+  const stack: number[] = [];
+  let ans = 0;
 
-**表达式求值 / 计算器**（227 题）：数字栈 + 运算符栈，遇到更高优先级先算栈里的。前端偶尔考简化版"只含加减乘除"。
+  for (let i = 0; i < h.length; i++) {
+    while (stack.length && h[stack[stack.length - 1]] > h[i]) {
+      const height = h[stack.pop()!];
+      const left = stack[stack.length - 1];
+      ans = Math.max(ans, height * (i - left - 1)); // 宽度 = 右边界 - 左边界 - 1
+    }
+    stack.push(i);
+  }
+  return ans;
+}
+```
 
-**函数调用栈与尾递归**：面试官聊到栈，常追问"递归会不会爆栈"。答案是：深度超过调用栈上限（V8 约 1 万层）就爆，改循环或用 `setTimeout` 拆帧可解——能自然引出这个话题，比背栈定义高级得多。
+**为什么两端补 0**：
+
+- 左边补 0：保证栈不会空，`left` 永远存在；
+- 右边补 0：保证所有柱子最后都会被弹出（0 比任何高度都小），否则递增序列会留在栈里没结算。
+
+没有哨兵，就得在循环结束后再写一段"清空栈"的收尾代码——**哨兵是"用数据换代码"的典型技巧**，面试提到这一点很加分。
 
 ---
 
-## 小结
+## 5. 单调队列：滑动窗口最大值
 
-- 匹配类：左入右查，结尾验栈空；最长有效括号用下标哨兵算长度。
-- 单调栈：递减栈，弹出即得"下一个更大"，每元素进出一次所以 O(n)。
-- 滑动窗口最大值：单调队列，队头即最大值，"小的必然先淘汰"是核心论证。
-- 场景联想：回退记录、计算器、递归爆栈，都是栈的变装。
+```ts
+function maxSlidingWindow(nums: number[], k: number): number[] {
+  const dq: number[] = []; // 存下标，对应值单调递减
+  let head = 0;            // 用 head 指针代替 shift，避免 O(n)
+  const ans: number[] = [];
+
+  for (let i = 0; i < nums.length; i++) {
+    // 1. 队尾弹出所有比当前小的
+    while (dq.length > head && nums[i] >= nums[dq[dq.length - 1]]) dq.pop();
+    dq.push(i);
+
+    // 2. 队头过期（滑出窗口）
+    if (dq[head] <= i - k) head++;
+
+    // 3. 窗口成型后，队头即最大值
+    if (i >= k - 1) ans.push(nums[dq[head]]);
+  }
+  return ans;
+}
+```
+
+核心论证（面试必答）：**比当前元素小的老元素，在当前元素出窗前必然先被淘汰，不可能再成为任何窗口的最大值**——所以可以放心从队尾弹掉。
+
+复杂度：每个元素最多进队一次、出队一次 → O(n)。用 `head` 指针而不是 `shift()`，是为了避免每次移动 O(n) 的数组重排。
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 6. 栈在前端场景题里的真身
+
+| 场景 | 栈的作用 |
+| --- | --- |
+| 浏览器前进/后退 | 后退栈 + 前进栈，push 新页面清空前进栈 |
+| 撤销/重做（编辑器） | 命令栈，undo/redo 两个栈互倒 |
+| 表达式求值（计算器） | 数字栈 + 运算符栈，遇高优先级先算 |
+| JSON / HTML 解析 | 标签/括号嵌套靠栈匹配 |
+| 函数调用 | 调用栈，深度过大爆栈 |
+
+**递归爆栈怎么答**：V8 的调用栈上限大致在 1 万层量级，深度递归会抛 `Maximum call stack size exceeded`。改法有两种：**显式栈**（手动模拟）或**拆帧**（`setTimeout`/`requestIdleCallback` 分批）。
+
+显式栈改写示例（嵌套数组求和）：
+
+```ts
+type Nested = number | Nested[];
+
+function sumNested(input: Nested): number {
+  const stack: Nested[] = [input];
+  let sum = 0;
+  while (stack.length) {
+    const cur = stack.pop()!;
+    if (typeof cur === 'number') sum += cur;
+    else stack.push(...cur);
+  }
+  return sum;
+}
+```
+
+---
+
+### 6.1 简化计算器（只含 + − × ÷）
+
+数字栈 + 运算符栈，是"栈"最经典的工程化用法，也是前端偶尔会考的手写题：
+
+```ts
+function calculate(s: string): number {
+  const nums: number[] = [];
+  const ops: string[] = [];
+  const prec: Record<string, number> = { '+': 1, '-': 1, '*': 2, '/': 2 };
+
+  const apply = () => {
+    const b = nums.pop()!;
+    const a = nums.pop()!;
+    const op = ops.pop()!;
+    if (op === '+') nums.push(a + b);
+    else if (op === '-') nums.push(a - b);
+    else if (op === '*') nums.push(a * b);
+    else nums.push(Math.trunc(a / b)); // 题目要求向零截断
+  };
+
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === ' ') { i++; continue; }
+
+    if (/\d/.test(ch)) {              // 处理多位数
+      let n = 0;
+      while (i < s.length && /\d/.test(s[i])) n = n * 10 + Number(s[i++]);
+      nums.push(n);
+      continue;
+    }
+
+    // 栈顶运算符优先级不低于当前，就先算
+    while (ops.length && prec[ops[ops.length - 1]] >= prec[ch]) apply();
+    ops.push(ch);
+    i++;
+  }
+
+  while (ops.length) apply();
+  return nums[0];
+}
+
+// calculate('3+2*2') === 7
+```
+
+这个版本**不含括号与一元负号**，面试如果要求"支持括号"，改法是遇到 `(` 入栈，遇到 `)` 就一直算到 `(` 为止——逻辑一样，只是多了个"括号也是运算符"的视角。
+
+---
+
+## 7. 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 括号 `"("` 判合法 | 没检查栈空 | `return stack.length === 0` |
+| 单调栈结果缺一段 | 循环结束没清栈 | 补哨兵或写收尾 |
+| 柱状图宽度算错 | 宽度写成 `i - left` | 应为 `i - left - 1` |
+| 接雨水栈解越界 | 弹空后还取左墙 | `if (!stack.length) break` |
+| 滑动窗口最大值超时 | 用 `shift()` 移队头 | 用 `head` 指针 |
+| 单调栈 O(n²) | 每个元素反复扫描 | 保证每个元素只进出一次 |
+| 用 `shift` 当栈 | 数组头部操作 O(n) | 用 `pop` / 尾部 |
+| 递归爆栈 | 深度过大 | 显式栈或分批 |
+
+---
+
+## 8. 小结
+
+- 匹配类：左入右查，结尾验栈空；相邻消除也用栈处理连锁反应。
+- 单调栈：递减栈，弹出即得"下一个更大"；每元素进出一次 → O(n)。
+- 柱状图最大矩形：两端补 0 的哨兵，宽度 `i - left - 1`。
+- 单调队列：队头即窗口最大值，"小的必然先淘汰"是核心论证。
+- 递归爆栈：改显式栈或分批。
+
+---
+
+## 9. 练习（LeetCode 同类题清单）
 
 1. 20. 有效的括号 —— 匹配类入门。
 2. 1047. 删除字符串中的所有相邻重复项 —— 栈匹配变体。
 3. 739. 每日温度 —— 单调栈必做。
-4. 496. 下一个更大元素 I —— 模板直用。
-5. 42. 接雨水 —— 单调栈经典难题，能讲清两种解法更佳。
+4. 496. 下一个更大元素 I —— 单调栈 + 哈希。
+5. 42. 接雨水 —— 单调栈与双指针两种解法都要会。
 6. 239. 滑动窗口最大值 —— 单调队列必做。
+7. 84. 柱状图中最大的矩形 —— 哨兵技巧。
 
-## 验收清单
+## 10. 验收清单
 
 - [ ] 有效的括号能一次 AC，且能说出"为什么用栈而不是计数"
-- [ ] 单调栈"下一个更大元素"能默写模板（从右往左 / 从左往右两种写法都会）
+- [ ] 单调栈"下一个更大元素"能默写模板（从左、从右两种写法都会）
 - [ ] 能解释单调栈为什么是 O(n)：每个元素最多入栈出栈各一次
-- [ ] 柱状图中最大矩形能说出"哨兵"技巧（两端补 0 省边界判断）
-- [ ] 知道递归深度过大导致栈溢出的表现，并能改成显式栈
+- [ ] 柱状图最大矩形能说出"两端补 0"的哨兵技巧，并算对宽度
+- [ ] 接雨水能写出单调栈与双指针两版，并说清双指针为什么可以确定水位
+- [ ] 知道递归深度过大的表现，并能改成显式栈
 - [ ] 测试过：空数组、严格递增、严格递减、全部相同
 - [ ] 能在 20 分钟内 AC 一道栈中等题

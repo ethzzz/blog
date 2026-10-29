@@ -1,174 +1,346 @@
 ---
 title: '02 · 字符串高频题与正则妙用'
 published: 2026-10-13T11:00:00+08:00
-description: '前端字符串高频面试题：反转、回文判断、有效括号匹配，以及正则表达式在题解中的实战妙用。'
+description: 'UTF-16 与不可变带来的反转陷阱、回文判断的三种写法、滑动窗口求最长无重复子串、括号匹配的空栈细节，以及正则捕获组、replaceAll、lastIndex 与千分位的实战用法。'
 tags: [算法, 字符串, 正则表达式, LeetCode]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 字符串题是前端面试的"主场题"——毕竟天天跟文本打交道。反转、回文、括号匹配这三类占了大头，而正则用得好，常常能让面试官眼前一亮。
+> 字符串题是前端面试的"主场题"。但真正拉开差距的不是能不能写出来，而是**知不知道 JS 字符串是 UTF-16 且不可变**——这决定了你的反转会不会把 emoji 撕成两半，以及频繁拼接为什么要用数组。
 
 ---
 
-## 1. 反转与翻转：reverse 三板斧
+## 1. 先搞清底子：UTF-16 与不可变
 
-**套路模板**：JS 里字符串不可变，反转要么转数组用 `reverse()`，要么手动双指针交换。
+JS 字符串是 **UTF-16 码元序列**，不是"字符数组"：
 
-```ts
-// 写法一：一行流（适合口头快速给出）
-function reverseStr(s: string): string {
-  return s.split("").reverse().join("");
-}
-
-// 写法二：双指针手动交换（面试官要求 O(1) 额外空间时用）
-function reverseArr(chars: string[]): void {
-  let l = 0, r = chars.length - 1;
-  while (l < r) {
-    [chars[l], chars[r]] = [chars[r], chars[l]];
-    l++; r--;
-  }
-}
+```js
+console.log('😀'.length);        // 2 —— 一个 emoji 占两个码元（代理对）
+console.log([...'😀'].length);   // 1 —— 按码点迭代才是"一个字符"
+console.log('a'.length, [...'a'].length); // 1 1
 ```
 
-例题：**反转字符串中的单词**。"the sky is blue" → "blue is sky the"。
+于是最经典的翻车现场：
+
+```js
+// ❌ 把 emoji 撕成两个非法码元
+const bad = 'a😀b'.split('').reverse().join('');
+console.log(bad); // 乱码：半个 emoji
+
+// ✅ 按码点反转
+const good = [...'a😀b'].reverse().join('');
+console.log(good); // b😀a
+```
+
+第二个底子：**字符串不可变**。`s += c` 每次都新建字符串，长循环里是 O(n²) 级别：
+
+```ts
+// ❌ 十万次拼接可能几百毫秒
+let s = '';
+for (let i = 0; i < 100000; i++) s += 'x';
+
+// ✅ 数组收集 + join，接近 O(n)
+const parts: string[] = [];
+for (let i = 0; i < 100000; i++) parts.push('x');
+const out = parts.join('');
+```
+
+工程里还有 `Array(n).fill('x').join('')` 和 `'x'.repeat(n)` 两种更直接的写法。**面试说到"字符串不可变，所以用数组"就已经加分了。**
+
+---
+
+## 2. 反转：三板斧与它们的取舍
+
+```ts
+// 写法一：一行流，面试口头快速给出
+const reverseStr = (s: string) => s.split('').reverse().join('');
+
+// 写法二：双指针原地交换（输入是字符数组、要求 O(1) 额外空间时）
+function reverseChars(chars: string[]): void {
+  let l = 0;
+  let r = chars.length - 1;
+  while (l < r) {
+    [chars[l], chars[r]] = [chars[r], chars[l]];
+    l++;
+    r--;
+  }
+}
+
+// 写法三：按码点（处理 emoji / 生僻字）
+const reverseByCodePoint = (s: string) => [...s].reverse().join('');
+```
+
+| 写法 | 空间 | 适用 | 隐患 |
+| --- | --- | --- | --- |
+| `split/reverse/join` | O(n) | 普通题目 | 破坏代理对 |
+| 双指针交换 | O(1) | 输入是 `string[]` | 同样破坏代理对 |
+| `[...s].reverse()` | O(n) | 含 emoji | 稍慢 |
+
+例题：**反转字符串中的单词**（"the sky is blue" → "blue is sky the"）：
 
 ```ts
 function reverseWords(s: string): string {
-  return s.trim().split(/\s+/).reverse().join(" ");
+  return s.trim().split(/\s+/).reverse().join(' ');
 }
 ```
 
-逐行讲：`trim()` 去首尾空格；`split(/\s+/)` 用正则按"一个或多个空白"切分，天然处理了单词间多个空格的情况；`reverse()` 反转单词顺序；`join(" ")` 用单空格拼接。这题的考点就是**能不能想到用正则切分**——用普通 `split(" ")` 会切出空字符串，还得再 filter 一遍。
+逐行：`trim()` 去首尾空格；`split(/\s+/)` 按"一个或多个空白"切分，天然合并连续空格；`reverse()` 反转单词顺序；`join(' ')` 用单空格拼接。
 
-我面试时见过最漂亮的答案就是这一行，但注意：写完后要主动说一句"这里正则 `\s+` 把连续空格合并处理了"，展示你理解每一步在干嘛，而不是背下来的。
+如果只用 `split(' ')`，连续空格会切出空串，还得再 `filter(Boolean)`——**这正是这道题想看你用不用正则的地方**。
 
 ---
 
-## 2. 回文判断：从双指针到正则预处理
+## 3. 回文：从双指针到"删一个字符"
 
-**套路模板**：回文 = 正读反读一样。预处理（去掉非字母数字、转小写）后对撞指针。
-
-例题：**验证回文串**。只考虑字母和数字，忽略大小写。
+**套路**：先规范化（去非字母数字、转小写），再对撞。
 
 ```ts
 function isPalindrome(s: string): boolean {
-  // 预处理：只留字母数字并转小写
-  const cleaned = s.toLowerCase().replace(/[^a-z0-9]/g, "");
-  let l = 0, r = cleaned.length - 1;
+  const cleaned = s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  let l = 0;
+  let r = cleaned.length - 1;
   while (l < r) {
     if (cleaned[l] !== cleaned[r]) return false;
-    l++; r--;
+    l++;
+    r--;
   }
   return true;
 }
 ```
 
-逐行讲：正则 `[^a-z0-9]` 匹配所有非字母数字字符并替换为空串，一行完成"过滤 + 规范化"。之后就是对撞指针标准流程：两端不等立即返回 false。
+进阶版要求 **O(1) 空间**：不生成新串，用 `isAlnum` 跳过非法字符，边跳边比：
 
-**变体：最多删除一个字符还能是回文吗？** 这是高频追问版。思路：双指针遇到不等时，有两种补救可能（跳左或跳右），任一成立即可。
+```ts
+function isPalindromeInPlace(s: string): boolean {
+  const isAlnum = (c: string) => /[a-z0-9]/i.test(c);
+  let l = 0;
+  let r = s.length - 1;
+  while (l < r) {
+    while (l < r && !isAlnum(s[l])) l++;
+    while (l < r && !isAlnum(s[r])) r--;
+    if (s[l].toLowerCase() !== s[r].toLowerCase()) return false;
+    l++;
+    r--;
+  }
+  return true;
+}
+```
+
+高频追问：**最多删除一个字符还能是回文吗？** 只在第一个不匹配处补救，两种可能各试一次：
 
 ```ts
 function validPalindrome(s: string): boolean {
-  const check = (str: string, l: number, r: number): boolean => {
+  const check = (l: number, r: number): boolean => {
     while (l < r) {
-      if (str[l] !== str[r]) return false;
-      l++; r--;
+      if (s[l] !== s[r]) return false;
+      l++;
+      r--;
     }
     return true;
   };
-  let l = 0, r = s.length - 1;
+
+  let l = 0;
+  let r = s.length - 1;
   while (l < r) {
     if (s[l] !== s[r]) {
-      // 差一步：跳过左边或跳过右边，试一次
-      return check(s, l + 1, r) || check(s, l, r - 1);
+      return check(l + 1, r) || check(l, r - 1); // 删左 或 删右
     }
-    l++; r--;
+    l++;
+    r--;
   }
   return true;
 }
 ```
 
-关键在遇到第一个不匹配的位置才试删除——前面的部分已经确认是回文的了。整个算法 O(n)。
+为什么只试一次就够：第一次不匹配之前的部分已确认是回文，删掉一个字符后，剩下的必须整体是回文——不需要再删第二个。
 
 ---
 
-## 3. 括号匹配：栈的预处理版
+## 4. 滑动窗口：最长无重复子串
 
-有效括号题第 04 篇会从栈的角度细讲，这里先给字符串视角的解法，因为它考的概率太高：
+这题是字符串里最高频的中等题，也是滑动窗口的标准模板：
+
+```ts
+function lengthOfLongestSubstring(s: string): number {
+  const last = new Map<string, number>(); // 字符 → 最近一次出现的下标
+  let l = 0;
+  let ans = 0;
+
+  for (let r = 0; r < s.length; r++) {
+    const ch = s[r];
+    const seen = last.get(ch);
+    if (seen !== undefined && seen >= l) {
+      l = seen + 1;              // 窗口左边界跳到重复字符之后
+    }
+    last.set(ch, r);
+    ans = Math.max(ans, r - l + 1);
+  }
+  return ans;
+}
+```
+
+三个容易写错的点：
+
+| 易错点 | 错误写法 | 后果 |
+| --- | --- | --- |
+| 左边界只增不减 | `l = seen + 1` 不加 `seen >= l` 判断 | `l` 可能往回跳，答案偏大 |
+| 先更新窗口再更新 map | `last.set` 在 `l` 更新之前 | 边界算错 |
+| 用 `indexOf` 求位置 | `s.indexOf(s[r], l)` | O(n²)，大数据超时 |
+
+复杂度：`l` 和 `r` 都只前进，总移动不超过 2n，所以 **O(n) 时间**；哈希表最多 n 个键，**O(min(n, 字符集)) 空间**。
+
+---
+
+## 5. 括号匹配：栈与两个空栈细节
 
 ```ts
 function isValid(s: string): boolean {
-  const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  const pairs: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
   const stack: string[] = [];
+
   for (const ch of s) {
-    if (ch === "(" || ch === "[" || ch === "{") {
-      stack.push(ch);                   // 左括号入栈
+    if (ch === '(' || ch === '[' || ch === '{') {
+      stack.push(ch);
     } else {
-      if (stack.pop() !== pairs[ch]) return false;  // 必须匹配栈顶
+      if (stack.pop() !== pairs[ch]) return false;
     }
   }
-  return stack.length === 0;            // 栈空才算全匹配
+  return stack.length === 0; // 必须收尾：防止 "(" 这种漏网
 }
 ```
 
-注意两个易错点：右括号到来时**栈可能为空**（`pop()` 返回 `undefined`，与 `pairs[ch]` 不等，恰好返回 false，逻辑天然正确，但你要能解释为什么）；结尾**必须检查栈是否清空**，只匹配不收尾会有 `"("` 这种漏网之鱼。
+两个细节必须能解释：
+
+1. **栈为空时来右括号**：`pop()` 返回 `undefined`，与 `pairs[ch]` 不相等，于是返回 false。逻辑恰好正确，但你要能说出"这是靠 `undefined !== '('` 兜住的"，而不是碰巧。
+2. **结尾必须检查栈空**：只匹配不检查，`"("` 会被判成合法。
+
+进阶：**最长有效括号**（LeetCode 32）。栈里存下标，并在底部放一个哨兵：
+
+```ts
+function longestValidParentheses(s: string): number {
+  const stack: number[] = [-1]; // 哨兵：最后一个无法匹配的位置
+  let ans = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '(') {
+      stack.push(i);
+    } else {
+      stack.pop();
+      if (stack.length === 0) stack.push(i); // 当前右括号无法匹配，更新哨兵
+      else ans = Math.max(ans, i - stack[stack.length - 1]);
+    }
+  }
+  return ans;
+}
+```
 
 ---
 
-## 4. 正则在题解里的妙用
+## 6. 正则：四个高频场景
 
-前端面试里正则用得好是明显的加分项，几个高频场景：
-
-**场景一：驼峰与短横线互转**（手写题常客）。
+### 6.1 `replace` 的回调与 `$1`
 
 ```ts
-const kebabToCamel = (s: string) =>
-  s.replace(/-(\w)/g, (_, c) => c.toUpperCase());   // "font-size" -> "fontSize"
+// 驼峰 ↔ 短横线
+const kebabToCamel = (s: string) => s.replace(/-(\w)/g, (_, c: string) => c.toUpperCase());
+const camelToKebab = (s: string) => s.replace(/([A-Z])/g, '-$1').toLowerCase();
 
-const camelToKebab = (s: string) =>
-  s.replace(/([A-Z])/g, "-$1").toLowerCase();       // "fontSize" -> "font-size"
+kebabToCamel('font-size');  // 'fontSize'
+camelToKebab('fontSize');   // 'font-size'
 ```
 
-`replace` 的第二个参数可以是函数，`(_, c)` 第一个参数是整体匹配、后面是捕获组——很多候选人不知道函数签名，这里能讲清楚就赢了。
-
-**场景二：统计字符出现次数。** 用正则配合 `match` 比手写循环简洁：
+`replace` 第二个参数两种用法都要会：
 
 ```ts
-function countChar(s: string, ch: string): number {
-  return (s.match(new RegExp(ch, "g")) ?? []).length;
-}
-// "hello world" 里数 o：s.match(/o/g) => ["o","o"]，长度 2
+'2026-10-30'.replace(/(\d+)-(\d+)-(\d+)/, '$3/$2/$1'); // '30/10/2026'
+'2026-10-30'.replace(/(\d+)-(\d+)-(\d+)/, (_, y, m, d) => `${d}/${m}/${y}`);
 ```
 
-注意 `match` 找不到时返回 `null` 而不是空数组，`?? []` 兜底是必写细节。
+回调参数依次是：整体匹配、各捕获组、匹配位置、原字符串。**能说清这个签名，比写出结果更能得分。**
 
-**场景三：手写模板字符串解析**（前端特色题）。
+### 6.2 `replace` vs `replaceAll`
 
 ```ts
-// "你好，${name}" + {name: "张三"} => "你好，张三"
+'a-b-c'.replace('-', '+');    // 'a+b-c'  —— 只替换第一个
+'a-b-c'.replaceAll('-', '+'); // 'a+b+c'  —— 替换全部
+'a-b-c'.replace(/-/g, '+');   // 'a+b+c'  —— 老写法，等效
+```
+
+`replaceAll` 在 Node 15+ / 现代浏览器可用。如果第一个参数是正则，**必须带 `g`**，否则抛错——这是个容易在面试现场翻车的点。
+
+### 6.3 动态正则与 `lastIndex` 坑
+
+```ts
+// 字符串里 \\ 会被再解析一次
+const re = new RegExp('\\d+');       // ✅ 等价于 /\d+/
+const bad = new RegExp('\d+');       // ⚠️ '\d' 先被字符串吃掉，变成 'd+'
+
+// 用户输入拼进正则前必须转义
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const userRe = new RegExp(escapeRegExp(userInput), 'g');
+```
+
+`g` 标志会记住 `lastIndex`，同一个正则对象反复 `test` 会出现"第一次 true、第二次 false"：
+
+```js
+const re = /a/g;
+re.test('a'); // true，lastIndex = 1
+re.test('a'); // false —— 从 1 开始找不到
+re.test('a'); // true —— 重置后又从头
+
+// 修法一：每次新建正则
+/a/.test('a');
+// 修法二：手动重置
+re.lastIndex = 0;
+```
+
+### 6.4 千分位与模板解析
+
+```ts
+// 千分位：从右往左每三位插一个逗号
+const thousands = (n: number | string) =>
+  String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+thousands(1234567); // '1,234,567'
+
+// 模板解析："你好，${name}" + { name: '张三' }
 function render(tpl: string, data: Record<string, string>): string {
-  return tpl.replace(/\$\{(\w+)\}/g, (_, key) => data[key] ?? "");
+  return tpl.replace(/\$\{(\w+)\}/g, (_, key: string) => data[key] ?? '');
 }
+render('你好，${name}', { name: '张三' }); // '你好，张三'
 ```
 
-`\$\{(\w+)\}` 三个部分：转义 `${`、捕获组拿到变量名、匹配结尾 `}`。这类题本质考的就是正则捕获组 + replace 回调的组合拳。
-
-**正则陷阱提醒**：`new RegExp("a+b")` 里字符串会被再解析一次反斜杠，动态构造正则要写 `new RegExp("\\d+")`；全局匹配的 `lastIndex` 状态坑——同一个 `g` 正则对象反复 `test` 结果会变。面试提一嘴这两个坑，可靠性分拉满。
+千分位那条正则拆开看：`\B` 非单词边界、`(?=(\d{3})+(?!\d))` 前瞻"后面是 3 的倍数个数字且不再接数字"。**能解释结构比背下来更有用**，面试官常顺着问"为什么用 `\B` 不用 `^`"。
 
 ---
 
-## 小结
+## 7. 常见坑
 
-- 反转三板斧：`split/reverse/join` 一行流 + 双指针 O(1) 空间版。
-- 回文：正则预处理后对撞指针；变体"删一个字符"只在第一个不匹配处补救。
-- 括号匹配：栈 + 映射表，结尾必须检查栈空。
-- 正则妙用：`\s+` 切词、捕获组 + replace 回调做格式转换、`\$\{(\w+)\}` 解析模板。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 反转后 emoji 乱码 | `split('')` 按码元切 | `[...s].reverse()` |
+| 长循环拼接很慢 | 字符串不可变，每次重建 | 数组 `push` + `join` |
+| 回文判断漏掉大小写 | 没统一 `toLowerCase` | 预处理阶段就统一 |
+| 最长子串答案偏大 | 左边界回跳 | `seen >= l` 才能更新 `l` |
+| 括号匹配 `"("` 判合法 | 没检查栈空 | `return stack.length === 0` |
+| `replaceAll` 抛错 | 第一参数是正则但没 `g` | 带 `g` 或用 `replace(/-/g, ...)` |
+| `test` 结果反复横跳 | `g` 正则的 `lastIndex` 残留 | 每次新建或手动重置 |
+| 动态正则报语法错 | 用户输入没转义 | `escapeRegExp` 后拼 |
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 8. 小结
+
+- 字符串是 UTF-16 + 不可变：反转按码点，拼接用数组。
+- 回文：规范化后对撞；删一字符只在首个不匹配处两个方向各试一次。
+- 最长无重复子串：滑动窗口 + 最近位置表，`seen >= l` 才移动左边界。
+- 括号匹配：栈 + 映射，结尾查栈空；最长有效括号用下标栈 + 哨兵。
+- 正则：捕获组与回调签名、`replaceAll` 要 `g`、动态构造要转义、`g` 会记 `lastIndex`。
+
+---
+
+## 9. 练习（LeetCode 同类题清单）
 
 1. 344. 反转字符串 —— 双指针交换基本功。[查看解答 →](/blog/solutions/algo-02-ex01-reverse-string/)
 2. 125. 验证回文串 —— 正则预处理 + 对撞指针。[查看解答 →](/blog/solutions/algo-02-ex02-valid-palindrome/)
@@ -177,12 +349,14 @@ function render(tpl: string, data: Record<string, string>): string {
 5. 20. 有效的括号 —— 提前为栈篇热身。[查看解答 →](/blog/solutions/algo-02-ex05-valid-parentheses/)
 6. 557. 反转字符串中的单词 III —— 单词内反转，综合题。[查看解答 →](/blog/solutions/algo-02-ex06-reverse-words-iii/)
 
-## 验收清单
+## 10. 验收清单
 
 - [ ] 回文判断能手写双指针版，并说出它和"反转后比较"在空间上的差别
-- [ ] 知道正则的 `g` 标志会让 `test`/`exec` 记住 `lastIndex`，能复现这个坑并给出两种修法
-- [ ] 无重复字符的最长子串能写出滑动窗口，复杂度说到 O(n)
+- [ ] 能说出 JS 字符串为什么不可变、频繁拼接为什么用数组
+- [ ] 知道 `split('')` 会破坏 emoji，能写出按码点反转
+- [ ] 知道正则的 `g` 会让 `test`/`exec` 记住 `lastIndex`，能复现并给出两种修法
+- [ ] 无重复字符的最长子串能写出滑动窗口，并解释 `seen >= l` 的作用
 - [ ] 字符串替换能区分 `replace` 与 `replaceAll`，知道 `$1` 与回调返回值两种用法
-- [ ] 能说出 JS 字符串不可变的后果（频繁拼接要用数组 join）
+- [ ] 动态构造正则会先转义，能说出 `new RegExp('\\d+')` 为什么是两个反斜杠
 - [ ] 每道题测过：空串、单字符、全相同字符、含 Unicode 字符
 - [ ] 能在 20 分钟内 AC 一道字符串中等题

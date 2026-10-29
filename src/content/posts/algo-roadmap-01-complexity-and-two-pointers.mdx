@@ -1,130 +1,316 @@
 ---
 title: '01 · 复杂度分析与双指针'
 published: 2026-10-13T10:00:00+08:00
-description: '大 O 复杂度的面试直觉、对撞指针与快慢指针模板、前缀和技巧，双指针拿下两数之和与盛水容器等高频题。'
+description: '大 O 的面试口径与实测方法、对撞指针的正确性证明、快慢指针的读写分离与入环点推导、前缀和从 O(n) 到 O(1)，每类模板都配完整代码、边界测试与高频变体。'
 tags: [算法, 双指针, 复杂度分析, LeetCode]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 双指针是前端面试出场率最高的算法技巧，没有之一。而复杂度分析是你写完代码后的必答追问。这篇把两者打包讲透——先会"说复杂度"，再会"用双指针"。
+> 双指针是前端面试出场率最高的技巧，而复杂度分析是你写完代码后的必答追问。这篇把两者打包讲透：先会"说复杂度"，再会"用双指针"，最后能用一个小测试器自己验证边界。
 
 ---
 
 ## 1. 大 O：面试官想听什么
 
-面试里说复杂度，其实只需要掌握四个档位：
+面试里说复杂度，只需要掌握五个档位：
 
 | 复杂度 | 名字 | 直觉 | 典型场景 |
-|--------|------|------|----------|
-| O(1) | 常数 | 与规模无关 | 哈希表取值、数组下标访问 |
+| --- | --- | --- | --- |
+| O(1) | 常数 | 与规模无关 | 哈希取值、数组下标 |
 | O(log n) | 对数 | 每次砍一半 | 二分查找、平衡树操作 |
-| O(n) | 线性 | 扫一遍 | 遍历数组、双指针 |
-| O(n log n) | 线性对数 | 排序级别 | 内置 sort、归并 |
-| O(n²) | 平方 | 双重循环 | 暴力枚举所有两两组合 |
+| O(n) | 线性 | 扫一遍 | 遍历、双指针、前缀和 |
+| O(n log n) | 线性对数 | 排序级别 | 内置 sort、归并、堆 |
+| O(n²) | 平方 | 双重循环 | 暴力枚举两两组合 |
 
-几个实战要点：
+### 1.1 三个容易说错的地方
 
-**嵌套循环不一定是 O(n²)。** 外层 `for (let i = 0; i < n; i++)` 内层 `while (i < n)` 递增，总执行次数还是 O(n)——比如滑动窗口。看总执行次数，别只看循环层数。
+**① 嵌套循环不一定是 O(n²)。**
 
-**空间复杂度别忽略递归栈。** 递归深度 n 的代码，空间复杂度就是 O(n)，哪怕你没有额外开数组。面试官问"空间复杂度"时把调用栈算进去，是加分的细节。
+```ts
+// 外层 for + 内层 while，但 i 只增不减，总执行次数 O(n)
+let i = 0;
+while (i < n) {
+  for (let j = 0; j < 2; j++) {
+    // 常数次
+  }
+  i++;
+}
+```
 
-**n 的规模暗示了目标复杂度。** 面试官说 n ≤ 10⁵，你给出 O(n²) 基本就挂了；n ≤ 100，O(n³) 都能过。拿到题先看数据范围再动手，这是老手的第一反应。
+看**总执行次数**，不看循环层数。滑动窗口、双指针都是"两层循环但线性"的典型。
 
-一个常用的"能过"参考：1 秒内大约能执行 10⁸ 次基本操作。所以 n=10⁵ 时目标复杂度是 O(n log n) 或 O(n)。
+**② 递归栈要算进空间复杂度。**
+
+```ts
+function sum(n: number): number {
+  return n === 0 ? 0 : n + sum(n - 1); // 空间 O(n)：n 层调用帧
+}
+```
+
+哪怕没有额外数组，深度为 n 的递归就是 O(n) 空间。面试官问空间时主动补一句"含递归栈"，是明确的加分项。
+
+**③ 均摊复杂度常常比最坏情况更有用。**
+
+`Array.prototype.push` 偶尔扩容是 O(n)，但均摊到每次是 O(1)。说"均摊 O(1)"比说"最坏 O(n)"更准确，也更像做过工程的人。
+
+### 1.2 用数据范围反推目标复杂度
+
+| 数据范围 | 可接受的复杂度 | 常见解法 |
+| --- | --- | --- |
+| n ≤ 20 | O(2ⁿ) / O(n!) | 回溯、状压 |
+| n ≤ 100 | O(n³) | 三重循环、Floyd |
+| n ≤ 1,000 | O(n²) | 区间 DP、暴力枚举 |
+| n ≤ 10⁵ | O(n log n) / O(n) | 排序 + 双指针、哈希、前缀和 |
+| n ≤ 10⁷ | O(n) | 一遍扫描 |
+
+经验值：**1 秒大约 10⁸ 次基本操作**。拿到题先看 `1 <= n <= ?`，再决定能不能写暴力——这是老手的第一反应。
+
+实测一下量级差异（同一台机器上跑，比值比绝对值更可信）：
+
+```ts
+function timeIt(label: string, fn: () => void) {
+  const t0 = performance.now();
+  fn();
+  console.log(label, (performance.now() - t0).toFixed(2), 'ms');
+}
+
+const n = 5000;
+const arr = Array.from({ length: n }, (_, i) => i);
+
+timeIt('O(n)', () => { let s = 0; for (const x of arr) s += x; });
+timeIt('O(n²)', () => { let s = 0; for (const a of arr) for (const b of arr) s += a + b; });
+```
+
+n 翻倍时，O(n) 耗时约翻倍，O(n²) 约翻四倍。**这就是复杂度在工程里的含义。**
 
 ---
 
 ## 2. 对撞指针：从两端向中间收
 
-**套路模板**：一个左指针 `l` 从头开始，一个右指针 `r` 从尾开始，根据比较结果决定移动哪一边。
+**识别信号**：数组有序，或题目要求"两数/三数之和""最大面积"这类与两端相关的量。
 
-例题 1：**两数之和 II（输入有序数组）**。找出有序数组中两个数之和等于 target 的下标。
+**模板**：`l` 从头、`r` 从尾，根据比较结果淘汰一侧。
+
+### 2.1 两数之和 II（有序数组）
 
 ```ts
 function twoSum(nums: number[], target: number): number[] {
-  let l = 0, r = nums.length - 1;
+  let l = 0;
+  let r = nums.length - 1;
   while (l < r) {
     const sum = nums[l] + nums[r];
-    if (sum === target) return [l, r];   // 命中
-    if (sum < target) l++;               // 和太小，左指针右移增大
-    else r--;                            // 和太大，右指针左移减小
+    if (sum === target) return [l, r];
+    if (sum < target) l++; // nums[l] 与任何右侧元素配对都不够 → 永久淘汰
+    else r--;              // nums[r] 与任何左侧元素配对都过大 → 永久淘汰
   }
   return [];
 }
 ```
 
-逐行讲：`l` 和 `r` 分别指向最小和最大值。`sum < target` 时，说明右边的数配 `nums[l]` 都太大了？不对——说明**任何数配 `nums[l]` 都不够大或刚好**，因此 `nums[l]` 可以永久淘汰，`l++`。同理 `sum > target` 时 `nums[r]` 永久淘汰。每次循环淘汰一个元素，所以是 O(n) 时间 O(1) 空间。
+**正确性证明（三句话，面试可直接背）**：
 
-例题 2：**盛最多水的容器**。选两条竖线使盛水最多。
+1. 数组有序，`nums[l]` 是左侧最小、`nums[r]` 是右侧最大。
+2. 若 `nums[l] + nums[r] < target`，则 `nums[l]` 与它右边**任意**元素相加都 ≤ 当前和 < target，故 `nums[l]` 不可能出现在答案里。
+3. 每轮至少淘汰一个元素，最多 n 轮，所以 O(n) 时间、O(1) 空间。
+
+### 2.2 盛最多水的容器
 
 ```ts
 function maxArea(height: number[]): number {
-  let l = 0, r = height.length - 1, ans = 0;
+  let l = 0;
+  let r = height.length - 1;
+  let ans = 0;
   while (l < r) {
-    ans = Math.max(ans, (r - l) * Math.min(height[l], height[r]));
-    height[l] < height[r] ? l++ : r--;   // 移动矮的那边
+    const h = Math.min(height[l], height[r]);
+    ans = Math.max(ans, (r - l) * h);
+    if (height[l] < height[r]) l++;
+    else r--;
   }
   return ans;
 }
 ```
 
-核心证明一句话：水高由矮的决定，移动高的那边宽度还变小、高度不会变好，必然更差；移动矮的那边才有可能更好。面试时能把这个"为什么移动矮的"讲清楚，比写出代码更重要。
+**为什么移动矮的那边**（反证）：假设移动高的一边（右侧），新宽度更小；新高度受左侧矮柱限制，不可能超过原来的 `h`。所以新面积一定更小，这次移动**不可能产生更优解**。移动矮的一边，虽然宽度也变小，但高度有变高的可能——只有它值得试。
+
+### 2.3 三数之和：对撞指针的高频变体
+
+排序 + 固定一个数 + 对撞，难点在**去重**：
+
+```ts
+function threeSum(nums: number[]): number[][] {
+  nums.sort((a, b) => a - b);
+  const res: number[][] = [];
+
+  for (let i = 0; i < nums.length - 2; i++) {
+    if (nums[i] > 0) break;                          // 最小的数都 > 0，后面不可能凑 0
+    if (i > 0 && nums[i] === nums[i - 1]) continue;  // 跳过重复的"第一个数"
+
+    let l = i + 1;
+    let r = nums.length - 1;
+    while (l < r) {
+      const sum = nums[i] + nums[l] + nums[r];
+      if (sum === 0) {
+        res.push([nums[i], nums[l], nums[r]]);
+        while (l < r && nums[l] === nums[l + 1]) l++;  // 跳过重复的第二个数
+        while (l < r && nums[r] === nums[r - 1]) r--;  // 跳过重复的第三个数
+        l++;
+        r--;
+      } else if (sum < 0) {
+        l++;
+      } else {
+        r--;
+      }
+    }
+  }
+  return res;
+}
+```
+
+三个去重点，漏一个就重复或漏解：
+
+| 位置 | 写法 | 作用 |
+| --- | --- | --- |
+| 外层 `i` | `i > 0 && nums[i] === nums[i-1]` | 相同首元素只算一次 |
+| 命中后 `l` | `while (l < r && nums[l] === nums[l+1]) l++` | 跳过相同次元素 |
+| 命中后 `r` | `while (l < r && nums[r] === nums[r-1]) r--` | 跳过相同末元素 |
+
+### 2.4 合并两个有序数组：从后往前的对撞
+
+`nums1` 尾部有足够空位时，**从后往前**填可以避免覆盖：
+
+```ts
+function merge(nums1: number[], m: number, nums2: number[], n: number): void {
+  let i = m - 1;      // nums1 有效部分末尾
+  let j = n - 1;      // nums2 末尾
+  let k = m + n - 1;  // 写入位置
+  while (j >= 0) {
+    nums1[k--] = i >= 0 && nums1[i] > nums2[j] ? nums1[i--] : nums2[j--];
+  }
+}
+```
+
+为什么从后往前：如果从前往后，`nums1` 的元素会被即将写入的值覆盖。从后往前，写入位置永远在未处理元素之后。
 
 ---
 
 ## 3. 快慢指针：同一方向的追赶
 
-**套路模板**：两个指针同向移动，速度不同或起点不同，用于找中点、判环、去重。
+**识别信号**：原地修改、去重、找中点、判环。
 
-例题：**移除元素 / 有序数组去重**。原地修改，返回新长度。
+### 3.1 删除有序数组中的重复项（读写分离）
 
 ```ts
 function removeDuplicates(nums: number[]): number {
   if (nums.length === 0) return 0;
-  let slow = 0;                            // slow：下一个"已确认唯一"的坑位
+  let slow = 0; // slow 左边是已确认的唯一前缀
   for (let fast = 1; fast < nums.length; fast++) {
     if (nums[fast] !== nums[slow]) {
       slow++;
-      nums[slow] = nums[fast];             // 把新值填进坑位
+      nums[slow] = nums[fast];
     }
   }
   return slow + 1;
 }
 ```
 
-逐行讲：`slow` 左边永远是处理好的前缀，`fast` 负责探路。遇到不重复的值就"填坑"并推进 `slow`。这类"读写指针分离"的写法在前端处理列表数据时也很常用，比如就地过滤一个有序列表。
+`slow` 是"下一个可写位置"，`fast` 是"探路者"。这类"读写指针分离"在处理列表数据时非常常用。
 
-快慢指针判环（第 05 篇链表篇会展开）：慢指针每次走 1 步、快指针每次走 2 步，若有环必相遇——快指针相对慢指针每轮多走 1 步，在环里迟早"追圈"。这个追及直觉记住就行。
+变体：**每个元素最多保留两次**（LeetCode 80），判断条件从"和前一个不同"改成"和前两个不同"：
+
+```ts
+function removeDuplicatesAtMostTwice(nums: number[]): number {
+  let k = 0;
+  for (const x of nums) {
+    if (k < 2 || nums[k - 2] !== x) nums[k++] = x;
+  }
+  return k;
+}
+```
+
+### 3.2 链表判环与入环点
+
+```ts
+class ListNode {
+  val: number;
+  next: ListNode | null = null;
+  constructor(v: number) { this.val = v; }
+}
+
+function hasCycle(head: ListNode | null): boolean {
+  let slow = head;
+  let fast = head;
+  while (fast && fast.next) {
+    slow = slow!.next;
+    fast = fast.next.next;
+    if (slow === fast) return true;
+  }
+  return false;
+}
+```
+
+**为什么必相遇**：快指针每轮比慢指针多走 1 步，进入环后两者距离每轮缩短 1，迟早归零。
+
+**入环点推导**（很多人只会背结论，这里补上证明）：
+
+```text
+设：头到入环点距离 a；入环点到相遇点距离 b；环长 c。
+慢指针走了 a + b；快指针走了 a + b + k·c（k ≥ 1）。
+快是慢的两倍：2(a + b) = a + b + k·c
+             ⇒ a = k·c − b = (k−1)·c + (c − b)
+```
+
+`c − b` 是"相遇点继续走到入环点"的距离。所以：**一个指针从头走 a 步，另一个从相遇点走 `(k−1)c + (c−b)` 步，会同时到达入环点。**
+
+```ts
+function detectCycle(head: ListNode | null): ListNode | null {
+  let slow = head;
+  let fast = head;
+  while (fast && fast.next) {
+    slow = slow!.next;
+    fast = fast.next.next;
+    if (slow === fast) {
+      let p = head;
+      while (p !== slow) {
+        p = p!.next;
+        slow = slow!.next;
+      }
+      return p;
+    }
+  }
+  return null;
+}
+```
 
 ---
 
 ## 4. 前缀和：把"区间求和"变 O(1)
 
-**套路模板**：先扫一遍算出 `prefix[i] = nums[0..i-1] 的和`，之后任意区间 `[l, r)` 的和就是 `prefix[r] - prefix[l]`。
+**模板**：预处理一次，之后任意区间 `[l, r)` 的和 = `prefix[r] - prefix[l]`。
 
 ```ts
 function buildPrefix(nums: number[]): number[] {
-  const prefix = [0];                      // prefix[0] = 0 是关键哨兵
+  const prefix = [0]; // 哨兵：prefix[0] = 0，让 [0, k) 不用特判
   for (let i = 0; i < nums.length; i++) {
     prefix.push(prefix[i] + nums[i]);
   }
   return prefix;
 }
-// 区间 [l, r) 的和 = prefix[r] - prefix[l]
+
+// 区间 [l, r) 的和
+const rangeSum = (prefix: number[], l: number, r: number) => prefix[r] - prefix[l];
 ```
 
-`prefix[0] = 0` 这个哨兵让 `[0, k)` 这种从头开始的区间不用特判，是前缀和最容易被面试官追问的细节。
+适用前提：**数组不变或只有追加**。频繁修改要用树状数组/线段树，这点面试常追问。
 
-例题：**寻找数组的中心下标**。中心下标左边元素和等于右边元素和。
+### 4.1 中心下标（O(1) 空间版）
 
 ```ts
 function pivotIndex(nums: number[]): number {
   const total = nums.reduce((a, b) => a + b, 0);
   let leftSum = 0;
   for (let i = 0; i < nums.length; i++) {
-    // 右边和 = 总和 - 左边和 - 当前元素
     if (leftSum * 2 + nums[i] === total) return i;
     leftSum += nums[i];
   }
@@ -132,20 +318,76 @@ function pivotIndex(nums: number[]): number {
 }
 ```
 
-这题是前缀思想的变体：不存前缀数组，用"总和减左边"推导右边，空间降到 O(1)。面试里这种"省掉数组"的小优化非常加分。
+不存前缀数组，用"总和减左边"推右边：`left + nums[i] + left = total`。
+
+### 4.2 和为 K 的子数组：前缀和 + 哈希
+
+这题是前缀和真正的高频考法——**统计**而非查询：
+
+```ts
+function subarraySum(nums: number[], k: number): number {
+  const count = new Map<number, number>([[0, 1]]); // 前缀和 → 出现次数
+  let sum = 0;
+  let ans = 0;
+  for (const x of nums) {
+    sum += x;
+    ans += count.get(sum - k) ?? 0;  // 之前出现过 sum-k，就有一段和为 k
+    count.set(sum, (count.get(sum) ?? 0) + 1);
+  }
+  return ans;
+}
+```
+
+关键在于 `[[0, 1]]` 这个初始化：它代表"空前缀出现了 1 次"，否则从下标 0 开始的子数组会被漏掉。**这是本题最容易错的边界。**
 
 ---
 
-## 小结
+## 5. 一个够用的小测试器
 
-- 复杂度四档：O(1)、O(log n)、O(n)、O(n log n)，看数据范围反推目标复杂度。
-- 对撞指针：两端向中间，每轮淘汰一个元素，O(n) 解决两数之和、盛水容器。
-- 快慢指针：同向追赶，读写分离，解决去重与原地修改类问题。
-- 前缀和：`prefix[r] - prefix[l]` 把区间和降到 O(1)，哨兵 `prefix[0]=0` 免特判。
+算法题最容易"样例过、边界挂"。三行写个断言器，每篇都用：
+
+```ts
+function check<T>(name: string, got: T, want: T) {
+  const ok = JSON.stringify(got) === JSON.stringify(want);
+  console.log(ok ? '✅' : '❌', name, ok ? '' : `got=${JSON.stringify(got)} want=${JSON.stringify(want)}`);
+}
+
+// 用法：空数组、单元素、全相同，三个边界先跑一遍
+check('twoSum 空', twoSum([], 9), []);
+check('twoSum 单元素', twoSum([1], 2), []);
+check('twoSum 正常', twoSum([2, 7, 11, 15], 9), [0, 1]);
+check('三数之和 全零', threeSum([0, 0, 0, 0]), [[0, 0, 0]]);
+check('去重 空', removeDuplicates([]), 0);
+check('和为K 单个命中', subarraySum([1, 1, 1], 2), 2);
+```
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 6. 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 对撞指针死循环 | `l++`/`r--` 放在 if 里漏了某个分支 | 每个分支都必须移动一个指针 |
+| 三数之和重复解 | 只去重了外层 `i` | 命中后同时收缩 `l`/`r` 跳过重复 |
+| 盛水容器答案偏小 | 移动了高的一边 | 永远移动矮的那边 |
+| 合并数组元素被覆盖 | 从前往后写 | 从后往前，`k = m+n-1` |
+| 去重后长度多 1 | 返回 `slow` 而不是 `slow+1` | `slow` 是下标，长度要 +1 |
+| 前缀和查询差一 | 区间写成闭区间 | 统一用 `[l, r)`，`prefix[r]-prefix[l]` |
+| 和为 K 漏掉从头开始的段 | 没初始化 `[[0,1]]` | 哈希表预置空前缀 |
+| 说 O(n) 被追问 | 空间复杂度含递归栈没算 | 主动说明"时间 O(n)，空间 O(1)/O(n) 含栈" |
+
+---
+
+## 7. 小结
+
+- 复杂度：五档 + 均摊 + 递归栈；看数据范围反推目标复杂度。
+- 对撞指针：有序或"两端相关"，每轮淘汰一个元素，核心是**证明淘汰的正确性**。
+- 快慢指针：读写分离；判环靠速度差，入环点靠 `a = (k−1)c + (c−b)`。
+- 前缀和：`prefix[r] - prefix[l]`；统计型问题配哈希，别忘 `[[0,1]]`。
+
+---
+
+## 8. 练习（LeetCode 同类题清单）
 
 1. 167. 两数之和 II —— 对撞指针入门，必做。[查看解答 →](/blog/solutions/algo-01-ex01-two-sum-ii/)
 2. 11. 盛最多水的容器 —— 练"为什么移动矮的"的话术。[查看解答 →](/blog/solutions/algo-01-ex02-container-with-most-water/)
@@ -154,12 +396,13 @@ function pivotIndex(nums: number[]): number {
 5. 724. 寻找数组的中心下标 —— 前缀和 O(1) 空间版。[查看解答 →](/blog/solutions/algo-01-ex05-pivot-index/)
 6. 15. 三数之和 —— 对撞指针 + 排序 + 去重，中等题高频。[查看解答 →](/blog/solutions/algo-01-ex06-three-sum/)
 
-## 验收清单（做完这些题之后逐条勾）
+## 9. 验收清单（做完这些题之后逐条勾）
 
-- [ ] 能口述"盛最多水的容器为什么移动矮的那边"——不是背结论，是能给出反证
+- [ ] 能口述"盛最多水的容器为什么移动矮的那边"——给出反证，不是背结论
 - [ ] 对撞指针题能在 15 分钟内写完并 AC，复杂度说到 O(n) 时间 / O(1) 空间
-- [ ] 快慢指针判断链表有环，能说清"为什么相遇后从头再走就能找到入口"
-- [ ] 前缀和题能写出"预处理一次、查询 O(1)"的版本，并知道它不适合频繁修改
-- [ ] 三数之和能处理重复元素（排序后跳过相等项），不漏解也不重复
+- [ ] 能写出入环点的推导（`a = (k−1)c + (c−b)`），而不是只背"从头再走"
+- [ ] 前缀和题能写"预处理一次、查询 O(1)"，并知道它不适合频繁修改
+- [ ] 三数之和三处去重都写对，且用 `[0,0,0,0]` 验过
+- [ ] 和为 K 的子数组能解释 `[[0,1]]` 的作用
 - [ ] 每道题都主动测过：空数组、单元素、全相同元素
 - [ ] 能在不看代码的情况下，用三句话说清本篇文章任意一道题的思路

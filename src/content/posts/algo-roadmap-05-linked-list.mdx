@@ -1,20 +1,20 @@
 ---
 title: '05 · 链表专题：虚拟头结点与反转全家桶'
 published: 2026-10-13T14:00:00+08:00
-description: '链表高频题套路：虚拟头结点技巧、反转链表全家桶、合并有序链表、快慢指针环检测与找中点。'
+description: '链表三大模板：虚拟头结点消灭边界特判、反转的迭代与递归双版本、合并与回文的三模板合体；附数组↔链表测试工具、相交链表走位法，以及每次访问 next 前先判空的纪律。'
 tags: [算法, 链表, 快慢指针, LeetCode]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 链表题规律性极强：**虚拟头结点 + 快慢指针 + 反转**三个模板能覆盖 90% 的考题。JS 面试里链表题还常和手写题联动（比如手写 LinkedList），这篇一次讲透。
+> 链表题规律性极强：**虚拟头结点 + 快慢指针 + 反转**三个模板覆盖 90% 的考题。链表题没有下标，所有错误都来自"多走了一步"或"少判了一次空"——这篇把这两类错误逐个钉死。
 
 ---
 
-## 1. 虚拟头结点：让头节点不再是特例
+## 1. 先准备测试工具：数组 ↔ 链表
 
-链表题一半的错误来自"头节点可能被删/被换"导致的边界特判。**虚拟头结点**（dummy node）一招解决：
+链表题最麻烦的是"怎么在 Console 里验"。两个十行工具函数就能让你像操作数组一样测链表：
 
 ```ts
 interface ListNode {
@@ -22,177 +22,324 @@ interface ListNode {
   next: ListNode | null;
 }
 
-// 套路模板：造一个假头，返回 dummy.next
-function withDummy(head: ListNode | null): ListNode | null {
+// 数组 → 链表（从右往左 reduce，把后一个当 next）
+const fromArray = (arr: number[]): ListNode | null =>
+  arr.reduceRight<ListNode | null>((next, val) => ({ val, next }), null);
+
+// 链表 → 数组（方便 console.log 和断言）
+function toArray(head: ListNode | null): number[] {
+  const out: number[] = [];
+  for (let p = head; p; p = p.next) out.push(p.val);
+  return out;
+}
+
+// 用法
+const head = fromArray([1, 2, 3, 4, 5]);
+console.log(toArray(reverseList(head))); // [5,4,3,2,1]
+```
+
+> 面试时也可以主动说"我会用数组辅助测试链表"，这是很实在的工程习惯。
+
+---
+
+## 2. 虚拟头结点：让头节点不再是特例
+
+链表题一半的错误来自"头节点可能被删或被换"导致的边界特判。**虚拟头结点**（dummy）一招解决：
+
+```ts
+function removeElements(head: ListNode | null, val: number): ListNode | null {
   const dummy: ListNode = { val: 0, next: head };
-  // ... 在 dummy 上操作，永远不用特判真正的头
-  return dummy.next;
+  let cur: ListNode = dummy;
+  while (cur.next) {
+    if (cur.next.val === val) cur.next = cur.next.next; // 跳过目标节点
+    else cur = cur.next;
+  }
+  return dummy.next; // 真正的头可能已被删，必须从 dummy.next 取
 }
 ```
 
-例题：**删除链表的倒数第 N 个节点**。快慢指针一步到位：
+对比不用 dummy 的版本：删头节点要单独写 `while (head && head.val === val) head = head.next;`，多一段几乎一样的逻辑。**所有"可能动头"的题，先造 dummy。**
+
+### 2.1 删除倒数第 N 个节点
 
 ```ts
 function removeNthFromEnd(head: ListNode | null, n: number): ListNode | null {
   const dummy: ListNode = { val: 0, next: head };
-  let fast: ListNode | null = dummy;
-  let slow: ListNode | null = dummy;
-  for (let i = 0; i < n; i++) fast = fast!.next;   // fast 先走 n 步
-  while (fast!.next) {                             // 一起走到 fast 在最后一个节点
-    fast = fast!.next;
-    slow = slow!.next;
+  let fast: ListNode = dummy;
+  let slow: ListNode = dummy;
+
+  for (let i = 0; i < n; i++) fast = fast.next!; // fast 先走 n 步
+  while (fast.next) {                            // fast 停在尾节点时停下
+    fast = fast.next;
+    slow = slow.next!;
   }
-  slow!.next = slow!.next!.next;                   // slow 正好停在待删节点的前一个
+  slow.next = slow.next!.next;                   // slow 正好是待删节点的前驱
   return dummy.next;
 }
 ```
 
-逐行讲：`fast` 先走 n 步后，两指针间距为 n；一起走到 `fast` 抵达尾节点时，`slow` 距尾部正好 n 个节点，即倒数第 n 个的**前驱**。删除需要前驱，所以慢指针要停在"前一个"——`while (fast.next)` 而不是 `while (fast)`，这个差一细节是本题唯一的坑，也是面试官最爱追问的点。
-
-虚拟头结点的价值在这里体现：如果要删的恰好是真头节点，没有 dummy 就得写 `if (slow === dummyHead)` 一堆特判。
+**差一细节**是本题唯一的坑：循环条件是 `while (fast.next)` 而不是 `while (fast)`。目标是让 `slow` 停在**前驱**，因为删除需要前驱；如果 `fast` 走到 `null`，`slow` 会停在待删节点本身，就无法删除它了。
 
 ---
 
-## 2. 反转全家桶：一个模板吃掉三道题
+## 3. 反转全家桶
 
-**核心模板：迭代反转整个链表**。必须默写级熟练：
+### 3.1 迭代版：存、反、进、进
 
 ```ts
 function reverseList(head: ListNode | null): ListNode | null {
   let prev: ListNode | null = null;
   let cur = head;
   while (cur) {
-    const next: ListNode | null = cur.next;   // 1. 先存后继
-    cur.next = prev;                          // 2. 反指
-    prev = cur;                               // 3. prev 前进
-    cur = next;                               // 4. cur 前进
+    const next = cur.next; // 1. 先存后继，防止断链
+    cur.next = prev;       // 2. 反指
+    prev = cur;            // 3. prev 前进
+    cur = next;            // 4. cur 前进
   }
-  return prev;                                // prev 即新头
+  return prev;             // prev 即新头
 }
 ```
 
-逐行讲：三指针各司其职——`prev` 是已反转部分的头，`cur` 是待处理节点，`next` 暂存防止断链。口诀"存、反、进、进"，四步一循环。
+三指针各司其职：`prev` 是已反转部分的头，`cur` 是待处理节点，`next` 只是暂存。**空间 O(1)**。
 
-**变体一：反转部分区间**（92 题）。找到第 m 个节点的前驱，局部反转到第 n 个，接回去：
+### 3.2 递归版：先反转后面，再处理自己
+
+```ts
+function reverseListRec(head: ListNode | null): ListNode | null {
+  if (!head || !head.next) return head;    // 终止：空或单节点
+  const newHead = reverseListRec(head.next); // 反转后面，返回新头
+  head.next.next = head;                   // 让后继指回自己
+  head.next = null;                        // 自己变成尾
+  return newHead;
+}
+```
+
+递归版的理解关键：**不要试图在脑子里展开整个调用栈**，只相信"递归已经把 `head.next` 之后的链反转好了，并返回了新头"。空间 O(n)（调用栈）。
+
+两版都要会，因为面试官常追问："递归版的空间复杂度是多少？能不能改成迭代？"
+
+### 3.3 区间反转：头插法
 
 ```ts
 function reverseBetween(head: ListNode | null, m: number, n: number): ListNode | null {
   const dummy: ListNode = { val: 0, next: head };
   let pre: ListNode = dummy;
-  for (let i = 0; i < m - 1; i++) pre = pre.next!;   // pre：区间前驱
-  const start = pre.next!;                           // 区间第一个（反转后变尾）
+  for (let i = 0; i < m - 1; i++) pre = pre.next!; // pre：区间前驱
+
+  const start = pre.next!;  // 区间第一个，反转后变成区间尾
   let cur = start.next;
-  for (let i = 0; i < n - m; i++) {                  // 头插法：把 cur 一个个搬到 pre 后面
-    start.next = cur!.next;
-    cur!.next = pre.next;
+
+  for (let i = 0; i < n - m; i++) {
+    start.next = cur!.next; // 把 cur 从原位摘下来
+    cur!.next = pre.next;   // 插到 pre 后面（头插）
     pre.next = cur;
-    cur = start.next;
+    cur = start.next;       // 下一个待搬的节点
   }
   return dummy.next;
 }
 ```
 
-这里用了**头插法**：保持 `start` 不动，把它后面的节点逐个摘下来插到 `pre` 之后。比"反转再拼接"少一次遍历，也更能体现对指针的掌控力。
+`start` 始终不动，它后面的节点被逐个"摘下来插到 `pre` 之后"。这个写法比"整段反转再拼接"少一次遍历，也更能体现指针掌控力。
 
-**变体二：两两交换节点**（24 题）。同样是头插思想，每轮交换 `pre` 后面的两个节点，代码结构几乎一样。建议做完 92 题后立刻做 24 题验证模板掌握度。
+### 3.4 两两交换
+
+```ts
+function swapPairs(head: ListNode | null): ListNode | null {
+  const dummy: ListNode = { val: 0, next: head };
+  let pre: ListNode = dummy;
+  while (pre.next && pre.next.next) {
+    const a = pre.next;
+    const b = a.next;
+    a.next = b.next;
+    b.next = a;
+    pre.next = b;
+    pre = a; // a 现在是这一对的尾
+  }
+  return dummy.next;
+}
+```
+
+结构与 3.3 相同：`pre` 是"上一段的尾"，每轮重排两个节点后把 `pre` 移到新的尾部。
 
 ---
 
-## 3. 合并与双链表操作
+## 4. 合并：两条链与 K 条链
 
-**合并两个有序链表**（21 题）：虚拟头 + 尾插，比对取小：
+### 4.1 合并两个有序链表
 
 ```ts
 function mergeTwoLists(l1: ListNode | null, l2: ListNode | null): ListNode | null {
   const dummy: ListNode = { val: 0, next: null };
   let tail = dummy;
+
   while (l1 && l2) {
     if (l1.val <= l2.val) { tail.next = l1; l1 = l1.next; }
-    else                   { tail.next = l2; l2 = l2.next; }
+    else { tail.next = l2; l2 = l2.next; }
     tail = tail.next;
   }
-  tail.next = l1 ?? l2;               // 剩下的直接整个接上
+
+  tail.next = l1 ?? l2; // 剩下的整条接上，不用逐个搬
   return dummy.next;
 }
 ```
 
-`tail.next = l1 ?? l2` 是精髓——循环结束时最多剩一条非空链，整体接上即可，不用逐个搬。
+`tail.next = l1 ?? l2` 是精髓：循环结束时最多剩一条非空链。
 
-**合并 K 个有序链表**（23 题）的追问版：分治两两合并，O(N log k)；或者把所有节点丢进数组排序重建。面试口头说清"两两分治 + 复用 21 题的 merge"就能拿到分数。
+### 4.2 合并 K 个有序链表：分治
 
-**回文链表**（234 题）：快慢指针找中点 + 反转后半段 + 逐个比对，三模板合体：
+```ts
+function mergeKLists(lists: Array<ListNode | null>): ListNode | null {
+  if (lists.length === 0) return null;
+
+  const divide = (l: number, r: number): ListNode | null => {
+    if (l === r) return lists[l];
+    const mid = (l + r) >> 1;
+    const left = divide(l, mid);
+    const right = divide(mid + 1, r);
+    return mergeTwoLists(left, right); // 复用 4.1
+  };
+
+  return divide(0, lists.length - 1);
+}
+```
+
+复杂度：每层合并总量 O(N)，共 log k 层 → **O(N log k)**（N 是节点总数）。逐条两两串行合并是 O(Nk)，差一个量级。
+
+---
+
+## 5. 快慢指针：找中点、判环、相交
+
+### 5.1 回文链表：三模板合体
 
 ```ts
 function isPalindrome(head: ListNode | null): boolean {
-  // 1. 快慢指针找中点（slow 停在前半段末尾）
-  let slow = head, fast = head;
-  while (fast?.next) { slow = slow!.next; fast = fast.next.next; }
+  // 1. 找中点：slow 停在前半段末尾
+  let slow = head;
+  let fast = head;
+  while (fast?.next && fast.next.next) {
+    slow = slow!.next;
+    fast = fast.next.next;
+  }
+
   // 2. 反转后半段
-  let prev: ListNode | null = null, cur = slow;
-  while (cur) { const nx = cur.next; cur.next = prev; prev = cur; cur = nx; }
-  // 3. 前后半段逐个比对
-  let p1 = head, p2 = prev;
+  let prev: ListNode | null = null;
+  let cur = slow!.next;
+  while (cur) {
+    const next = cur.next;
+    cur.next = prev;
+    prev = cur;
+    cur = next;
+  }
+
+  // 3. 逐段比对
+  let p1 = head;
+  let p2 = prev;
   while (p2) {
     if (p1!.val !== p2.val) return false;
-    p1 = p1!.next; p2 = p2.next;
+    p1 = p1!.next;
+    p2 = p2.next;
   }
   return true;
 }
 ```
 
-这题是链表三模板的期末考试：找中点（快慢）、反转（迭代）、比对。面试出它就是想看你模板熟不熟。
+中点判断的两种写法要分清：
 
----
+| 循环条件 | 偶数个节点时 slow 停在 | 适用 |
+| --- | --- | --- |
+| `while (fast?.next)` | 后半段的第一个 | 反转后半段（本解法） |
+| `while (fast?.next && fast.next.next)` | 前半段的最后一个 | 切成两半、归并排序 |
 
-## 4. 环检测：快慢指针的追及问题
+面试如果要求"不能改原链表"，比对完再把后半段反转回去即可（多写一次 3.1）。
 
-**环形链表**（141/142 题）：快指针每次走 2 步，慢指针每次走 1 步，有环必相遇。
+### 5.2 环形链表 II
 
 ```ts
 function detectCycle(head: ListNode | null): ListNode | null {
-  let slow = head, fast = head;
+  let slow = head;
+  let fast = head;
+
   while (fast?.next) {
     slow = slow!.next;
     fast = fast.next.next;
-    if (slow === fast) {              // 相遇 => 有环，找入口
+    if (slow === fast) {
       let p = head;
-      while (p !== slow) { p = p.next!; slow = slow!.next; }
-      return p;                       // 相向而行再次相遇处即环入口
+      while (p !== slow) {
+        p = p!.next;
+        slow = slow!.next;
+      }
+      return p;
     }
   }
   return null;
 }
 ```
 
-第二步的数学证明面试常追问，口头版：设头到入口距离 a，入口到相遇点距离 b，环长 L。相遇时快指针路程是慢指针的 2 倍，化简得 `a ≡ b (mod L)`，所以从头和从相遇点同速前进，必在入口相遇。记不住推导就背结论："**相遇后，一个从头出发一个从相遇点出发，同速再走，再相遇处就是入口**"。
+数学依据：设头到入口 `a`、入口到相遇点 `b`、环长 `c`。相遇时快指针走了慢指针的两倍：`2(a+b) = a+b+kc`，化简得 `a = (k−1)c + (c−b)`。所以从头走 `a` 步、从相遇点走 `c−b` 步，会同时到达入口。
+
+### 5.3 相交链表：走位消除长度差
+
+```ts
+function getIntersectionNode(
+  headA: ListNode | null,
+  headB: ListNode | null,
+): ListNode | null {
+  let p = headA;
+  let q = headB;
+  while (p !== q) {
+    p = p ? p.next : headB; // 走完 A 接 B
+    q = q ? q.next : headA; // 走完 B 接 A
+  }
+  return p;
+}
+```
+
+两人走的总路程都是 `lenA + lenB`，所以若有交点必然同时到达；若无交点，最后会同时变成 `null`（退出循环）。**三行代码，不需要先算长度。**
 
 ---
 
-## 小结
+## 6. 常见坑
 
-- 虚拟头结点：消灭头节点特判，所有"可能动头"的题先造 dummy。
-- 反转模板：存、反、进、进；区间反转头插法。
-- 合并：dummy + 尾插，`??` 接剩余；回文链表 = 找中点 + 反转 + 比对。
-- 环检测：快慢追及，相遇后同速再走找入口。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 删头节点后结果不对 | 返回了 `head` 而不是 `dummy.next` | 所有 dummy 题统一 `return dummy.next` |
+| 删除倒数第 N 个，删错了位置 | `while (fast)` 导致 `slow` 停在目标本身 | `while (fast.next)` |
+| 反转后链断了 | 没先存 `next` | "存、反、进、进" |
+| 递归反转爆栈 | 链表过长 | 改迭代版 |
+| 合并后尾部有环 | 复用了原链表节点又接错 | 合并只改 `next`，不要创建环 |
+| 回文判断改坏了链表 | 反转后没恢复 | 需要保留原链时再反转回去 |
+| 相交链表死循环 | 两条链无交点且写法有误 | 标准写法会自动落到 `p === q === null` |
+| 越界崩溃 | `node.next.next` 前没判空 | 先判 `node?.next` |
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 7. 小结
 
-1. 206. 反转链表 —— 核心模板，默写两次。
+- 三个模板：dummy（消灭头特判）、反转（存反进进）、快慢（中点/环/相交）。
+- 反转两版都要会：迭代 O(1) 空间，递归 O(n) 栈空间。
+- 合并：dummy + 尾插，`??` 接剩余；K 条用分治 O(N log k)。
+- 回文链表 = 找中点 + 反转后半 + 比对；相交链表 = 走位消除长度差。
+
+---
+
+## 8. 练习（LeetCode 同类题清单）
+
+1. 206. 反转链表 —— 核心模板，迭代与递归各默写两次。
 2. 21. 合并两个有序链表 —— dummy + 尾插。
 3. 19. 删除链表的倒数第 N 个结点 —— 快慢间距。
 4. 141/142. 环形链表 I/II —— 追及问题。
 5. 234. 回文链表 —— 三模板合体，必做。
 6. 92. 反转链表 II —— 区间头插法。
 7. 160. 相交链表 —— 双指针走位消除长度差。
+8. 23. 合并 K 个升序链表 —— 分治复用两两合并。
 
-## 验收清单
+## 9. 验收清单
 
 - [ ] 所有链表题都用了虚拟头结点（`dummy`），且能说清它解决了什么边界问题
 - [ ] 反转链表迭代版与递归版都能默写，空间复杂度分别是 O(1) 与 O(n)
 - [ ] 快慢指针找中点能区分"偶数个节点时取前一个还是后一个"，并按题目要求调整
-- [ ] 删除倒数第 n 个节点用"快指针先走 n 步"一次遍历完成
+- [ ] 删除倒数第 n 个节点用"快指针先走 n 步"一次遍历完成，能解释 `while (fast.next)`
 - [ ] 环形链表 II 能推导出"相遇后从头走"的数学依据，而不是背结论
+- [ ] 相交链表能用"走位法"三行写完，并解释为什么无交点也能退出
 - [ ] 测试过：空链表、单节点、两节点、整条反转
 - [ ] 能在 20 分钟内 AC 一道链表中等题，且全程不越界（`node.next.next` 之前先判空）

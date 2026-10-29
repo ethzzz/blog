@@ -1,83 +1,124 @@
 ---
 title: '03 · 哈希表与集合'
 published: 2026-10-13T12:00:00+08:00
-description: '哈希表与集合高频题：两数之和家族、字符统计、字母异位词分组，以及缓存思想在前端场景题中的应用。'
+description: '哈希表高频题：两数之和的先查后存、最长连续序列的起点剪枝、字符统计的三种写法、异位词分组的 key 取舍、LRU 与请求去重，附 Map/对象/Set 的选择依据与冲突原理。'
 tags: [算法, 哈希表, LeetCode, 空间换时间]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 哈希表的核心思想就一句话：**用 O(n) 空间换 O(n) 查找**。它可能是面试里最常用的"降复杂度武器"——凡是看到"找配对""数次数""判重复"，第一反应就该是它。
+> 哈希表的核心思想就一句话：**用 O(n) 空间换 O(1) 查找**。看到"找配对""数次数""判重复""缓存"，第一反应就该是它。这篇除了题，还会讲清 JS 里到底该用 `Map`、对象还是 `Set`。
 
 ---
 
-## 1. 两数之和家族：哈希的一次遍历
+## 1. 先选对容器：Map / 对象 / Set
 
-两数之和是面试出场率天花板级的题，先看暴力为什么不行：
+| 容器 | 键类型 | 顺序 | 原型污染 | 适合 |
+| --- | --- | --- | --- | --- |
+| `Object` | 字符串 / Symbol（数字会被转字符串） | 整数键升序 + 插入序 | **有**（`__proto__`） | 配置、JSON、固定字段 |
+| `Map` | **任意类型**（对象、NaN 都行） | 严格插入序 | 无 | 频繁增删、键是数字/对象 |
+| `Set` | 值即键 | 插入序 | 无 | 去重、判存在 |
+| 定长数组 | 数字下标 | — | 无 | 字符集固定（26 字母、128 ASCII） |
+
+三个实际影响：
 
 ```ts
-// 暴力 O(n²)：每个数都和别人配一次对
-for (let i = 0; i < nums.length; i++)
-  for (let j = i + 1; j < nums.length; j++)
-    if (nums[i] + nums[j] === target) return [i, j];
+// ① 对象的键会被转成字符串
+const o: Record<number, string> = {};
+o[1] = 'a';
+o['1'] = 'b';
+console.log(o[1]); // 'b' —— 同一个键
+
+// ② 对象有原型链，查 'constructor' 会命中
+const m = new Map();
+console.log(m.get('constructor'));       // undefined
+console.log(({} as any)['constructor']); // [Function: Object]
+
+// ③ Map 的键是引用
+const a = { id: 1 };
+const map = new Map<object, string>([[a, 'x']]);
+console.log(map.get({ id: 1 }));         // undefined —— 不是同一个对象
+console.log(map.get(a));                 // 'x'
 ```
 
-**套路模板**：遍历时问自己一个问题——"我要找的另一半出现过吗？"把答案存进 Map。
+**选型口诀**：键是数字或需要频繁增删 → `Map`；只要去重/判存在 → `Set`；字符集固定 → 数组；要序列化成 JSON → 对象。
+
+---
+
+## 2. 两数之和：先查后存
+
+暴力是 O(n²)：每个数都和后面的配一次。哈希把它降到 O(n)：
 
 ```ts
 function twoSum(nums: number[], target: number): number[] {
-  const seen = new Map<number, number>();    // 值 -> 下标
+  const seen = new Map<number, number>(); // 值 → 下标
   for (let i = 0; i < nums.length; i++) {
-    const need = target - nums[i];           // 我需要的另一半
+    const need = target - nums[i];
     if (seen.has(need)) return [seen.get(need)!, i];
-    seen.set(nums[i], i);                    // 先查后存，避免用到自己
+    seen.set(nums[i], i); // 先查后存
   }
   return [];
 }
 ```
 
-逐行讲：每到一个新元素，先查"伴侣"是否在 `seen` 里，在就直接返回；不在才把自己存进去。**先查后存**这个顺序很关键——如果先存后查，`target` 是当前元素两倍时会错误地匹配到自己。
+**为什么必须"先查后存"**：若先存再查，`target = 6`、`nums = [3, 3]` 时，第一个 3 存入后立刻查到"自己"，返回 `[0, 0]`——同一元素用了两次。先查后存天然避免了自匹配。
 
-**家族成员**（套路完全一致，只是存的东西变了）：
+### 2.1 家族成员与"换个条件换个解法"
 
-- 两数之和 II（有序版）：用第 01 篇的对撞指针更优，O(1) 空间——面试官常拿这题考察你能不能根据"有序"换方案。
-- 三数之和：排序 + 固定一个数 + 对撞指针，O(n²)。
-- 最长连续序列（128 题）：把数组丢进 Set，只从"序列起点"（即 `x-1` 不在 Set 中）开始往后数。
+| 题目 | 解法 | 复杂度 | 关键点 |
+| --- | --- | --- | --- |
+| 1. 两数之和 | 哈希一次遍历 | O(n) / O(n) | 先查后存 |
+| 167. 两数之和 II（有序） | 对撞指针 | O(n) / **O(1)** | 有序 → 换方案 |
+| 15. 三数之和 | 排序 + 对撞 | O(n²) / O(1) | 三处去重 |
+| 128. 最长连续序列 | Set + 起点剪枝 | O(n) / O(n) | 只从起点数 |
+
+面试官给"有序"两个字，就是在提示你"别用哈希，用双指针省空间"。**能主动换方案，比写出来更重要。**
+
+### 2.2 最长连续序列：为什么只从起点数仍是 O(n)
 
 ```ts
 function longestConsecutive(nums: number[]): number {
   const set = new Set(nums);
   let ans = 0;
+
   for (const x of set) {
-    if (set.has(x - 1)) continue;      // 不是起点，跳过
+    if (set.has(x - 1)) continue; // 有前驱 → 不是起点，跳过
     let len = 1;
-    while (set.has(x + len)) len++;    // 从起点往后数
+    while (set.has(x + len)) len++;
     ans = Math.max(ans, len);
   }
   return ans;
 }
 ```
 
-"只从起点开始数"这个剪枝保证了每个元素最多被访问两次，整体 O(n)——这是 Set 题 里最值得背的一个模板。
+复杂度追问的标准回答：**外层每个元素只被看一眼；内层 `while` 只会从"起点"开始，且整条序列的每个元素只被数一次**。所以总操作 ≤ 2n，是 O(n)，不是 O(n²)。
+
+如果去掉 `set.has(x - 1) continue` 这个剪枝，`[1,2,3,...,n]` 会退化成 O(n²)——这是本题唯一的考点。
 
 ---
 
-## 2. 字符统计：计数的三种写法
-
-**套路模板**：对象、Map、定长数组都能当计数器，按场景选。
+## 3. 字符统计：三种写法与 key 的取舍
 
 ```ts
+// ① 对象：最顺手，但键会被转字符串
 function charCount(s: string): Record<string, number> {
   const count: Record<string, number> = {};
   for (const ch of s) count[ch] = (count[ch] ?? 0) + 1;
   return count;
 }
+
+// ② Map：键保持类型，适合非字符串键
+const m = new Map<string, number>();
+
+// ③ 定长数组：字符集固定时最快（26 字母）
+const cnt = new Array(26).fill(0);
+for (const ch of s) cnt[ch.charCodeAt(0) - 97]++;
 ```
 
-注意 `for...of` 走的是码点，`for...in` 走的是索引——遍历字符串统计字符**永远用 `for...of`**，中文 emoji 场景会感谢你。
+遍历字符串统计**永远用 `for...of`**：它按码点迭代，`for...in` 走的是下标。
 
-例题：**有效的字母异位词**。两个字符串字符及次数完全相同。
+### 3.1 有效的字母异位词
 
 ```ts
 function isAnagram(s: string, t: string): boolean {
@@ -86,37 +127,88 @@ function isAnagram(s: string, t: string): boolean {
   for (const ch of s) count.set(ch, (count.get(ch) ?? 0) + 1);
   for (const ch of t) {
     const c = count.get(ch);
-    if (!c) return false;              // 没有 or 已耗尽
+    if (!c) return false; // 没有 或 已耗尽
     count.set(ch, c - 1);
   }
   return true;
 }
 ```
 
-逐行讲：先给 `s` 计数，再用 `t` 做减法。长度相等 + 每次减法都成功，等价于完全匹配。这题还有个进阶版 **字母异位词分组**（49 题）：把"排序后的字符串"当 Map 的 key，异位词自然归为一组——**用规范化结果做 key** 是哈希题的一个万能思路。
+长度相等 + 每次减法都成功 ⇔ 字符及次数完全一致。
 
----
-
-## 3. 判重复与去重：Set 的主场
-
-判重复用 Set，O(1) 查询：
+### 3.2 字母异位词分组：用"规范化结果"当 key
 
 ```ts
-// 存在重复元素
-function hasDuplicate(nums: number[]): boolean {
-  return new Set(nums).size !== nums.length;
+function groupAnagrams(strs: string[]): string[][] {
+  const groups = new Map<string, string[]>();
+  for (const s of strs) {
+    const key = [...s].sort().join(''); // 排序后作为规范形式
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(s);
+  }
+  return [...groups.values()];
 }
 ```
 
-这行代码值得背——构造 Set 自动去重，比较 size 就知道有没有重复。**最长无重复字符子串**（第 3 题，字符串题高频王）是滑动窗口 + Set 的组合，这里先给一个 Set 版本：
+两种 key 的取舍是常见追问：
+
+| key 方案 | 时间 | 空间 | 适用 |
+| --- | --- | --- | --- |
+| 排序后的字符串 | O(k log k) 每词 | O(k) | 通用、最好写 |
+| 26 位计数数组转字符串 | O(k) 每词 | O(1) 额外 | 只有小写字母时更快 |
+| 质数乘积 | O(k) | 大数溢出风险 | **不推荐**，长串会溢出 |
 
 ```ts
-function lengthOfLongestSubstring(s: string): string {
+// 计数 key 版本
+function groupAnagramsByCount(strs: string[]): string[][] {
+  const groups = new Map<string, string[]>();
+  for (const s of strs) {
+    const cnt = new Array(26).fill(0);
+    for (const ch of s) cnt[ch.charCodeAt(0) - 97]++;
+    const key = cnt.join('#');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(s);
+  }
+  return [...groups.values()];
+}
+```
+
+---
+
+## 4. 判重复与最长无重复子串
+
+```ts
+// 存在重复元素：一行
+const hasDuplicate = (nums: number[]): boolean => new Set(nums).size !== nums.length;
+```
+
+变体：**存在重复元素 II**（219 题）——要求两个相同元素的下标差不超过 k。这就不只是"判重复"，而是"维护一个大小不超过 k 的窗口"：
+
+```ts
+function containsNearbyDuplicate(nums: number[], k: number): boolean {
+  const window = new Set<number>();
+  for (let i = 0; i < nums.length; i++) {
+    if (window.has(nums[i])) return true;
+    window.add(nums[i]);
+    if (window.size > k) window.delete(nums[i - k]); // 只保留最近 k 个
+  }
+  return false;
+}
+```
+
+窗口里永远只有最近 k 个元素，所以命中时下标差必然 ≤ k。**Set 也能维护"有界窗口"，不只是全局去重。**
+
+**最长无重复子串**有两个版本，面试建议直接给 Map 版：
+
+```ts
+// 版本 A：Set + 逐个收缩（好理解）
+function lengthOfLongestSubstringA(s: string): number {
   const window = new Set<string>();
-  let l = 0, ans = 0;
+  let l = 0;
+  let ans = 0;
   for (let r = 0; r < s.length; r++) {
     while (window.has(s[r])) {
-      window.delete(s[l]);             // 右边撞车，左边收缩
+      window.delete(s[l]);
       l++;
     }
     window.add(s[r]);
@@ -124,84 +216,130 @@ function lengthOfLongestSubstring(s: string): string {
   }
   return ans;
 }
+
+// 版本 B：Map 记最近下标，左边界一步跳到位（推荐）
+function lengthOfLongestSubstring(s: string): number {
+  const last = new Map<string, number>();
+  let l = 0;
+  let ans = 0;
+  for (let r = 0; r < s.length; r++) {
+    const seen = last.get(s[r]);
+    if (seen !== undefined && seen >= l) l = seen + 1;
+    last.set(s[r], r);
+    ans = Math.max(ans, r - l + 1);
+  }
+  return ans;
+}
 ```
 
-逐行讲：`window` 维护当前无重复的子串。右指针每进一个字符，如果撞车，就不停从左边删直到不撞。每个字符最多进出窗口各一次，O(n)。这题还有用 Map 记下标的优化版（一步跳到位不逐个删），面试官追问时可以主动提。
+版本 A 的真实复杂度是 O(2n)（每个字符进出窗口各一次），说法上仍是 O(n)；版本 B 的 `l` 只前进，更接近严格线性。**`seen >= l` 这个判断不能省**，否则 `l` 会往回跳。
 
 ---
 
-## 4. 缓存思想：哈希在前端场景题里的真身
+## 5. 场景题：哈希在前端里的真身
 
-哈希思想在前端无处不在，面试的场景题也爱考：
-
-**接口请求去重**——同一接口短时间重复触发只发一次请求：
+### 5.1 请求去重（并发合并）
 
 ```ts
 const pending = new Map<string, Promise<unknown>>();
 
-function onceRequest(url: string, fn: () => Promise<unknown>) {
-  if (!pending.has(url)) {
-    const p = fn().finally(() => pending.delete(url));
-    pending.set(url, p);
-  }
-  return pending.get(url)!;            // 复用同一个 Promise
+export function onceRequest<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = pending.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const p = fn().finally(() => pending.delete(key)); // 成功失败都要清
+  pending.set(key, p);
+  return p;
 }
 ```
 
-**LRU 缓存**（LeetCode 146，前端高频）：`Map` 天然保持插入顺序，配合 `delete + set` 实现"访问即置新"：
+三个细节：`finally` 保证失败也能重试；key 要包含参数（`url + JSON.stringify(body)`）；如果需要"失败后短期不重试"，把 `finally` 换成 `catch` 后再决定是否删除。
+
+### 5.2 LRU 缓存
 
 ```ts
 class LRUCache {
   private map = new Map<number, number>();
-  constructor(private cap: number) {}
+
+  constructor(private readonly cap: number) {}
 
   get(key: number): number {
-    if (!this.map.has(key)) return -1;
-    const val = this.map.get(key)!;
-    this.map.delete(key);              // 删掉再放，移到"最新"位置
-    this.map.set(key, val);
+    const val = this.map.get(key);
+    if (val === undefined) return -1;
+    this.map.delete(key);
+    this.map.set(key, val); // 删了再插 = 移到最新
     return val;
   }
 
-  set(key: number, val: number): void {
+  put(key: number, value: number): void {
     if (this.map.has(key)) this.map.delete(key);
-    this.map.set(key, val);
+    this.map.set(key, value);
     if (this.map.size > this.cap) {
-      this.map.delete(this.map.keys().next().value!);  // Map 第一个 key 即最旧
+      // Map 的第一个 key 就是最久未使用
+      this.map.delete(this.map.keys().next().value as number);
     }
   }
 }
 ```
 
-`Map` 迭代顺序 = 插入顺序，第一个 key 就是最久未使用的——这个语言特性让 LRU 从"手写双向链表"降维成十行代码，是 JS 面试的经典福利题。
+`Map` 的迭代顺序 = 插入顺序，所以"删了再插"就是把元素移到队尾。手写双向链表版本是 O(1) 严格保证，但代码量翻三倍；面试里能说清"Map 版依赖插入顺序，链表版不依赖语言特性"就够了。
 
 ---
 
-## 小结
+## 6. 哈希冲突：被追问时的标准回答
 
-- 哈希核心：空间换时间，"找配对 / 数次数 / 判重复"三句话识别哈希题。
-- 两数之和：先查后存；最长连续序列：只从起点数。
-- 字符统计：`for...of` + `?? 0 + 1`；异位词分组用规范化结果做 key。
-- 场景题：请求去重、LRU 缓存都是哈希思想的变装，Map 的插入顺序是 JS 特有福利。
+哈希表不是"真的 O(1)"，平均 O(1)、最坏 O(n)（全部冲突）。
+
+| 冲突处理 | 做法 | 特点 |
+| --- | --- | --- |
+| 拉链法 | 每个桶挂一个链表/树 | 实现简单；Java HashMap 在链表过长时转红黑树 |
+| 开放寻址 | 冲突了就往后找空位 | 缓存友好；删除需要墓碑标记 |
+
+JS 的 `Map` 由引擎实现（V8 用哈希表 + 有序索引），你**不需要关心实现细节**，但要知道两点：键的比较用 SameValueZero（`NaN` 等于 `NaN`），对象按引用比较。这两条决定了你在算法题里能不能把对象当键。
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 7. 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 两数之和返回 `[i, i]` | 先存后查，用了自己 | 先查后存 |
+| 三数之和超时 | 用哈希做三数 | 排序 + 对撞，O(n²) |
+| 最长连续序列超时 | 没做起点剪枝 | `set.has(x-1)` 就跳过 |
+| 异位词分组 key 冲突 | 用质数乘积，长串溢出 | 排序串或计数数组 |
+| 对象当键取不到 | 对象按引用比较 | 用 id 字符串当键，或 WeakMap |
+| 最长子串答案偏大 | `l` 回跳 | `seen >= l` 才更新 |
+| 请求去重后永远失败 | `finally` 写在 `then` 里没清 | 用 `.finally()` 统一清理 |
+| LRU 淘汰错元素 | 用对象存，顺序不可靠 | 用 `Map` 的插入顺序 |
+
+---
+
+## 8. 小结
+
+- 容器选择：数字键/频繁增删用 `Map`，去重用 `Set`，固定字符集用数组，要序列化用对象。
+- 两数之和：先查后存；有序版本换对撞指针。
+- 最长连续序列：起点剪枝，总操作 ≤ 2n。
+- 异位词分组：用规范化结果当 key（排序串或计数数组）。
+- LRU：Map 的插入顺序是 JS 的福利，但要知道链表版的存在。
+
+---
+
+## 9. 练习（LeetCode 同类题清单）
 
 1. 1. 两数之和 —— 先查后存模板，必做。
 2. 217. 存在重复元素 —— 一行 Set。
 3. 242. 有效的字母异位词 —— 计数减法。
 4. 49. 字母异位词分组 —— 规范化做 key。
 5. 128. 最长连续序列 —— 起点剪枝，必做。
-6. 3. 无重复字符的最长子串 —— 滑动窗口 + Set。
+6. 3. 无重复字符的最长子串 —— 滑动窗口 + 哈希。
 7. 146. LRU 缓存 —— 用 Map 插入顺序实现。
 
-## 验收清单
+## 10. 验收清单
 
-- [ ] 两数之和能写出"一遍哈希"版本（边查边存），复杂度 O(n)
-- [ ] 字母异位词分组能说清两种 key 的取舍：排序后的字符串 vs 26 位计数数组
-- [ ] 最长连续序列能做到 O(n)：只从"没有前驱"的数开始扩展，能解释为什么这样仍是 O(n)
+- [ ] 两数之和能写出"一遍哈希"版本（边查边存），并解释为什么不能先存后查
+- [ ] 字母异位词分组能说清两种 key 的取舍：排序串 vs 26 位计数数组
+- [ ] 最长连续序列能做到 O(n)，并能证明"只从起点扩展"为什么仍是线性
 - [ ] 知道 `Map` 与普通对象的区别（键类型、原型污染、遍历顺序），并能在代码里做对选择
-- [ ] 能回答"哈希冲突怎么处理"（拉链法/开放寻址），知道 JS 引擎大致怎么做
+- [ ] 能回答"哈希冲突怎么处理"（拉链法/开放寻址），知道最坏复杂度是 O(n)
 - [ ] 测试过：空数组、单元素、含负数、含重复、极大 n
 - [ ] 能在 20 分钟内 AC 一道哈希中等题

@@ -1,111 +1,187 @@
 ---
 title: '12 · 手写高频合集：深拷贝、call/bind、instanceof 等'
 published: 2026-10-13T21:00:00+08:00
-description: '手写题高频合集：深拷贝处理循环引用、call/apply/bind 三件套、instanceof、EventEmitter、数组扁平化。'
+description: '手写题合集：深拷贝处理循环引用与 Map/Set、call/apply/bind 与手写 new、instanceof、柯里化与偏应用、EventEmitter 的 once 自毁、数组扁平化递归与迭代双版本。'
 tags: [手写题, 深拷贝, JavaScript, 面试]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 这篇是手写题的"杂粮袋"：单拎出来不够一篇、但出场率都很高的题。深拷贝（循环引用版）、call/apply/bind、instanceof、EventEmitter、数组扁平化——每道都是十分钟内能讲完的高频款。
+> 这篇是手写题的"杂粮袋"：单拎出来不够一篇、但出场率都很高的题。每道都给可直接跑的版本和一个"追问会问什么"的清单。
 
 ---
 
-## 1. 深拷贝：处理循环引用是分水岭
+## 1. 深拷贝：循环引用是分水岭
 
-浅拷贝只复制第一层引用，深拷贝递归复制所有层级。`JSON.parse(JSON.stringify())` 的缺陷必先说：丢函数、undefined、Symbol，Date 变字符串，循环引用直接报错。
+先说清 `JSON.parse(JSON.stringify())` 的五个缺陷（面试开口就说，显得你有踩坑经验）：
 
-**递归版 + WeakMap 解决循环引用**：
+| 缺陷 | 例子 | 结果 |
+| --- | --- | --- |
+| 丢函数 | `{ f() {} }` | 属性消失 |
+| 丢 undefined | `{ a: undefined }` | 属性消失 |
+| 丢 Symbol 键/值 | `{ [Symbol()]: 1 }` | 消失 |
+| Date 变字符串 | `new Date()` | `"2026-10-30T..."` |
+| 循环引用 | `a.self = a` | 直接抛 `TypeError` |
+
+完整版：
 
 ```ts
 function deepClone<T>(obj: T, map = new WeakMap<object, unknown>()): T {
-  // 基础类型、函数直接返回
-  if (obj === null || typeof obj !== "object") return obj;
+  if (obj === null || typeof obj !== 'object') return obj; // 原始值、函数按引用
 
   if (obj instanceof Date) return new Date(obj.getTime()) as unknown as T;
   if (obj instanceof RegExp) return new RegExp(obj.source, obj.flags) as unknown as T;
 
-  // 循环引用检测：正在拷贝中 => 返回半成品引用
-  if (map.has(obj as object)) return map.get(obj as object) as T;
+  if (map.has(obj as object)) return map.get(obj as object) as T; // 循环引用
 
-  const cloned = (Array.isArray(obj) ? [] : {}) as T;
-  map.set(obj as object, cloned);                // ⚠️ 先登记再递归，顺序不能反
+  // Map / Set 要单独处理
+  if (obj instanceof Map) {
+    const cloned = new Map();
+    map.set(obj, cloned); // ⚠️ 先登记，再递归
+    obj.forEach((v, k) => cloned.set(deepClone(k, map), deepClone(v, map)));
+    return cloned as unknown as T;
+  }
 
-  for (const key of Reflect.ownKeys(obj as object)) {  // 含 Symbol 键
+  if (obj instanceof Set) {
+    const cloned = new Set();
+    map.set(obj, cloned);
+    obj.forEach((v) => cloned.add(deepClone(v, map)));
+    return cloned as unknown as T;
+  }
+
+  const cloned = (Array.isArray(obj) ? [] : Object.create(Object.getPrototypeOf(obj))) as T;
+  map.set(obj as object, cloned); // ⚠️ 顺序不能反
+
+  for (const key of Reflect.ownKeys(obj as object)) { // 含 Symbol 键
     (cloned as Record<PropertyKey, unknown>)[key] = deepClone(
-      (obj as Record<PropertyKey, unknown>)[key], map,
+      (obj as Record<PropertyKey, unknown>)[key],
+      map,
     );
   }
   return cloned;
 }
 ```
 
-逐行讲，三个必答点：
+三个必答点：
 
-1. **WeakMap 在递归前 set**：先登记"原对象 → 半成品"，再递归子属性。循环引用（`a.child = a`）走到子属性时查 map 命中，返回半成品，死循环解开。**先递归后登记**是这题最经典的错误写法。
-2. **为什么用 WeakMap 不用 Map**：WeakMap 键是弱引用，不影响原对象被垃圾回收。
-3. **`Reflect.ownKeys`**：同时拿到字符串键和 Symbol 键，比 `Object.keys` 完整。
+1. **WeakMap 必须在递归前 `set`**：先登记"原对象 → 半成品"，再递归子属性。`a.self = a` 走到子属性时命中 map，返回半成品，死循环解开。**先递归后登记**是这题最经典的错误。
+2. **为什么用 WeakMap 不用 Map**：弱引用，不影响原对象被 GC。
+3. **`Reflect.ownKeys`**：同时拿到字符串键与 Symbol 键，比 `Object.keys` 完整。
 
-追问"还有哪些没覆盖"：Map/Set（`new Map(obj)` 后递归 value）、原型链（`Object.create(getPrototypeOf(obj))`）、getter/setter（`Object.getOwnPropertyDescriptor`）。全结构版一般不需要现场写，讲清思路即可。
+验证循环引用：
+
+```ts
+const a: any = { name: 'a' };
+a.self = a;
+const b = deepClone(a);
+console.log(b.name, b.self === b); // a true —— 拷贝后的 self 指向新对象自己
+console.log(a.self === b);         // false —— 不是同一个对象
+```
+
+追问"还有哪些没覆盖"：属性描述符（getter/setter / 不可枚举）、`ArrayBuffer`/`Blob` 等二进制、`WeakMap`（不可枚举，只能按引用）。**讲清边界比硬写全结构更重要。**
 
 ---
 
-## 2. call / apply / bind 三件套
+## 2. call / apply / bind 与手写 new
 
-**call**：把函数临时挂到目标对象上借 this：
+### 2.1 call：借 this，用完即删
 
 ```ts
-Function.prototype.myCall = function <T, A extends unknown[]>(
-  this: (this: T, ...args: A) => unknown,
-  ctx: T,
-  ...args: A
-): unknown {
-  const context = ctx ?? globalThis;             // null/undefined 时指向全局
-  const key = Symbol("fn");                      // Symbol 避免键冲突
-  (context as Record<symbol, unknown>)[key] = this;
-  const result = (context as Record<symbol, (this: T, ...args: A) => unknown>)[key](...args);
-  delete (context as Record<symbol, unknown>)[key];   // 用完删除，不留痕
+Function.prototype.myCall = function (this: Function, ctx: unknown, ...args: unknown[]) {
+  const context = (ctx ?? globalThis) as Record<PropertyKey, unknown>;
+  const key = Symbol('fn'); // Symbol 避免覆盖对象已有属性
+  context[key] = this;
+  const result = (context[key] as Function)(...args);
+  delete context[key]; // 清理，不留痕
   return result;
 };
 ```
 
-必答点：`Symbol` 当临时键防止覆盖对象已有属性；`ctx ?? globalThis` 处理严格模式下传 null 的场景；调用后 delete 清理。**apply** 只差参数形式：`...args` 变成数组 `context[key](...argsArr)`。
+`ctx ?? globalThis` 处理 `null`/`undefined`；严格模式下的真实规则更细（非严格模式会装箱），面试说到"null 指向全局"即可。
 
-**bind**：返回永久绑定的函数，还要支持 `new` 调用：
+### 2.2 apply：只差参数形式
 
 ```ts
-Function.prototype.myBind = function <T, A extends unknown[]>(
-  this: (this: T, ...args: A) => unknown,
-  ctx: T,
-  ...boundArgs: A
-) {
+Function.prototype.myApply = function (this: Function, ctx: unknown, args: unknown[] = []) {
+  const context = (ctx ?? globalThis) as Record<PropertyKey, unknown>;
+  const key = Symbol('fn');
+  context[key] = this;
+  const result = (context[key] as Function)(...args);
+  delete context[key];
+  return result;
+};
+```
+
+### 2.3 bind：返回新函数 + new 优先级
+
+```ts
+Function.prototype.myBind = function (this: Function, ctx: unknown, ...boundArgs: unknown[]) {
   const fn = this;
+
   function bound(this: unknown, ...restArgs: unknown[]) {
-    // new 调用时 this 是新实例，应优先于绑定的 ctx
-    return fn.apply(
-      this instanceof bound ? this : ctx,
-      [...boundArgs, ...restArgs],               // 预置参数 + 调用时参数
-    );
+    const target = this instanceof bound ? this : ctx; // new 时 this 是新实例
+    return fn.apply(target, [...boundArgs, ...restArgs]);
   }
-  // 维持原型链，让 new bound() 的实例能访问 fn.prototype
-  bound.prototype = Object.create(fn.prototype);
+
+  bound.prototype = Object.create(fn.prototype); // 保住原型链
   return bound;
 };
 ```
 
-必答点：`this instanceof bound` 判断是否被 new——new 时 this 是新实例，绑定目标被忽略（new 优先级高于 bind）；`Object.create(fn.prototype)` 保住原型链。bind 是三件套里唯一"返回新函数"的，也是追问最多的。
+两个必答点：
+
+- **`this instanceof bound`**：被 `new` 调用时 `this` 是新实例，绑定的 `ctx` 必须失效——**new 的优先级高于 bind**。
+- **`Object.create(fn.prototype)`**：让 `new bound()` 的实例能访问原函数的原型方法。
+
+### 2.4 手写 new
+
+```ts
+function myNew<T>(Ctor: new (...args: any[]) => T, ...args: unknown[]): T {
+  const obj = Object.create(Ctor.prototype);   // 1. 连原型
+  const ret = (Ctor as Function).apply(obj, args); // 2. 执行构造函数
+  return ret !== null && (typeof ret === 'object' || typeof ret === 'function')
+    ? (ret as T)                                // 3. 构造函数返回对象则以它为准
+    : (obj as T);
+}
+```
+
+四步口诀：**建对象 → 连原型 → 绑 this 执行 → 处理返回值**。第三步用 `apply` 把 `obj` 当 `this` 传进去。
+
+### 2.5 柯里化与偏应用
+
+```ts
+// 柯里化：把 f(a,b,c) 变成 f(a)(b)(c)
+function curry(fn: (...args: any[]) => any) {
+  return function curried(this: unknown, ...args: any[]): any {
+    if (args.length >= fn.length) return fn.apply(this, args);
+    return (...rest: any[]) => curried.apply(this, [...args, ...rest]);
+  };
+}
+
+const add = curry((a: number, b: number, c: number) => a + b + c);
+add(1)(2)(3);   // 6
+add(1, 2)(3);   // 6
+add(1)(2, 3);   // 6
+
+// 偏应用：先固定一部分参数，不要求一次一个
+const addTen = (a: number, b: number) => a + b;
+const addTo10 = addTen.bind(null, 10);
+addTo10(5); // 15
+```
+
+区别：**柯里化要求按参数个数逐层调用，偏应用只固定部分参数、其余一次给完**。面试问"两者区别"时，各给一行例子最清楚。
 
 ---
 
-## 3. instanceof：原型链的行走
+## 3. instanceof：沿原型链走
 
 ```ts
 function myInstanceof(obj: unknown, ctor: Function): boolean {
-  if (obj === null || (typeof obj !== "object" && typeof obj !== "function")) {
-    return false;                                // 原始值直接 false
+  if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
+    return false; // 原始值没有原型链
   }
-  let proto = Object.getPrototypeOf(obj);        // 不用 __proto__，更规范
+  let proto = Object.getPrototypeOf(obj);
   while (proto !== null) {
     if (proto === ctor.prototype) return true;
     proto = Object.getPrototypeOf(proto);
@@ -114,85 +190,144 @@ function myInstanceof(obj: unknown, ctor: Function): boolean {
 }
 ```
 
-逐行讲：instanceof 的本质是**沿着原型链找 ctor.prototype**。用 `getPrototypeOf` 而非 `obj.__proto__` 显得规范；终止条件 `proto === null`（原型链尽头即 null）。追问"基础类型为什么永远 false"：基础类型没有原型链，第一步就被拦下。
+```ts
+myInstanceof([], Array);      // true
+myInstanceof('a', String);    // false —— 原始值
+new String('a') instanceof String; // true —— 包装对象
+```
+
+追问"为什么跨 realm（iframe）会失效"：不同 realm 的 `Array.prototype` 不是同一个对象，所以 `[] instanceof otherWindow.Array` 为 false。这就是为什么库代码更爱用 `Array.isArray` 或 `Object.prototype.toString.call(x)`。
 
 ---
 
-## 4. EventEmitter 与数组扁平化
-
-**EventEmitter**（发布订阅的裸实现，场景题常客）：
+## 4. EventEmitter
 
 ```ts
-class EventEmitter {
-  private events = new Map<string, Set<Function>>();
+type Handler = (...args: unknown[]) => void;
 
-  on(event: string, cb: Function): this {
-    if (!this.events.has(event)) this.events.set(event, new Set());
-    this.events.get(event)!.add(cb);
-    return this;                                  // 支持链式调用
+class EventEmitter {
+  private events = new Map<string, Set<Handler>>();
+
+  on(event: string, cb: Handler): this {
+    let set = this.events.get(event);
+    if (!set) {
+      set = new Set();
+      this.events.set(event, set);
+    }
+    set.add(cb); // Set 天然去重
+    return this; // 支持链式调用
   }
 
-  off(event: string, cb: Function): this {
+  off(event: string, cb: Handler): this {
     this.events.get(event)?.delete(cb);
     return this;
   }
 
-  once(event: string, cb: Function): this {
-    const wrapper = (...args: unknown[]) => {
+  once(event: string, cb: Handler): this {
+    const wrapper: Handler = (...args) => {
+      this.off(event, wrapper); // 先注销，防止回调里再次 emit 造成重复执行
       cb(...args);
-      this.off(event, wrapper);                   // 触发一次后自毁
     };
     return this.on(event, wrapper);
   }
 
   emit(event: string, ...args: unknown[]): this {
-    this.events.get(event)?.forEach((cb) => cb(...args));
+    const set = this.events.get(event);
+    if (!set) return this;
+    [...set].forEach((cb) => cb(...args)); // 先拷贝再遍历
     return this;
   }
 }
 ```
 
-必答点：`once` 的自毁包装器（注销用的是 wrapper 而不是原回调）；用 `Set` 天然去重；`emit` 时先拷贝回调列表再遍历更稳（防止回调里 off 自己导致遍历异常，主动提这一点很加分）。
+三个必答点：
 
-**数组扁平化**：
+- **`once` 注销的是 wrapper 而不是原回调**，否则 `off(event, cb)` 找不到它；
+- **`emit` 先拷贝 `[...set]`**：回调里如果 `off` 自己或新增监听，直接遍历 Set 会因为修改集合而漏执行；
+- **用 `Set` 而不是数组**：同一个回调注册两次只算一次（如果业务要求重复注册，改用数组并记录 token）。
+
+---
+
+## 5. 数组扁平化：递归与迭代
 
 ```ts
-// 递归版
+// 递归版：支持指定深度
 function flatten(arr: unknown[], depth = Infinity): unknown[] {
-  return arr.reduce<unknown[]>((acc, item) =>
-    Array.isArray(item) && depth > 0
-      ? acc.concat(flatten(item, depth - 1))
-      : acc.concat(item),
-  []);
+  return arr.reduce<unknown[]>((acc, item) => {
+    if (Array.isArray(item) && depth > 0) acc.push(...flatten(item, depth - 1));
+    else acc.push(item);
+    return acc;
+  }, []);
+}
+
+// 迭代版：用栈，避免深嵌套爆栈
+function flattenIterative(arr: unknown[]): unknown[] {
+  const stack: unknown[] = [...arr];
+  const out: unknown[] = [];
+
+  while (stack.length) {
+    const item = stack.pop()!;
+    if (Array.isArray(item)) stack.push(...item);
+    else out.push(item);
+  }
+  return out.reverse(); // 栈是逆序，最后反转
 }
 ```
 
-追问梯度：`arr.flat(Infinity)` 一行流 → 递归实现 → 迭代实现（用栈 + `shift`，大数组递归会爆栈，这是迭代版的存在意义）→ "扁平化 + 去重 + 升序"组合题（`[...new Set(flatten(arr))].sort((a,b) => a-b)`）。
+追问梯度：
+
+1. 一行流 `arr.flat(Infinity)`；
+2. 递归实现 + `depth` 参数；
+3. 迭代实现（深嵌套递归会爆栈）；
+4. 组合题：扁平化 + 去重 + 升序 → `[...new Set(flatten(arr))].sort((a, b) => a - b)`。
+
+`flat` 的取舍：原生实现快且简单，但不支持"边扁平边过滤"这类定制；手写版的价值在于可组合。
 
 ---
 
-## 小结
+## 6. 常见坑
 
-- 深拷贝：WeakMap **先登记后递归**解循环引用，`Reflect.ownKeys` 收 Symbol 键。
-- call 借 this 用完即删；bind 要处理 new 优先级和原型链。
-- instanceof：沿原型链找 ctor.prototype。
-- EventEmitter：once 自毁包装器；扁平化递归/迭代双版本。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 深拷贝循环引用爆栈 | 先递归后登记 | WeakMap 先 `set` 再递归 |
+| 拷贝后原型方法没了 | 用了 `{}` | `Object.create(getPrototypeOf(obj))` |
+| Map/Set 拷贝成空对象 | 只处理了普通对象 | 单独分支处理 |
+| `myCall` 覆盖了对象属性 | 用固定字符串当键 | `Symbol('fn')` |
+| bind 后 `new` 失效 | 没判 `this instanceof bound` | new 时用 `this` |
+| bind 实例访问不到原型方法 | 没连原型链 | `Object.create(fn.prototype)` |
+| `once` 注销不掉 | off 传了原回调 | 注销 wrapper |
+| emit 里漏执行 | 遍历时集合被修改 | 先 `[...set]` 再遍历 |
+| 扁平化结果逆序 | 栈是后进先出 | 最后 `reverse()` |
 
 ---
 
-## 练习
+## 7. 小结
 
-1. 构造 `const a = {name:'a'}; a.self = a;` 验证你的深拷贝不死循环。
-2. 默写 myCall 和 myBind，用 `new myBind(...)` 验证 new 优先级。
-3. 写 `myInstanceof([], Array)` 和 `myInstanceof('a', String)`，解释后者为什么 false。
-4. 手写 EventEmitter，实现 `once` 后用 `off` 注销 once 注册的回调。
+- 深拷贝：WeakMap 先登记后递归；Map/Set/Date/RegExp 单独处理；原型用 `Object.create` 保住。
+- call/apply 借 this、Symbol 当键、用完删除；bind 处理 new 优先级 + 原型链。
+- new 四步：建对象 → 连原型 → 执行 → 处理返回值。
+- instanceof 沿原型链找 `ctor.prototype`；跨 realm 会失效。
+- EventEmitter：once 注销 wrapper，emit 先拷贝。
+- 扁平化：递归给 depth，迭代防爆栈。
 
-## 验收清单
+---
 
-- [ ] `deepClone` 能处理循环引用（`WeakMap`）、Date/RegExp/Map/Set，函数按引用拷贝
-- [ ] 手写 `call` / `apply` / `bind`，且 `bind` 支持"new 调用时 this 失效"的规则
+## 8. 练习
+
+1. 构造 `const a = { name: 'a' }; a.self = a;` 验证深拷贝不死循环，并验证 `b.self === b`。
+2. 给 deepClone 加 Map/Set 分支，用 `new Map([[{ k: 1 }, new Set([1, 2])]])` 测。
+3. 默写 myCall / myBind，用 `new (myBind(fn, obj))()` 验证 new 优先级。
+4. 手写 new，用它创建 `class A { constructor(x) { this.x = x } }` 的实例并验证 `instanceof A`。
+5. 写 curry 与偏应用各一个，说明区别。
+6. 手写 EventEmitter，测 `once` + `off` + emit 中 off 自己。
+7. 写扁平化递归版与迭代版，用 1000 层嵌套对比。
+
+## 9. 验收清单
+
+- [ ] `deepClone` 能处理循环引用（WeakMap）、Date/RegExp/Map/Set，函数按引用拷贝
+- [ ] 手写 `call` / `apply` / `bind`，且 `bind` 支持"new 调用时 this 失效"
 - [ ] 手写 `instanceof`，能说清它沿原型链查找、以及跨 realm 失效的原因
 - [ ] 柯里化与偏应用各写一个，能说清区别
-- [ ] 数组扁平化能手写递归版与迭代版（栈），并知道 `flat(Infinity)` 的取舍
+- [ ] 数组扁平化能手写递归版与迭代版，并知道 `flat(Infinity)` 的取舍
 - [ ] 手写 `new`：创建对象、连原型、执行构造函数、处理返回值
 - [ ] 每道题都从空文件默写过，而不是复制粘贴

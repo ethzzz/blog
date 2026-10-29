@@ -1,26 +1,24 @@
 ---
 title: '06 · 二叉树与递归套路'
 published: 2026-10-13T15:00:00+08:00
-description: '二叉树高频题套路：前中后序递归、层序 BFS、最大深度家族，一个"拆成左右子树"的万能思考框架。'
+description: '二叉树万能框架：递归三要素、四种遍历的递归与迭代写法、深度家族、直径与最大路径和的"返回值/全局答案分离"、层序变体与最大宽度编号，以及最近公共祖先的返回值设计。'
 tags: [算法, 二叉树, 递归, BFS]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 二叉树题的万能思考框架只有一句话：**整棵树的问题 = 处理根节点 + 左子树的问题 + 右子树的问题**。会这句话，前中后序只是"根在什么时候被处理"的区别。
+> 二叉树题的万能框架只有一句话：**整棵树的问题 = 处理根 + 左子树的问题 + 右子树的问题**。会这句话，前中后序只是"根在什么时候被处理"的区别；而所有"全局最优"类题目，区别只在"返回值该带什么信息"。
 
 ---
 
-## 1. 递归三部曲与三种遍历
+## 1. 递归三要素
 
-写树的递归，先固定三件事（类似回溯的套路化）：
+写树的递归，先固定三件事：
 
-1. **递归函数的参数和返回值是什么**——返回值通常携带"子树的信息"。
-2. **终止条件是什么**——90% 的题是 `if (!root) return ...`。
+1. **返回值是什么**——它携带的是"子树的信息"，不一定是最终答案；
+2. **终止条件是什么**——90% 是 `if (!root) return ...`；
 3. **单层逻辑是什么**——拿到左右子树的结果，拼出当前层的答案。
-
-三种遍历只是"处理根的时机"不同：
 
 ```ts
 interface TreeNode {
@@ -29,106 +27,220 @@ interface TreeNode {
   right: TreeNode | null;
 }
 
-// 前序：根 -> 左 -> 右（进入节点时处理）
+const node = (val: number, left: TreeNode | null = null, right: TreeNode | null = null): TreeNode =>
+  ({ val, left, right });
+
+// 建一棵小树用于测试：
+//       1
+//      / \
+//     2   3
+//    / \
+//   4   5
+const tree = node(1, node(2, node(4), node(5)), node(3));
+```
+
+---
+
+## 2. 四种遍历：递归与迭代
+
+### 2.1 递归版
+
+```ts
 function preorder(root: TreeNode | null, res: number[] = []): number[] {
   if (!root) return res;
-  res.push(root.val);            // 根先
+  res.push(root.val);       // 根先
   preorder(root.left, res);
   preorder(root.right, res);
   return res;
 }
 
-// 中序：左 -> 根 -> 右（BST 中序即升序，必背性质）
 function inorder(root: TreeNode | null, res: number[] = []): number[] {
   if (!root) return res;
   inorder(root.left, res);
-  res.push(root.val);            // 根中
+  res.push(root.val);       // 根中（BST 的中序是升序，必背）
   inorder(root.right, res);
   return res;
 }
 
-// 后序：左 -> 右 -> 根（需要子树信息时用，见下文最大深度）
 function postorder(root: TreeNode | null, res: number[] = []): number[] {
   if (!root) return res;
   postorder(root.left, res);
   postorder(root.right, res);
-  res.push(root.val);            // 根后
+  res.push(root.val);       // 根后（需要子树结果时用）
   return res;
 }
 ```
 
-**选遍历的口诀**：需要"先知道子树才能决定根" → 后序（如求高度、判断平衡）；需要"边走边收集且顺序敏感" → 前序（如路径收集）；涉及 BST 的有序性 → 中序。记住这个口诀，选题型的速度会快很多。
+**选遍历的口诀**：
+
+- 需要"先知道子树才能决定根" → **后序**（高度、平衡、直径、路径和）；
+- 需要"边走边收集、顺序敏感" → **前序**（路径、复制树）；
+- 涉及 BST 的有序性 → **中序**；
+- 按层处理 → **层序**。
+
+### 2.2 迭代版：栈与队列
+
+面试常追问"不用递归怎么写"。三种深度优先遍历的迭代写法：
+
+```ts
+// 前序：根入栈 → 弹出即访问 → 先压右再压左（保证左先出）
+function preorderIter(root: TreeNode | null): number[] {
+  const res: number[] = [];
+  const stack: TreeNode[] = [];
+  if (root) stack.push(root);
+  while (stack.length) {
+    const n = stack.pop()!;
+    res.push(n.val);
+    if (n.right) stack.push(n.right);
+    if (n.left) stack.push(n.left);
+  }
+  return res;
+}
+
+// 中序：一路向左压栈，弹出访问后再转向右子树
+function inorderIter(root: TreeNode | null): number[] {
+  const res: number[] = [];
+  const stack: TreeNode[] = [];
+  let cur = root;
+  while (cur || stack.length) {
+    while (cur) { stack.push(cur); cur = cur.left; }
+    cur = stack.pop()!;
+    res.push(cur.val);
+    cur = cur.right;
+  }
+  return res;
+}
+
+// 后序：按"根右左"访问再整体反转，得到"左右根"
+function postorderIter(root: TreeNode | null): number[] {
+  if (!root) return [];
+  const res: number[] = [];
+  const stack: TreeNode[] = [root];
+  while (stack.length) {
+    const n = stack.pop()!;
+    res.push(n.val);
+    if (n.left) stack.push(n.left);
+    if (n.right) stack.push(n.right);
+  }
+  return res.reverse();
+}
+```
+
+中序迭代是三者里最需要理解的：**栈里保存的是"还没访问根的路径"**，一路向左到底，弹出时才访问，然后转向右子树。
 
 ---
 
-## 2. 深度家族：自底向上收集子树信息
+## 3. 深度家族：答案依赖子树
 
-**最大深度**（104 题）是后序套路的标准样板：
+### 3.1 最大深度
 
 ```ts
 function maxDepth(root: TreeNode | null): number {
-  if (!root) return 0;                          // 终止：空树深度 0
-  const l = maxDepth(root.left);                // 左子树深度
-  const r = maxDepth(root.right);               // 右子树深度
-  return Math.max(l, r) + 1;                    // 当前层 = max(左,右) + 1
+  if (!root) return 0;
+  return Math.max(maxDepth(root.left), maxDepth(root.right)) + 1;
 }
 ```
 
-逐行讲：不关心遍历顺序，只关心"左右子树把答案给我，我 +1 返回"。这就是后序的价值——**答案依赖子树结果**。
+后序样板：不关心遍历顺序，只关心"左右子树把答案给我，我 +1 返回"。
 
-**家族变体**（都改最后一行）：
+### 3.2 最小深度：单边空要特判
 
 ```ts
-// 最小深度（111 题）：注意"一边为空不算较短"
 function minDepth(root: TreeNode | null): number {
   if (!root) return 0;
-  const l = maxDepthLike(root.left), r = maxDepthLike(root.right);
-  if (!root.left) return r + 1;    // 单边空要取另一边！
-  if (!root.right) return l + 1;
-  return Math.min(l, r) + 1;
+  if (!root.left) return minDepth(root.right) + 1; // 只有右孩子
+  if (!root.right) return minDepth(root.left) + 1; // 只有左孩子
+  return Math.min(minDepth(root.left), minDepth(root.right)) + 1;
 }
-// maxDepthLike 即 maxDepth 的实现
 ```
 
-最小深度的坑：只有一个孩子的节点，最小深度不是 1 而是沿非空边走到底——**单边为空必须特判**，这是 111 题唯一的考点。
+坑：只有一个孩子的节点，最小深度**不是 1**，而是沿非空边走到底。直接写 `Math.min(l, r) + 1` 会得到 1——这是 111 题唯一的考点。
 
-**平衡二叉树**（110 题）：返回"高度"，不满足平衡时返回 -1 当信号：
+### 3.3 平衡二叉树：用 -1 当失败信号
 
 ```ts
 function isBalanced(root: TreeNode | null): boolean {
   return height(root) !== -1;
-}
-function height(node: TreeNode | null): number {
-  if (!node) return 0;
-  const l = height(node.left);
-  if (l === -1) return -1;                     // 提前短路
-  const r = height(node.right);
-  if (r === -1) return -1;
-  return Math.abs(l - r) > 1 ? -1 : Math.max(l, r) + 1;
+
+  function height(n: TreeNode | null): number {
+    if (!n) return 0;
+    const l = height(n.left);
+    if (l === -1) return -1;   // 提前短路
+    const r = height(n.right);
+    if (r === -1) return -1;
+    return Math.abs(l - r) > 1 ? -1 : Math.max(l, r) + 1;
+  }
 }
 ```
 
-用 -1 做"失败信号"把判断平衡和求高度合并进一次递归，O(n)——比"对每个节点再调 maxDepth"的 O(n²) 暴力版高一个档次，面试主动对比这两个复杂度很加分。
+把"判断平衡"和"求高度"合并成一次递归，O(n)。对比"对每个节点再调一次 maxDepth"的 O(n²) 暴力版，**面试主动报这两个复杂度并说明差异**，是很明显的加分点。
 
 ---
 
-## 3. 层序 BFS：队列 + 按层取数
+## 4. 全局答案类：返回值与答案分离
 
-**套路模板**：队列 + 记录每层节点数，逐层处理。
+这是树题的分水岭。**返回值服务于父节点，答案另外用变量收集**。
+
+### 4.1 二叉树的直径
+
+```ts
+function diameterOfBinaryTree(root: TreeNode | null): number {
+  let ans = 0;
+
+  const depth = (n: TreeNode | null): number => {
+    if (!n) return 0;
+    const l = depth(n.left);
+    const r = depth(n.right);
+    ans = Math.max(ans, l + r); // 以当前节点为"拐点"的路径长度
+    return Math.max(l, r) + 1;  // 返回给父节点的是"单边最大深度"
+  };
+
+  depth(root);
+  return ans;
+}
+```
+
+关键区别：**答案可能是 `l + r`（穿过当前节点），但返回给父节点的只能是 `max(l, r) + 1`（一条边）**。很多人在返回值里直接返回 `l + r`，结果父节点会用到一条"折线路径"，答案就错了。
+
+### 4.2 二叉树中的最大路径和
+
+```ts
+function maxPathSum(root: TreeNode | null): number {
+  let ans = -Infinity;
+
+  const gain = (n: TreeNode | null): number => {
+    if (!n) return 0;
+    const l = Math.max(0, gain(n.left));   // 负贡献不如不要
+    const r = Math.max(0, gain(n.right));
+    ans = Math.max(ans, n.val + l + r);    // 答案：可以两边都要
+    return n.val + Math.max(l, r);         // 返回：只能选一边
+  };
+
+  gain(root);
+  return ans;
+}
+```
+
+与直径完全同构，只多了两件事：**负数分支直接砍掉（取 0）**，以及答案要包含节点自身的值。
+
+---
+
+## 5. 层序 BFS 与三个变体
 
 ```ts
 function levelOrder(root: TreeNode | null): number[][] {
   if (!root) return [];
   const res: number[][] = [];
   const queue: TreeNode[] = [root];
+
   while (queue.length) {
-    const size = queue.length;               // 本层节点数，先锁定
+    const size = queue.length; // 必须在本层循环外锁定
     const level: number[] = [];
-    for (let i = 0; i < size; i++) {         // 只消费本层
-      const node = queue.shift()!;
-      level.push(node.val);
-      if (node.left) queue.push(node.left);
-      if (node.right) queue.push(node.right);
+    for (let i = 0; i < size; i++) {
+      const n = queue.shift()!;
+      level.push(n.val);
+      if (n.left) queue.push(n.left);
+      if (n.right) queue.push(n.right);
     }
     res.push(level);
   }
@@ -136,75 +248,140 @@ function levelOrder(root: TreeNode | null): number[][] {
 }
 ```
 
-逐行讲：`size = queue.length` 必须在 for 循环**外**取——循环里会 push 下一层节点，边取边变就乱了。这个"锁定层大小"是 BFS 模板最经典的易错点。
+`size` 必须在 for 循环**外**取——循环里会 push 下一层节点，边取边变就乱了。这是 BFS 模板最经典的易错点。
 
-层序模板是大量变体题的地基，改动都发生在"level 怎么用"：
+### 5.1 右视图
 
-- **锯齿形层序**（103 题）：层号奇偶决定 `level.reverse()` 或 `unshift`。
-- **右视图**（199 题）：每层只取最后一个节点 `level[size - 1]`。
-- **最大宽度**（662 题）：给节点编号（`i` 的孩子是 `2i+1`、`2i+2`），每层宽度 = 首尾编号差。
+```ts
+function rightSideView(root: TreeNode | null): number[] {
+  if (!root) return [];
+  const res: number[] = [];
+  let queue: TreeNode[] = [root];
+  while (queue.length) {
+    res.push(queue[queue.length - 1].val); // 每层最后一个
+    const next: TreeNode[] = [];
+    for (const n of queue) {
+      if (n.left) next.push(n.left);
+      if (n.right) next.push(n.right);
+    }
+    queue = next;
+  }
+  return res;
+}
+```
 
-面试里"层序遍历 + 一个小改动"的组合出场率极高，模板背熟后基本是送分题。
+### 5.2 最大宽度：给节点编号
+
+```ts
+function widthOfBinaryTree(root: TreeNode | null): number {
+  if (!root) return 0;
+  let ans = 0;
+  let level: Array<[TreeNode, number]> = [[root, 0]];
+
+  while (level.length) {
+    const base = level[0][1]; // 归一化，防止编号溢出
+    ans = Math.max(ans, level[level.length - 1][1] - base + 1);
+    const next: Array<[TreeNode, number]> = [];
+    for (const [n, i] of level) {
+      const idx = i - base;
+      if (n.left) next.push([n.left, idx * 2]);
+      if (n.right) next.push([n.right, idx * 2 + 1]);
+    }
+    level = next;
+  }
+  return ans;
+}
+```
+
+两个细节：编号用 `2i / 2i+1`；**每层要减去该层最左编号**，否则深树会把编号撑到超出安全整数范围。
 
 ---
 
-## 4. 对称、翻转与最近公共祖先
-
-**翻转二叉树**（226 题，"谷歌面试官不会写"梗题）：每个节点交换左右孩子，先序或后序都行：
+## 6. 对称、翻转与最近公共祖先
 
 ```ts
 function invertTree(root: TreeNode | null): TreeNode | null {
   if (!root) return null;
-  [root.left, root.right] = [root.right, root.left];   // 处理根
-  invertTree(root.left);                                // 左
-  invertTree(root.right);                               // 右
+  [root.left, root.right] = [root.right, root.left];
+  invertTree(root.left);
+  invertTree(root.right);
   return root;
 }
-```
 
-**对称二叉树**（101 题）：把"一个树的对称"转化为"两个树互相镜像"：
-
-```ts
 function isSymmetric(root: TreeNode | null): boolean {
   const mirror = (a: TreeNode | null, b: TreeNode | null): boolean => {
     if (!a && !b) return true;
     if (!a || !b) return false;
     return a.val === b.val
-      && mirror(a.left, b.right)      // a 的左 vs b 的右
-      && mirror(a.right, b.left);     // a 的右 vs b 的左
+      && mirror(a.left, b.right)
+      && mirror(a.right, b.left);
   };
   return mirror(root, root);
 }
 ```
 
-**最近公共祖先**（236 题，中高频）：后序的经典应用——左右子树的结果决定根的答案：
+**最近公共祖先**（236 题）是"返回值携带信息"的最佳教材：
 
 ```ts
 function lowestCommonAncestor(
-  root: TreeNode | null, p: TreeNode, q: TreeNode
+  root: TreeNode | null,
+  p: TreeNode,
+  q: TreeNode,
 ): TreeNode | null {
-  if (!root || root === p || root === q) return root;   // 命中目标或走到头
+  if (!root || root === p || root === q) return root;
+
   const l = lowestCommonAncestor(root.left, p, q);
   const r = lowestCommonAncestor(root.right, p, q);
-  if (l && r) return root;        // p、q 分居两侧 => 当前根即 LCA
-  return l ?? r;                  // 只有一侧命中，继续上传
+
+  if (l && r) return root; // p、q 分居两侧 → 当前即是 LCA
+  return l ?? r;           // 只命中一侧 → 继续上传
 }
 ```
 
-逐行讲：递归含义定义为"这棵子树里 p 或 q 的存在情况"。左右都命中说明 p、q 在两侧，当前节点就是最近公共祖先；否则把命中的那一侧继续上传。这题是"递归函数返回值设计"的最佳教材——**把返回值定义成'携带信息'而不是'最终答案'**，是递归进阶的关键一步。
+递归函数的含义不是"返回 LCA"，而是**"这棵子树里是否找到了 p 或 q"**——返回值定义对了，代码就三行。
+
+BST 版本可以利用有序性，不用递归到两边：
+
+```ts
+function lowestCommonAncestorBST(root: TreeNode | null, p: TreeNode, q: TreeNode): TreeNode | null {
+  while (root) {
+    if (p.val < root.val && q.val < root.val) root = root.left;
+    else if (p.val > root.val && q.val > root.val) root = root.right;
+    else return root; // 分居两侧（或就是其中之一）
+  }
+  return null;
+}
+```
 
 ---
 
-## 小结
+## 7. 常见坑
 
-- 递归三部曲：定返回值、定终止条件、定单层逻辑；三种遍历 = 根的处理时机。
-- 深度家族：后序"子树给答案我 +1"；最小深度单边空要特判；平衡树用 -1 信号短路。
-- 层序 BFS：锁定每层 size 再消费；右视图、锯齿形都只改 level 的用法。
-- LCA：返回值携带"命中信息"，左右都命中则当前是祖先。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| BFS 每层数量错乱 | `queue.length` 在循环里实时取 | 进 for 前先锁定 `size` |
+| 最小深度恒为 1 | 单边空没特判 | 分别为空时只走另一边 |
+| 直径答案偏小 | 返回值直接给了 `l + r` | 返回 `max(l, r) + 1` |
+| 最大路径和漏负数节点 | 全负树时初始化为 0 | `ans` 初始 `-Infinity` |
+| 后序迭代顺序反了 | 忘了整体 reverse | 按"根右左"收集后反转 |
+| BST 中序判断写错 | 只比较父子 | 中序是严格升序，用前驱比较 |
+| 最大宽度溢出 | 编号未归一化 | 每层减去最左编号 |
+| 递归爆栈 | 树退化成链 | 改迭代或显式栈 |
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 8. 小结
+
+- 递归三要素：返回值含义、终止条件、单层逻辑。
+- 四种遍历：递归三件套 + 迭代（前序栈、中序一路向左、后序反转）+ 层序队列。
+- 深度家族：后序"子树给答案我 +1"；最小深度单边空特判；平衡树用 -1 短路。
+- 全局答案类：答案可以是 `l + r`，返回值只能是一边。
+- 层序变体只改"level 怎么用"；最大宽度要编号并归一化。
+- LCA：返回值携带"是否命中"，BST 版用有序性一路走。
+
+---
+
+## 9. 练习（LeetCode 同类题清单）
 
 1. 104. 二叉树的最大深度 —— 后序样板，必做。
 2. 226. 翻转二叉树 —— 前序处理根。
@@ -212,14 +389,17 @@ function lowestCommonAncestor(
 4. 102. 层序遍历 —— BFS 模板，必做。
 5. 199. 二叉树的右视图 —— 层序取每层最后一个。
 6. 110. 平衡二叉树 —— -1 信号短路。
-7. 236. 二叉树的最近公共祖先 —— 返回值携带信息。
+7. 543. 二叉树的直径 —— 返回值与答案分离。
+8. 124. 二叉树中的最大路径和 —— 同上，注意负数。
+9. 236. 二叉树的最近公共祖先 —— 返回值携带信息。
 
-## 验收清单
+## 10. 验收清单
 
-- [ ] 前/中/后/层序四种遍历都能写（递归 + 迭代至少各一种）
+- [ ] 前/中/后/层序四种遍历都能写（递归 + 迭代各至少一种）
 - [ ] 能说出"递归三要素"：终止条件、当前层做什么、返回值含义
-- [ ] 层序遍历用队列实现，能说清"为什么用 `queue.length` 而不是 `queue.length` 的实时值"
-- [ ] 最大深度、直径、路径和这类"返回值与全局答案分离"的题能一次写对
-- [ ] 知道递归的空间复杂度是 O(h)，退化成链表时是 O(n)
+- [ ] 层序遍历能说清"为什么进 for 之前要锁定 `size`"
+- [ ] 最大深度、直径、最大路径和这类题能一次写对，并解释"返回值和答案为什么不同"
+- [ ] 最小深度的单边空特判能说清，并知道不特判会得到什么
+- [ ] 知道递归的空间复杂度是 O(h)，退化成链时是 O(n)
 - [ ] 测试过：空树、单节点、只有左/右子树、完全二叉树
 - [ ] 能在 25 分钟内 AC 一道二叉树中等题

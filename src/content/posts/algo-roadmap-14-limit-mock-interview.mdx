@@ -86,6 +86,46 @@ C 组的共同点是"代码量大、边界多"。它测的不是套路记忆，�
 
 注意：**沟通救场是独立维度**——很多人技术上 2.5 分，这一项 1 分，整体就被拖下来了。
 
+### 一个能算分的脚本
+
+填完表别凭感觉，用 20 行脚本算出均分和短板：
+
+```js
+const DIMS = ['读题澄清', '思路口述', '编码正确', '自测习惯', '复杂度', '沟通救场'];
+
+/**
+ * rows：3 道题 × 6 个维度，每格 0–3
+ */
+function score(rows) {
+  const total = rows.flat().reduce((a, b) => a + b, 0);
+  const avg = total / rows.length / DIMS.length;
+  const verdict =
+    avg >= 2.7 ? '稳' :
+    avg >= 2.3 ? '能过' :
+    avg >= 1.8 ? '边缘' : '回炉';
+
+  // 找出最低的两个维度
+  const weak = DIMS
+    .map((dim, i) => ({ dim, s: rows.reduce((a, r) => a + r[i], 0) / rows.length }))
+    .sort((a, b) => a.s - b.s)
+    .slice(0, 2)
+    .map((x) => `${x.dim}(${x.s.toFixed(1)})`);
+
+  return { 总分: `${total}/54`, 均分: +avg.toFixed(2), 判定: verdict, 短板: weak.join('、') };
+}
+
+// 例：三题、六维
+console.table(
+  score([
+    [3, 2, 3, 2, 3, 2],
+    [2, 2, 2, 2, 2, 1],
+    [2, 1, 2, 1, 2, 1],
+  ]),
+);
+```
+
+输出里的「短板」就是下一周的训练重点——**别平均用力，补最低那两项涨分最快**。
+
 ## 卡住时的四个救场动作
 
 按顺序用，别硬撑：

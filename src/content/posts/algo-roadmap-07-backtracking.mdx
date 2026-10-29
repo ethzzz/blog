@@ -1,90 +1,97 @@
 ---
 title: '07 · 回溯：排列、组合、子集三板斧'
 published: 2026-10-13T16:00:00+08:00
-description: '回溯算法模板：排列/组合/子集三大模板、剪枝技巧与去重套路，一棵决策树讲透所有回溯题。'
+description: '回溯骨架与三条铁律、子集/组合/排列三大模板、同层去重的两种写法、组合总和的"可重复选"、括号生成的计数剪枝，以及复杂度推导与 ReDoS 的关联。'
 tags: [算法, 回溯, 剪枝, LeetCode]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 回溯听起来吓人，本质就是**带后悔功能的暴力枚举**：做选择 → 递归 → 撤销选择。所有回溯题都是一棵"决策树"，三板斧模板覆盖 90% 的考题。
+> 回溯听起来吓人，本质就是**带后悔功能的暴力枚举**：做选择 → 递归 → 撤销选择。所有回溯题都是同一棵"决策树"，能画清"哪一层、哪些分支"就赢了一半。
 
 ---
 
-## 1. 回溯的骨架：一棵决策树
-
-所有回溯题共享同一个骨架：
+## 1. 骨架与三条铁律
 
 ```ts
-const res: T[] = [];
-const path: T[] = [];
+const res: number[][] = [];
+const path: number[] = [];
 
-function backtrack(选择列表, depth): void {
-  if (满足结束条件) {              // 到达叶子
-    res.push([...path]);           // ⚠️ 必须拷贝，path 是共享引用
+function backtrack(选择列表: number[], depth: number): void {
+  if (满足结束条件) {
+    res.push([...path]); // ⚠️ 必须拷贝
     return;
   }
   for (const choice of 选择列表) {
-    path.push(choice);             // 做选择：进入树的下一层
-    backtrack(下一层的选择列表);
-    path.pop();                    // 撤销选择：回到本层试下一种
+    path.push(choice);              // 做选择
+    backtrack(下一层的选择列表, depth + 1);
+    path.pop();                     // 撤销选择
   }
 }
 ```
 
-三个铁律，每个都值一分面试印象分：
+三条铁律：
 
-1. **收集结果必须 `[...path]` 拷贝**——`path` 全程是同一个数组，直接 push 会收集到空壳，这是回溯题第一大坑。
-2. **pop 必须和 push 配对**——漏了 pop，状态就回不去。
-3. **for 循环 = 同层的分支，递归 = 向下一层**——画决策树时永远想清楚"层"在哪。
+1. **收集结果必须 `[...path]` 拷贝**——`path` 全程是同一个数组引用，直接 `res.push(path)` 最后会得到一堆空数组。这是回溯第一大坑。
+2. **`pop` 必须和 `push` 配对**——漏了 pop，状态回不去，后续分支全错。
+3. **for 循环 = 同层分支，递归 = 下一层**——画决策树时永远先标出"层"。
 
 ---
 
-## 2. 子集：每个节点都要收集
-
-**78 题 子集**：输入 `[1,2,3]`，输出所有子集。特点：**每个走过的节点都是一个答案**，不需要结束条件。
+## 2. 子集：每个节点都收集
 
 ```ts
 function subsets(nums: number[]): number[][] {
   const res: number[][] = [];
   const path: number[] = [];
-  const start = { v: 0 };                       // 用 start 控制不回头选
 
   function backtrack(startIdx: number): void {
-    res.push([...path]);                        // 每个节点都是子集
+    res.push([...path]); // 每个节点都是答案（含空集）
     for (let i = startIdx; i < nums.length; i++) {
       path.push(nums[i]);
-      backtrack(i + 1);                         // i+1：下一层只能选更后面的
+      backtrack(i + 1); // 只能往后选，天然防重复
       path.pop();
     }
   }
+
   backtrack(0);
   return res;
 }
 ```
 
-逐行讲：`startIdx` 是子集/组合类回溯的灵魂——**只允许往后选，天然防重复**。如果传 `0` 不传 `i + 1`，就会把 `[1,2]` 和 `[2,1]` 当成两个子集。
+`startIdx` 是子集/组合类回溯的灵魂。如果递归时传 `0` 而不是 `i + 1`，`[1,2]` 和 `[2,1]` 会被当成两个子集。
 
-**变体：元素可重复的子集**（90 题）。先排序，同层跳过相同值：
+### 2.1 含重复元素的子集（90 题）
 
 ```ts
-// nums 已排序
-for (let i = startIdx; i < nums.length; i++) {
-  if (i > startIdx && nums[i] === nums[i - 1]) continue;  // 同层去重
-  path.push(nums[i]);
-  backtrack(i + 1);
-  path.pop();
+function subsetsWithDup(nums: number[]): number[][] {
+  nums.sort((a, b) => a - b); // 去重的前提是排序
+  const res: number[][] = [];
+  const path: number[] = [];
+
+  function backtrack(startIdx: number): void {
+    res.push([...path]);
+    for (let i = startIdx; i < nums.length; i++) {
+      if (i > startIdx && nums[i] === nums[i - 1]) continue; // 同层去重
+      path.push(nums[i]);
+      backtrack(i + 1);
+      path.pop();
+    }
+  }
+
+  backtrack(0);
+  return res;
 }
 ```
 
-`i > startIdx` 的含义：`i === startIdx` 是本层第一个分支，允许选；后面的重复值是"同一层的孪生分支"，剪掉。**树层去重 vs 分支内重复**这个区分是 90 题的核心考点，面试时画出"同层剪枝"的决策树，比代码本身更打动人。
+`i > startIdx` 的含义：`i === startIdx` 是本层第一个分支，必须允许；之后的重复值是"同一层的孪生分支"，剪掉。
+
+**树层去重 vs 分支内重复**是 90 题的核心考点——分支内允许出现重复值（比如 `[1,1]` 是合法子集），只有"同一层选了两个相同的数"才要剪。
 
 ---
 
 ## 3. 组合：凑够 k 个才收集
-
-**77 题 组合**：从 n 个数里选 k 个。与子集唯一的区别——**只在叶子收集**。
 
 ```ts
 function combine(n: number, k: number): number[][] {
@@ -92,7 +99,7 @@ function combine(n: number, k: number): number[][] {
   const path: number[] = [];
 
   function backtrack(startIdx: number): void {
-    if (path.length === k) {                 // 凑够 k 个才收集
+    if (path.length === k) {
       res.push([...path]);
       return;
     }
@@ -102,25 +109,69 @@ function combine(n: number, k: number): number[][] {
       path.pop();
     }
   }
+
   backtrack(1);
   return res;
 }
 ```
 
-**剪枝版**只需改循环上界：还缺 `need = k - path.length` 个数，而 `[i, n]` 只剩 `n - i + 1` 个可选，所以 `n - i + 1 >= need`，即 `i <= n - need + 1`：
+与子集唯一的区别：**只在叶子收集**。
+
+### 3.1 剪枝上界的推导
+
+还缺 `need = k - path.length` 个数，而 `[i, n]` 只剩 `n - i + 1` 个可选。若 `n - i + 1 < need`，这个分支再走也凑不齐，直接不进入：
+
+```text
+n - i + 1 >= need
+⇒ i <= n - need + 1
+```
 
 ```ts
 const need = k - path.length;
-for (let i = startIdx; i <= n - need + 1; i++) { ... }
+for (let i = startIdx; i <= n - need + 1; i++) {
+  // ...
+}
 ```
 
-剪枝不改变答案，只是砍掉"必然后悔"的分支。面试里能把剪枝条件推导说出来（而不是背 `n - need + 1`），是"会思考"的直接证据。
+剪枝不改变答案，只砍掉"必然后悔"的分支。面试里能**推导**出上界，比背 `n - need + 1` 更有说服力。
+
+### 3.2 组合总和（39 题）：元素可重复选
+
+```ts
+function combinationSum(candidates: number[], target: number): number[][] {
+  candidates.sort((a, b) => a - b);
+  const res: number[][] = [];
+  const path: number[] = [];
+
+  function backtrack(startIdx: number, rest: number): void {
+    if (rest === 0) {
+      res.push([...path]);
+      return;
+    }
+    for (let i = startIdx; i < candidates.length; i++) {
+      if (candidates[i] > rest) break; // 排序后可以提前结束
+      path.push(candidates[i]);
+      backtrack(i, rest - candidates[i]); // ⚠️ 传 i 而不是 i+1：可以重复选
+      path.pop();
+    }
+  }
+
+  backtrack(0, target);
+  return res;
+}
+```
+
+**`backtrack(i)` 还是 `backtrack(i + 1)` 是这类题的分水岭**：
+
+| 传参 | 含义 | 题目 |
+| --- | --- | --- |
+| `i + 1` | 每个元素最多用一次 | 子集、组合 |
+| `i` | 当前元素可重复用 | 组合总和 |
+| `0` + `used` | 顺序有意义 | 全排列 |
 
 ---
 
-## 4. 排列：used 数组代替 startIdx
-
-**46 题 全排列**：`[1,2,3]` 的所有排列。与组合的根本区别：**顺序有意义，每层都能重新从头选**，所以不能靠 startIdx，改用 `used` 标记：
+## 4. 排列：used 数组
 
 ```ts
 function permute(nums: number[]): number[][] {
@@ -134,60 +185,159 @@ function permute(nums: number[]): number[][] {
       return;
     }
     for (let i = 0; i < nums.length; i++) {
-      if (used[i]) continue;              // 已在当前排列里，跳过
+      if (used[i]) continue;
       used[i] = true;
       path.push(nums[i]);
       backtrack();
-      path.pop();                          // ⚠️ pop 和 used 重置都要做
-      used[i] = false;
+      path.pop();
+      used[i] = false; // ⚠️ 和 pop 一样不能漏
     }
   }
+
   backtrack();
   return res;
 }
 ```
 
-逐行讲：`used[i]` 防止同一分支里重复用同一个元素；循环从 0 开始所以 `[1,2]` 和 `[2,1]` 都能出现。撤销时 `pop` 和 `used[i] = false` **缺一不可**。
+排列与组合的根本区别：**顺序有意义，每层都能从头选**，所以不能用 `startIdx`，要用 `used` 标记"当前分支里已经用过谁"。
 
-**变体：可重复的全排列**（47 题）。排序 + `used[i-1] === false && nums[i] === nums[i-1]` 跳过——保证相同元素"只能按原顺序被选入"，同层去重的另一种表达。这三题（78→90、77→剪枝、46→47）就是三板斧各自的进阶版，建议两两对照着做。
+### 4.1 含重复元素的排列（47 题）
+
+```ts
+function permuteUnique(nums: number[]): number[][] {
+  nums.sort((a, b) => a - b);
+  const res: number[][] = [];
+  const path: number[] = [];
+  const used: boolean[] = new Array(nums.length).fill(false);
+
+  function backtrack(): void {
+    if (path.length === nums.length) {
+      res.push([...path]);
+      return;
+    }
+    for (let i = 0; i < nums.length; i++) {
+      if (used[i]) continue;
+      // 相同元素必须"按原顺序"使用：前一个还没用过就跳过
+      if (i > 0 && nums[i] === nums[i - 1] && !used[i - 1]) continue;
+
+      used[i] = true;
+      path.push(nums[i]);
+      backtrack();
+      path.pop();
+      used[i] = false;
+    }
+  }
+
+  backtrack();
+  return res;
+}
+```
+
+`!used[i - 1]` 是关键：它表示"前一个相同元素在这一层已经回退了"，此时再选当前的就会产生重复排列。
 
 ---
 
-## 5. 前端场景里的回溯
+## 5. 括号生成：计数剪枝
 
-回溯在前端面试偶尔以场景题出现：
+```ts
+function generateParenthesis(n: number): string[] {
+  const res: string[] = [];
+  const path: string[] = [];
 
-- **菜单/文件树的所有路径枚举**：递归组件里收集路径，本质是子集/路径回溯。
-- **正则匹配的回溯灾难**：`/(a+)+b/` 匹配长字符串会指数级回溯，导致 ReDoS——能从"回溯算法"的角度解释这个安全漏洞，是前端工程师聊回溯的独特切入点。
-- **CSS 选择器优先级冲突排查、嵌套路由匹配**：都是"尝试 + 撤销"的思想。
+  function backtrack(open: number, close: number): void {
+    if (path.length === 2 * n) {
+      res.push(path.join(''));
+      return;
+    }
+    if (open < n) {
+      path.push('(');
+      backtrack(open + 1, close);
+      path.pop();
+    }
+    if (close < open) { // 右括号不能多于左括号
+      path.push(')');
+      backtrack(open, close + 1);
+      path.pop();
+    }
+  }
+
+  backtrack(0, 0);
+  return res;
+}
+```
+
+这题的"选择列表"不是数组，而是**两个计数条件**：`open < n` 才能放左括号，`close < open` 才能放右括号。**剪枝在这里不是优化，而是唯一正确答案的来源**——不剪就会生成 `")("`。
 
 ---
 
-## 小结
+## 6. 复杂度与回溯灾难
 
-- 回溯骨架：for 同层分支、递归下一层、push/pop 配对、收集必拷贝。
-- 子集：每个节点收集；组合：叶子收集 + 剪枝上界；排列：used 数组。
-- 去重：排序后 `i > startIdx && nums[i] === nums[i-1]` 同层剪枝。
-- 复杂度口径：子集/组合 O(2ⁿ)、排列 O(n!)，面试说"决策树的节点数"就对了。
+| 题型 | 决策树节点数 | 复杂度口径 |
+| --- | --- | --- |
+| 子集 | 每个元素选/不选 | O(n · 2ⁿ)（拷贝 path 另算） |
+| 组合 | C(n,k) 个叶子 | O(k · C(n,k)) |
+| 排列 | n! 个叶子 | O(n · n!) |
+| 括号生成 | 第 n 个卡特兰数 | O(4ⁿ / √n) |
+
+**说复杂度的标准句式**："决策树有 X 个节点，每个节点拷贝 path 要 O(k)，所以是 O(k·X)。"
+
+回溯灾难（ReDoS）：正则的回溯实现遇到 `/(a+)+b/` 这类嵌套量词，在长串上会指数级尝试：
+
+```js
+// 不要在生产里跑这段
+const re = /(a+)+b/;
+const evil = 'a'.repeat(30) + 'c';
+console.time('regex');
+re.test(evil); // 30 个 a 就可能卡住数秒
+console.timeEnd('regex');
+```
+
+防护手段：避免嵌套量词、限制输入长度、用 RE2 这类线性引擎。**能从"回溯算法"解释 ReDoS 的成因，是前端聊回溯的独特切入点。**
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 7. 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 结果全是空数组 | `res.push(path)` 没拷贝 | `res.push([...path])` |
+| 结果里有重复组合 | 递归传了 `i` 而不是 `i+1` | 组合用 `i+1` |
+| 组合总和漏解 | 传了 `i+1` | 可重复选就用 `i` |
+| 排列出现重复 | 没做同层去重 | 排序 + `!used[i-1]` 跳过 |
+| 子集 II 重复 | 只排序没剪枝 | `i > startIdx && nums[i]===nums[i-1]` |
+| 括号生成出现 `")("` | 没加 `close < open` | 两个计数条件都要判 |
+| 状态串到下一个分支 | 漏了 `pop` 或 `used=false` | push/pop、true/false 成对 |
+| 大数据超时 | 没剪枝 | 排序 + 提前 break |
+
+---
+
+## 8. 小结
+
+- 骨架：for 同层、递归下一层、push/pop 配对、收集必拷贝。
+- 子集每个节点收集；组合叶子收集 + 上界剪枝；排列用 `used`。
+- 传 `i` 还是 `i+1` 决定"能不能重复选"。
+- 去重：排序 + 同层跳过（子集）或 `!used[i-1]`（排列）。
+- 复杂度按"决策树节点数 × 每个节点的拷贝成本"报。
+
+---
+
+## 9. 练习（LeetCode 同类题清单）
 
 1. 78. 子集 —— 每个节点收集，必做。
 2. 77. 组合 —— 叶子收集 + 剪枝推导。
 3. 46. 全排列 —— used 数组，必做。
 4. 90. 子集 II —— 同层去重。
 5. 47. 全排列 II —— 排序 + used 去重。
-6. 39. 组合总和 —— 元素可重复选（backtrack(i) 而非 i+1）。
+6. 39. 组合总和 —— 元素可重复选（`backtrack(i)`）。
 7. 22. 括号生成 —— 左右括号计数剪枝。
 
-## 验收清单
+## 10. 验收清单
 
 - [ ] 能默写回溯模板：选择 → 递归 → 撤销选择
-- [ ] 全排列能写两种去重方式（`used` 数组 / 排序后跳过相邻重复），并说清各自的适用条件
-- [ ] 组合题会用 `start` 参数避免重复组合，并会做剪枝（剩余元素不够就返回）
-- [ ] 子集问题能说清"每个节点都收集"和"叶子才收集"的区别
-- [ ] 能估出时间复杂度（子集/组合约 O(n·2^n)）并解释推导
+- [ ] 全排列能写两种去重方式（`used` + `!used[i-1]` / 同层跳过），并说清适用条件
+- [ ] 组合题会用 `startIdx` 避免重复，并能推导剪枝上界 `i <= n - need + 1`
+- [ ] 子集能说清"每个节点收集"和"叶子才收集"的区别
+- [ ] 能说清 `backtrack(i)` 与 `backtrack(i+1)` 分别对应哪类题
+- [ ] 能估出时间复杂度（节点数 × 拷贝成本）并解释推导
 - [ ] 测试过：空输入、单元素、含重复元素
 - [ ] 能在 25 分钟内 AC 一道回溯中等题

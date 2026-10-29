@@ -1,32 +1,36 @@
 ---
 title: '09 · 动态规划进阶：LIS、编辑距离与区间 DP'
 published: 2026-10-13T18:00:00+08:00
-description: '动态规划进阶：最长递增子序列 O(n²) 与贪心二分两种解法、编辑距离二维 DP、最长公共子序列、区间 DP 直觉。'
+description: 'LIS 的 O(n²) 与贪心二分两解、LCS 与编辑距离的二维 DP 及一维压缩、区间 DP 的"枚举长度"遍历，附 off-by-one 检查表与复杂度口径。'
 tags: [算法, 动态规划, 子序列, LeetCode]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> 进阶篇处理两类高频题：**子序列 DP**（LIS、LCS、编辑距离——两两比较的二维思考）和**区间 DP**（从小区间合并到大区间）。这三种形态是大厂二面的常客。
+> 进阶篇处理两类高频题：**子序列 DP**（LIS、LCS、编辑距离——两两比较的二维思考）和**区间 DP**（从小区间合并到大区间）。它们是大厂二面的常客，也是"会不会做空间压缩"的分水岭。
 
 ---
 
-## 1. 最长递增子序列（LIS）：从 O(n²) 到 O(n log n)
+## 1. 最长递增子序列（LIS）
 
 **300 题**：找最长的严格递增子序列长度（可不连续）。
 
-**解法一：O(n²) 定义式 DP**——`dp[i]` = **以 nums[i] 结尾**的 LIS 长度：
+### 1.1 O(n²) 定义式 DP
+
+`dp[i]` = **以 `nums[i]` 结尾**的 LIS 长度：
 
 ```ts
 function lengthOfLIS(nums: number[]): number {
-  const dp: number[] = new Array(nums.length).fill(1);   // 每个元素自己就是长度 1
+  const n = nums.length;
+  if (n === 0) return 0;
+
+  const dp = new Array(n).fill(1); // 每个元素自己就是长度 1
   let ans = 1;
-  for (let i = 1; i < nums.length; i++) {
+
+  for (let i = 1; i < n; i++) {
     for (let j = 0; j < i; j++) {
-      if (nums[j] < nums[i]) {                 // j 能接到 i 前面
-        dp[i] = Math.max(dp[i], dp[j] + 1);
-      }
+      if (nums[j] < nums[i]) dp[i] = Math.max(dp[i], dp[j] + 1);
     }
     ans = Math.max(ans, dp[i]);
   }
@@ -34,91 +38,133 @@ function lengthOfLIS(nums: number[]): number {
 }
 ```
 
-逐行讲：状态定义成"**以 i 结尾**"是 LIS 的精髓——只有锚定结尾，"前面的比它小"才构成合法转移。答案不是 `dp[n-1]` 而是 `max(dp)`，因为最长子序列可能以任何位置结尾，这个细节常被问。
+两个关键点：
 
-**解法二：贪心 + 二分，O(n log n)**——维护数组 `tails`，`tails[k]` = 长度为 k+1 的递增子序列的最小结尾：
+- **状态必须锚定"以 i 结尾"**——只有这样，"前面的比它小"才构成合法转移；
+- **答案不是 `dp[n-1]` 而是 `max(dp)`**——最长子序列可能以任何位置结尾。
+
+如果状态写成"前 i 个元素里的 LIS 长度"，就无法判断新元素能不能接上，这是 LIS 最常见的错误状态定义。
+
+### 1.2 O(n log n) 贪心 + 二分
+
+维护 `tails`：`tails[k]` = 长度为 `k+1` 的递增子序列的**最小结尾**。
 
 ```ts
-function lengthOfLISBinary(nums: number[]): number {
+function lengthOfLISFast(nums: number[]): number {
   const tails: number[] = [];
+
   for (const x of nums) {
-    // 在 tails 里找第一个 >= x 的位置
-    let l = 0, r = tails.length;
+    // 找第一个 >= x 的位置（lower_bound）
+    let l = 0;
+    let r = tails.length;
     while (l < r) {
       const mid = (l + r) >> 1;
-      tails[mid] < x ? (l = mid + 1) : (r = mid);
+      if (tails[mid] < x) l = mid + 1;
+      else r = mid;
     }
-    if (l === tails.length) tails.push(x);   // x 比所有都大，LIS 变长
-    else tails[l] = x;                       // 替换，让后续更容易接上
+
+    if (l === tails.length) tails.push(x); // 比所有结尾都大 → LIS 变长
+    else tails[l] = x;                     // 替换成更小的结尾
   }
   return tails.length;
 }
 ```
 
-直觉：tails 始终有序，`tails[l] = x` 是"同样长度下把结尾换得更小，给未来留更多机会"。**tails 不是 LIS 本身，长度才是答案**——这句话是面试官验证你是否真懂的标准问题，务必答对。
+直觉：`tails[l] = x` 是"在同样长度下把结尾换得更小，给未来留更多机会"。
+
+> **`tails` 不是 LIS 本身，长度才是答案。** 这句话是面试官验证你是否真懂的标准问题。要还原具体序列，需要额外记录每个元素的前驱下标，另建 `pre` 数组回溯。
 
 ---
 
-## 2. 最长公共子序列（LCS）：二维 DP 的样板
+## 2. LCS：二维 DP 的样板
 
-**1143 题**：两个字符串的最长公共子序列长度。这是**二维 DP 的样板题**，编辑距离、两个字符串的题全是它的变装。
+**1143 题**：两个字符串的最长公共子序列长度。编辑距离、不相交的线、删除操作，全是它的变装。
 
 **三步走**：
 
-1. `dp[i][j]` = s1 前 i 个字符与 s2 前 j 个字符的 LCS 长度。
-2. 转移：末尾字符相同则 `dp[i-1][j-1] + 1`；不同则丢掉其中一个的末尾，`max(dp[i-1][j], dp[i][j-1])`。
-3. 初始化：`dp[0][*] = dp[*][0] = 0`（空串 LCS 为 0）；双重循环正序。
+1. `dp[i][j]` = `s1` 前 i 个字符与 `s2` 前 j 个字符的 LCS 长度；
+2. 末尾相同 → `dp[i-1][j-1] + 1`；不同 → `max(dp[i-1][j], dp[i][j-1])`；
+3. `dp[0][*] = dp[*][0] = 0`（空串），双重循环正序。
 
 ```ts
 function longestCommonSubsequence(s1: string, s2: string): number {
-  const m = s1.length, n = s2.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  const m = s1.length;
+  const n = s2.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
-      if (s1[i - 1] === s2[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;     // 末尾匹配，双双前进
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);  // 丢一个末尾
-      }
+      dp[i][j] = s1[i - 1] === s2[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
     }
   }
   return dp[m][n];
 }
 ```
 
-两个易错点：dp 尺寸是 `(m+1) × (n+1)`（多出的第 0 行/列表示空串），访问字符串时下标要减一（`s1[i-1]` 对应 dp 的第 i 格）——这两处是二维 DP 最常见的 off-by-one，面试官专门盯这里。
+**两个 off-by-one 是本篇最容易错的地方**：
+
+| 位置 | 规则 | 记法 |
+| --- | --- | --- |
+| `dp` 尺寸 | `(m+1) × (n+1)` | 多一行一列表示"空串" |
+| 字符串下标 | `s1[i-1]`、`s2[j-1]` | dp 的第 i 格对应字符串第 i-1 个 |
+
+### 2.1 空间压缩到 O(n)
+
+`dp[i][*]` 只依赖 `dp[i-1][*]` 和当前行左侧，所以两行滚动即可：
+
+```ts
+function lcsRolling(s1: string, s2: string): number {
+  const n = s2.length;
+  let prev = new Array(n + 1).fill(0);
+  let cur = new Array(n + 1).fill(0);
+
+  for (let i = 1; i <= s1.length; i++) {
+    for (let j = 1; j <= n; j++) {
+      cur[j] = s1[i - 1] === s2[j - 1]
+        ? prev[j - 1] + 1
+        : Math.max(prev[j], cur[j - 1]); // 注意：cur[j-1] 是当前行左侧
+    }
+    [prev, cur] = [cur, prev]; // 交换，cur 变成下一轮的草稿区
+  }
+  return prev[n];
+}
+```
+
+压缩后要特别小心两个引用：`prev[j]` 是**上一行**，`cur[j-1]` 是**当前行左侧**，写反了结果就错，但小样例可能仍然通过。
 
 ---
 
-## 3. 编辑距离：二维 DP 的巅峰考题
+## 3. 编辑距离
 
-**72 题**：把 word1 变成 word2 的最少操作次数（插入/删除/替换）。这题是"为什么你会 DP"的试金石。
+**72 题**：把 `w1` 变成 `w2` 的最少操作次数（插入/删除/替换）。
 
 **三步走**：
 
-1. `dp[i][j]` = word1 前 i 个字符变成 word2 前 j 个字符的最少操作数。
-2. 转移（核心，四种情况）：
-   - 末尾相同：`dp[i][j] = dp[i-1][j-1]`（不用操作）。
-   - 末尾不同：三种操作取最小——
-     - 替换：`dp[i-1][j-1] + 1`
-     - 删 word1 末尾：`dp[i-1][j] + 1`
-     - 插入（等价于删 word2 末尾）：`dp[i][j-1] + 1`
-3. 初始化：`dp[i][0] = i`（删光），`dp[0][j] = j`（一个个插入）。
+1. `dp[i][j]` = `w1` 前 i 个字符变成 `w2` 前 j 个字符的最少操作数；
+2. 末尾相同 → `dp[i-1][j-1]`；不同 → `1 + min(替换 dp[i-1][j-1], 删 dp[i-1][j], 插 dp[i][j-1])`；
+3. `dp[i][0] = i`（删光），`dp[0][j] = j`（逐个插入）。
 
 ```ts
 function minDistance(w1: string, w2: string): number {
-  const m = w1.length, n = w2.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  const m = w1.length;
+  const n = w2.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
   for (let i = 0; i <= m; i++) dp[i][0] = i;
   for (let j = 0; j <= n; j++) dp[0][j] = j;
+
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
       if (w1[i - 1] === w2[j - 1]) {
         dp[i][j] = dp[i - 1][j - 1];
       } else {
-        dp[i][j] = 1 + Math.min(dp[i - 1][j - 1],   // 替换
-                                dp[i - 1][j],       // 删 w1
-                                dp[i][j - 1]);      // 插入 w1
+        dp[i][j] = 1 + Math.min(
+          dp[i - 1][j - 1], // 替换
+          dp[i - 1][j],     // 删掉 w1 末尾
+          dp[i][j - 1],     // 在 w1 插入（等价于删 w2 末尾）
+        );
       }
     }
   }
@@ -126,67 +172,145 @@ function minDistance(w1: string, w2: string): number {
 }
 ```
 
-面试时先画一个 5×5 的表格演示填表过程，再写代码——编辑距离这种题，**画表讲清转移的物理含义**比代码本身更能体现功底。它在前端也有实际投影：diff 算法（React 的列表 diff、文本编辑器的 diff）底层就是 LCS/编辑距离的变体，能顺口带出这个关联，是"前端工程师懂算法"的高光时刻。
+**三种操作对应哪个格子**，要能指着表格说清楚：
+
+```text
+        w2[0..j-1]
+      ┌────┬────┬────┐
+w1[i-1]│ ↖  │ ←  │ ...│   ↖ 替换（dp[i-1][j-1]）
+      │ ↑  │ ?  │    │   ↑ 删除（dp[i-1][j]）
+      └────┴────┴────┘   ← 插入（dp[i][j-1]）
+```
+
+面试时先画 5×5 表格演示两行填法，再写代码——**编辑距离考的是"能不能讲清转移的物理含义"**，代码只是结果。
+
+### 3.1 一维压缩：必须多存一个对角值
+
+```ts
+function minDistance1D(w1: string, w2: string): number {
+  const n = w2.length;
+  let dp = Array.from({ length: n + 1 }, (_, j) => j); // 第 0 行
+
+  for (let i = 1; i <= w1.length; i++) {
+    let diag = dp[0]; // 上一行的 dp[j-1]，先存起来
+    dp[0] = i;
+
+    for (let j = 1; j <= n; j++) {
+      const up = dp[j];       // 覆盖前先存"上一行同列"
+      dp[j] = w1[i - 1] === w2[j - 1]
+        ? diag
+        : 1 + Math.min(diag, dp[j], dp[j - 1]);
+      diag = up;              // 给下一列当对角值
+    }
+  }
+  return dp[n];
+}
+```
+
+压缩的关键就是那个 `diag`：二维版的 `dp[i-1][j-1]` 在一维里已经被覆盖了，必须提前保存。
 
 ---
 
 ## 4. 区间 DP：从小洞合并到大洞
 
-**516 题 最长回文子序列**是区间 DP 的入门代表：
+**516 题 最长回文子序列**：
 
-**三步走**：
+1. `dp[i][j]` = `s[i..j]` 内最长回文子序列长度；
+2. `s[i] === s[j]` → `dp[i+1][j-1] + 2`；否则 `max(dp[i+1][j], dp[i][j-1])`；
+3. `dp[i][i] = 1`。
 
-1. `dp[i][j]` = s 在区间 `[i, j]` 内的最长回文子序列长度。
-2. 转移：`s[i] === s[j]` 则 `dp[i+1][j-1] + 2`；否则 `max(dp[i+1][j], dp[i][j-1])`。
-3. 初始化：`dp[i][i] = 1`（单字符是回文）；遍历顺序 **i 从后往前、j 从 i+1 往后**——因为 `dp[i][j]` 依赖更"短"的区间，必须先算短的。
+遍历顺序有两种写法，等价的：
 
 ```ts
-function longestPalindromeSubseq(s: string): number {
+// 写法 A：i 倒序（依赖 i+1 和 j-1，保证先算短的）
+function longestPalindromeSubseqA(s: string): number {
   const n = s.length;
-  const dp: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
+  const dp = Array.from({ length: n }, () => new Array(n).fill(0));
+
   for (let i = n - 1; i >= 0; i--) {
     dp[i][i] = 1;
     for (let j = i + 1; j < n; j++) {
-      if (s[i] === s[j]) {
-        dp[i][j] = dp[i + 1][j - 1] + 2;
-      } else {
-        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j - 1]);
-      }
+      dp[i][j] = s[i] === s[j]
+        ? dp[i + 1][j - 1] + 2
+        : Math.max(dp[i + 1][j], dp[i][j - 1]);
+    }
+  }
+  return n ? dp[0][n - 1] : 0;
+}
+
+// 写法 B：枚举区间长度（更通用，复杂区间 DP 都用这个骨架）
+function longestPalindromeSubseqB(s: string): number {
+  const n = s.length;
+  if (n === 0) return 0;
+  const dp = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (let i = 0; i < n; i++) dp[i][i] = 1;
+
+  for (let len = 2; len <= n; len++) {       // 先枚举长度
+    for (let i = 0; i + len - 1 < n; i++) {  // 再枚举起点
+      const j = i + len - 1;
+      dp[i][j] = s[i] === s[j]
+        ? dp[i + 1][j - 1] + 2
+        : Math.max(dp[i + 1][j], dp[i][j - 1]);
     }
   }
   return dp[0][n - 1];
 }
 ```
 
-区间 DP 的遍历顺序有个通用口诀：**dp[i][j] 依赖谁，就保证谁先算**。这里是依赖 i+1（更大下标）和 j-1（更小区间），所以 i 倒着走。分不清顺序时画依赖箭头，比背口诀可靠。
+**区间 DP 的通用口诀**：`dp[i][j]` 依赖谁，就保证谁先算。写法 B 的"长度 → 起点 → 分割点"是最稳的骨架：
+
+```text
+for (len = 2..n)
+  for (i = 0; i + len - 1 < n)
+    j = i + len - 1
+    for (k = i..j-1)  // 需要枚举分割点的题才加这层
+      dp[i][j] = ...
+```
+
+分不清顺序时**画依赖箭头**，比背口诀可靠。
 
 ---
 
-## 小结
+## 5. 常见坑
 
-- LIS：状态定义"以 i 结尾"；O(n log n) 用贪心 + 二分，tails 长度才是答案。
-- LCS：二维 DP 样板，`dp` 尺寸 +1、字符串下标 -1。
-- 编辑距离：四种转移（相同/替换/删除/插入），画表讲物理含义。
-- 区间 DP：按"区间长度"依赖排序遍历，谁先算由依赖箭头决定。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| LIS 答案偏小 | 返回 `dp[n-1]` | 返回 `max(dp)` |
+| LIS 状态写错 | 定义成"前 i 个的 LIS" | 必须"以 i 结尾" |
+| `tails` 当成答案 | 误以为它是子序列 | 只有长度是答案 |
+| LCS 结果差一 | `dp` 尺寸没 +1 / 下标没 -1 | 表 +1、串 -1 |
+| 压缩后结果错但样例过 | `prev[j]` 与 `cur[j-1]` 写反 | 记住"上一行 vs 当前行左侧" |
+| 编辑距离压缩错 | 没保存对角值 | 用 `diag` 暂存 |
+| 区间 DP 用了错值 | 先算了长区间 | 长度从 2 递增，或 i 倒序 |
+| 空串崩溃 | 没处理 `n === 0` | 提前返回 |
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 6. 小结
+
+- LIS：状态"以 i 结尾"，答案 `max(dp)`；O(n log n) 用 `tails`，长度才是答案。
+- LCS：`(m+1)×(n+1)` 表，下标 -1；可压成两行。
+- 编辑距离：三种操作对应三个格子；一维压缩要存 `diag`。
+- 区间 DP：按长度递增（或 i 倒序）保证短区间先算。
+
+---
+
+## 7. 练习（LeetCode 同类题清单）
 
 1. 300. 最长递增子序列 —— 两种解法都写。
 2. 674. 最长连续递增序列 —— LIS 的连续简化版。
 3. 1143. 最长公共子序列 —— 二维样板，必做。
-4. 72. 编辑距离 —— 画表 + 代码，必做。
+4. 72. 编辑距离 —— 画表 + 代码 + 一维压缩，必做。
 5. 516. 最长回文子序列 —— 区间 DP 入门。
 6. 1035. 不相交的线 —— LCS 换皮题。
 7. 583. 两个字符串的删除操作 —— 编辑距离的删减版。
 
-## 验收清单
+## 8. 验收清单
 
-- [ ] LIS 能写 O(n²) 版本，并能说出 O(n log n) 的贪心 + 二分思路（`tails` 数组的含义）
-- [ ] 编辑距离能写二维 DP，转移的三种操作（插入/删除/替换）各对应哪个格子能说清
+- [ ] LIS 能写 O(n²) 版本，并能说清 O(n log n) 里 `tails` 的含义与"长度才是答案"
+- [ ] 编辑距离能写二维 DP，三种操作各对应哪个格子能指着表说清
 - [ ] 区间 DP 会按"枚举长度 → 枚举起点 → 枚举分割点"的顺序遍历
-- [ ] 至少给两道题做过空间压缩（二维降一维），并说明压缩后遍历顺序的变化
+- [ ] 至少给两道题做过空间压缩（二维降一维），并说明压缩后遍历顺序/临时变量的变化
 - [ ] 能估出复杂度（时间 O(n²)、空间 O(n²) 或压缩后 O(n)）
 - [ ] 测试过：空串、单字符、完全相同、完全不同
 - [ ] 能在 30 分钟内 AC 一道 DP 中等题

@@ -1,14 +1,14 @@
 ---
 title: '08 · 动态规划入门：状态定义三步走'
 published: 2026-10-13T17:00:00+08:00
-description: '动态规划入门：状态定义三步走方法论、爬楼梯、打家劫舍、零钱兑换，从递归暴力到滚动数组优化的完整路径。'
+description: 'DP 三步走：状态定义、转移方程、初始化与遍历顺序；爬楼梯与最小花费、打家劫舍的三种形态、0/1 背包与完全背包的遍历方向、零钱兑换与组合计数、最大子数组和，附贪心反例。'
 tags: [算法, 动态规划, LeetCode, 状态转移]
 category: 算法与手写题
 draft: false
 ---
 
 > [!NOTE]
-> DP 的门槛不在聪明，在**套路**。所有入门题都走同一套流程：定义状态 → 找转移方程 → 定初始化 → 定遍历顺序。这篇把四步变成肌肉记忆。
+> DP 的门槛不在聪明，在**套路**。所有入门题都走同一套流程：定状态 → 写转移 → 定初值与顺序。这篇用六道必考题把这四步变成肌肉记忆，并补上验收清单里必问的 0/1 背包。
 
 ---
 
@@ -16,91 +16,211 @@ draft: false
 
 拿到 DP 题，按顺序回答三个问题：
 
-1. **dp[i] 的含义是什么？**（一句话说清：到第 i 个位置/前 i 个元素，最优答案是什么）
-2. **dp[i] 怎么由更小的子问题算出来？**（转移方程）
-3. **初始值和遍历顺序？**（哪些位置没有"更小的子问题"，从哪开始填表）
+1. **`dp[i]` 的含义**：一句话说清——"到第 i 个位置 / 用前 i 个元素，最优答案是什么"；
+2. **转移方程**：`dp[i]` 怎么由更小的子问题算出来；
+3. **初值与遍历顺序**：哪些位置没有"更小的子问题"，从哪开始填表。
 
-一句话判断是不是 DP 题：**当前的最优解能否由"更小规模的最优解"推出？** 能——DP；不能——可能该回溯或贪心。
+一句话判断是不是 DP：**当前最优能否由"更小规模的最优"推出？** 能——DP；不能——回溯、贪心或别的。
 
-两个高频的"DP 信号词"帮你快速识别：题目问**最值**（最长、最少、最大、最少操作）且**后面的决策依赖前面的结果**，比如"不能偷相邻两家"——DP 的概率极大；题目问**方案数**（多少种走法、多少种组合），也是 DP 的标志，对应转移从 `max/min` 换成 `+`。反过来，问"所有方案是什么"（枚举）就是回溯，问"贪心选择是否安全"才考虑贪心。面试前两分钟完成这个分诊，方向就不会错。
+### 1.1 三类信号词
 
-**从记忆化递归开始理解**是最平滑的路径。以爬楼梯（70 题）为例：
+| 题目问法 | 转移写法 | 例子 |
+| --- | --- | --- |
+| **最值**（最多/最少/最长） | `max` / `min` | 最大子数组和、零钱兑换 |
+| **方案数**（多少种） | **累加** | 爬楼梯、零钱兑换 II |
+| **可行性**（能不能） | `or` / `boolean` | 分割等和子集 |
+
+如果题目问"**所有**方案是什么"——那是回溯，不是 DP。
+
+### 1.2 从记忆化递归到填表
+
+以爬楼梯（70 题）为例，先理解状态依赖：
 
 ```ts
-// 递归 + 备忘录：dp 的"来源"形态
-const memo = new Map<number, number>();
-function climb(n: number): number {
+// 记忆化递归：dp 的"来源"形态
+function climb(n: number, memo = new Map<number, number>()): number {
   if (n <= 2) return n;
   if (memo.has(n)) return memo.get(n)!;
-  const ways = climb(n - 1) + climb(n - 2);   // 到第 n 阶 = 从 n-1 跨 1 步 或 n-2 跨 2 步
+  const ways = climb(n - 1, memo) + climb(n - 2, memo);
   memo.set(n, ways);
   return ways;
 }
 ```
 
-再改写成自底向上的填表版：
+再改写成自底向上的滚动变量版：
 
 ```ts
 function climbStairs(n: number): number {
   if (n <= 2) return n;
-  let prev = 1, cur = 2;
+  let prev = 1;
+  let cur = 2;
   for (let i = 3; i <= n; i++) {
-    [prev, cur] = [cur, cur + prev];    // 只依赖前两个 => 滚动变量省数组
+    [prev, cur] = [cur, cur + prev]; // 只依赖前两个 → 两个变量足够
   }
   return cur;
 }
 ```
 
-面试建议：先给递归版证明你理解了"状态依赖"，再给填表版证明你会优化——两分钟讲完，层次分明。
+**面试节奏**：先用递归版说明"状态依赖"，再用填表版展示空间优化，两分钟讲完。
+
+变体：**使用最小花费爬楼梯**（746 题），"到达"的是第 i 阶，初值有两项：
+
+```ts
+function minCostClimbingStairs(cost: number[]): number {
+  const n = cost.length;
+  const dp = new Array(n + 1).fill(0); // dp[i]：到达第 i 阶的最小花费
+  for (let i = 2; i <= n; i++) {
+    dp[i] = Math.min(dp[i - 1] + cost[i - 1], dp[i - 2] + cost[i - 2]);
+  }
+  return dp[n];
+}
+```
+
+`dp[0] = dp[1] = 0`：从第 0 或第 1 阶出发都不花钱，这是本题唯一的"反直觉"初值。
 
 ---
 
-## 2. 打家劫舍：相邻不相邻的经典依赖
+## 2. 打家劫舍：偷/不偷两分支
 
-**198 题**：一排房子，不能偷相邻两家，求最大金额。
+**198 题**：不能偷相邻两家，求最大金额。
 
-**三步走**：
-
-1. dp[i] = 考虑前 i+1 间房的最大金额。
-2. 转移：第 i 家**偷或不偷**——偷则 `dp[i-2] + nums[i]`（隔壁必不能偷），不偷则 `dp[i-1]`，取大者。
-3. 初始化：`dp[0] = nums[0]`，`dp[1] = max(nums[0], nums[1])`；从 i=2 正序遍历。
+1. `dp[i]` = 考虑前 i+1 间房的最大金额；
+2. 转移：`dp[i] = max(dp[i-1], dp[i-2] + nums[i])`——不偷 vs 偷；
+3. 初值：`dp[0] = nums[0]`，`dp[1] = max(nums[0], nums[1])`。
 
 ```ts
 function rob(nums: number[]): number {
   const n = nums.length;
   if (n === 1) return nums[0];
-  const dp: number[] = new Array(n);
+
+  const dp = new Array(n);
   dp[0] = nums[0];
   dp[1] = Math.max(nums[0], nums[1]);
   for (let i = 2; i < n; i++) {
-    dp[i] = Math.max(dp[i - 1], dp[i - 2] + nums[i]);   // 不偷 vs 偷
+    dp[i] = Math.max(dp[i - 1], dp[i - 2] + nums[i]);
   }
   return dp[n - 1];
 }
+
+// O(1) 空间版：只保留前两间房的答案
+function robRolling(nums: number[]): number {
+  let prev2 = 0; // dp[i-2]
+  let prev1 = 0; // dp[i-1]
+  for (const x of nums) {
+    const cur = Math.max(prev1, prev2 + x);
+    prev2 = prev1;
+    prev1 = cur;
+  }
+  return prev1;
+}
 ```
 
-逐行讲：转移方程里"偷/不偷"两个分支，就是这题的**状态设计核心**——不确定就"枚举所有可能的决策，各取最优"。这题的环形版（213 题，首尾相邻）追问思路：拆成"不偷第一家"和"不偷最后一家"两个线性问题分别跑 rob，取 max。面试答出"环形拆线性"四个字就够了。
+`prev2`/`prev1` 同时充当"空数组"的初值，所以不需要特判 `n === 1`——**滚动变量版往往比数组版更少边界**。
 
-还有一个树形版（337 题，打家劫舍 III，房子排成二叉树），是"树形 DP"的入门题：递归函数返回一个二元组 `[偷当前的最大收益, 不偷当前的最大收益]`，每个节点用孩子的两组状态拼出自己的两组状态。它能答出来的前提是第 06 篇的"递归函数返回值携带信息"已经吃透——这也是我把树篇排在 DP 篇之前的原因之一。
+### 2.1 环形（213 题）与树形（337 题）
+
+环形：首尾相邻，所以首尾不能同时偷。拆成两个线性问题：
+
+```ts
+const robRange = (nums: number[], l: number, r: number): number => {
+  let prev2 = 0;
+  let prev1 = 0;
+  for (let i = l; i <= r; i++) {
+    const cur = Math.max(prev1, prev2 + nums[i]);
+    prev2 = prev1;
+    prev1 = cur;
+  }
+  return prev1;
+};
+
+function robCircle(nums: number[]): number {
+  if (nums.length === 1) return nums[0];
+  return Math.max(
+    robRange(nums, 0, nums.length - 2), // 不偷最后一家
+    robRange(nums, 1, nums.length - 1), // 不偷第一家
+  );
+}
+```
+
+树形（337 题）：递归返回二元组 `[不偷当前, 偷当前]`，用孩子的两组状态拼自己的两组：
+
+```ts
+function robTree(root: TreeNode | null): number {
+  const dfs = (n: TreeNode | null): [number, number] => {
+    if (!n) return [0, 0];
+    const [l0, l1] = dfs(n.left);
+    const [r0, r1] = dfs(n.right);
+    return [
+      Math.max(l0, l1) + Math.max(r0, r1), // 不偷当前：孩子随意
+      n.val + l0 + r0,                    // 偷当前：孩子必须不偷
+    ];
+  };
+  const [skip, take] = dfs(root);
+  return Math.max(skip, take);
+}
+```
 
 ---
 
-## 3. 零钱兑换：完全背包的入门形态
+## 3. 0/1 背包与完全背包：遍历方向决定一切
 
-**322 题**：无限枚面额的硬币，凑出 amount 的最少硬币数。
+这是验收清单里必问、但很多入门文章跳过的一节。
 
-**三步走**：
+### 3.1 0/1 背包：每个物品最多一次
 
-1. `dp[i]` = 凑出金额 i 的最少硬币数。
-2. 转移：对每种硬币 `coin`，`dp[i] = min(dp[i], dp[i - coin] + 1)`——用一枚 coin，剩下金额交给子问题。
-3. 初始化：`dp[0] = 0`（凑 0 元要 0 枚），其余设为 `Infinity` 表示"暂时凑不出"；正序遍历金额。
+```ts
+// weights/values 一一对应，容量 cap，求最大价值
+function knapsack01(weights: number[], values: number[], cap: number): number {
+  const dp = new Array(cap + 1).fill(0); // dp[c]：容量 c 时的最大价值
+
+  for (let i = 0; i < weights.length; i++) {
+    for (let c = cap; c >= weights[i]; c--) {
+      // 倒序！dp[c] 依赖"上一轮"的 dp[c-w]
+      dp[c] = Math.max(dp[c], dp[c - weights[i]] + values[i]);
+    }
+  }
+  return dp[cap];
+}
+```
+
+**为什么必须倒序**：一维数组压缩掉"物品"这一维后，`dp[c]` 的转移要用到 `dp[c - w]`。如果正序遍历，`dp[c - w]` 可能**已经被当前物品更新过**，等于同一件物品用了两次——那就变成完全背包了。
+
+倒序遍历保证：读取 `dp[c - w]` 时，它还是"上一件物品"的状态。
+
+### 3.2 完全背包：每个物品无限次
+
+```ts
+function knapsackComplete(weights: number[], values: number[], cap: number): number {
+  const dp = new Array(cap + 1).fill(0);
+  for (let i = 0; i < weights.length; i++) {
+    for (let c = weights[i]; c <= cap; c++) {
+      // 正序！允许重复使用当前物品
+      dp[c] = Math.max(dp[c], dp[c - weights[i]] + values[i]);
+    }
+  }
+  return dp[cap];
+}
+```
+
+一句话记住：**0/1 背包倒序，完全背包正序**。面试只问这一句，但你要能解释"为什么"。
+
+---
+
+## 4. 零钱兑换：最少硬币与组合计数
+
+### 4.1 最少硬币数（322 题）
+
+1. `dp[i]` = 凑出金额 i 的最少硬币数；
+2. 转移：对每种硬币，`dp[i] = min(dp[i], dp[i - coin] + 1)`；
+3. 初值：`dp[0] = 0`，其余 `Infinity`。
 
 ```ts
 function coinChange(coins: number[], amount: number): number {
-  const dp: number[] = new Array(amount + 1).fill(Infinity);
+  const dp = new Array(amount + 1).fill(Infinity);
   dp[0] = 0;
-  for (let i = 1; i <= amount; i++) {        // 遍历金额
-    for (const coin of coins) {              // 遍历决策
+
+  for (let i = 1; i <= amount; i++) {
+    for (const coin of coins) {
       if (i >= coin && dp[i - coin] !== Infinity) {
         dp[i] = Math.min(dp[i], dp[i - coin] + 1);
       }
@@ -110,58 +230,97 @@ function coinChange(coins: number[], amount: number): number {
 }
 ```
 
-逐行讲：`Infinity` 哨兵是关键——表示"该金额无法凑出"，参与 min 之前必须排除，否则 `Infinity + 1` 污染答案。**初始化为"求最小设最大、求最大设最小"**，是 DP 初始化的通用口诀。
+`Infinity` 哨兵是"求最小设最大"的口诀；但参与运算前要排除，否则 `Infinity + 1` 会污染答案。
 
-**零钱兑换 II**（518 题，追问版）从"最少枚数"变成"组合数"，转移从 `min` 改成累加 `dp[i] += dp[i - coin]`，且**外层必须遍历硬币、内层遍历金额**——反过来会重复计数排列。面试官问"为什么内外顺序影响结果"，答案：外层硬币保证每种硬币只被"考虑一轮"，计数的是组合而非排列。
+### 4.2 组合数（518 题）：内外层顺序敏感
+
+```ts
+function change(amount: number, coins: number[]): number {
+  const dp = new Array(amount + 1).fill(0);
+  dp[0] = 1; // 凑 0 元有 1 种方式：什么都不选
+
+  for (const coin of coins) {        // 外层：物品
+    for (let a = coin; a <= amount; a++) { // 内层：容量，正序
+      dp[a] += dp[a - coin];
+    }
+  }
+  return dp[amount];
+}
+```
+
+如果**交换内外层**（金额外层、硬币内层），计数的是**排列**而不是组合，`amount = 3, coins = [1,2]` 会把 `1+2` 和 `2+1` 算两次。
+
+一句话解释：**外层硬币保证"每种硬币只被考虑一轮"**，所以结果的顺序无关。
 
 ---
 
-## 4. 最大子数组和：一维 DP 的贪心变体
-
-**53 题**（超高频）：连续子数组的最大和。
+## 5. 最大子数组和：滚动 DP
 
 ```ts
 function maxSubArray(nums: number[]): number {
-  let cur = nums[0], ans = nums[0];
+  let cur = nums[0];
+  let ans = nums[0];
   for (let i = 1; i < nums.length; i++) {
-    // dp[i] = max(nums[i], dp[i-1] + nums[i])：带上前面 or 重新开始
-    cur = Math.max(nums[i], cur + nums[i]);
+    cur = Math.max(nums[i], cur + nums[i]); // 带上前面 or 重新开始
     ans = Math.max(ans, cur);
   }
   return ans;
 }
 ```
 
-转移的直觉表述：**前面的累积和如果拖后腿（负数），就果断断开重开**。这题还展示了 DP 的一类通用优化——`dp[i]` 只依赖 `dp[i-1]` 时，用一个变量替代整个数组，空间 O(n) → O(1)。爬楼梯、打家劫舍同理，面试答完 O(n) 主动补一句"可以滚动优化到 O(1)"，基本是标配动作。
+直觉：**前面的累积和如果拖后腿（负数），就断开重开**。
+
+### 5.1 为什么这题不能贪心
+
+贪心会错的反例：`coins = [1, 3, 4]`，`amount = 6`。贪心每次拿最大面额：`4 + 1 + 1 = 3` 枚；最优是 `3 + 3 = 2` 枚。
+
+**贪心只看局部最优，不做"后悔"**；DP 通过枚举状态保留所有可能。这道反例面试常用来区分"知道 DP"和"只会背公式"。
 
 ---
 
-## 小结
+## 6. 常见坑
 
-- DP 三步走：一句话定义状态 → 转移方程 → 初始化与遍历顺序。
-- 识别口诀：当前最优能否由更小规模的最优推出。
-- 打家劫舍：偷/不偷两分支取大；环形拆线性。
-- 零钱兑换：求最小初始化 Infinity；组合数题内外层顺序敏感。
-- 滚动优化：只依赖上一步时用变量省数组，O(1) 空间。
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| 0/1 背包算成"无限用" | 容量正序遍历 | 0/1 倒序，完全背包正序 |
+| 组合数算成排列数 | 金额在外层、硬币在内层 | 硬币外层、金额内层 |
+| 零钱兑换出现 `Infinity+1` | 没排除不可达状态 | 转移前判 `!== Infinity` |
+| 最大子数组和全负数答案错 | 初始化为 0 | `ans = nums[0]` |
+| 打家劫舍空数组崩 | 没处理 `n === 0/1` | 用滚动变量版，天然免特判 |
+| 环形打家劫舍漏解 | 只跑了一个区间 | 首尾各排除一次，取 max |
+| 爬楼梯初值写反 | `dp[0]` 定义不清 | 明确"到达第 i 阶"还是"走 i 步" |
+| 说成 O(2ⁿ) | 没提记忆化/填表 | DP 后是 O(n) / O(n·cap) |
 
 ---
 
-## 练习（LeetCode 同类题清单）
+## 7. 小结
+
+- 三步走：状态含义 → 转移方程 → 初值与顺序。
+- 三类信号：最值 `max/min`、方案数累加、可行性布尔。
+- 打家劫舍：偷/不偷；环形拆线性；树形返回二元组。
+- 背包：0/1 倒序、完全正序；组合计数硬币在外层。
+- 能滚动就滚动，O(1) 空间是标配加分项。
+
+---
+
+## 8. 练习（LeetCode 同类题清单）
 
 1. 70. 爬楼梯 —— 递归版 + 填表版各写一遍。
-2. 198. 打家劫舍 —— 偷/不偷分支，必做。
-3. 213. 打家劫舍 II —— 环形拆线性。
-4. 322. 零钱兑换 —— 最少硬币数，必做。
-5. 518. 零钱兑换 II —— 组合计数与遍历顺序。
-6. 53. 最大子数组和 —— 滚动变量优化。
-7. 746. 使用最小花费爬楼梯 —— 换个皮的三步走。
+2. 746. 使用最小花费爬楼梯 —— 初值有两项。
+3. 198. 打家劫舍 —— 偷/不偷分支，必做。
+4. 213. 打家劫舍 II —— 环形拆线性。
+5. 322. 零钱兑换 —— 最少硬币数，必做。
+6. 518. 零钱兑换 II —— 组合计数与遍历顺序。
+7. 53. 最大子数组和 —— 滚动变量优化。
+8. 416. 分割等和子集 —— 0/1 背包的可行性版。
 
-## 验收清单
+## 9. 验收清单
 
 - [ ] 能写出"状态定义三步走"：状态含义、转移方程、初始化与边界
 - [ ] 打家劫舍能写出 O(1) 空间版本，并说清"为什么可以只保留两个变量"
 - [ ] 0/1 背包能说清"为什么容量要倒序"，以及完全背包为什么正序
 - [ ] 能判断一道题是"求最大值/方案数/可行性"中的哪类，并选对转移写法
-- [ ] 知道 DP 与贪心的区别，能举一个贪心会错的例子
+- [ ] 知道 DP 与贪心的区别，能举出 `[1,3,4]` 凑 6 的反例
+- [ ] 能说清零钱兑换 II 内外层交换后为什么会算成排列
 - [ ] 测试过：空输入、单元素、全负数、极大 n
 - [ ] 能在 25 分钟内 AC 一道 DP 简单/中等题
