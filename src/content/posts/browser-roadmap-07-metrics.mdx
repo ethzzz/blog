@@ -1,38 +1,49 @@
 ---
 title: '07 · 性能指标与测量'
 published: 2026-10-26T11:00:00+08:00
-description: 'LCP / INP / CLS / TTFB 各测什么、为什么会变差、实验室数据与真实用户的差别，为什么只看 P75，以及怎么用 PerformanceObserver 把数据采回来。'
+description: 'LCP / INP / CLS / TTFB 各测什么、阈值怎么定、为什么只看 P75，附一份不依赖第三方库的原生采集实现、P75 聚合代码、INP 三段拆解与 LoAF 归因。'
 tags: [浏览器, 性能指标, CoreWebVitals, LCP, INP, RUM]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 先有指标，才有方向
-
-"页面很慢"不是问题描述。可行动的问题长这样：
-
-> 移动端 P75 的 LCP 是 3.4s，其中 1.9s 花在 hero 图下载上（4G 下 480KB），TTFB 只有 0.2s。
-
-这一篇就是教你把前者变成后者的方法论。
+> [!NOTE]
+> "页面很慢"不是问题描述。可行动的问题长这样：**移动端 P75 的 LCP 是 3.4s，其中 1.9s 花在 hero 图下载上（4G 下 480KB），TTFB 只有 0.2s**。这一篇就是把你从前者带到后者的方法论。
 
 ---
 
-## 四个核心指标
+## 1. 四个核心指标
 
 | 指标 | 测什么 | 好 / 需改进 / 差 | 常见变差原因 |
 | --- | --- | --- | --- |
-| **TTFB** | 请求发出到收到首字节 | < 0.8s / < 1.8s / > 1.8s | 服务端慢、DNS/TLS 慢、无 CDN、重定向 |
-| **LCP** | 视口内最大内容元素的渲染时间 | < 2.5s / < 4s / > 4s | 大图/大标题、阻塞 CSS、字体、服务端渲染慢 |
-| **INP** | 交互到下一帧绘制的延迟（P98） | < 200ms / < 500ms / > 500ms | 长任务、大列表渲染、同步布局、重计算 |
-| **CLS** | 布局偏移累计得分 | < 0.1 / < 0.25 / > 0.25 | 图片无尺寸、字体切换、动态插入、广告位 |
+| **TTFB** | 请求发出到收到首字节 | ≤0.8s / ≤1.8s / >1.8s | 服务端慢、DNS/TLS 慢、无 CDN、重定向 |
+| **LCP** | 视口内最大内容元素的渲染时间 | ≤2.5s / ≤4s / >4s | 大图/大标题、阻塞 CSS、字体、服务端渲染慢 |
+| **INP** | 交互到下一帧绘制的延迟（取高分段） | ≤200ms / ≤500ms / >500ms | 长任务、大列表渲染、同步布局、重计算 |
+| **CLS** | 布局偏移累计得分（会话窗口） | ≤0.1 / ≤0.25 / >0.25 | 图片无尺寸、字体切换、动态插入、广告位 |
 
-> INP 在 2023 年取代 FID。FID 只测"输入延迟"，INP 测的是**整个交互从输入到画面更新**，更接近用户感受，也更难优化。
+> INP 在 2023 年取代 FID。FID 只测"输入延迟"这一段，INP 测的是**整个交互从输入到画面更新**，更接近用户感受，也更难优化。
 
-三个补充指标：**FCP**（首次内容绘制，看"有没有东西"）、**TBT**（总阻塞时间，实验室里代理 INP）、**Speed Index**（内容填充速度）。
+三个补充指标：
+
+- **FCP**（首次内容绘制，≤1.8s）：只能说明"有东西出来了"，不保证是主要内容；
+- **TBT**（总阻塞时间，实验室）：主线程上超过 50ms 的部分累加，是 INP 的实验室代理；
+- **Speed Index**：内容填充速度，对"骨架屏慢慢填"这类页面更敏感。
+
+### 1.1 指标之间不是并列关系
+
+```text
+TTFB ──→ FCP ──→ LCP
+  │               ↑
+  └──→ 资源加载 ───┘
+主线程长任务 ──→ INP（输入延迟 + 处理 + 呈现）
+布局不稳定   ──→ CLS
+```
+
+它们各自回答不同问题：TTFB 问"服务端快不快"，FCP 问"什么时候有东西"，LCP 问"主要内容什么时候好"，INP 问"用起来顺不顺"，CLS 问"画面稳不稳"。**优化前先确定是哪一类问题**，否则很容易优化了 TTFB，瓶颈却在图片。
 
 ---
 
-## 实验室 vs 真实用户：两套数据不能互相替代
+## 2. 实验室 vs 真实用户：两套数据不能互相替代
 
 | | 实验室（Lighthouse / Performance 面板） | 真实用户（RUM） |
 | --- | --- | --- |
@@ -41,81 +52,254 @@ draft: false
 | 能代表用户 | ❌ 只代表"一种用户" | ✅ 但要看分布 |
 | 用途 | **找根因、验证改动** | **判断真实体验、设阈值** |
 
+Lighthouse 的移动端模拟大致是：Moto G Power 级 CPU、4 倍降速、Slow 4G（下行约 1.6Mbps、RTT 150ms）。**它刻意比大多数真机更差**，所以分数低不代表用户一定慢；反过来，分数高也不代表你的低端用户不慢。
+
 **只看 Lighthouse 会翻车**：它给你 95 分，但你的用户里有 40% 在用三年前的安卓机。
 
-看分布：**P75 是行业标准**（Google 也用 P75）。均值会被大量"秒开"的旗舰机稀释，P75 才代表"四分之三用户的体验"。
+### 2.1 为什么是 P75
+
+| 统计量 | 含义 | 问题 |
+| --- | --- | --- |
+| 均值 | 所有样本平均 | 被大量"秒开"的旗舰机稀释 |
+| P50 | 一半用户好于此 | 掩盖长尾 |
+| **P75** | 75% 的用户好于此 | Google 与行业标准，兼顾长尾与稳定性 |
+| P95 | 95% 用户好于此 | 太敏感，样本少时抖动大 |
+
+P75 的直观解释：**每 4 个用户里，有 3 个的体验至少和你看到的一样好。** 它不追求"最差的那个"，但也不再被优等生拉高。
 
 ---
 
-## 采集：一段能直接用的代码
+## 3. 采集：不依赖第三方库的完整实现
+
+`web-vitals` 很好用，但知道底层怎么算，才能判断"这个数字为什么不对"。下面是一份原生实现（可整段放进项目）：
 
 ```ts
 // src/monitor/vitals.ts
-import { onCLS, onINP, onLCP, onTTFB, type Metric } from 'web-vitals';
+type Sample = {
+  name: 'TTFB' | 'FCP' | 'LCP' | 'INP' | 'CLS';
+  value: number;
+  path: string;
+  release: string;
+  device: 'low' | 'high';
+  conn: string;
+  ts: number;
+};
 
-function send(m: Metric) {
-  navigator.sendBeacon(
-    '/api/rum',
-    JSON.stringify({
-      name: m.name,          // LCP / INP / CLS / TTFB
-      value: m.value,
-      rating: m.rating,      // good / needs-improvement / poor
-      id: m.id,
-      // 分维度才能定位：设备档位、网络、页面
-      device: navigator.hardwareConcurrency >= 8 ? 'high' : 'low',
-      conn: (navigator as any).connection?.effectiveType ?? 'unknown',
-      path: location.pathname,
-      release: window.__BUILD_ID__,
-    }),
-  );
+const samples: Sample[] = [];
+
+const base = () => ({
+  path: location.pathname,
+  release: (window as any).__BUILD_ID__ ?? 'dev',
+  device: (navigator.hardwareConcurrency ?? 2) >= 8 ? ('high' as const) : ('low' as const),
+  conn: (navigator as any).connection?.effectiveType ?? 'unknown',
+  ts: Date.now(),
+});
+
+const push = (name: Sample['name'], value: number) =>
+  samples.push({ name, value: Math.round(value * 1000) / 1000, ...base() });
+
+// ① TTFB
+new PerformanceObserver((list) => {
+  const nav = list.getEntries()[0] as PerformanceNavigationTiming;
+  if (nav) push('TTFB', nav.responseStart);
+}).observe({ type: 'navigation', buffered: true });
+
+// ② FCP
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) {
+    if (e.name === 'first-contentful-paint') push('FCP', e.startTime);
+  }
+}).observe({ type: 'paint', buffered: true });
+
+// ③ LCP：取最后一个候选，遇到首次交互就停止
+let lcp = 0;
+const lcpObserver = new PerformanceObserver((list) => {
+  const entries = list.getEntries();
+  lcp = entries[entries.length - 1].startTime;
+});
+lcpObserver.observe({ type: 'largest-contentful-paint', buffered: true });
+const stopLcp = () => {
+  if (!lcp) return;
+  lcpObserver.disconnect();
+  push('LCP', lcp);
+};
+addEventListener('keydown', stopLcp, { once: true });
+addEventListener('click', stopLcp, { once: true });
+
+// ④ CLS：会话窗口（间隔 <1s 且窗口 <5s 的偏移累加，取最大窗口）
+let cls = 0;
+let session = 0;
+let sessionStart = 0;
+let last = 0;
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries() as (PerformanceEntry & {
+    value: number;
+    hadRecentInput: boolean;
+  })[]) {
+    if (e.hadRecentInput) continue;
+    const gap = e.startTime - last;
+    if (session && gap < 1000 && e.startTime - sessionStart < 5000) {
+      session += e.value;
+    } else {
+      session = e.value;
+      sessionStart = e.startTime;
+    }
+    last = e.startTime;
+    cls = Math.max(cls, session);
+  }
+}).observe({ type: 'layout-shift', buffered: true });
+
+// ⑤ INP：取交互延迟的高分段（这里用最大值近似）
+let inp = 0;
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries() as (PerformanceEntry & { duration: number })[]) {
+    inp = Math.max(inp, e.duration);
+  }
+}).observe({ type: 'event', durationThreshold: 40, buffered: true });
+
+// ⑥ 统一上报：页面隐藏时一次发完
+function flush() {
+  if (samples.length === 0) return;
+  if (lcp) push('LCP', lcp);
+  push('CLS', cls);
+  if (inp) push('INP', inp);
+  navigator.sendBeacon('/api/rum', JSON.stringify(samples));
+  samples.length = 0;
 }
 
-onLCP(send);
-onINP(send);
-onCLS(send);
-onTTFB(send);
+addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flush();
+});
+addEventListener('pagehide', flush);
 ```
 
-三个要点：
+四个关键细节：
 
-1. **`sendBeacon`**：页面关闭时也能发出去；`fetch` 会被取消。
+1. **`sendBeacon`**：页面关闭时也能发出去；`fetch` 会被浏览器取消，手机端尤其明显。
 2. **带 `release`**：没有版本号，"指标变差"你无法归因到哪次发布。
 3. **带维度**（设备/网络/路径）：不然你只知道"慢了"，不知道"谁慢了"。
+4. **`buffered: true`**：脚本可能晚于指标发生（LCP 在脚本加载前就发生了），`buffered` 会把历史条目补给你。
 
-`buffered: true` 注意：`web-vitals` 内部已经处理"页面加载前发生的指标"（比如 LCP 在脚本加载前就发生了）。
+### 3.1 P75 在后端怎么算
+
+别存平均值，存**直方图**或原始样本：
+
+```js
+// 内存版（小流量可用；生产建议落库后按天聚合）
+function p75(values) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor((sorted.length - 1) * 0.75)];
+}
+
+// 直方图版：固定桶（如 0-100ms、100-200ms……），存储量恒定
+function p75FromBuckets(buckets, total) {
+  const target = Math.ceil(total * 0.75);
+  let acc = 0;
+  for (const [upper, count] of buckets) {
+    acc += count;
+    if (acc >= target) return upper;
+  }
+  return buckets[buckets.length - 1][0];
+}
+```
+
+SQL 版本（PostgreSQL）一行就够：
+
+```sql
+SELECT
+  percentile_cont(0.75) WITHIN GROUP (ORDER BY value) AS p75
+FROM rum_samples
+WHERE name = 'LCP'
+  AND path = '/blog/'
+  AND ts >= now() - interval '7 days';
+```
 
 ---
 
-## INP 难在哪：拆成三段看
+## 4. INP 难在哪：拆成三段看
 
 ```text
 用户按下 → [输入延迟] → [事件处理] → [呈现延迟] → 画面更新
              ↑ 主线程在忙           ↑ 渲染/合成排队
 ```
 
-| 段 | 常见原因 | 对应手段 |
-| --- | --- | --- |
-| 输入延迟 | 主线程有长任务在跑 | 拆分任务、`scheduler.yield`、Web Worker |
-| 事件处理 | 回调里做了重计算/大量 setState | 减少同步计算、`startTransition`、批量更新 |
-| 呈现延迟 | 一次更新渲染太多 DOM | 虚拟滚动、`content-visibility`、减少布局抖动 |
+| 段 | 怎么算 | 常见原因 | 对应手段 |
+| --- | --- | --- | --- |
+| 输入延迟 | `processingStart - startTime` | 主线程有长任务在跑 | 拆分任务、`scheduler.yield`、Worker |
+| 事件处理 | `processingEnd - processingStart` | 回调里做重计算 / 大量 setState | 减少同步计算、`startTransition`、批量更新 |
+| 呈现延迟 | `duration - (processingEnd - startTime)` | 一次更新渲染太多 DOM | 虚拟滚动、`content-visibility`、减少布局抖动 |
 
-定位工具：Performance 面板 → Interactions 轨道，能直接看到每个交互的三段耗时。
+一段能打印三段的探针：
+
+```js
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) {
+    const inputDelay = e.processingStart - e.startTime;
+    const processing = e.processingEnd - e.processingStart;
+    const presentation = e.duration - (e.processingEnd - e.startTime);
+    console.log(e.name, {
+      total: Math.round(e.duration),
+      inputDelay: Math.round(inputDelay),
+      processing: Math.round(processing),
+      presentation: Math.round(presentation),
+    });
+  }
+}).observe({ type: 'event', durationThreshold: 40, buffered: true });
+```
+
+三段对应的优化手段完全不同：
+
+- `inputDelay` 大 → 说明**上一个任务**没让出主线程，优化点在"拆分/让出"，而不是这段代码本身；
+- `processing` 大 → 才是你的回调写得太重；
+- `presentation` 大 → 渲染量太大，优化点在 DOM 数量、布局复杂度。
+
+> 很多人一看到 INP 高就去改点击回调，结果 `inputDelay` 占 80%——真正的问题是页面刚加载时有个 500ms 的初始化长任务。
+
+### 4.1 让出主线程的三种写法
+
+```js
+// ① scheduler.yield（Chrome 129+）：让出后优先级仍高于普通任务
+async function processAll(items, handle) {
+  for (let i = 0; i < items.length; i++) {
+    handle(items[i]);
+    if (i % 200 === 0) {
+      if ('scheduler' in globalThis && 'yield' in scheduler) await scheduler.yield();
+      else await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+}
+
+// ② 用 rAF 切帧（适合"要跟渲染对齐"的场景）
+function inChunks(items, fn, perFrame = 100) {
+  let i = 0;
+  const step = () => {
+    const end = Math.min(i + perFrame, items.length);
+    for (; i < end; i++) fn(items[i]);
+    if (i < items.length) requestAnimationFrame(step);
+  };
+  step();
+}
+
+// ③ React：把非紧急更新降级
+startTransition(() => setList(filter(all, query)));
+```
 
 ---
 
-## 长任务与 LoAF：找到"谁占住了主线程"
+## 5. 长任务与 LoAF：找到"谁占住了主线程"
 
 ```js
 // Long Animation Frames（Chrome 123+）：比 longtask 更能定位到脚本
 new PerformanceObserver((list) => {
   for (const entry of list.getEntries()) {
     if (entry.duration < 50) continue;
-    console.warn('长帧', entry.duration.toFixed(0), 'ms', {
-      blocking: entry.blockingDuration,
+    console.warn('长帧', Math.round(entry.duration), 'ms', {
+      blocking: Math.round(entry.blockingDuration),
       scripts: entry.scripts?.map((s) => ({
         source: s.sourceURL,
         fn: s.sourceFunctionName,
-        dur: s.duration,
+        dur: Math.round(s.duration),
       })),
     });
   }
@@ -124,9 +308,44 @@ new PerformanceObserver((list) => {
 
 老的 `longtask` 只告诉你"有 200ms 卡顿"，LoAF 能告诉你 **`sourceFunctionName` 是哪个函数**——这是从"指标"到"代码行"的关键一跃。
 
+两个读数的经验：
+
+- `blockingDuration` 才是用户"感觉卡"的部分（超过 50ms 的累加），`duration` 里包含渲染与合成；
+- 一个长帧里可能有多个脚本，按 `duration` 排序看主要责任方，别被第一个条目带偏。
+
 ---
 
-## 定阈值：别抄，按你的用户定
+## 6. CLS 的五类来源与修法
+
+| 来源 | 机制 | 修法 |
+| --- | --- | --- |
+| 图片/视频无尺寸 | 加载后才知道高度，把下方内容顶走 | `width`/`height` 或 `aspect-ratio` |
+| 字体切换 | 系统字体与自定义字体度量不同 | `font-display: optional` + `size-adjust` |
+| 动态插入内容 | 顶部插入通知/广告把内容推下去 | 预留固定槽位（`min-height`） |
+| 骨架屏 → 真实内容 | 两者高度不一致 | 骨架屏按真实高度做 |
+| 动画用布局属性 | 改 `top/left/width` 触发布局 | 改 `transform`（不参与布局，不产生 CLS） |
+
+```css
+/* 图片：占位与实际尺寸一致 */
+.thumb { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; }
+
+/* 字体：减少切换时的度量差异 */
+@font-face {
+  font-family: 'App';
+  src: url('/f/app-subset.woff2') format('woff2');
+  font-display: optional;   /* 要么立刻用，要么本次不换 —— 换取 0 偏移 */
+  size-adjust: 96%;
+}
+
+/* 动态区域：先占位，再填充 */
+.banner-slot { min-height: 56px; }
+```
+
+> `font-display: optional` 与 `swap` 的取舍：`swap` 优先"尽快显示正确字体"，代价是一次重排（可能计 CLS）；`optional` 优先"不抖动"，代价是首次访问可能用系统字体。内容站、长文优先 `optional`。
+
+---
+
+## 7. 定阈值：别抄，按你的用户定
 
 | 场景 | 建议目标（P75，移动端） |
 | --- | --- |
@@ -134,39 +353,85 @@ new PerformanceObserver((list) => {
 | 中后台 | LCP < 2.5s，INP < 200ms |
 | 电商 / 转化关键页 | LCP < 2.5s，INP < 200ms，CLS < 0.1 |
 
-设阈值的原则：**先测两周拿到基线，再定"比基线好 20%"为目标**；抄 Google 的绝对值容易变成"永远不达标"。
+设阈值的原则：**先测两周拿到基线，再定"比基线好 20%"为目标**。直接抄 Google 的绝对值，容易变成"永远不达标"，团队也就慢慢不看指标了。
+
+阈值还要**写进发布流程**：把"P75 LCP 退化超过 10%"设成告警，比"每月看一次报表"有效得多。
+
+### 7.1 用 CI 守住预算
+
+```json
+// budget.json —— Lighthouse 的体积与时间预算
+[
+  {
+    "path": "/*",
+    "resourceSizes": [
+      { "resourceType": "total", "budget": 1000 },
+      { "resourceType": "script", "budget": 170 },
+      { "resourceType": "image", "budget": 400 }
+    ],
+    "timings": [
+      { "metric": "largest-contentful-paint", "budget": 2500 },
+      { "metric": "total-blocking-time", "budget": 200 }
+    ]
+  }
+]
+```
+
+```json
+// .lighthouserc.json —— 跑 3 次取中位数，低于分数直接失败
+{
+  "ci": {
+    "collect": { "url": ["http://localhost:4400/blog/"], "numberOfRuns": 3 },
+    "assert": {
+      "assertions": {
+        "categories:performance": ["error", { "minScore": 0.85 }]
+      }
+    }
+  }
+}
+```
+
+预算的意义不是"卡死提交"，而是**让"这次改动多带了 200KB"当场可见**，而不是三周后从用户投诉里发现。
 
 ---
 
-## 常见坑
+## 8. 常见坑
 
 | 现象 | 根因 | 解法 |
 | --- | --- | --- |
 | Lighthouse 95 但用户抱怨慢 | 实验室≠真实用户 | 上 RUM，看 P75 |
 | 指标时好时坏 | 看的是均值 | 改看 P75 与分布 |
-| 优化后指标没动 | 改的不是瓶颈（如优化了 TTFB，问题在 LCP 的图片） | 先拆 LCP 四段（11 篇） |
-| INP 数据缺失 | 页面交互太少（SPA 首页无点击） | 结合 TBT 与自定义交互打点 |
-| CLS 报 0 但页面明显抖 | 偏移发生在用户交互后 500ms 内（不计入） | 用 PerformanceObserver 自己采 `layout-shift` |
+| 优化后指标没动 | 改的不是瓶颈 | 先拆 LCP 四段（11 篇） |
+| INP 数据缺失 | 页面交互太少 | 结合 TBT 与自定义交互打点 |
+| CLS 报 0 但页面明显抖 | 偏移发生在交互后 500ms 内（不计入） | 自己采 `layout-shift` 看全部条目 |
 | 无法归因到发布 | 上报没带版本号 | 加 `release` 字段 |
+| LCP 比 FCP 还早 | 只报了 FCP 之后的候选，或发生 bfcache 恢复 | 用 `web-vitals` 或处理 `pageshow.persisted` |
+| 上报数量远少于访问量 | 页面关闭时用 `fetch` | 换 `sendBeacon` + `pagehide` |
 
 ---
 
-## 验收清单
+## 9. 验收清单
 
 - [ ] 能说出四个核心指标的"测什么"和"常见变差原因"
 - [ ] 有 RUM 数据，且看的是 P75（不是均值）
 - [ ] 上报带了版本号与设备/网络/路径维度
 - [ ] 能用 LoAF 或 Performance 面板定位到具体函数
+- [ ] 能把一次高 INP 拆成输入延迟/处理/呈现三段，并指出该改哪段
+- [ ] 知道 CLS 的五类来源，并能对应到自己的页面
 - [ ] 每个指标有明确目标值，且是"按自己基线定的"
-- [ ] 知道实验室与真实用户数据各自用来干什么
+- [ ] 指标异常能归因到某次发布
 
 ---
 
-## 练习
+## 10. 练习
 
-1. **采一次真实数据**：给任意页面接上上面的 `vitals.ts`，用 4G 限速 + CPU 4x 降速跑 10 次，记录 P75。  
-   *自检*：能给出三个指标的数字，并指出哪个最差。
-2. **定位一次长帧**：用 LoAF 录一次点击后的卡顿，找到 `sourceFunctionName`，回到源码确认耗时逻辑。  
-   *自检*：能说出"这 180ms 具体花在哪个函数"。
-3. **对比实验室与真机**：同一页面分别用 Lighthouse（模拟移动）与你手机实测，列出差异最大的指标并解释原因。  
-   *自检*：能说明"为什么模拟环境总会乐观一些"。
+1. **采一次真实数据**：给任意页面接上第 3 节的采集代码，用 4G 限速 + CPU 4x 降速跑 10 次，算出 P75。  
+   *自检*：能给出三个指标的数字，并指出哪个最差、差在哪一段。
+2. **定位一次长帧**：用 LoAF 录一次点击后的卡顿，找到 `sourceFunctionName`，回源码确认耗时逻辑。  
+   *自检*：能说出"这 180ms 具体花在哪个函数"，而不是"大概在渲染"。
+3. **拆一次 INP**：找一个交互，打印输入延迟/处理/呈现三段。  
+   *自检*：能判断优化点应该在"上一个任务"还是"这段回调"。
+4. **对比实验室与真机**：同一页面分别用 Lighthouse（模拟移动）与你手机实测，列出差异最大的指标并解释原因。  
+   *自检*：能说明"为什么模拟环境总会乐观一些"（CPU/网络/缓存三类差异）。
+5. **修一次 CLS**：找一个会抖的页面，按第 6 节的五类来源定位并修复。  
+   *自检*：修复前后 CLS 有具体数字对比，且能说出属于哪一类来源。

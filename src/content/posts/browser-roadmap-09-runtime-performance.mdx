@@ -1,15 +1,20 @@
 ---
 title: '09 · 运行时性能'
 published: 2026-10-26T12:00:00+08:00
-description: '50ms 长任务阈值、INP 为什么比 FID 难、大列表与频繁更新的处理、内存泄漏的四类来源与排查手法，以及什么时候该把计算搬到 Worker。'
+description: '长任务的五个来源、虚拟滚动与 content-visibility 的取舍、频繁更新的四种降级手段、内存泄漏的四类复现与排查、Worker 的传输成本与适用边界，全部配可运行代码。'
 tags: [浏览器, 运行时性能, INP, 长任务, 内存泄漏]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 一句话：所有卡顿都是主线程被占住
+> [!NOTE]
+> 加载性能决定"多久能看到"，运行时性能决定"用起来顺不顺"。后者的判断标准只有一条：**主线程有没有被长时间占住**。所有手段——虚拟滚动、分批、Worker——本质都是在给主线程减负或让路。
 
-主线程要同时干：执行 JS、算样式、布局、绘制指令。任何一环超过 50ms，用户就能感觉到"点了没反应"。
+---
+
+## 1. 一句话：所有卡顿都是主线程被占住
+
+主线程要同时干：执行 JS、算样式、布局、生成绘制指令。任何一环超过 50ms，用户就能感觉到"点了没反应"。
 
 ```text
 主线程时间轴
@@ -17,129 +22,337 @@ draft: false
         ↑ 这期间点击、滚动、输入全部排队
 ```
 
-所以优化顺序永远是：**先减少长任务的数量与时长，再谈其它**。
+所以优化顺序永远是：**先减少长任务的数量与时长，再谈其它。**
+
+一个 300ms 卡顿的完整归因，比"感觉卡"有用得多：
+
+```text
+点击"筛选" → INP = 380ms
+  ├─ 输入延迟 40ms      （上一个任务刚结束）
+  ├─ 事件处理 290ms     ← setState 后同步过滤 8000 条 + 渲染 8000 行
+  └─ 呈现延迟 50ms      （浏览器布局 8000 行）
+结论：优化点在"过滤 + 渲染量"，不是加个 loading 动画。
+```
 
 ---
 
-## 五个最常见的长任务来源
+## 2. 五个最常见的长任务来源
 
 | 来源 | 典型场景 | 手段 |
 | --- | --- | --- |
 | **大列表一次性渲染** | 1000 行表格、聊天记录 | 虚拟滚动 / `content-visibility` / 分页 |
-| **频繁 setState** | 输入框每次按键都重渲整棵树 | 防抖、`startTransition`、把状态下沉到叶子 |
-| **同步重计算** | 每次渲染都 `JSON.parse` / 排序 / 正则 | `useMemo`、缓存、把计算移到 Worker |
+| **频繁 setState** | 输入框每次按键都重渲整棵树 | 防抖、`startTransition`、状态下沉 |
+| **同步重计算** | 每次渲染都 `JSON.parse` / 排序 / 正则 | `useMemo`、缓存、移到 Worker |
 | **强制同步布局** | 循环里读写 DOM 交替 | 批量读 → 批量写（02 篇） |
 | **大库初始化** | 图表/编辑器/地图在首屏 import | 动态导入，交互时再加载 |
 
+排查时先问："这个长任务里，时间花在 JS、样式、还是布局？"——Performance 面板会把这三类分别染色，答案决定你该改代码、改 CSS 还是改 DOM 结构。
+
 ---
 
-## 虚拟滚动：长列表唯一正解
+## 3. 虚拟滚动：长列表唯一正解
 
-```ts
-// 思路：只渲染视口内的 N 条 + 上下占位撑起滚动高度
-const ITEM_H = 48;
-const visibleCount = Math.ceil(viewportH / ITEM_H) + 2;
+原理：**只渲染视口内的 N 条 + 用占位撑起总高度**。
 
-const start = Math.floor(scrollTop / ITEM_H);
-const slice = items.slice(start, start + visibleCount);
+```html
+<div id="viewport" style="height: 480px; overflow: auto; contain: strict">
+  <div id="spacer" style="position: relative"></div>
+</div>
+
+<script>
+  const ITEM_H = 48;
+  const OVERSCAN = 3;
+
+  const viewport = document.getElementById('viewport');
+  const spacer = document.getElementById('spacer');
+  let items = Array.from({ length: 10000 }, (_, i) => `第 ${i + 1} 行`);
+
+  let start = -1;
+  let end = -1;
+
+  function render() {
+    const scrollTop = viewport.scrollTop;
+    const viewH = viewport.clientHeight;
+
+    const nextStart = Math.max(0, Math.floor(scrollTop / ITEM_H) - OVERSCAN);
+    const nextEnd = Math.min(
+      items.length,
+      Math.ceil((scrollTop + viewH) / ITEM_H) + OVERSCAN,
+    );
+    if (nextStart === start && nextEnd === end) return; // 没变就不重渲染
+    start = nextStart;
+    end = nextEnd;
+
+    // 总高度必须撑起来，否则滚动条长度不对
+    spacer.style.height = items.length * ITEM_H + 'px';
+
+    const frag = document.createDocumentFragment();
+    for (let i = start; i < end; i++) {
+      const row = document.createElement('div');
+      row.style.cssText = `position:absolute;top:${i * ITEM_H}px;height:${ITEM_H}px;left:0;right:0`;
+      row.textContent = items[i];
+      frag.appendChild(row);
+    }
+    spacer.replaceChildren(frag);
+  }
+
+  // scroll 用 passive + rAF 合并（03 篇）
+  let ticking = false;
+  viewport.addEventListener(
+    'scroll',
+    () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        render();
+        ticking = false;
+      });
+    },
+    { passive: true },
+  );
+
+  render();
+</script>
 ```
 
 三条必须处理的细节：
 
-1. **占位高度**：上下各放一个 `div`（`height: start*ITEM_H`），否则滚动条长度不对；
-2. **不定高**：需要测量缓存（react-virtuoso / TanStack Virtual 已处理）；
-3. **滚动时的读取**：监听 `scroll` 用 `passive: true`，并用 rAF 合并（03 篇）。
+1. **占位高度**：容器总高必须是 `条目数 × 行高`，否则滚动条长度不对、滚到底会露白；
+2. **不定高**：上面的写法定高；不定高需要"测量 + 缓存 + 前缀和"，直接用 TanStack Virtual / react-virtuoso，别自己写；
+3. **`contain: strict`**：把布局/绘制范围限制在容器内，避免每次重渲染触发整页布局。
 
-如果只是"长页面里有很多块"，不一定需要虚拟滚动——`content-visibility: auto` + `contain-intrinsic-size` 更省事（02 篇）。
+如果只是"长页面里有很多块"，不一定需要虚拟滚动——`content-visibility: auto` 更省事：
+
+```css
+.section {
+  content-visibility: auto;
+  contain-intrinsic-size: 0 600px; /* 必须给，否则滚动条乱跳 */
+}
+```
+
+两者的区别：**虚拟滚动不创建 DOM**，`content-visibility` 创建但**跳过渲染**。前者省内存，后者省实现成本。
 
 ---
 
-## 频繁更新：三种手段的选择
+## 4. 频繁更新：四种手段的选择
 
 | 手段 | 适用 | 副作用 |
 | --- | --- | --- |
 | 防抖/节流 | 输入、滚动、resize | 有延迟，交互场景要小心 |
 | 状态下沉 | 输入框的值影响范围过大 | 需要重构组件边界 |
-| `startTransition`（React 18） | 非紧急更新（列表过滤） | 更新可被打断，需要接受"稍后生效" |
+| `startTransition` / `useDeferredValue` | 非紧急更新（列表过滤） | 更新可被打断，"稍后生效" |
 | 分批处理（`scheduler.yield`） | 大量 DOM 操作 | 逻辑要能拆成多步 |
 
-```ts
-// React 18：把"列表过滤"标记为非紧急，输入框输入不再卡
+```tsx
+// React 18：输入框必须立刻响应，列表过滤可以慢一点
 const [query, setQuery] = useState('');
-const [list, setList] = useState(all);
+const deferred = useDeferredValue(query);   // 列表用"滞后版"的值
+const list = useMemo(() => filter(all, deferred), [all, deferred]);
 
+<input value={query} onChange={(e) => setQuery(e.target.value)} />;
+```
+
+```tsx
+// 或者显式标记非紧急
 function onChange(v: string) {
-  setQuery(v);                                  // 紧急：输入框必须立刻响应
-  startTransition(() => setList(filter(all, v)));  // 非紧急：可以被打断
+  setQuery(v);
+  startTransition(() => setList(filter(all, v)));
 }
 ```
 
+两个容易被忽略的点：
+
+- **React 18 自动批处理**只合并同一事件里的 `setState`，不会把一次大渲染拆开——渲染量本身还是得靠虚拟滚动/分批解决；
+- **状态下沉**往往比 `useMemo` 更有效：把输入框的 state 从"页面级"降到"输入框组件内"，整棵树就不重渲了。
+
+---
+
+## 5. 分批渲染：把 300ms 切成 3×100ms
+
 ```js
-// 纯 JS：把一个大循环让出主线程
-async function processAll(items, handle) {
-  for (let i = 0; i < items.length; i++) {
-    handle(items[i]);
-    if (i % 200 === 0) await scheduler.yield?.() ?? new Promise((r) => setTimeout(r, 0));
+// 让出主线程：优先 scheduler.yield，退化到 setTimeout
+async function yieldToMain() {
+  if ('scheduler' in globalThis && 'yield' in scheduler) return scheduler.yield();
+  return new Promise((r) => setTimeout(r, 0));
+}
+
+async function renderInChunks(container, items, renderOne, budget = 8) {
+  let i = 0;
+  while (i < items.length) {
+    const t0 = performance.now();
+    // 每帧只干 budget 毫秒，干完就还回去
+    while (i < items.length && performance.now() - t0 < budget) {
+      container.appendChild(renderOne(items[i++]));
+    }
+    await yieldToMain();
   }
 }
 ```
 
-`await` 让出后，浏览器有机会处理输入与渲染——这是"把 300ms 降到 3×100ms"的标准做法（每段都在 50ms 以下，就感觉不卡了）。
+为什么"切成 3×100ms"比"一次 300ms"体验好？因为让出期间浏览器可以：
+
+- 处理用户的点击/输入（INP 从 380ms 降到 60ms）；
+- 渲染中间状态（用户看到内容在长出来，而不是干等）。
+
+代价是总耗时可能略增（多了两次调度）。这是典型的**用吞吐换响应**，值不值取决于"用户是否在等"。
+
+一个常被问到的选择：`requestAnimationFrame` 还是 `setTimeout(0)`？
+
+| 方式 | 让出后何时继续 | 适用 |
+| --- | --- | --- |
+| `scheduler.yield()` | 高优先级任务之后、下一帧之前 | 首选（Chrome 129+） |
+| `setTimeout(0)` | 下一个宏任务（≥4ms 限制） | 兼容兜底 |
+| `requestAnimationFrame` | 下一帧开始 | 需要与渲染对齐（动画、测量） |
+| `requestIdleCallback` | 浏览器空闲时 | 可无限延后的低优任务，**别用于首屏** |
 
 ---
 
-## 内存泄漏：四类来源
+## 6. 内存泄漏：四类来源
 
 | 类型 | 例子 | 排查 |
 | --- | --- | --- |
 | **全局引用** | `window.__cache.push(x)` 永不清理 | 搜索挂到 `window` 上的东西 |
 | **未清理的监听/定时器** | `addEventListener` / `setInterval` 没在卸载时移除 | SPA 路由切换后内存阶梯上升 |
 | **闭包持有大对象** | 回调里引用了整个列表 | Heap snapshot 看 retained size |
-| **detached DOM** | 移除节点但 JS 还持有引用 | Heap snapshot 搜 "Detached" |
+| **detached DOM** | 移除节点但 JS 还持有引用 | Heap snapshot 搜 `Detached` |
 
-排查流程（Chrome）：
-
-1. DevTools → Memory → **Heap snapshot**，操作前后各拍一张；
-2. 对比两张的 `Objects` 增长，按 `Retained Size` 排序；
-3. 看 `Detached HTMLElement` 数量——正常应该接近 0；
-4. 反复切换 5 次，如果内存阶梯上升且不回落，就是泄漏。
+三类能直接复现的泄漏：
 
 ```js
-// 典型修复：卸载时清理
-useEffect(() => {
-  const id = setInterval(poll, 5000);
-  const onResize = () => update();
-  window.addEventListener('resize', onResize);
-  return () => {
-    clearInterval(id);
-    window.removeEventListener('resize', onResize);
-  };
-}, []);
+// ① 监听未清理：每次挂载都加一个，永不删除
+function mountBad() {
+  window.addEventListener('resize', () => {
+    // 引用了 bigData
+    console.log(bigData.length);
+  });
+}
+
+// ② 定时器未清理
+function pollBad() {
+  setInterval(() => fetch('/api/status'), 5000); // 组件卸载后仍在跑
+}
+
+// ③ detached DOM：移除节点但仍被闭包引用
+const cache = [];
+function leakNode() {
+  const el = document.createElement('div');
+  el.innerHTML = '<span>很大的子树</span>'.repeat(1000);
+  document.body.appendChild(el);
+  document.body.removeChild(el); // 已移除
+  cache.push(el);                // 但 JS 还持有 → detached
+}
+```
+
+修法分别是：用 `AbortController` 统一解绑、在 `useEffect` 清理函数里 `clearInterval`、不要长期持有已移除节点的引用。
+
+```js
+// 现代写法：一个 signal 管所有监听
+const ac = new AbortController();
+window.addEventListener('resize', onResize, { signal: ac.signal });
+window.addEventListener('scroll', onScroll, { passive: true, signal: ac.signal });
+// 卸载
+ac.abort();
+```
+
+### 6.1 排查流程
+
+```text
+① 打开 Performance monitor（More tools → Performance monitor）
+   看 JS heap size / DOM nodes 是否在反复操作后阶梯上升
+② 操作 5 次（进出页面/开关弹窗），拍 Heap snapshot
+③ 再操作 5 次，拍第二张，切到 "Comparison" 看增长对象
+④ 搜 "Detached"，数量应接近 0
+⑤ 按 Retained Size 排序，找到持有者（Retainers 面板）
+```
+
+`performance.memory` 只在 Chrome 可用且精度受限，仅作粗看：
+
+```js
+// 仅 Chrome，数值有粒度和安全限制
+console.log(performance.memory?.usedJSHeapSize / 1024 / 1024, 'MB');
+```
+
+要精确测整页内存（含 iframe），需要跨源隔离后调用：
+
+```js
+// 需要 COOP: same-origin + COEP: require-corp
+const { bytes } = await performance.measureUserAgentSpecificMemory();
+console.log(bytes / 1024 / 1024, 'MB');
 ```
 
 ---
 
-## 什么时候该上 Worker
+## 7. 什么时候该上 Worker
 
 判断标准很简单：**这段计算超过 50ms、且不碰 DOM**。
 
-- ✅ 适合：大 JSON 解析、图片处理（OffscreenCanvas）、加密/哈希、复杂 diff、CSV 导出、语法高亮
+- ✅ 适合：大 JSON 解析、图片处理（`OffscreenCanvas`）、加密/哈希、复杂 diff、CSV 导出、语法高亮
 - ❌ 不适合：要读写 DOM、很轻的计算（通信开销 > 计算收益）、需要高频同步交互
 
 ```js
-// 主线程
-const worker = new Worker(new URL('./parse.worker.ts', import.meta.url), { type: 'module' });
-worker.postMessage(arrayBuffer, [arrayBuffer]);   // 第二个参数：Transferable，零拷贝
-worker.onmessage = (e) => render(e.data);
+// main.js
+const worker = new Worker(new URL('./parse.worker.js', import.meta.url), {
+  type: 'module',
+});
+
+// 传 ArrayBuffer 时用 Transferable：零拷贝，主线程侧会变成 detached
+const buf = await file.arrayBuffer();
+worker.postMessage({ id: 1, buf }, [buf]);
+worker.onmessage = (e) => render(e.data.rows);
 ```
 
-通信成本是关键：结构化克隆复制数据，10MB 对象传一次可能几十毫秒。**用 `Transferable`（ArrayBuffer/ImageBitmap）或 `SharedArrayBuffer` 才能真省。**
+```js
+// parse.worker.js
+self.onmessage = (e) => {
+  const { id, buf } = e.data;
+  const text = new TextDecoder().decode(buf);
+  const rows = JSON.parse(text);
+  self.postMessage({ id, rows }); // rows 会被结构化克隆（有成本）
+};
+```
 
-详见 10 篇。
+通信成本是关键：
+
+| 传输方式 | 成本 | 适用 |
+| --- | --- | --- |
+| 结构化克隆（普通对象） | 深拷贝，10MB 可能几十 ms | 小对象 |
+| `Transferable`（`ArrayBuffer`、`ImageBitmap`） | 零拷贝，所有权转移 | 大二进制 |
+| `SharedArrayBuffer` | 共享内存，需 COOP/COEP 跨源隔离 | 高频共享状态 |
+
+**Worker 用了反而更慢**，九成是把大对象来回克隆。先量"计算耗时"和"传输耗时"，再决定要不要上。
 
 ---
 
-## 常见坑
+## 8. 动画：为什么有的流畅有的卡
+
+| 做法 | 每帧动作 | 结果 |
+| --- | --- | --- |
+| `setInterval(fn, 16)` 改 `left` | 定时器 + 布局 + 绘制 | 抖动、掉帧 |
+| `requestAnimationFrame` 改 `left` | 布局 + 绘制 | 一般 |
+| `rAF` + `transform` | 仅合成 | 流畅 |
+| CSS `transition: transform` | 合成线程处理 | 最省主线程 |
+
+```js
+// ✅ rAF + transform
+function animate(el, to) {
+  const t0 = performance.now();
+  const from = el.getBoundingClientRect().left;
+
+  const step = (now) => {
+    const p = Math.min(1, (now - t0) / 300);
+    const x = from + (to - from) * p;
+    el.style.transform = `translateX(${x}px)`;
+    if (p < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+```
+
+`will-change` 要"用完即撤"（02 篇已算过显存账）：常驻的 `will-change` 等于常驻一张 GPU 纹理。
+
+---
+
+## 9. 常见坑
 
 | 现象 | 根因 | 解法 |
 | --- | --- | --- |
@@ -148,26 +361,34 @@ worker.onmessage = (e) => render(e.data);
 | 切换页面越用越卡 | 监听/定时器未清理 | 卸载清理，Heap snapshot 验证 |
 | 图表页打开就卡 1s | 图表库在首屏同步 import | 动态导入 + 骨架屏 |
 | 优化后仍卡 | 改的是渲染量，瓶颈是同步布局 | 用 Performance 找 Layout/Recalculate Style |
-| Worker 用了反而更慢 | 传了大对象（结构化克隆） | 用 Transferable 或改小传输量 |
+| Worker 用了反而更慢 | 传了大对象（结构化克隆） | `Transferable` 或减小传输量 |
+| 分批后总耗时变长 | 每批预算太小 / 调度太频繁 | 调到 8–12ms 一批，别每 10 条切一次 |
+| 内存一直涨但不崩 | 泄漏，且被 GC 前的碎片掩盖 | 反复操作 5 次以上再拍快照对比 |
 
 ---
 
-## 验收清单
+## 10. 验收清单
 
-- [ ] 能在 Performance 面板里数出一次交互里有几个 >50ms 的任务
+- [ ] 能在 Performance 面板里数出一次交互里有几个 >50ms 的任务，并说出时间花在 JS/样式/布局哪一类
 - [ ] 长列表（>200 项）有虚拟滚动或 `content-visibility`
 - [ ] 输入/搜索类交互有防抖，且没有"整棵树重渲"
-- [ ] 组件卸载时清理了定时器、监听、订阅
-- [ ] 能用 Heap snapshot 判断"是否泄漏"（有没有 detached DOM）
-- [ ] CPU 密集任务（>50ms 且不碰 DOM）已移到 Worker
+- [ ] 大批量 DOM 操作做了分批或让出主线程
+- [ ] 组件卸载时清理了定时器、监听、订阅（用 `AbortController` 或清理函数）
+- [ ] 能用 Heap snapshot 判断"是否泄漏"（detached DOM 接近 0）
+- [ ] CPU 密集任务（>50ms 且不碰 DOM）已移到 Worker，且用上了 `Transferable`
+- [ ] 动画全部走 `transform/opacity`，没有 `setInterval` 驱动
 
 ---
 
-## 练习
+## 11. 练习
 
 1. **数一次长任务**：给一个 1000 行的表格打点，用 Performance 录制首次渲染，数出长任务个数与总时长。  
-   *自检*：能给出"共 3 个长任务、合计 620ms"这类数字。
-2. **做一次分批**：把上面的渲染改成每 200 行 `await yield()`，再测 INP 与总时长。  
+   *自检*：能给出"共 3 个长任务、合计 620ms"这类数字，并指出每个任务在做什么。
+2. **做一次分批**：把首次渲染改成每 8ms 让出一次，再测 INP 与总时长。  
    *自检*：总时长可能没降，但**首帧与交互响应明显变快**——能解释这个反差。
-3. **抓一次泄漏**：写一个每次路由切换都 `addEventListener` 而不移除的组件，切换 5 次后拍 Heap snapshot，看监听器与 detached 节点增长。  
-   *自检*：能定位到具体是哪个监听没清理。
+3. **实现一次虚拟滚动**：用第 3 节的代码渲染 10000 行，对比不虚拟化时的 DOM 节点数与滚动帧率。  
+   *自检*：能说出"DOM 从 10000 降到约 15"以及滚动时 `Layout` 次数变化。
+4. **抓一次泄漏**：写一个每次路由切换都 `addEventListener` 而不移除的组件，切换 5 次后拍 Heap snapshot，看监听器与 detached 节点增长。  
+   *自检*：能定位到具体是哪个监听没清理，并用 `AbortController` 修好。
+5. **量一次 Worker 的传输成本**：分别用结构化克隆与 `Transferable` 传 20MB `ArrayBuffer`，比较 `postMessage` 前后耗时。  
+   *自检*：能给出两个数字，并说明 `Transferable` 为什么是零拷贝。

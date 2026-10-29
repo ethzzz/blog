@@ -1,130 +1,312 @@
 ---
 title: '11 · 首屏优化实战（LCP 四段拆解）'
 published: 2026-10-26T13:00:00+08:00
-description: '把 LCP 拆成 TTFB / 资源加载延迟 / 资源加载时长 / 元素渲染延迟四段，逐段对症；给一个真实的 4.2s → 1.8s 案例，每一步改了什么、降了多少。'
+description: '把 LCP 拆成 TTFB / 资源加载延迟 / 资源加载时长 / 元素渲染延迟四段，附一段能直接算出四段的代码、按段对症的动作清单，以及一个真实的 4.2s → 1.8s 案例。'
 tags: [浏览器, LCP, 首屏优化, 性能实战, CoreWebVitals]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 别再"优化首屏"，先拆开它
+> [!NOTE]
+> "优化首屏"是个伪命题——LCP 是四段耗时相加的结果，每段的对策完全不同。**不分段就动手，八成在优化不痛的那一段。** 这篇的核心就是那段把四段算出来的代码。
 
-LCP 是一个合成结果，四段耗时相加：
+---
+
+## 1. 先拆开它
 
 ```text
-TTFB            资源加载延迟        资源加载时长        元素渲染延迟
+TTFB            资源加载延迟          资源加载时长          元素渲染延迟
 [服务器响应]  →  [发现资源的时间]  →  [下载完的时间]  →  [画到屏幕]
+     ↑                 ↑                   ↑                  ↑
+  CDN/缓存      preload/fetchpriority    格式/尺寸/压缩      字体/长任务/阻塞
 ```
-
-每一段的对策完全不同。**不分段就动手，80% 是在优化不痛的那一段。**
 
 | 段 | 怎么测 | 对策 |
 | --- | --- | --- |
-| TTFB | Network 里首个字节时间；或 `responseStart - requestStart` | CDN、服务端缓存、减少重定向、流式 SSR |
-| 资源加载延迟 | LCP 元素是 `<img>` 时：`loadTime - startTime` 与 HTML 解析时间差 | `preload`、`fetchpriority=high`、别 lazy、别让它被 CSS/JS 挡住 |
-| 资源加载时长 | 资源 `duration` | 换格式（AVIF）、压尺寸、CDN、Brotli |
-| 元素渲染延迟 | 资源到位到 LCP 上报之间的差 | 减少阻塞 CSS/字体、避免长任务 |
+| TTFB | `navigation.responseStart` | CDN、服务端缓存、减少重定向、流式 SSR |
+| 资源加载延迟 | 资源 `startTime` − HTML 可用时间 | `preload`、`fetchpriority=high`、别 lazy、别被 CSS/JS 挡住 |
+| 资源加载时长 | 资源 `responseEnd − startTime` | 换格式（AVIF）、压尺寸、CDN、Brotli |
+| 元素渲染延迟 | LCP 时间 − 资源可用时间 | 减少阻塞 CSS/字体、避免长任务、别做二次布局 |
+
+判读经验（不是硬标准，但很好用）：
+
+- **TTFB > 800ms** → 先查服务端与网络，别急着改前端；
+- **加载延迟 > LCP 的 10%** → 资源被"发现得太晚"，preload / 优先级问题；
+- **加载时长占大头** → 纯粹是体积问题，换格式、压尺寸；
+- **渲染延迟 > LCP 的 10%** → 资源早就到了但画不出来，查字体、阻塞 JS、长任务。
 
 ---
 
-## 一个真实案例：4.2s → 1.8s
+## 2. 一段能直接算出四段的代码
 
-背景：内容型页面，移动端 4G 限速，hero 图是 LCP 元素，P75 LCP = 4.2s。
+```js
+// 粘到 Console 或埋点脚本里，页面加载完后执行
+function reportLcpBreakdown() {
+  new PerformanceObserver((list) => {
+    const lcp = list.getEntries().at(-1);
+    if (!lcp) return;
 
-| 步骤 | 改了什么 | LCP | 差值 |
-| --- | --- | --- | --- |
-| 基线 | — | 4.2s | — |
-| 1 | `index.html` 从 `max-age=600` 改成 `no-cache`（拿掉旧 HTML 导致的二次请求） | 3.9s | -0.3s |
-| 2 | hero 图 480KB JPEG → 160KB AVIF（尺寸按 DPR 出图） | 3.3s | -0.6s |
-| 3 | hero 图去掉 `loading="lazy"`，加 `fetchpriority="high"` + `<link rel=preload>` | 2.6s | -0.7s |
-| 4 | 中文字体 6MB → 280KB 子集 + `font-display: swap` | 2.2s | -0.4s |
-| 5 | 首屏 JS 从 310KB(gz) 砍到 145KB（图表/编辑器改动态导入） | 2.0s | -0.2s |
-| 6 | TTFB 320ms → 90ms（上 CDN + 服务端缓存） | **1.8s** | -0.2s |
+    const nav = performance.getEntriesByType('navigation')[0];
+    const res = lcp.url
+      ? performance.getEntriesByName(lcp.url, 'resource')[0]
+      : null;
 
-关键点：**第 2、3 步合计贡献 1.3s，占全部收益的一半以上**——它们都作用在"资源加载"这一段。如果一开始就去优化 JS（很多人第一反应），只能拿到 0.2s。
+    const ttfb = nav.responseStart;
+    const resourceStart = res?.startTime ?? nav.responseEnd;
+    const resourceEnd = res?.responseEnd ?? nav.responseEnd;
+    const renderEnd = lcp.renderTime || lcp.startTime;
+
+    console.table({
+      LCP: Math.round(renderEnd),
+      TTFB: Math.round(ttfb),
+      加载延迟: Math.round(resourceStart - nav.responseEnd),
+      加载时长: Math.round(resourceEnd - resourceStart),
+      渲染延迟: Math.round(renderEnd - resourceEnd),
+      元素: lcp.element?.tagName ?? 'unknown',
+      资源: lcp.url || '(文本，无资源)',
+    });
+  }).observe({ type: 'largest-contentful-paint', buffered: true });
+}
+
+reportLcpBreakdown();
+```
+
+几点说明：
+
+- **`lcp.element` 很关键**：你以为的 LCP 元素可能不是真正的 LCP 元素（标题文字常常比图片更大）；
+- **文本型 LCP 没有 `url`**，此时"加载延迟/时长"为 0，收益全在 TTFB 与渲染延迟；
+- **`renderTime` 可能为 0**（跨域图片且没配 `Timing-Allow-Origin`），此时退化为 `startTime`，四段会略有偏差。
+
+真实输出长这样：
+
+```text
+┌──────────┬───────┐
+│ LCP      │ 4200  │
+│ TTFB     │ 320   │
+│ 加载延迟  │ 900   │   ← 图片被 CSS 挡住，很晚才发现
+│ 加载时长  │ 1800  │   ← 480KB JPEG 在 4G 上下载
+│ 渲染延迟  │ 1180  │   ← 字体阻塞 + 首屏长任务
+│ 元素      │ IMG   │
+└──────────┴───────┘
+```
+
+一眼就能看出：**加载延迟 900ms 和渲染延迟 1180ms 都异常大**，只换图片格式最多拿到 1.8s，剩下的必须靠"提前发现"和"减少渲染阻塞"。
 
 ---
 
-## 四段的通用动作清单
+## 3. 一个真实案例：4.2s → 1.8s
 
-### TTFB
+背景：内容型页面，移动端 4G 限速，hero 图是 LCP 元素，P75 LCP = 4.2s，四段拆解如上。
 
-- 静态资源上 CDN，HTML 走边缘缓存；
-- 服务端渲染首屏（SSR/SSG），别让前端等接口再渲染；
-- 去掉多余重定向（`http→https`、`/→/index`、域名跳转）；
-- 数据库慢查询（这是最常见的隐藏原因）。
+| 步骤 | 改了什么 | LCP | 差值 | 作用在哪段 |
+| --- | --- | --- | --- | --- |
+| 基线 | — | 4.2s | — | — |
+| 1 | `index.html` 从 `max-age=600` 改成 `no-cache`（避免拿旧 HTML 再二次请求） | 3.9s | −0.3s | TTFB / 加载延迟 |
+| 2 | hero 图 480KB JPEG → 160KB AVIF（按 DPR 出图） | 3.3s | −0.6s | 加载时长 |
+| 3 | 去掉 `loading="lazy"`，加 `fetchpriority="high"` + `<link rel=preload>` | 2.6s | −0.7s | 加载延迟 |
+| 4 | 中文字体 6MB → 280KB 子集 + `font-display: swap` | 2.2s | −0.4s | 渲染延迟 |
+| 5 | 首屏 JS 310KB(gz) → 145KB（图表/编辑器改动态导入） | 2.0s | −0.2s | 渲染延迟 |
+| 6 | TTFB 320ms → 90ms（CDN + 服务端缓存） | **1.8s** | −0.2s | TTFB |
 
-### 资源加载延迟（最容易忽略的一段）
+关键点：**第 2、3 步合计 1.3s，占全部收益的一半以上**，它们都作用在"资源加载"。如果一开始就去优化 JS（很多人的第一反应），只能拿到 0.2s。
 
-- LCP 元素是图片：**必须**有 `fetchpriority="high"`，且不能 `loading="lazy"`；
-- 用 `<link rel="preload">` 提前发现（只给这一个）；
+第 1 步值得单独解释：HTML 被缓存 10 分钟，导致用户拿到的是**上一版的 HTML**，里面引用的旧资源 404，浏览器重试/回退又多花了一轮。这类问题在指标上表现为"TTFB 与加载延迟同时偏大"，很容易被误判成"服务器慢"。
+
+---
+
+## 4. 按段对症的动作清单
+
+### 4.1 TTFB（目标 < 800ms）
+
+```text
+□ 静态 HTML 上 CDN / 边缘缓存
+□ 服务端首屏渲染（SSR/SSG），别让前端等接口再渲染
+□ 去掉多余重定向（http→https、/→/index、域名跳转）
+□ 查数据库慢查询（最常见的隐藏原因）
+□ 接口串行 → 并行 / 预取
+```
+
+验证：`curl -w` 看各阶段耗时，或 Network 里的 `Waiting for server response`。
+
+```bash
+curl -o /dev/null -s -w \
+  "dns:%{time_namelookup} connect:%{time_connect} tls:%{time_appconnect} ttfb:%{time_starttransfer}\n" \
+  https://example.com/
+```
+
+### 4.2 资源加载延迟（最容易忽略）
+
+- LCP 元素是图片：**必须** `fetchpriority="high"`，且**不能** `loading="lazy"`；
+- 用 `<link rel="preload" as="image">` 提前发现（只给这一个）；
 - 确认它没被大 CSS 挡住（CSS 阻塞渲染，也推迟图片发现）；
 - 不要在 `<head>` 塞同步脚本。
 
-### 资源加载时长
+```html
+<link rel="preload" as="image" href="/img/hero.avif" fetchpriority="high">
+<img src="/img/hero.avif" width="1600" height="900" alt="" fetchpriority="high" decoding="async">
+```
 
-- 图片格式与尺寸（`srcset` 按 DPR 出图）；
+### 4.3 资源加载时长
+
+- 格式与尺寸（`srcset` 按 DPR 出图）；
 - 字体子集化；
 - 压缩（Brotli）+ HTTP/2；
-- 减少首屏请求数里的"大块头"。
+- 减少首屏请求里的"大块头"。
 
-### 元素渲染延迟
+### 4.4 元素渲染延迟
 
-- 字体阻塞（`font-display: swap`）；
+- 字体阻塞（`font-display: swap/optional` + preload）；
 - 首屏 JS 里不要有长任务（>50ms 会推迟绘制）；
-- 避免"先渲染骨架再替换"造成的二次布局（会推后 LCP）。
+- 避免"骨架屏 → 真实内容"的二次布局（会把 LCP 推后）；
+- 避免首屏同步请求接口（SSR 直接出内容）。
 
 ---
 
-## 怎么确认"改对了"
+### 4.5 字体常常是"渲染延迟"的主因
 
-**一次只改一项，改完立刻量**。用同一条件：
+如果 LCP 元素是**文字**（标题、大段正文），而四段里"渲染延迟"特别大，八成是字体：
 
-```bash
-# 固定条件：4G 限速 + CPU 4x 降速 + 清缓存，跑 5 次取中位数
+- 自定义字体没下载完，浏览器在 `block` 期内**不画文字**（最多约 3 秒）；
+- 字体在 CSS 最深处才被发现，等 CSSOM 建完、匹配到 `@font-face` 才开始下载；
+- 中文字体动辄几 MB，4G 下下载就要 1 秒以上。
+
+三件事一起做：
+
+```html
+<!-- ① 提前发现：只 preload 首屏用到的那一个字重 -->
+<link rel="preload" as="font" type="font/woff2" href="/fonts/app-bold.woff2" crossorigin>
+```
+
+```css
+/* ② 不阻塞首次绘制：先系统字体，字体到了再换 */
+@font-face {
+  font-family: 'App';
+  src: url('/fonts/app-bold.woff2') format('woff2');
+  font-display: swap;
+  unicode-range: U+4E00-9FFF, U+0000-00FF; /* 只对用到的字符集生效 */
+  size-adjust: 96%;                        /* 减少切换时的尺寸跳变 */
+}
 ```
 
 ```js
-// 用 PerformanceObserver 精确记录 LCP 与元素
-new PerformanceObserver((list) => {
-  const last = list.getEntries().at(-1);
-  console.log('LCP', Math.round(last.startTime), 'ms', last.element?.tagName, last.url);
-}).observe({ type: 'largest-contentful-paint', buffered: true });
+// ③ 量一下字体到底拖了多久
+const t0 = performance.now();
+document.fonts.ready.then(() => {
+  console.log('字体就绪', Math.round(performance.now() - t0), 'ms');
+});
 ```
 
-`last.element` 很有用：**你以为的 LCP 元素可能不是真正的 LCP 元素**（比如标题比图更大）。
+判断标准：如果 `document.fonts.ready` 的时间**接近或超过 LCP**，字体就是瓶颈；如果远小于 LCP，别在字体上浪费时间。
 
 ---
 
-## 常见坑
+## 5. 怎么确认你找对了元素
+
+```js
+// 除了 LCP，还可以给"你认为重要的元素"打标记，单独量
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) {
+    console.log('element timing', e.identifier, Math.round(e.renderTime), e.element?.tagName);
+  }
+}).observe({ type: 'element', buffered: true });
+```
+
+```html
+<!-- 打上 elementtiming 属性即可被上面的 observer 捕获 -->
+<img src="/hero.avif" elementtiming="hero" alt="" width="1600" height="900">
+<h1 elementtiming="h1">标题</h1>
+```
+
+用途：当 LCP 元素是你不关心的东西（比如一个大 logo），而真正的内容在下面时，可以用 `elementtiming` 建立自己的"业务首屏"指标。
+
+---
+
+## 6. 怎么量才可信
+
+```text
+固定条件：
+□ DevTools Network → Slow 4G（或自定义 1.6Mbps / 150ms RTT）
+□ Performance → CPU 4x slowdown
+□ 清空缓存（或每次用无痕窗口）
+□ 跑 5 次，取中位数（不要取最好的一次）
+□ 只改一个变量，改完立刻复测
+```
+
+一段可以重复跑的测量脚本（Puppeteer 伪代码）：
+
+```js
+// 固定环境 + 取 5 次中位数
+const results = [];
+for (let i = 0; i < 5; i++) {
+  const page = await browser.newPage();
+  const client = await page.createCDPSession();
+  await client.send('Network.emulateNetworkConditions', {
+    offline: false,
+    latency: 150,
+    downloadThroughput: (1.6 * 1024 * 1024) / 8,
+    uploadThroughput: (750 * 1024) / 8,
+  });
+  await client.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+  await page.goto(url, { waitUntil: 'load' });
+  const lcp = await page.evaluate(() => window.__lcp ?? 0);
+  results.push(lcp);
+  await page.close();
+}
+results.sort((a, b) => a - b);
+console.log('LCP 中位数', Math.round(results[2]));
+```
+
+单次测量的噪声可以到 ±300ms，**不取中位数的结论基本不可信**。
+
+### 6.1 四个常见的测量误差来源
+
+| 来源 | 表现 | 规避 |
+| --- | --- | --- |
+| 冷/热缓存混用 | 第二次跑总是快很多 | 每次新开无痕上下文，或统一清缓存 |
+| bfcache 恢复 | 返回页面时指标异常小/缺失 | 用 `pageshow.persisted` 判断并重采 |
+| 第三方脚本抖动 | 同一版本时快时慢 | 多跑几次，或临时屏蔽第三方再测 |
+| 服务端波动（CDN/DB） | TTFB 上下浮动几百毫秒 | 同时记录 TTFB，把前后端波动分开 |
+
+一个容易忽略的点：**优化前后不在同一时段测**，服务端负载本身就可能带来几百毫秒差异。所以最好同一天、同一网络、交替跑 A/B 两组。
+
+---
+
+## 7. 常见坑
 
 | 现象 | 根因 | 解法 |
 | --- | --- | --- |
 | 优化了 JS 但 LCP 没动 | LCP 元素与 JS 无关 | 先看 `last.element` 是什么 |
 | 首屏图加了 lazy | 浏览器延迟发现 | 去掉 lazy + `fetchpriority=high` |
 | 加了 preload 没用 | 元素不是 LCP，或 preload 被低优先级挤掉 | 用 `last.element` 确认 |
+| 四段加起来不等于 LCP | `renderTime` 为 0（跨域图片）或统计口径不同 | 配 `Timing-Allow-Origin`，或接受误差 |
 | Lighthouse 分数高、线上差 | 模拟环境太乐观 | 用 RUM 的 P75 判断 |
-| 骨架屏让 LCP 变差 | 骨架先绘制、真实内容后到 | 骨架尺寸与内容一致，或直接服务端渲染内容 |
+| 骨架屏让 LCP 变差 | 骨架先绘制、真实内容后到 | 骨架尺寸与内容一致，或直接 SSR 出内容 |
 | 改完指标波动大 | 单次测量噪声 | 固定环境跑 5 次取中位 |
+| 图片优化后 LCP 反而晚 | 图片变小后不再是 LCP，文字成了新 LCP | 重新看 `last.element` |
 
 ---
 
-## 验收清单
+## 8. 验收清单
 
 - [ ] 能说出自己页面 LCP 元素的标签与 URL
 - [ ] 把 LCP 拆成四段，并指出当前最耗时的一段
 - [ ] 首屏图有 `fetchpriority="high"`、没有 lazy、有 preload
-- [ ] 字体做了子集化 + `font-display: swap`
-- [ ] 有一张"改前/改后"的表格，每行标注改了什么、降了多少
-- [ ] 每次只改一项，测量条件固定（限速 + 降 CPU + 清缓存）
+- [ ] 字体做了子集化 + 合适的 `font-display`
+- [ ] 有一张"改前/改后"的表格，每行标注改了什么、降了多少、作用在哪段
+- [ ] 每次只改一项，测量条件固定（限速 + 降 CPU + 清缓存 + 5 次中位）
+- [ ] 知道 `renderTime` 为 0 时该怎么处理
 
 ---
 
-## 练习
+## 9. 练习
 
-1. **找出真正的 LCP 元素**：用上面的 observer 打印 `element.tagName` 与 `url`，对比你原本以为的那个。  
+1. **找出真正的 LCP 元素**：用第 2 节的代码打印 `element.tagName` 与 `url`，对比你原本以为的那个。  
    *自检*：如果两者不一致，说明你之前优化错了对象。
-2. **做一次四段拆解**：在 Network 里算 TTFB、资源发现延迟、下载时长、渲染延迟四个数，加起来接近 LCP。  
+2. **做一次四段拆解**：算出 TTFB、加载延迟、加载时长、渲染延迟四个数，加起来接近 LCP。  
    *自检*：能指出最大的一段，并说出对应的一条手段。
 3. **单变量验证**：只把首屏图换成 AVIF（其它不动），跑 5 次对比。  
    *自检*：给出体积变化与 LCP 变化两个数字；若 LCP 没动，解释原因（可能不是 LCP 元素）。
+4. **复现一次"HTML 被缓存"**：给 HTML 设 `max-age=600` 后发版，观察首屏多出来的请求与 TTFB。  
+   *自检*：能说出为什么它同时拉高了"TTFB"和"加载延迟"。
+5. **给自己的页面建四段基线**：把四段数字填进表格，作为后续每次改动的对照。  
+   *自检*：能明确"下一次改哪个段、预期降多少"。

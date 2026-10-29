@@ -1,7 +1,7 @@
 ---
 title: '浏览器与性能 · 路线总览'
 published: 2026-09-30T08:00:00+08:00
-description: '浏览器与性能学习路线总览：按 L1 浏览器怎么工作 / L2 慢与白屏 / L3 性能工程 三层组织 13 篇，给出「做到什么算过」的五条尺子和四类起点的读法。'
+description: '浏览器与性能学习路线总览：L1 怎么工作 / L2 为什么慢 / L3 性能工程 三层组织 13 篇，给出五条「做到什么算过」的尺子、四类起点的读法、症状速查表，以及一段可直接粘到 Console 的首屏体检脚本。'
 tags: [浏览器, 性能优化, 学习路线, CoreWebVitals, 渲染]
 category: 浏览器与性能学习路线
 draft: false
@@ -24,6 +24,16 @@ draft: false
 5. **能给"改前/改后"两组数字**：没有数字的优化等于没做。
 
 第 2 条区分"看过文章"和"排查过问题"；第 5 条区分"感觉快了"和"真的快了"。
+
+每条尺子对应一个可交付物，别用"我读完了"当验收：
+
+| 尺子 | 交付物 | 判定标准 |
+| --- | --- | --- |
+| 关键路径 | 一张箭头图（HTML → CSS → JS → 图片/字体） | 能指出至少一处可打破的串行 |
+| 卡顿定位 | 一条 Trace + 函数名 | 能说出"这 180ms 花在哪个函数" |
+| CLS | 一份偏移来源清单 | 每一处都能对应到"图片/字体/插入/骨架/动画"五类之一 |
+| LCP | 四段数字表 | 四段相加接近 LCP，且能指出最大的一段 |
+| 改前改后 | 一张对照表 | 每次改动只有一行，且有数字 |
 
 ---
 
@@ -64,21 +74,21 @@ draft: false
 **目标：把"玄学"变成机制。**
 
 - **01 进程模型与渲染流水线**：为什么一个 tab 崩了不影响别的、主线程到底在忙什么、CSS/JS 为什么会阻塞渲染。
-- **02 重排、重绘与合成层**：改 `width` 和改 `transform` 的代价差在哪；`will-change` 用错反而更慢。
+- **02 重排、重绘与合成层**：改 `width` 和改 `transform` 的代价差在哪；`will-change` 用错反而更慢；强制同步布局怎么把 1ms 变成 60ms。
 - **03 事件机制**：捕获/冒泡、事件委托的边界（哪些事件不冒泡）、`passive` 与滚动卡顿、中文输入法的 composition。
-- **04 存储**：cookie / localStorage / IndexedDB 的容量与阻塞差别；`localStorage` 为什么能卡住主线程。
-- **05 网络与 HTTP 缓存**：强缓存 vs 协商缓存、`immutable` 与 `index.html` 必须配对、HTTP/2 之后"合并请求"为什么不再必要。
+- **04 存储**：cookie / localStorage / IndexedDB 的容量与阻塞差别；`localStorage` 为什么能卡住主线程；cookie 的 `SameSite` 怎么决定登录态。
+- **05 网络与 HTTP 缓存**：强缓存 vs 协商缓存、`immutable` 与 `index.html` 必须配对、`Vary: Origin` 怎么导致缓存串号、HTTP/2 之后"合并请求"为什么不再必要。
 
-> 读法：01→02 必读且连读（渲染是性能的地基）；03/04/05 按你手上问题挑，都不长。
+> 读法：01→02 必读且连读（渲染是性能的地基）；03/04/05 按你手上问题挑。
 
 ---
 
 ## L2：为什么慢（06–09）
 
 - **06 跨域与安全**：CORS 预检为什么有时不发、`SameSite` 怎么影响登录、XSS/CSRF 的真实攻击面。**这一篇看着不像性能，但它决定"能不能安全地用 CDN 与第三方脚本"**。
-- **07 性能指标与测量**：LCP / INP / CLS / TTFB 各测什么、实验室与真实用户的差别、为什么只看 P75。
+- **07 性能指标与测量**：LCP / INP / CLS / TTFB 各测什么、实验室与真实用户的差别、为什么只看 P75、INP 三段怎么拆。
 - **08 加载性能**：瀑布图怎么读、`preload` 用错反而更慢、图片与字体的正确姿势。
-- **09 运行时性能**：long task 的 50ms 阈值、INP 拆解（输入延迟 / 处理 / 呈现）、内存泄漏四类。
+- **09 运行时性能**：long task 的 50ms 阈值、虚拟滚动、分批让出主线程、内存泄漏四类。
 
 > 读法：07 先读（没有指标就没有方向），再按症状选 08（首屏慢）或 09（点了卡）。
 
@@ -87,10 +97,89 @@ draft: false
 ## L3：性能工程（10–12）
 
 - **10 Web Workers**：什么时候真的需要多线程、通信成本（结构化克隆 vs Transferable）、哪些任务搬过去没意义。
-- **11 首屏优化实战**：把 LCP 拆成四段逐段对症；一个完整 case 的数字，从 4.2s 到 1.8s 每一步改了什么。
+- **11 首屏优化实战**：把 LCP 拆成四段逐段对症；一段能直接算出四段的代码；从 4.2s 到 1.8s 每一步改了什么。
 - **12 毕业项目**：给一个故意很慢的页面做优化，交"改前/改后"表 + 预算 + 监控。
 
 > 读法：10 按需（有 CPU 密集型任务才看）；11 必读；12 留一整块时间做。
+
+---
+
+## 症状速查：先看哪一篇
+
+| 你遇到的现象 | 先看 | 再去 |
+| --- | --- | --- |
+| 页面白屏几百毫秒到几秒 | 01（阻塞资源）→ 11（四段拆解） | 08 图片/字体 |
+| 点按钮没反应 / 输入卡顿 | 09（长任务）→ 07（INP 三段） | 02 强制布局、10 Worker |
+| 滚动列表卡 | 02（重排）→ 09（虚拟滚动） | 03 passive、10 Worker |
+| 页面会"跳一下" | 02（CLS 来源）→ 08（尺寸/字体） | 11 渲染延迟 |
+| 发版后用户看到旧页面/白屏 | 05（HTML 缓存 + hash 配对） | 工程化 13 回滚 |
+| 跨域请求偶尔失败 | 06（CORS + `Vary`） | 04 cookie 属性 |
+| 内存越用越大、低端机闪退 | 09（泄漏四类）→ 02（合成层显存） | — |
+| 首屏指标好但用户说慢 | 07（RUM / P75） | 11 真实元素确认 |
+
+---
+
+## 一段可直接粘到 Console 的首屏体检
+
+跑完能一次拿到"主要指标 + 资源构成 + LCP 元素"，够你判断该往哪一层查：
+
+```js
+(async () => {
+  const nav = performance.getEntriesByType('navigation')[0];
+  const paint = performance.getEntriesByType('paint');
+  const res = performance.getEntriesByType('resource');
+
+  const fcp = paint.find((p) => p.name === 'first-contentful-paint')?.startTime ?? 0;
+
+  // 按类型汇总传输体积（只统计有 transferSize 的，跨域资源可能为 0）
+  const byType = {};
+  for (const r of res) {
+    const t = r.initiatorType || 'other';
+    byType[t] ??= { count: 0, kb: 0 };
+    byType[t].count += 1;
+    byType[t].kb += (r.transferSize || 0) / 1024;
+  }
+
+  // 阻塞类资源：同步脚本 + 样式表
+  const blockingScripts = [...document.scripts].filter(
+    (s) => s.src && !s.defer && !s.async && s.type !== 'module',
+  ).length;
+  const stylesheets = [...document.styleSheets].length;
+
+  const lcp = await new Promise((resolve) => {
+    let last = null;
+    new PerformanceObserver((list) => {
+      last = list.getEntries().at(-1);
+    }).observe({ type: 'largest-contentful-paint', buffered: true });
+    // 给 observer 一帧时间把 buffered 条目吐出来
+    requestAnimationFrame(() => setTimeout(() => resolve(last), 0));
+  });
+
+  console.table({
+    TTFB: Math.round(nav.responseStart),
+    FCP: Math.round(fcp),
+    'DOMContentLoaded': Math.round(nav.domContentLoadedEventEnd),
+    Load: Math.round(nav.loadEventEnd),
+    'LCP(ms)': lcp ? Math.round(lcp.renderTime || lcp.startTime) : '-',
+    'LCP 元素': lcp?.element?.tagName ?? '-',
+    '阻塞脚本数': blockingScripts,
+    '样式表数': stylesheets,
+  });
+
+  console.table(
+    Object.fromEntries(
+      Object.entries(byType).map(([k, v]) => [k, { 数量: v.count, KB: Math.round(v.kb) }]),
+    ),
+  );
+})();
+```
+
+读法：
+
+- **阻塞脚本数 > 0** → 先看 01 篇的 `defer/async`，再看 11 篇的渲染延迟；
+- **样式表数很多 / 某个 CSS 很大** → 05 篇与 08 篇的关键 CSS；
+- **`img` 的 KB 占一半以上** → 08 篇的格式与尺寸；
+- **LCP 元素不是你预期的那个** → 先确认对象，别急着优化。
 
 ---
 
@@ -105,11 +194,36 @@ draft: false
 
 ---
 
+## 四周节奏（可选）
+
+| 周 | 做什么 | 周末验收 |
+| --- | --- | --- |
+| 第 1 周 | 01 / 02 / 03 | 能在自己的项目里指出一次强制布局与一次合成层滥用 |
+| 第 2 周 | 04 / 05 / 06 | 能给项目的 HTML/资源/接口写出正确的缓存头，并跑通跨域带 cookie |
+| 第 3 周 | 07 / 08 | 有 RUM P75 基线，且首屏 LCP 降了至少 20% |
+| 第 4 周 | 09 / 10 / 11 | 一次交互 INP 降到 200ms 以内，并交出四段拆解表 |
+
+---
+
 ## 我踩过最贵的三个坑
 
 - **用 `localStorage` 存了一个 2MB 的缓存对象**：每次读都同步解析，首屏白屏 800ms，最后换 IndexedDB。
 - **给所有元素加 `will-change: transform`**：图层爆炸，内存涨到 1.2G，低端机直接崩。
 - **把 `preload` 当银弹**：给 8 个资源都加了 `preload`，结果关键 CSS 的带宽被抢，LCP 反而慢了 0.4s。
+
+---
+
+## 工具清单
+
+| 目的 | 工具 | 备注 |
+| --- | --- | --- |
+| 看主线程时间花在哪 | DevTools Performance | 最常用，配 4x CPU 降速 |
+| 看资源加载顺序 | DevTools Network | 按 Priority 排序，注意 `Queueing`/`TTFB` |
+| 看合成层与显存 | DevTools → Layers | 层数 > 20 要警惕 |
+| 看指标基线 | Lighthouse | 只代表一种模拟用户 |
+| 看真实用户 | RUM（自建或第三方） | 看 P75，不看均值 |
+| 看内存 | Performance monitor + Heap snapshot | 反复操作 5 次再对比 |
+| 看构建体积 | rollup-plugin-visualizer / webpack-bundle-analyzer | 按 parsed size 排序 |
 
 ---
 

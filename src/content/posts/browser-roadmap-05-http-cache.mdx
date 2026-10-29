@@ -1,163 +1,396 @@
 ---
 title: '05 · 网络与 HTTP 缓存'
 published: 2026-10-26T10:00:00+08:00
-description: '强缓存与协商缓存的组合规则、immutable 必须与 index.html 的 no-cache 配对、preload/prefetch/preconnect 该怎么选，以及 HTTP/2 之后为什么"合并请求"反而拖慢。'
+description: '强缓存与协商缓存的组合规则、no-cache 与 no-store 的真实差别、Vary 与 CDN 缓存错乱的坑、immutable 必须与 index.html 的 no-cache 配对，以及 nginx/Node/SW 三份可直接抄的配置。'
 tags: [浏览器, HTTP缓存, ServiceWorker, 网络, preload]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 缓存分三层，别只记一层
-
-```text
-1. 强缓存（不发请求）        Cache-Control: max-age / immutable
-2. 协商缓存（发请求但可 304）  ETag / If-None-Match、Last-Modified / If-Modified-Since
-3. Service Worker 缓存（可编程）  Cache Storage + 自定义策略
-```
-
-命中顺序：先看强缓存是否新鲜 → 不新鲜就带 `If-None-Match` 问服务端 → 服务端回 304（用本地）或 200（用新的）。
+> [!NOTE]
+> 缓存配错有两种极端：配太松，发布后用户看到旧页面甚至白屏；配太紧，每次访问都重新下载，首屏白白慢一截。这篇把"哪个文件该配哪个头"讲成一张可执行的对照表。
 
 ---
 
-## 强缓存：四种组合的实际效果
+## 1. 缓存分三层，别只记一层
 
-| 响应头 | 行为 |
-| --- | --- |
-| `Cache-Control: no-store` | 完全不缓存（含内存），敏感接口用 |
-| `Cache-Control: no-cache` | **可以存，但每次都要协商**（≠ 不缓存！） |
-| `Cache-Control: max-age=3600` | 1 小时内直接用本地，不发请求 |
-| `Cache-Control: max-age=31536000, immutable` | 一年内不请求，**用户手动刷新也不请求** |
+```text
+1. 强缓存（不发请求）          Cache-Control: max-age / immutable
+2. 协商缓存（发请求，可能 304） ETag / If-None-Match、Last-Modified / If-Modified-Since
+3. Service Worker 缓存（可编程）Cache Storage + 自定义策略
+```
+
+一次请求的完整决策顺序：
+
+```text
+有 Service Worker？
+  ├─ 有 → 先过 fetch 事件里的策略（可能直接返回 Cache Storage）
+  └─ 无 → 查 HTTP 缓存
+          ├─ 强缓存仍新鲜（未超过 max-age）→ 直接用本地，0 请求
+          └─ 已过期 → 带 If-None-Match / If-Modified-Since 回源
+                      ├─ 304 → 用本地副本，只花一个 RTT
+                      └─ 200 → 用新响应，覆盖本地
+```
+
+一条完整报文，把要看的头都标出来：
+
+```http
+HTTP/1.1 200 OK
+Date: Tue, 27 Oct 2026 02:00:00 GMT
+Cache-Control: public, max-age=31536000, immutable
+ETag: "a1b2c3"
+Last-Modified: Mon, 26 Oct 2026 10:00:00 GMT
+Vary: Accept-Encoding          # 注意：跨域接口还要加 Origin
+Age: 120                       # 在 CDN 里已经放了 120 秒
+
+# 过期后的下一次请求
+GET /app.3f2a1c.js
+If-None-Match: "a1b2c3"
+If-Modified-Since: Mon, 26 Oct 2026 10:00:00 GMT
+```
+
+---
+
+## 2. 强缓存：四种组合的实际效果
+
+| 响应头 | 行为 | 典型用途 |
+| --- | --- | --- |
+| `no-store` | 完全不存（内存也不存） | 支付、账单、带个人信息的接口 |
+| `no-cache` | **可以存，但每次使用前都要协商** | `index.html` |
+| `max-age=3600` | 1 小时内直接用本地，不发请求 | 变化不频繁的接口、图片 |
+| `max-age=31536000, immutable` | 一年内不请求，**用户刷新也不回源** | 带内容哈希的 JS/CSS/字体 |
 
 最常见的两个误解：
 
-1. **`no-cache` 不是"不缓存"**，而是"每次验证"。真正的不缓存是 `no-store`。
-2. **`immutable` 意味着连刷新都不回源**，所以只能给**内容变则文件名必变**的资源用（带 hash 的 JS/CSS）。
+1. **`no-cache` 不是"不缓存"**，而是"每次用之前问一句"。真正不缓存的是 `no-store`。
+2. **`immutable` 只对"内容变则文件名必变"的资源安全**。文件名不变的资源加 `immutable`，等于给用户钉死一个旧版本，且刷新都救不回来。
 
-### 配对规则（配错就是白屏）
+还有三个常在面试和排障里出现的指令：
+
+| 指令 | 作用 | 什么时候用 |
+| --- | --- | --- |
+| `must-revalidate` | 过期后**必须**回源验证，不许用过期副本 | 价格、库存这类不能容忍旧值的接口 |
+| `stale-while-revalidate=60` | 过期后 60 秒内先返回旧副本，同时后台更新 | 内容列表、头像——先用旧的不卡，再悄悄换新 |
+| `s-maxage=600` | 只对共享缓存（CDN）生效，覆盖 `max-age` | 想让 CDN 缓存久一点、浏览器短一点 |
+| `private` | 只允许浏览器缓存，CDN 不许存 | 带用户身份但可短暂缓存的响应 |
+
+`stale-while-revalidate` 的收益很直观：用户不用等回源，页面立刻有内容；代价是**第一次打开可能看到上一版**。所以它适合"晚 60 秒无所谓"的内容，不适合余额、订单状态。
+
+### 2.1 配对规则（配错就是白屏）
 
 | 文件 | 策略 | 原因 |
 | --- | --- | --- |
-| `index.html` | `no-cache` | 它是"版本指针"，缓存住就拿不到新的资源引用 |
-| `app.[hash].js/css` | `immutable, max-age=31536000` | 内容变则名变，永久缓存安全 |
+| `index.html` | `no-cache` | 它是"版本指针"，缓存住就拿不到新资源的引用 |
+| `app.[hash].js/css` | `public, max-age=31536000, immutable` | 内容变则名变，永久缓存安全 |
 | 图片/字体（带 hash） | 同上 | 同上 |
-| 接口 JSON | `no-store` 或短 `max-age` | 取决于业务实时性 |
+| 接口 JSON | `no-store` 或短 `max-age` + `must-revalidate` | 取决于业务实时性 |
+| 用户头像等 | `private, max-age=600` | 可缓存但不许 CDN 存 |
 
 > 这套配对和[工程化 13 篇](/blog/posts/engineering-roadmap-13-release-rollback/)的"发布回滚"是同一件事的两面：**HTML 不缓存 + 旧产物保留两个版本**，缺一个就会出现"HTML 是新的、引用的 JS 已经 404"。
 
+### 2.2 nginx 最小可用配置
+
+```nginx
+# 带 hash 的静态资源：永久缓存
+location ~* \.(?:js|css|woff2|png|jpg|jpeg|svg|webp|avif)$ {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    try_files $uri =404;
+}
+
+# HTML：每次协商
+location = /index.html {
+    add_header Cache-Control "no-cache";
+}
+
+# 接口：不缓存
+location /api/ {
+    add_header Cache-Control "no-store";
+    proxy_pass http://127.0.0.1:4400;
+}
+```
+
+一个 nginx 的坑值得单独说：**`add_header` 不会继承**。父级 `server` 块里写了安全头（HSTS、`X-Content-Type-Options`），只要子 `location` 里也写了任意 `add_header`，父级的就全部失效。要么每个 location 重复写，要么用 `add_header ... always` 配合统一片段。
+
+### 2.3 Node/Express 版本
+
+```js
+import express from 'express';
+
+const app = express();
+
+// 静态资源：交给 express.static，注意 immutable 与 maxAge 一起用
+app.use(
+  '/assets',
+  express.static('dist/assets', {
+    maxAge: '1y',
+    immutable: true,
+    etag: true,
+  }),
+);
+
+// API：默认不缓存，个别接口单独放宽
+app.get('/api/tasks', (req, res) => {
+  res.set('Cache-Control', 'private, max-age=30, must-revalidate');
+  res.json(tasks);
+});
+```
+
 ---
 
-## 协商缓存：`ETag` 与 `Last-Modified`
+## 3. 协商缓存：ETag 与 Last-Modified
 
 ```http
 HTTP/1.1 200 OK
 ETag: "v123"
-Last-Modified: Mon, 20 Oct 2026 10:00:00 GMT
+Last-Modified: Mon, 26 Oct 2026 10:00:00 GMT
 
 # 下次请求
 If-None-Match: "v123"
+If-Modified-Since: Mon, 26 Oct 2026 10:00:00 GMT
 ```
 
-服务端判断未变 → 回 `304 Not Modified`（无 body，只有头）。省的是**带宽**，不省往返（仍需一次 RTT）。
+服务端判断未变 → 回 `304 Not Modified`（无 body，只有头）。**省的是带宽，不省往返**——仍然要一个 RTT，所以协商缓存不能替代强缓存。
 
-`ETag` 优于 `Last-Modified`（时间精度到秒，且文件可能"改了内容但时间没变"）。两者都提供时浏览器优先用 `ETag`。
+| 对比 | `ETag` | `Last-Modified` |
+| --- | --- | --- |
+| 精度 | 内容级（可到字节） | 秒级 |
+| 可靠性 | 高 | 文件"改了内容但 mtime 没变"时会漏判 |
+| 生成成本 | 需计算（哈希或 inode+mtime+size） | 几乎为零 |
+| 强弱之分 | `"abc"` 强 / `W/"abc"` 弱 | 无 |
+
+两者都提供时浏览器优先用 `ETag`。`W/` 前缀表示弱校验：语义等价即可（比如压缩前后内容不同但表达相同），适合动态生成的响应。
+
+`ETag` 有两个常见配置错误：
+
+1. **多台机器各算各的 ETag**（用 inode 或内存地址），负载均衡下同一文件返回不同 ETag，缓存永远不命中，304 变成全量 200；
+2. **CDN 改写响应体却沿用源站 ETag**，浏览器拿到的内容和 ETag 不匹配。
+
+修法：用**内容哈希**生成 ETag（构建期算好最强），或直接让 CDN 按内容重算。
 
 ---
 
-## HTTP/2、/3 之后缓存策略变了什么
+## 4. `Vary`：被忽略的"缓存错乱"来源
+
+`Vary` 告诉缓存"这个响应随哪些请求头变化"。漏了它，CDN 会把 A 用户的响应发给 B 用户：
+
+```http
+# 需要吗？取决于 Allow-Origin 是否动态
+Access-Control-Allow-Origin: https://app.example.com
+Vary: Origin          # 必须！否则 CDN 会把这个响应复用到其它 Origin
+```
+
+同样必须 `Vary: Accept-Encoding`，否则可能把 gzip 的内容发给不支持压缩的客户端。
+
+```nginx
+# 动态回源 Origin 时的正确写法
+add_header Vary "Origin, Accept-Encoding";
+```
+
+排查现象：**同一个接口，刷新几次有时带 CORS 头、有时不带**，或者 A 域名的页面偶尔报跨域——先看 CDN 缓存键里有没有 `Origin`。
+
+---
+
+## 5. HTTP/2、/3 之后缓存策略变了什么
 
 | | HTTP/1.1 | HTTP/2 | HTTP/3 |
 | --- | --- | --- | --- |
-| 并发 | 每域 6 个连接 | **单连接多路复用** | 单连接 + QUIC（UDP） |
-| 队头阻塞 | 有（连接级） | 缓解（流级），但 TCP 层仍有 | 基本消除 |
-| 合并请求 | 必要（减少连接数） | **不再必要** | 不必要 |
-| 域名分片 | 常见 | 反而有害（多连接开销） | 有害 |
+| 并发 | 每域约 6 个连接 | **单连接多路复用** | 单连接 + QUIC（UDP） |
+| 队头阻塞 | 有（连接级） | 缓解（流级），TCP 层仍有 | 基本消除 |
+| 头部压缩 | 无 | HPACK | QPACK |
+| 合并请求 | 必要（减少连接数） | 大部分不必要 | 不必要 |
+| 域名分片 | 常见 | 反而有害 | 有害 |
 
-所以老项目里这两个做法该删掉：
+所以老项目里这些做法该删掉：
 
-- **雪碧图 / 大 bundle 合并**：在 HTTP/2 下，拆成多个小文件反而能利用多路复用 + 更精准的缓存。
-- **多域名 CDN 分片**：每个域名都要另建连接与 TLS 握手。
+- **雪碧图**：HTTP/2 下拆开更利于按需加载与独立缓存；
+- **多域名 CDN 分片**：每个域名都要另建连接与 TLS 握手；
+- **所有 JS 打成一个巨型 bundle**：首屏要下完整个包才能执行。
+
+但"拆"也有边界：**几十上百个 1KB 小文件**同样有请求开销与压缩率损失。合理粒度是"按路由 + 按更新频率"拆，不是无限拆。
 
 ---
 
-## 资源提示：preload / prefetch / preconnect
+## 6. 资源提示：preload / prefetch / preconnect
 
 | 指令 | 含义 | 何时用 |
 | --- | --- | --- |
 | `preload` | **当前页面**马上就要用，提前高优下载 | 关键字体、首屏大图、必须的 JS chunk |
 | `prefetch` | **下一个页面**可能用，空闲时低优下载 | 用户大概率会去的下一页 |
 | `preconnect` | 提前建连（DNS + TCP + TLS） | 第三方域（CDN、API） |
-| `dns-prefetch` | 只做 DNS | preconnect 的降级 |
-| `modulepreload` | 预加载 ES 模块并解析依赖 | 关键入口 chunk |
+| `dns-prefetch` | 只做 DNS | `preconnect` 的降级 |
+| `modulepreload` | 预加载 ES 模块，**并解析依赖** | 关键入口 chunk |
+| `fetchpriority` | 调整同一类资源的优先级 | 首屏 hero 图设为 `high` |
 
 ```html
+<!-- 第三方域：提前建连，省掉 DNS+TCP+TLS 的往返 -->
 <link rel="preconnect" href="https://cdn.example.com" crossorigin>
+<link rel="dns-prefetch" href="https://cdn.example.com">
+
+<!-- 关键字体：as 必须是 font，且必须 crossorigin（字体请求永远是 CORS 模式） -->
 <link rel="preload" as="font" type="font/woff2" href="/f/main.woff2" crossorigin>
-<link rel="preload" as="image" href="/img/hero.webp" fetchpriority="high">
+
+<!-- 首屏 hero 图：提高优先级，别 lazy -->
+<link rel="preload" as="image" href="/img/hero.avif" fetchpriority="high">
+
+<!-- 入口模块：会顺带解析依赖图 -->
+<link rel="modulepreload" href="/assets/entry.js">
 ```
 
-**`preload` 误用会反效果**：每个 `preload` 都抢带宽与优先级。把 8 个资源都设成 preload，等于"什么都优先"，结果关键 CSS 反而排队——实测 LCP 会掉 0.3–0.5s。
+三个高频错误：
 
-判断标准：**只 preload"首屏渲染必需、且发现得晚"的那 1–2 个资源**（通常是字体与 hero 图）。
+1. **`as` 写错**：`as="script"` 却是个字体，浏览器会**再下一次**（缓存键不同），控制台给出 "preloaded but not used" 警告；
+2. **字体漏 `crossorigin`**：同源字体也是 CORS 请求，漏了等于白 preload，还会二次下载；
+3. **preload 泛滥**：把 8 个资源都设成 preload，等于"什么都优先"，关键 CSS 反而排队。实测 LCP 会掉 0.3–0.5s。
+
+判断标准：**只 preload"首屏必需、且发现得晚"的 1–2 个资源**（通常是字体与 hero 图）。
 
 ---
 
-## Service Worker：可编程的缓存层
+## 7. Service Worker：可编程的缓存层
+
+SW 是唯一能"自己写缓存策略"的地方，也最容易写出"用户永远用旧版"的事故。
+
+### 7.1 三种标准策略
 
 ```js
-// sw.js —— 三段式策略：导航走网络优先，静态资源缓存优先
+// sw.js
+const VERSION = 'v5';
+const STATIC = `static-${VERSION}`;
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(caches.open(STATIC).then((c) => c.addAll(['/offline.html'])));
+  self.skipWaiting(); // 立即进入 activating，不等旧页面关闭
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== STATIC).map((k) => caches.delete(k))),
+    ).then(() => self.clients.claim()), // 立即接管已打开的页面
+  );
+});
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
+  if (request.method !== 'GET') return;
+
+  // ① 导航请求：网络优先，失败回离线页（HTML 绝不做缓存优先）
   if (request.mode === 'navigate') {
     event.respondWith(
       fetch(request).catch(() => caches.match('/offline.html')),
     );
     return;
   }
-  event.respondWith(
-    caches.match(request).then((hit) => hit ?? fetch(request)),
-  );
+
+  // ② 带 hash 的静态资源：缓存优先（名字变则 URL 变）
+  if (/\.(?:js|css|woff2|png|webp|avif)$/.test(new URL(request.url).pathname)) {
+    event.respondWith(
+      caches.match(request).then((hit) => hit ?? fetch(request).then((res) => {
+        const copy = res.clone();
+        caches.open(STATIC).then((c) => c.put(request, copy));
+        return res;
+      })),
+    );
+  }
 });
 ```
 
-代价与风险：
+### 7.2 更新流程为什么必须显式处理
 
-- **必须处理更新**：新 SW 装好后处于 `waiting`，要 `skipWaiting` + `clients.claim` 才会接管，否则用户可能长期用旧缓存；
-- **调试坑**：本地开发容易缓存住旧代码，记得 DevTools → Application → Service Workers → Update on reload；
-- **不要给 HTML 做强缓存**（同上，会导致版本指针卡死）。
+新 SW 装好后会停在 `waiting`，直到所有旧页面关闭。用户可能几周不关标签页，于是长期跑旧代码。两种收尾方式：
 
-普通内容站**不需要 SW**；需要离线可用或强缓存控制时才上。
+```js
+// 方式 A：激进——装好就接管（适合内部系统）
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+
+// 方式 B：温和——提示用户"有新版本，点击刷新"
+self.addEventListener('message', (e) => {
+  if (e.data === 'SKIP_WAITING') self.skipWaiting();
+});
+```
+
+```js
+// 页面侧：发现 waiting 就弹提示
+navigator.serviceWorker.register('/sw.js').then((reg) => {
+  reg.addEventListener('updatefound', () => {
+    const sw = reg.installing;
+    sw?.addEventListener('statechange', () => {
+      if (sw.state === 'installed' && navigator.serviceWorker.controller) {
+        showUpdateToast(() => {
+          reg.waiting?.postMessage('SKIP_WAITING');
+          location.reload();
+        });
+      }
+    });
+  });
+});
+```
+
+**不要给 HTML 做强缓存**（同第 2 节）：版本指针一旦卡死，SW 更新也救不回来。
+
+普通内容站**不需要 SW**；需要离线可用或强缓存控制时才上，且必须有"怎么退"的方案（`unregister` + 清 Cache Storage）。
 
 ---
 
-## 常见坑
+## 8. 怎么在 DevTools 里读缓存
+
+Network 面板的 `Size` 列直接告诉你命中哪层：
+
+| 显示 | 含义 |
+| --- | --- |
+| `(memory cache)` | 本次会话内的内存缓存，最快 |
+| `(disk cache)` | 磁盘缓存，跨页面/重启仍有效 |
+| `(ServiceWorker)` | 被 SW 拦截并返回 |
+| `304` | 协商缓存命中，只有头 |
+| 实际字节数 | 未命中，走了网络 |
+
+两个调试要点：
+
+- **勾选 "Disable cache" 只对当前 DevTools 打开期间生效**，关掉面板就恢复，别拿它当"用户环境"；
+- **硬刷新（Ctrl+Shift+R）会绕过缓存**，所以"我刷新了还是旧的"与"用户看到旧的"是两件事——用户用的是普通刷新。
+
+---
+
+## 9. 常见坑
 
 | 现象 | 根因 | 解法 |
 | --- | --- | --- |
 | 发布后白屏 | `index.html` 被强缓存 | 改 `no-cache`，并保留旧产物 |
 | 改了代码用户看不到 | 资源没带 hash，被 `immutable` 缓存 | 文件名带内容哈希 |
+| 硬刷新能看到、普通刷新看不到 | 硬刷新绕过缓存 | 查 HTML 的缓存头，不是资源 |
 | `preload` 加了反而更慢 | 抢了关键资源带宽 | 只 preload 1–2 个必需资源 |
+| 控制台警告 "preloaded but not used" | `as` 类型不匹配 / 漏 `crossorigin` | 对齐 `as`，字体加 `crossorigin` |
+| 401 后所有请求都失败 | 错误响应被缓存了 | 4xx/5xx 不要带长缓存头 |
+| 同一接口偶尔没 CORS 头 | 漏 `Vary: Origin`，CDN 复用了别的响应 | 加 `Vary: Origin, Accept-Encoding` |
+| CDN 上是旧内容 | `s-maxage` / CDN 缓存键配置 | 检查 `Age` 头与刷新策略 |
+| SW 上线后老用户一直用旧版 | 没处理 `waiting` | `skipWaiting` + 提示刷新 |
 | 304 但页面还是旧的 | 是 HTML 被缓存，不是资源 | 排查 HTML 的缓存头 |
-| SW 上线后老用户一直用旧版 | 没做 `skipWaiting` | 加更新提示 + `skipWaiting` |
-| 首屏字体闪烁（FOUT/FOIT） | 字体未 preload 或 `font-display` 不当 | `font-display: swap` + preload 关键字体 |
 
 ---
 
-## 验收清单
+## 10. 验收清单
 
-- [ ] 能区分 `no-store` / `no-cache` / `max-age` / `immutable` 的实际行为
+- [ ] 能区分 `no-store` / `no-cache` / `max-age` / `immutable` / `must-revalidate` 的实际行为
 - [ ] HTML 是 `no-cache`，带 hash 的静态资源是 `immutable`
+- [ ] 动态 `Allow-Origin` 的接口带了 `Vary: Origin`
 - [ ] 项目里能说清哪些资源用了 `preload`，以及为什么只有这几个
-- [ ] 知道 HTTP/2 下"合并请求/域名分片"的坏处
+- [ ] 知道 HTTP/2 下"合并请求/域名分片"的坏处，也知道拆分的边界
 - [ ] 若用了 Service Worker：有更新策略，且不会缓存 HTML 到过期
-- [ ] 能在 DevTools 的 Network 里区分 `from memory cache` / `from disk cache` / `304`
+- [ ] 能在 DevTools 的 Network 里区分 `from memory cache` / `from disk cache` / `304` / `(ServiceWorker)`
+- [ ] 4xx/5xx 响应不会被缓存成"永久错误"
 
 ---
 
-## 练习
+## 11. 练习
 
 1. **验证 `no-cache` 与 `no-store`**：给同一个接口分别设置两个头，各请求两次，看第二次是否有请求发出。  
-   *自检*：能说出"no-cache = 每次验证，no-store = 完全不存"。
+   *自检*：能说出"no-cache = 每次验证，no-store = 完全不存"，并指出两者在 Network 里的表现差异。
 2. **做一次 preload 反例**：给 6 个资源都加 `preload`，用 Lighthouse 对比加之前的 LCP。  
    *自检*：能给出前后数字，并解释"优先级通胀"。
-3. **数一次缓存命中**：打开一个真实站点，Network 面板看 `Size` 列里的 `(memory cache)` / `(disk cache)` / 实际字节，判断哪些命中了强缓存。  
-   *自检*：能指出"哪个文件本该缓存却没缓存"。
+3. **复现一次 `Vary` 事故**：用两个 Origin 请求同一接口，服务端动态回 `Allow-Origin` 但不加 `Vary`，前面挂一层缓存。  
+   *自检*：能观察到第二个 Origin 拿到第一个 Origin 的头，并说出修法。
+4. **数一次缓存命中**：打开一个真实站点，Network 面板看 `Size` 列，判断哪些命中了强缓存。  
+   *自检*：能指出"哪个文件本该缓存却没缓存"，以及对应缺了哪个头。
+5. **写一份 HTML/资源配对策略**：为你自己的项目列出 `index.html`、hash 资源、接口、图片四类文件的完整 `Cache-Control`，并在 nginx 或 Node 里落地。  
+   *自检*：发布一次后普通刷新能看到新版本，且第二次访问静态资源是 `(disk cache)`。

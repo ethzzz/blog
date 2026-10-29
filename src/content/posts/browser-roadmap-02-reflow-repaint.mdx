@@ -1,41 +1,53 @@
 ---
 title: '02 · 重排、重绘与合成层'
 published: 2026-10-26T08:30:00+08:00
-description: '改一个属性到底触发了布局、绘制还是只做合成；强制同步布局是怎么把 1ms 变成 60ms 的；will-change 与 translateZ 为什么会把内存吃光。给出「哪些属性便宜、哪些贵」的完整对照。'
+description: '改一个属性到底触发了布局、绘制还是只做合成；强制同步布局怎么把 1ms 变成 60ms；will-change 与 translateZ 为什么会把内存吃光。附可运行对照 demo 与逐条排查方法。'
 tags: [浏览器, 重排, 重绘, 合成层, 布局抖动]
 category: 浏览器与性能学习路线
 draft: false
 ---
 
-## 三种更新，代价差 100 倍
-
-一次样式变化，浏览器可能只做其中一步：
-
-| 阶段 | 做什么 | 典型耗时 | 触发条件 |
-| --- | --- | --- | --- |
-| **Layout（重排）** | 重算位置与尺寸 | 慢，可能整棵树 | 改 `width/height/top/left/font-size/padding/display` |
-| **Paint（重绘）** | 重新生成绘制指令 | 中 | 改 `color/background/border-radius/box-shadow` |
-| **Composite（合成）** | GPU 直接挪图层 | 最快 | 改 `transform` / `opacity`（在合成层上） |
-
-口诀：**能只改合成，就不要碰布局**。
+> [!NOTE]
+> 01 篇讲了流水线有七步，这篇回答一个更实际的问题：**我改这一行 CSS，到底会让浏览器走几步？** 记住一张表、一个反模式（读写交替）、一个代价（显存），这一篇就够用了。
 
 ---
 
-## 属性代价对照表
+## 1. 三种更新，代价差 100 倍
+
+一次样式变化，浏览器可能只做其中一步：
+
+| 阶段 | 做什么 | 相对代价 | 触发条件 |
+| --- | --- | --- | --- |
+| **Layout（重排）** | 重算位置与尺寸，可能波及整棵树 | 最慢，几十 ms 级 | 改 `width/height/top/left/font-size/padding/display` |
+| **Paint（重绘）** | 重新生成绘制指令并光栅化 | 中等 | 改 `color/background/border-radius/box-shadow` |
+| **Composite（合成）** | GPU 直接平移/缩放已有图层 | 最快，通常 < 1ms | 改合成层上的 `transform` / `opacity` |
+
+口诀：**能只改合成，就不要碰布局。**
+
+为什么差这么多？因为三者的作用范围不同：
+
+- **Layout** 是「全局约束求解」：一个 `width` 变了，父容器高度可能变，兄弟节点要重排，下面的内容整体位移——所以要遍历受影响子树。
+- **Paint** 是「重画自己的像素」：位置没变，只是这块区域的颜色变了，把绘制指令重新生成、光栅化。
+- **Composite** 是「挪一张已经画好的图」：像素早就存在 GPU 纹理里，只改变换矩阵，主线程完全不参与。
+
+---
+
+## 2. 属性代价对照表
 
 | 属性 | 触发 | 备注 |
 | --- | --- | --- |
-| `transform: translate/scale/rotate` | Composite | 最便宜，优先用它做位移/缩放动画 |
-| `opacity` | Composite | 同上 |
-| `filter`（部分） | Composite/Paint | 视实现，仍比布局便宜 |
+| `transform: translate/scale/rotate` | Composite | 最便宜，优先用它做位移/缩放 |
+| `opacity` | Composite | 同上（元素需在独立合成层上） |
+| `filter`（部分实现） | Composite / Paint | 视浏览器实现，仍比布局便宜 |
 | `color` / `background-color` | Paint | 大元素上仍可能明显 |
-| `box-shadow` | Paint | 大面积阴影很贵，尤其是动画里 |
+| `box-shadow` | Paint | 大面积阴影很贵，动画里尤其明显 |
+| `border-radius` | Paint | 圆角裁剪要重绘 |
 | `width/height/padding/margin` | Layout | 影响兄弟/父节点，可能整页重排 |
-| `top/left`（非 absolute） | Layout | **改用 `transform` 代替** |
-| `font-size` | Layout | 文本重排最贵之一 |
-| `display: none ↔ block` | Layout | 会移除/重建子树 |
+| `top/left`（`position: absolute`） | Layout | **改用 `transform` 代替** |
+| `font-size` / `line-height` | Layout | 文本重排最贵的一类 |
+| `display: none ↔ block` | Layout | 移除/重建子树，代价最高 |
 
-一个常见误区：
+一个最容易改、收益也最直接的替换：
 
 ```css
 /* ❌ 每帧都触发布局 */
@@ -47,98 +59,251 @@ draft: false
 .panel.open { transform: translateX(240px); }
 ```
 
----
+注意 `transform` 的位移**不改变布局占位**：它不会把后面的元素推开。侧边栏用 `left` 推内容、用 `transform` 不推内容——这是行为差异，不只是性能差异，改造前先确认交互是否需要"占位"。
 
-## 强制同步布局：把 1ms 变成 60ms
+一个可运行的对照 demo，自己验一遍比记表更牢：
 
-浏览器本来会把"写样式"和"读布局"批量处理。但你一旦**在同一个任务里交替读写**，它就必须立刻算一遍布局：
+```html
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  .box { width: 80px; height: 80px; background: #2b6cb0; position: absolute; top: 0; }
+  .by-left { left: 0; transition: left .6s linear; }
+  .by-left.go { left: 800px; }
+  .by-transform { left: 0; transition: transform .6s linear; }
+  .by-transform.go { transform: translateX(800px); }
+</style>
 
-```js
-// ❌ 布局抖动：每次循环都强制重算
-for (const el of items) {
-  el.style.width = el.offsetWidth + 10 + 'px';   // 读 → 写 → 读 → 写…
-}
-
-// ✅ 先读后写（一次布局解决）
-const widths = items.map((el) => el.offsetWidth);
-items.forEach((el, i) => { el.style.width = widths[i] + 10 + 'px'; });
+<div class="box by-left" id="a"></div>
+<div class="box by-transform" id="b" style="top: 120px"></div>
+<button onclick="document.getElementById('a').classList.toggle('go')">left 版</button>
+<button onclick="document.getElementById('b').classList.toggle('go')">transform 版</button>
 ```
 
-会触发"强制布局"的读操作（记住这几个高频的）：
-
-`offsetTop/Left/Width/Height`、`clientWidth/Height`、`scrollTop/Left`、`getBoundingClientRect()`、`getComputedStyle()`、`window.innerHeight`（部分情况）。
-
-排查办法：Performance 面板里看到 **`Recalculate Style` / `Layout` 出现紫色三角警告**，就是它。
+用 Performance 面板各录一次，对比 Main 轨道：`left` 版每一帧都有 `Layout`，`transform` 版只有开始那一下有 `Composite Layers`。**同一段动画，主线程工作量差几十倍。**
 
 ---
 
-## 合成层：便宜的来源，也是内存杀手
+## 3. 强制同步布局：把 1ms 变成 60ms
+
+浏览器本来会把"写样式"和"读布局"批量处理（写进队列，渲染帧里统一算）。但你一旦**在同一个任务里交替读写**，它就必须立刻算一遍布局，才能给你正确的读数——这叫**强制同步布局**（forced synchronous layout），也叫布局抖动（layout thrashing）。
+
+```js
+// ❌ 读写交替：每次循环都强制重算一次布局
+for (const el of items) {
+  el.style.width = el.offsetWidth + 10 + 'px'; // 读(触发布局) → 写 → 再读…
+}
+
+// ✅ 先批量读，再批量写：一次布局解决
+const widths = items.map((el) => el.offsetWidth);
+items.forEach((el, i) => {
+  el.style.width = widths[i] + 10 + 'px';
+});
+```
+
+把差距量化出来（1000 个元素，肉眼可见的差别）：
+
+```js
+function thrash(root) {
+  const t0 = performance.now();
+  for (const el of root.children) {
+    el.style.width = el.offsetWidth + 1 + 'px'; // 每次读都强制布局
+  }
+  return performance.now() - t0;
+}
+
+function batch(root) {
+  const t0 = performance.now();
+  const widths = [...root.children].map((el) => el.offsetWidth); // 一次读完
+  [...root.children].forEach((el, i) => {
+    el.style.width = widths[i] + 1 + 'px'; // 一次写完
+  });
+  return performance.now() - t0;
+}
+```
+
+实测数量级：1000 个节点上，`thrash` 通常是几十到上百毫秒，`batch` 只有 1~3ms。**同样的逻辑，只因为顺序不同，差了 30~50 倍。**
+
+会触发强制布局的读操作（高频的就这几个，值得背）：
+
+`offsetTop/offsetLeft/offsetWidth/offsetHeight`、`clientWidth/clientHeight`、`scrollTop/scrollLeft`（写也会）、`getBoundingClientRect()`、`getComputedStyle()`、`window.innerHeight/innerWidth`（部分场景）、`element.focus()`（读布局后滚动）。
+
+识别方法：
+
+- Performance 面板里 `Layout` 事件带**紫色三角警告**（Warning），旁边标注 `Forced reflow`；
+- 火焰图上看到密集的 `Layout` 小方块夹在 JS 之间，基本就是它；
+- 代码里搜索上面那串属性，看它们是否出现在"写样式之后、同一任务内"。
+
+三个常见变体，坑法各不相同：
+
+```js
+// ① 循环里改 class + 读尺寸
+list.forEach((el) => {
+  el.classList.add('expanded');
+  heights.push(el.offsetHeight); // 🚨 每次 add 后都强制布局
+});
+
+// ② 滚动监听里读位置（不节流）
+window.addEventListener('scroll', () => {
+  const top = header.offsetTop; // 🚨 滚动每帧都读
+  header.classList.toggle('stuck', window.scrollY > top);
+});
+
+// ③ ResizeObserver 回调里改尺寸（自触发循环）
+new ResizeObserver((entries) => {
+  for (const e of entries) {
+    e.target.style.width = e.contentRect.width + 'px'; // 🚨 可能无限循环
+  }
+}).observe(el);
+```
+
+改法分别是：① 先 `add` 完再统一读；② 读操作放进 `rAF`，或缓存不变的值；③ 回调里只**读**不写，写操作推到下一帧。
+
+---
+
+## 4. 合成层：便宜的来源，也是内存杀手
 
 满足某些条件时，元素会被提升为独立的合成层（GPU 纹理）：
 
 ```css
 .promote {
-  will-change: transform;      /* 提前告诉浏览器"我要动" */
-  /* 或者 */
-  transform: translateZ(0);    /* 老写法，副作用大 */
+  will-change: transform;   /* 提前告诉浏览器"我要动" */
+  /* 或者老写法：transform: translateZ(0); —— 副作用更大 */
 }
 ```
 
-**代价**：每个合成层都是一张 GPU 纹理，占显存/内存。全屏大小的层约 **4MB**（1920×1080×4 字节）。
+**代价必须算清楚**：每个合成层都是一张 GPU 纹理，尺寸按元素在屏幕上的像素算，每像素 4 字节（RGBA）。
+
+```text
+全屏 1920 × 1080 → 1920 × 1080 × 4 B ≈ 8 MB
+带 devicePixelRatio = 2 的高分屏 → ≈ 33 MB
+```
+
+也就是说，**一个全屏层的代价是 8MB 起**，而它换来的是"动画不重排"。这笔账在移动端极容易算崩：
 
 ```css
-/* ❌ 这个写法等于给列表里每一项都开一个层 */
+/* ❌ 等于给列表里每一项都开一个层 */
 .list-item { will-change: transform; }
 ```
 
-100 个列表项 × 每层几百 KB → 内存暴涨，**低端机直接闪退**。真实事故里见过 1.2G。
+100 个列表项、每项 300×80 CSS 像素、DPR 2 → 每层约 0.37MB，合计约 37MB 显存；如果每项带阴影/圆角，实际还要更多。真实事故里见过 `will-change` 滥用把内存推到 1GB 以上，低端机直接闪退。
 
-正确用法：
+正确的用法是**有生命周期**：
 
-- **只在交互开始前加，结束后移除**（或干脆不加，直接用 `transform` 动画）；
-- 针对性强作用域：只给"真正会动的那一个元素"；
-- 用 DevTools → Layers 面板确认层数（超过 20 个就该警惕）。
-
-`contain` / `content-visibility` 是更安全的替代：
-
-```css
-.card { contain: layout paint; }        /* 限制布局/绘制影响范围 */
-.long-list-item { content-visibility: auto; contain-intrinsic-size: 0 120px; }
+```js
+// 只在交互开始前加，动画结束后立刻移除
+el.addEventListener('pointerenter', () => {
+  el.style.willChange = 'transform';
+});
+el.addEventListener('transitionend', () => {
+  el.style.willChange = 'auto';
+});
 ```
 
-`content-visibility: auto` 让屏幕外的内容**跳过渲染**，长列表首屏能省几百毫秒——但必须给 `contain-intrinsic-size`，否则滚动条会乱跳（导致 CLS）。
+很多情况下更好的选择是**根本不开层**：直接写 `transform` 动画，浏览器会在动画期间自动提升图层，结束后自动回收——不需要你手动管理。
+
+DevTools 检查方式：More tools → **Layers** 面板，能看层数、每层尺寸、内存占用。**超过 20 个层就该警惕**，先问"真的需要这么多层吗"。
+
+### `contain` 与 `content-visibility`：更安全的替代
+
+```css
+.card { contain: layout paint; }   /* 把布局/绘制影响限制在卡片内部 */
+
+.long-list-item {
+  content-visibility: auto;
+  contain-intrinsic-size: 0 120px;  /* 必须给！否则滚动条会乱跳 */
+}
+```
+
+`content-visibility: auto` 让屏幕外的内容**跳过样式计算、布局、绘制**，长列表首屏能省几百毫秒。但它有两条硬约束：
+
+1. **必须给 `contain-intrinsic-size`**（或用 JS 记录真实高度），否则未渲染项高度为 0，滚动条总长在滚动过程中不断变化——这就是 CLS 的直接来源。
+2. **可访问性受影响**：屏幕外内容在辅助技术里可能不可见，`find-in-page` 行为也会变。表单列表、需要 Ctrl+F 的长文档慎用。
 
 ---
 
-## 常见坑
+## 5. 一个完整案例：滚动时列表卡顿
+
+现象：列表滚动时明显掉帧，Profiler 里每帧都有 `Layout`，但代码"只是滚动而已"。
+
+排查顺序（这套顺序可以套用到所有"莫名重排"）：
+
+```text
+① 是不是有元素在滚动时改尺寸/位置？ → 看 scroll 监听里有没有写 style/class
+② 有没有读布局？                   → 搜 offsetTop/getBoundingClientRect
+③ 动画属性对不对？                 → 是不是用了 left/top
+④ 是否开了太多层？                 → Layers 面板
+⑤ DOM 是否太多？                   → 节点数 × 每次样式重算
+```
+
+这个案子的根因往往是「滚动监听里读 `offsetTop` 再切 class」：
+
+```js
+// ❌ 滚动高频触发 + 读布局 + 写 class
+window.addEventListener('scroll', onScroll);
+
+function onScroll() {
+  const top = hero.offsetTop;              // 强制布局
+  navbar.classList.toggle('stuck', scrollY > top); // 触发样式重算 + 布局
+  progress.style.width = `${scrollY / max}%`;      // 再写一次布局属性
+}
+```
+
+```js
+// ✅ 读一次、算一次、写一次；滚动的"读"也放到 rAF
+let ticking = false;
+window.addEventListener('scroll', () => {
+  if (ticking) return;
+  ticking = true;
+  requestAnimationFrame(() => {
+    const y = window.scrollY;            // 只是在读 scrollY，代价低
+    navbar.classList.toggle('stuck', y > heroTopCache); // heroTopCache 提前缓存
+    progress.style.transform = `scaleX(${y / max})`;    // 用 transform，不写 width
+    ticking = false;
+  });
+});
+```
+
+`heroTopCache` 在 `resize` 时更新一次即可——**不要把"可以缓存的值"放进滚动回调里反复读**，这是最省事的一次优化。
+
+---
+
+## 6. 常见坑
 
 | 现象 | 机制 | 解法 |
 | --- | --- | --- |
-| 动画掉帧 | 用 `left/top` 做位移 → 每帧布局 | 改 `transform` |
-| 滚动时页面抖 | `content-visibility` 没给预估尺寸 | 补 `contain-intrinsic-size` |
-| 内存暴涨/闪退 | 合成层过多（`will-change` 滥用） | 只在需要时加，用 Layers 面板核查 |
+| 动画掉帧 | 用 `left/top` 做位移 → 每帧布局 | 改 `transform`，确认是否影响布局占位 |
+| 滚动时页面抖 | `content-visibility` 没给预估尺寸 | 补 `contain-intrinsic-size`（或 JS 记录高度） |
+| 内存暴涨/闪退 | 合成层过多（`will-change` 滥用） | 有生命周期地加/删，用 Layers 面板核查 |
 | 循环里改样式很慢 | 读写交替导致强制布局 | 先批量读、再批量写 |
-| 首屏大图卡顿 | 大尺寸 `box-shadow` / `filter: blur` | 用图片替代、或减少作用面积 |
-| 列表滚动卡 | 一次性渲染上千节点 | 虚拟滚动（见 09 篇） |
+| `ResizeObserver` 死循环 | 回调里写尺寸，再次触发自己 | 回调只读，写入推下一帧 |
+| 首屏大图卡顿 | 大尺寸 `box-shadow` / `filter: blur` | 用图片替代、或缩小作用面积 |
+| 列表滚动卡 | 一次性渲染上千节点 | 虚拟滚动（09 篇）或 `content-visibility` |
+| 改 `transform` 后布局错位 | `transform` 不参与布局计算 | 需要占位就改 `margin`/`padding` 或容器尺寸 |
 
 ---
 
-## 验收清单
+## 7. 验收清单
 
 - [ ] 能说出任意一个 CSS 属性会触发 Layout / Paint / Composite 中的哪一个
 - [ ] 项目里的位移动画全部用 `transform`，没有用 `left/top`
-- [ ] 知道哪些 JS 读写会触发强制同步布局，并能在 Performance 面板里认出来
-- [ ] `will-change` 没有大面积使用（能用 Layers 面板说出当前层数）
+- [ ] 知道哪些 JS 读写会触发强制同步布局，并能写出"先读后写"的版本
+- [ ] 能在 Performance 面板里认出 `Forced reflow` 警告
+- [ ] `will-change` 没有大面积使用，能说出当前页面的合成层数与估算内存
 - [ ] 长列表用了虚拟滚动或 `content-visibility`，且没有引入 CLS
-- [ ] 能把一次"滚动卡顿"定位到具体的重排/重绘来源
+- [ ] 能把一次"滚动卡顿"按第 5 节的五步定位到具体来源
 
 ---
 
-## 练习
+## 8. 练习
 
-1. **对比两种动画**：同一个位移分别用 `left` 与 `transform` 实现，用 Performance 录制 3 秒，比较 FPS 与 Layout 次数。  
-   *自检*：`left` 版本每帧都有 Layout（紫色），`transform` 版本几乎没有。
-2. **制造布局抖动**：写上面那个"读 `offsetWidth` 再写 width"的循环（100 个元素），记录耗时；改成先读后写再测。  
-   *自检*：能给出两次耗时差，并从 Performance 里指出强制布局的位置。
-3. **数一次合成层**：给 50 个元素加 `will-change: transform`，用 Layers 面板看内存变化，再删掉。  
-   *自检*：能说出"每层多少 MB、总共多吃了多少内存"。
+1. **对比两种动画**：用第 2 节的 demo，分别录 3 秒，比较 FPS 与 `Layout` 次数。  
+   *自检*：`left` 版每帧都有 Layout（或紫色警告），`transform` 版几乎没有；能说出主线程工作量差多少倍。
+2. **量化布局抖动**：1000 个元素跑第 3 节的 `thrash` 与 `batch`，各测 3 次取中位数。  
+   *自检*：能给出两个具体毫秒数，并从 Performance 里指出强制布局的位置。
+3. **算一笔显存账**：给 50 个 300×80 的元素加 `will-change: transform`，用 Layers 面板看内存变化，再删掉对比。  
+   *自检*：能说出"每层约多少 MB、总共多吃了多少"，而不是"好像变大了"。
+4. **修一个真实卡顿**：在你自己的项目里找一个滚动卡顿页面，按第 5 节的五步排查并修复。  
+   *自检*：修复前后各录一次 Performance，`Layout` 次数与长任务数量都要有数字对比。
+5. **验证 `content-visibility` 的副作用**：给长列表加 `content-visibility: auto` 但不给 `contain-intrinsic-size`，滚动到底再回顶。  
+   *自检*：能描述滚动条如何跳变，并解释这与 CLS 的关系。
