@@ -49,6 +49,15 @@ Event Loop 是 JavaScript 的执行机制，用于协调单线程与异步操作
 3. 执行一个宏任务
 4. 重复步骤 2-3
 
+**追问链（这段是拉开差距的地方）：**
+
+- **「为什么微任务优先级必须高于宏任务？」**
+  答：为了保证**状态一致性**。Promise 的回调要能看到「resolve 那一刻的完整状态」，如果中间插进一个宏任务（可能是另一次用户交互或 I/O），回调执行时依赖的数据可能已经变了，代码逻辑就会「先看到的和后处理的不一致」。把微任务设计成「当前宏任务结束后立刻清空」，等于给了一次「同步逻辑的自然延续」——Promise 的 `.then` 读起来才像紧接着上一行执行。
+- **「UI 渲染发生在微任务之间吗？」⭐⭐⭐ 高频陷阱**
+  答：不是。渲染机会出现在**宏任务与宏任务之间**（每轮 event loop 的末尾），而且是在**微任务队列清空之后**。推论有两个：① 微任务里改 DOM，能在**同一帧**内合并渲染，不会闪；② 如果在微任务里不断产生新微任务（`function loop(){ Promise.resolve().then(loop) }`），微任务队列永远清不空，**渲染被彻底饿死**——页面卡死但 CPU 打满，这是「微任务死循环」的真实故障形态，排查时要看 Performance 面板里有没有连续的 Microtask 而没有 Paint。
+- **「`requestAnimationFrame` 算宏任务还是微任务？」**
+  答：都不是。它是**渲染前的回调**，在「样式计算 → 布局 → 绘制」之前由浏览器统一调度，属于渲染管线的一部分。所以它既不受微任务队列长度影响，也不会和 setTimeout 一起排队。做动画用 rAF 而不是 setTimeout 的深层原因就在这——rAF 与屏幕刷新对齐，不会被宏任务排队拖成跳帧。
+
 ### Q2: 宏任务和微任务有哪些？⭐ 🔥
 
 **答：**
@@ -164,6 +173,12 @@ console.log('script end');
 // setTimeout
 ```
 
+**这道题真正的考点（面试官在等的那句话）：**
+
+- `await async2()` 后面那行 `console.log('async1 end')` **不是在原地同步执行的**，而是被包进了 `async1` 返回的 Promise 的 `then` 回调里——所以它排在同步代码之后、作为一个微任务执行。
+- `async1 end` 和 `promise2` 谁先，取决于 `await` 展开成多少层 `.then`。规范语义下 `await` 会多一层（`promise2` 在前），但 V8 早已做了 **await 优化**（减少一个 tick），现代 Node/Chrome 里就是示例输出的顺序。**面试现场的正确答法**：先讲清「await 之后是微任务、不是同步」，再补一句「两者精确先后取决于引擎对 await 的优化层数，规范语义与实现可能差一个 tick，所以工程上不该依赖这个顺序」——这句话比背结论值钱。
+- **追问「怎么让这段代码不依赖这种顺序？」** 答：真实代码里不要把「有副作用的两个微任务」写成互相依赖顺序，需要顺序就显式 `await`，需要并发就 `Promise.all`。
+
 ### Q4: Node.js 的 Event Loop 和浏览器有什么不同？⭐⭐⭐
 
 **答：**
@@ -206,6 +221,15 @@ fs.readFile(__filename, () => {
 });
 // 输出：setImmediate -> setTimeout
 ```
+
+**追问链：**
+
+- **「`process.nextTick` 和 `setImmediate` 差在哪？」⭐⭐⭐**
+  答：`nextTick` 不属于 event loop 的任何阶段，它在**当前操作完成后、进入下一阶段前**立刻执行——优先级比 Promise 微任务还高（Node 里 nextTick 队列先清空，再清 Promise 队列）。`setImmediate` 是 **check 阶段**的宏任务。所以在 I/O 回调里 `nextTick` 一定最先，`setImmediate` 早于 `setTimeout`。用 nextTick 递归会产生「饿死 I/O」的经典事故——因为下一阶段永远轮不到。
+- **「Node 的 poll 阶段会阻塞吗？」**
+  答：会。poll 阶段在没有其他待处理任务时，会**阻塞等待** I/O 事件（这是 Node 不用忙轮询的原因）。所以 `setTimeout` 的定时精度在 Node 里也会受 poll 阻塞时长影响，业务上别把它当高精度定时器用。
+- **「为什么说 Node 的「单线程」是个简化说法？」**
+  答：JS 执行是单线程，但 libuv 有**线程池**（默认 4 个，`UV_THREADPOOL_SIZE` 可调）负责文件 I/O、DNS、加密等「看起来异步其实是线程池在跑」的操作，网络 I/O 走 epoll/kqueue 不需要线程。所以「CPU 密集任务阻塞主线程」仍成立，但「Node 只有一个线程」是错的。
 
 ---
 
@@ -595,6 +619,66 @@ function throttleTimer(fn, interval) {
   };
 }
 ```
+
+---
+
+## 异步反模式（面试问「你踩过什么坑」时用这些答）
+
+```javascript
+// ❌ 反模式 1：在 Promise 构造函数里用 async 函数
+new Promise(async (resolve) => {
+  const data = await fetchData(); // 这里抛错会变成「永不 reject」
+  resolve(data);
+});
+// 问题：async executor 抛出的异常不会传到外层 Promise，
+// 结果是 unhandledRejection + 外层 Promise 永久 pending。
+// ✅ 正确：不用 new Promise，直接用 async 函数本身（它已经是 Promise）
+
+// ❌ 反模式 2：forEach + async（以为会等待）
+items.forEach(async (item) => {
+  await save(item); // 全部并发跑，且 forEach 立刻返回
+});
+// ✅ 需要串行：for...of + await；需要并发：Promise.all(items.map(...))
+
+// ❌ 反模式 3：循环里逐个 await（串行放大耗时）
+for (const id of ids) {
+  results.push(await fetchOne(id)); // N 个请求串成一条线
+}
+// ✅ 并发：await Promise.all(ids.map(fetchOne))，注意并发上限
+
+// ❌ 反模式 4：忘记 catch，只留 unhandledRejection
+fetchData(); // 没有 .catch，失败时在控制台刷红字、业务无感知
+// ✅ Promise.all 之外还要兜：window.addEventListener('unhandledrejection', ...)
+
+// ⚠️ 陷阱 5：Promise.all 的 fail-fast 不取消其他任务
+Promise.all([a(), b()]).catch(() => {}); // a 失败后 b 仍在跑、仍占资源
+// ✅ 需要真取消：AbortController + signal
+```
+
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 页面卡死、CPU 打满但无长任务 | 微任务死循环，渲染被饿死 | 用宏任务（setTimeout/setImmediate）分片，或 rAF 让出 |
+| `Promise.all` 已 catch 但控制台仍报未处理异常 | 其他任务的 rejection 无人接 | 用 `allSettled`，或对每个 promise 挂空 catch |
+| 接口并发 200 个直接 429/超时 | 无并发控制 | 信号量式并发控制器（限 3~6），配重试退避 |
+| 组件卸载后仍 setState 报内存泄漏警告 | 异步回来后组件已销毁 | AbortController 取消请求 + 卸载标志位 |
+| `setTimeout(fn, 0)` 实际等了 4ms+ | 浏览器嵌套层级钳制、后台标签页节流 | 精确调度用 postMessage/MessageChannel 替代 |
+| Node 里服务偶发卡顿 | nextTick 递归饿死 I/O / 同步 fs 阻塞 | 检查 nextTick 递归，替换为异步 fs API |
+| 定时器越走越偏 | setTimeout 漂移累积 | 用「下一次基于目标时间戳重算」的自校正定时器 |
+
+## 自测清单（能答上 8 条算过关）
+
+1. 微任务优先级高于宏任务的**设计动机**是什么？
+2. UI 渲染发生在哪个位置？为什么微任务死循环会饿死渲染？
+3. rAF 属于宏任务还是微任务？它和渲染管线的关系？
+4. `await` 之后的代码运行在哪一类任务里？async1 end 与 promise2 的顺序为何可能因引擎而异？
+5. process.nextTick、Promise 微任务、setImmediate 三者的优先级排序？
+6. Node 的 poll 阶段为什么会阻塞？它对定时精度有什么影响？
+7. `new Promise(async ...)` 为什么是反模式？会导致什么症状？
+8. forEach + async 会得到什么结果？正确写法有哪两种？
+9. `Promise.all` 有一个失败时，其他任务会停止吗？怎么真正取消？
+10. 手写并发控制器时，怎么加「失败重试」和「整体取消」？
 
 ---
 

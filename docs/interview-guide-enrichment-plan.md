@@ -16,9 +16,9 @@
 | B1 | 21-frontend-deep-practice | 9.1k | ✅ 正文本就扎实，补自测清单 |
 | B2 | 08-network-http | 7.3k | ✅ 已加深（TIME_WAIT 治理/QUIC/TLS1.3/ETag 坑/CORS credentials/坑表/自测） |
 | B2 | 10-mysql | 5.8k | ✅ 已加深（2000 万估算/自增 vs UUID/RR 幻读边界/RC 取舍/行锁加在索引上/坑表/自测） |
-| B3 | 20-frontend-core-qa | 12.1k | 待做（抽查答案深度，补追问链） |
-| B3 | 07-build-tools | 9.2k | 待做 |
-| B3 | 03-javascript-async | 9.6k | 待做 |
+| B3 | 20-frontend-core-qa | 12.1k | ✅ 已加深（Q1/Q8/Q14/Q18 追问 + 资深面压力追问 6 类 + 自测） |
+| B3 | 07-build-tools | 9.2k | ✅ 已加深（Compiler/Compilation、Tapable、sideEffects 事故、Fast Refresh、Vite 代价与 Rspack 选型、定位方法、坑表、自测） |
+| B3 | 03-javascript-async | 9.6k | ✅ 已加深（微任务动机、渲染时机、rAF 归属、await tick 差异、Node 线程池、五种反模式、坑表、自测） |
 | B4 | 05-react | 9.7k | 待做 |
 | B4 | 02-javascript-core | 10.3k | 待做 |
 | B4 | 18-soft-skills | 10.7k | 待做 |

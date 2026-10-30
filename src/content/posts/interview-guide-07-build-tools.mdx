@@ -63,6 +63,15 @@ module.exports = {
 };
 ```
 
+**追问链：**
+
+- **「Compiler 和 Compilation 有什么区别？」⭐⭐⭐**
+  答：**Compiler 是全局唯一**的编译实例，贯穿整个 watch 生命周期（启动时创建一次，配置、插件、文件系统都在它身上）；**Compilation 是一次构建过程**，每次改动都会新建一个（`compiler.hooks.watchRun` 之后 `newCompilation()`）。所以插件里要拿「本次构建的模块图/产物」用 `compilation`，要拿「全局配置/长期状态」用 `compiler`。说错这一层，说明没真写过插件。
+- **「Webpack 的插件机制靠什么实现？」**
+  答：Tapable 的发布订阅（hooks）。`compiler.hooks.emit.tapAsync(...)` 就是往 emit 这个 AsyncSeriesHook 上挂回调。三种 tap：`tap`（同步）、`tapAsync`（回调式异步）、`tapPromise`（Promise 式异步）。所以「写插件 = 找对 hook + 在正确时机改 compilation」。
+- **「Loader 为什么必须从右到左执行？」**
+  答：不是设计偏好，是**数据流方向**决定的。Loader 是「源码进、转换后代码出」的管道，右侧的 `sass-loader` 把 SCSS 变成 CSS，左侧的 `css-loader` 才能接着解析 CSS——反过来喂 CSS 给 sass-loader 直接报错。写成数组是为了让阅读顺序与书写习惯一致，执行顺序仍是链式从尾到头。
+
 ### Q2: Loader 和 Plugin 的区别？⭐ 🔥
 
 **答：**
@@ -226,6 +235,15 @@ class MyClass {
 }
 ```
 
+**追问链：**
+
+- **「为什么 ESM 能静态分析，CommonJS 就不行？」**
+  答：ESM 的 import/export 必须是**顶层声明**，且导入导出的绑定名在语法解析阶段就确定，不需要执行代码——所以打包器在「还没运行任何代码」时就能画出模块依赖图并标记未使用导出。CJS 的 `require` 是普通函数调用，参数可以是运行时表达式，导出对象可以被任意改写（`module.exports.x = ...` 动态挂载），打包器无法在编译期确定「到底用了什么」。一句话：**ESM 的静态性来自语法约束，而不是工具能力**。
+- **「sideEffects: false 写错了会怎样？」⭐⭐⭐ 真实事故题**
+  答：`sideEffects: false` 告诉打包器「这个包里的模块被 import 但未使用导出时，可以整模块删除」。如果某个模块 import 只为执行副作用（注册全局样式、`@babel/polyfill`、自定义元素注册、`import './global.css'`），就会被误删——典型症状是**线上样式丢失或 polyfill 没生效，本地 dev 正常**（dev 不做 DCE）。正确写法是声明白名单：`"sideEffects": ["*.css", "./src/register.ts"]`。这是我在项目里真踩过的坑，也是这道题最好的答法。
+- **「usedExports 和 sideEffects 各管什么？」**
+  答：`usedExports`（标记哪块代码被用）解决「导出没用就别留」，由 Terser 在压缩阶段真正删除，属于**语句级 DCE**；`sideEffects` 解决「整个模块能不能跳过」，属于**模块级 DCE**，能在不解析模块内容的前提下直接剪掉依赖。两者叠加才是完整 Tree Shaking。
+
 ---
 
 ## 代码分割
@@ -333,6 +351,13 @@ if (module.hot) {
 // React 中（react-hot-loader / Fast Refresh）
 ```
 
+**追问链：**
+
+- **「Vue 的 HMR 为什么天然好做，React 却要 Fast Refresh？」⭐⭐⭐**
+  答：本质差异在**状态存储位置**。Vue 的组件状态在组件实例（响应式对象）里，vue-loader 的 accept handler 能「换掉 render 函数、保留实例」，所以改模板时组件状态不丢。React 的函数组件状态在 Fiber 的 hooks 链表里，函数本身被重新定义后 hooks 顺序必须能对齐——Fast Refresh 靠**给每个组件打签名**（函数名 + hooks 顺序哈希）判断能否原地替换：签名一致就保留 state，签名变了（改了 hooks 数量/顺序）就强制卸载重建，状态丢失。这也是「改 hooks 顺序后页面状态突然清空」的原因。
+- **「HMR 会内存泄漏吗？」**
+  答：会。每次热替换都会在旧模块上执行 `module.hot.dispose`；如果模块里有全局监听、定时器、WebSocket、`addEventListener` 却没在 dispose 里清理，旧实例的引用一直挂着。症状是开发时页面越改越卡、内存曲线只涨不降。这也是「HMR 卡了就重启 dev server」的经验来源，但正确做法是补 dispose 清理。
+
 ---
 
 ## Vite
@@ -389,6 +414,15 @@ export default {
   // 3. esbuild 比 Webpack 快 10-100x
 };
 ```
+
+**追问链（Vite 的题必须答到「代价」才算过关）：**
+
+- **「Vite 在生产构建上还快吗？」⭐⭐⭐**
+  答：不快多少。生产构建走 Rollup，是**完整打包**，冷构建时间与 Webpack 同量级（大项目甚至更慢，因为 Rollup 的插件生态对某些场景不如 Webpack 成熟）。Vite 的优势集中在**开发态**：不打包 → 冷启动秒级；按需编译 → 改哪个模块编哪个模块。所以正确表述是「Vite 赢在开发体验，不赢在生产构建」——只背「Vite 比 Webpack 快 100 倍」会被追问穿。
+- **「Vite 开发模式有哪些反直觉的坑？」**
+  答：三个高频：① **请求瀑布**：浏览器原生 ESM 意味着每个 `import` 一次请求，依赖深的模块图首屏会发几百个请求，靠预构建合并缓解，但项目写得太碎（`import` 大量小文件）仍会慢；② **预构建失效整页刷新**：发现新依赖要重新 optimize，Vite 会 reload 整个页面，第一次跑起来看到「莫名其妙刷新一次」就是这个；③ **CJS 依赖**：只能在预构建阶段转成 ESM，动态 `require` 的包（少数老库）会直接报错，需要 `optimizeDeps.include` 手动兜。
+- **「那大项目该怎么选？Rspack / Turbopack 是什么定位？」**
+  答：先说结论——**Rspack（Rust 重写 Webpack）是「无痛迁移」路线**，配置与 Webpack 高度兼容（loader/plugin 生态大量复用），构建速度提升一个量级，适合存量 Webpack 大仓平滑替换；**Turbopack（Rust，Vercel）绑定 Next.js**，增量编译做到极致，但独立使用生态还在补齐。选型看约束：存量配置重、插件多 → Rspack；新项目 + Next.js → Turbopack / Vite；库开发 → Vite/tsup 足够。这类题的分值在「说清迁移成本」，不在背速度数字。
 
 ### Q10: Vite 的生产构建？⭐⭐
 
@@ -555,6 +589,45 @@ module.exports = {
   ],
 };
 ```
+
+---
+
+## 构建慢/包大怎么定位（面试常问「你怎么证明优化有效」）
+
+| 症状 | 先量什么 | 工具 | 常见根因 |
+|:--|:--|:--|:--|
+| 构建慢 | 各 loader/plugin 耗时占比 | `speed-measure-webpack-plugin`、`--profile` + `webpack-bundle-analyzer` | babel 扫了 node_modules、SourceMap 全量生成、压缩串行 |
+| 包大 | 模块占比树图 | `webpack-bundle-analyzer`、`rollup-plugin-visualizer` | 全量引入组件库、moment/lodash 未按需、重复依赖多版本 |
+| 首屏慢但包不大 | 请求数与关键路径 | Lighthouse、Network 瀑布图 | 分包过碎、preload 缺失、第三方脚本阻塞 |
+| 缓存命中差 | hash 是否抖动 | 连续两次构建 diff 产物名 | 缺 `moduleIds: 'deterministic'`、runtime 未单独提取 |
+
+> 面试要给的回答结构：**先定指标（构建时长 / 首屏体积 / 缓存命中率）→ 用工具定位到具体模块 → 改一项 → 复测对比**。只说「我配了 splitChunks 所以快了」是没说服力的。
+
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 线上样式丢失，本地正常 | `sideEffects: false` 误删了只做副作用导入的模块 | 改白名单 `["*.css"]` |
+| 发版后用户拿着新旧混杂的 chunk 报错 | HTML 与 chunk 缓存策略不一致 / 旧 chunk 被清 | HTML 不缓存 + 保留上一版产物（或 `output.clean` 谨慎用） |
+| Tree Shaking 完全不生效 | Babel 把 ESM 转成了 CJS | `@babel/preset-env` 设 `modules: false` |
+| 每次构建 hash 都变 | 模块 ID 不稳定 | `moduleIds/chunkIds: 'deterministic'` |
+| dev 正常、build 报 `window is not defined` | 服务端/预渲染阶段执行了浏览器代码 | 浏览器 API 放到 `onMounted`/动态 import 内 |
+| Vite 大依赖报 CJS 错误 | 未走预构建 | `optimizeDeps.include` 显式声明 |
+| HMR 改样式无效但改逻辑有效 | CSS 被 `MiniCssExtractPlugin` 抽离（dev 也开） | dev 用 `style-loader`，仅 prod 抽取 |
+| 构建内存 OOM | 大项目 sourcemap + 并行压缩 | 调 `--max-old-space-size`、拆分 chunk、关 dev sourcemap |
+
+## 自测清单（能答上 8 条算过关）
+
+1. Compiler 与 Compilation 的区别？插件里什么时候用哪个？
+2. Webpack 插件体系的底层是哪个库？三种 tap 的差异？
+3. Loader 从右到左执行的根本原因？
+4. ESM 为什么可静态分析、CJS 为什么不行？
+5. `usedExports` 与 `sideEffects` 各解决什么层级的问题？
+6. `sideEffects: false` 误标会导致什么线上事故？怎么修？
+7. Vue HMR 与 React Fast Refresh 的机制差异？为什么 React 改 hooks 顺序会丢状态？
+8. Vite 在生产构建上是否更快？它的「快」边界在哪？
+9. Vite 开发模式三个典型坑分别是什么？
+10. Rspack / Turbopack / Vite 的选型判断依据是什么？
 
 ---
 
