@@ -151,6 +151,17 @@ function workLoop(deadline) {
 requestIdleCallback(workLoop);
 ```
 
+> ⚠️ 上面是**教学简化模型**。React 实际没有用 `requestIdleCallback`——它自己实现了 Scheduler（基于 `MessageChannel`，5ms 时间片 + 过期时间优先级），原因是 rIC 只在「浏览器认为空闲」时回调，频率不可控（可能几秒才来一次），而 React 需要在「有高优更新时立刻抢占」。
+
+**追问链（Fiber 真正的考点）：**
+
+- **「render 阶段和 commit 阶段分别能做什么，为什么这么分？」⭐⭐⭐**
+  答：render 阶段（`beginWork`/`completeUnitOfWork`）是**可中断**的，只做计算：生成新的 fiber 树、diff 出副作用标记（flags）。commit 阶段（`commitRoot`）是**不可中断**的：一次跑完 DOM 变更、`useLayoutEffect`、`componentDidMount/Update`，然后再让浏览器绘制。这么分的根因是：DOM 操作一旦开始就不能回到中间态，否则用户会看到半个界面。所以「Fiber 能中断」严格说只适用于 render 阶段——`useLayoutEffect` 里写死循环照样卡死页面。
+- **「双缓存 Fiber 树是什么？」**
+  答：内存里同时存在 `current`（屏幕上正在显示的）和 `workInProgress`（正在构建的）两棵 fiber 树，通过 `alternate` 指针互指。render 阶段在 wip 树上改，commit 阶段把 `root.current` 指向 wip，完成一次「交换」。好处是：渲染过程中屏幕上的树始终完整可用，中断/放弃重渲染只需丢掉 wip 树，不影响已显示内容。
+- **「Lane 模型解决了什么？」**
+  答：优先级。React 15 用 `expirationTime`（单一数值，比较粗暴），React 17+ 换成 31 位 bitmask 的 lanes：一次更新可以打多个 lane（比如 transition + 默认），`entangle` 保证同一批更新一起提交；高优更新（用户输入）可以打断低优渲染（大列表渲染）并复用已完成的工作。
+
 ---
 
 ## Hooks
@@ -366,7 +377,112 @@ const prevCount = usePrevious(count);
 
 ---
 
-## 组件设计
+## Hooks 原理与陷阱（这一段才是中高级的分水岭）
+
+### Q7b: 为什么 Hooks 不能写在条件/循环里？⭐⭐⭐ 🔥
+
+**答：** 因为 Hooks 的状态不是存在组件上，而是**存在 fiber 的链表里，靠调用顺序对齐**。
+
+```
+mount 阶段（首次渲染）
+fiber.memoizedState → hook1 → next → hook2 → next → hook3 → null
+                        ↑        ↑        ↑
+调用顺序：           useState  useEffect  useRef
+```
+
+每次渲染时，React 沿着 `memoizedState` 链表**按顺序**读取每个 hook 的状态。如果某次渲染少调了一个 hook（因为写在 if 里），链表指针就会错位——第二个 hook 读到第一个的状态，`useState` 拿到 `useEffect` 的 effect 对象。这不是「React 不让你这么写」，而是**顺序即身份，没有 key 可对齐**。
+
+```jsx
+// ❌ 条件调用：第一次渲染 cond=true，第二次 false，链表错位
+if (cond) {
+  const [a, setA] = useState(0);
+}
+const [b, setB] = useState(1);
+
+// ✅ 规则：所有 hook 无条件、按固定顺序、在顶层调用；
+//    条件逻辑放到 hook 内部或返回值上
+const [a, setA] = useState(0);
+if (!cond) { /* 用不用 a 是另一回事，hook 必须调 */ }
+```
+
+**追问：「那自定义 hook 里的 hook 算不算违反规则？」** 答：不算——只要自定义 hook 本身无条件调用、且以 `use` 开头（让 lint 插件能识别），它内部的 hook 也天然按固定顺序执行。
+
+### Q7c: 什么是「闭包陷阱」（stale closure）？⭐⭐⭐ 🔥
+
+```jsx
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      console.log(count);      // ❌ 永远是 0
+      setCount(count + 1);     // ❌ 永远加不到 1 以上
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []); // 空依赖：effect 只跑一次，捕获了首次渲染的 count=0
+
+  return <div>{count}</div>;
+}
+```
+
+**根因**：函数组件每次渲染都是**一次全新的函数调用**，闭包捕获的是「这一次渲染的变量快照」。空依赖的 effect 只执行一次，回调里捕获的就是首次渲染的 `count`（=0）。组件重渲染不会改写已有闭包里的变量。
+
+**三种解法（按推荐度）：**
+
+```jsx
+// ① 函数式更新：不依赖外部快照值（最优）
+setCount(c => c + 1);
+
+// ② useRef 保存最新值（需要读取但不想重建 effect）
+const countRef = useRef(count);
+useEffect(() => { countRef.current = count; });
+
+// ③ 把依赖写全，effect 重建（代价是清理/重建频繁）
+useEffect(() => { /* ... */ }, [count]);
+```
+
+**追问：「哪些场景最容易踩？」** 答：① 定时器/轮询；② WebSocket 消息回调里读 state；③ 事件监听回调（`addEventListener` 注册一次但需要读最新 state）；④ 防抖节流函数的参数。这类「长生命周期回调 + 短生命周期变量」的组合就是闭包陷阱的高发区。
+
+### Q7d: setState 是同步还是异步？批处理怎么变了？⭐⭐⭐
+
+**答：** 在 React 18 之前，`setState` 的「异步」只是**批处理**的表现：在 React 合成事件和生命周期里会合并成一次渲染，在 `setTimeout`/原生事件里是同步立即渲染。**React 18 起自动批处理覆盖所有场景**（包括 Promise 回调、setTimeout、原生事件），只有 `flushSync` 能强制同步刷。
+
+```jsx
+// React 18：这两次 set 会合并成一次渲染
+setTimeout(() => {
+  setCount(c => c + 1);
+  setFlag(f => !f);   // 同一个微任务批次，只渲染一次
+}, 0);
+
+// 需要立刻拿到 DOM 更新后同步执行（慎用，会打断批处理）
+import { flushSync } from 'react-dom';
+flushSync(() => setCount(c => c + 1));
+```
+
+**追问：「连续 setState 三次，值会变成 3 吗？」** 答：取决于写法——`setCount(count + 1)` 三次都基于同一快照，最终 +1；`setCount(c => c + 1)` 三次基于前一次结果累积，最终 +3。**这是同一道题的两个知识点：批处理 + 函数式更新**。
+
+### Q7e: React 18 的并发特性怎么用？⭐⭐⭐
+
+```jsx
+// useTransition：把「非紧急更新」标记为可打断
+const [isPending, startTransition] = useTransition();
+
+function onSearch(keyword) {
+  setKeyword(keyword);              // 紧急：输入框必须立刻响应
+  startTransition(() => {
+    setResults(search(keyword));    // 非紧急：可被后续输入打断
+  });
+}
+
+// useDeferredValue：给「派生的重计算」降级
+const deferredQuery = useDeferredValue(query);
+const list = useMemo(() => filterHugeList(deferredQuery), [deferredQuery]);
+```
+
+**追问链：**
+
+- **「transition 和 debounce 有什么区别？」** 答：debounce 是**延迟**（等用户停下再算），transition 是**让路**（立刻开始算，但一有紧急更新就丢弃重来）。所以 transition 不会让结果变慢，只是保证输入不卡；debounce 会牺牲响应时效。搜索框这类「输入必须跟手、结果可以稍慢」的场景，transition 更合适，且不需要猜延迟时长。
+- **「`useDeferredValue` 什么时候真的有用？」** 答：只在「子组件渲染成本高、且数据能从当前 props 派生」时有用。如果渲染很便宜，它只是多一层状态反而更慢——这是典型的「看起来高级但不该用」的 API。
 
 ### Q8: 受控组件和非受控组件？⭐⭐ 🔥
 
@@ -623,6 +739,44 @@ const style = useMemo(() => ({ color: 'red' }), []);
 // 8. 状态提升 vs 下沉
 // 只在需要的组件维护状态，避免不必要的重渲染
 ```
+
+**追问链（性能题的天花板在这里）：**
+
+- **「怎么证明某个组件在无谓重渲染？」⭐⭐⭐**
+  答：三步：① React DevTools Profiler 录一段交互，看 flame chart 里哪些组件「渲染了但 props 没变」；② 打开「Highlight updates」直观看到闪烁范围；③ 开发期加 `why-did-you-render` 打印具体是哪个 prop 导致比较失败（通常是内联对象/函数、或 `children` 每次新建）。**能说出「先测再改」的顺序，比背 8 条优化手段值钱。**
+- **「什么时候不该用 memo/useMemo？」**
+  答：当组件渲染成本很低（几百个 DOM 节点以内）、父组件很少重渲染时，`memo` 的比较开销 + 缓存维护成本可能高于收益。判断标准是「有没有实测到重渲染热点」，而不是「代码里看到子组件就包 memo」。这也是 React 官方一直强调 memo 不能到处撒的原因。
+- **「React Compiler 会取代这些手写优化吗？」**
+  答：方向上是。React Compiler 在编译期自动插入 memoization，把手写的 `useMemo/useCallback/memo` 变成编译器职责。但它要求代码符合规则（纯函数、不在渲染期改外部状态），违反规则的部分会被跳过。所以「理解闭包与依赖」依然是必要的——**编译器只能优化语义正确的代码**。
+
+---
+
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 定时器里读到的 state 永远是最初值 | 闭包陷阱（effect 只挂载一次） | 函数式更新 / ref 同步最新值 |
+| 条件渲染时 hook 报「Rendered fewer hooks than expected」 | hook 写在 if/循环里，链表错位 | hook 提到顶层，条件逻辑内移 |
+| 无限重渲染 | effect 依赖里放了每次新建的对象/函数 | 依赖拆到原始值，或把对象创建提到外面 useMemo |
+| 改列表顺序后输入框内容串了 | 用 index 当 key | 用稳定唯一 id 当 key |
+| `setState` 后立刻读 state 拿不到新值 | 批处理 + 快照语义 | 在 useEffect/回调里读，或用函数式更新 |
+| 弹窗定位闪一下才归位 | 用 useEffect 测量 DOM | 换 useLayoutEffect 在绘制前算完 |
+| Context 一改整棵树都重渲染 | Provider value 每次新建对象 | value 用 useMemo，或按域拆多个 Context |
+| SSR 报 `window is not defined` | 渲染期访问浏览器 API | 移到 useEffect / 动态 import `ssr: false` |
+| StrictMode 下 effect 执行两次 | 开发期故意双调用以暴露副作用 | 清理函数写完整，别关 StrictMode |
+
+## 自测清单（能答上 8 条算过关）
+
+1. Fiber 把渲染拆成哪两个阶段？哪个可中断、为什么？
+2. 双缓存 Fiber 树的 `alternate` 指针解决了什么问题？
+3. React 为什么不用 requestIdleCallback 而自研 Scheduler？
+4. Hook 为什么不能条件调用？状态存在哪里、靠什么对齐？
+5. 闭包陷阱的根因是什么？三种解法各自的代价？
+6. `setCount(count+1)` 连续三次和 `setCount(c=>c+1)` 连续三次，结果差多少？为什么？
+7. React 18 的自动批处理覆盖了哪些新场景？`flushSync` 什么时候该用（及为什么慎用）？
+8. transition 与 debounce 的本质区别？`useDeferredValue` 什么情况下反而更慢？
+9. 怎么用工具证明「这个组件在无谓重渲染」？
+10. React Compiler 能自动化的边界在哪？为什么仍要懂依赖规则？
 
 ---
 

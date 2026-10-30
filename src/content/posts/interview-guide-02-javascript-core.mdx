@@ -125,6 +125,17 @@ function deepClone(obj, map = new WeakMap()) {
 const copy3 = structuredClone(obj);
 ```
 
+**追问链（这道题的分水岭在第 3 问）：**
+
+- **「JSON 深拷贝到底丢什么？逐个说。」⭐⭐⭐**
+  答：五类丢失/变形：① `undefined`、函数、`Symbol` 作为值被直接丢弃（作为对象属性时）；② `Date` 变成 ISO 字符串；③ `NaN` / `Infinity` 变成 `null`；④ `RegExp` 变成 `{}`；⑤ 循环引用直接抛错。另外还会丢原型（实例变普通对象）和不可枚举属性。所以 **JSON 深拷贝只在纯数据场景可用**（POJO + 基础类型），一旦对象带原型、Date、函数，就得换方案。
+- **「`structuredClone` 能替代手写深拷贝吗？」**
+  答：日常够用且更安全（原生实现、支持循环引用、支持 Date/Map/Set/RegExp/ArrayBuffer）。但它**不支持函数、Symbol、DOM 节点、class 实例的方法**，克隆 class 实例会丢原型变成普通对象。所以「配置数据/接口数据」用 structuredClone，「带行为/带原型的对象」还是得手写或走工厂函数重建。
+- **「手写深拷贝里为什么用 WeakMap 而不是 Map 存循环引用？」**
+  答：WeakMap 的 key 是弱引用，克隆完成后原对象若没有其他引用，可以被正常 GC；用 Map 会让所有被克隆过的对象**永久驻留**在 map 里，等于自己造了一个内存泄漏。这也是面试官判断「你是背代码还是真写过」的细节。
+- **「深拷贝就一定要递归到底吗？」**
+  答：不一定。实践中常用**按需深拷贝**：只对会变化的分支深拷贝（结构共享），其余复用引用。这也是 immer 这类库的思路——用 Proxy 记录改动，产出「看起来全新」的对象但共享未变部分，既满足不可变语义又不付出全量递归的代价。
+
 ---
 
 ## 作用域与闭包
@@ -234,6 +245,15 @@ const module = (function() {
 - 内存泄漏：闭包引用的变量不会被回收
 - 解决：及时释放不需要的引用 `fn = null`
 
+**追问链（闭包这题的高分点）：**
+
+- **「『闭包导致内存泄漏』这句话对不对？」⭐⭐⭐**
+  答：不严谨。闭包本身是正常且必要的机制，只有当「闭包的生命周期远长于所需数据」时才是问题——例如把大对象挂进一个永不移除的全局事件监听；或组件销毁后定时器仍在跑，里面的闭包持有整个组件作用域（连带 detached DOM）。**正确表述**：闭包会延长其捕获变量的存活时间，泄漏的判据是「本该回收的作用域被长期持有」。
+- **「线上怎么确认是闭包泄漏？」**
+  答：DevTools Memory 面板：① 拍两次堆快照（操作前/反复操作后），Comparison 视图看 `Detached HTMLElement` 与自定义类实例是否持续增长；② 用 Allocation instrumentation on timeline 定位持续分配的来源；③ 快照里展开 Retainers，往上追到「谁持有它」——通常能找到挂着闭包的事件监听/定时器。**能说出 Retainers 这一层，基本就是真排查过。**
+- **「循环里的 `var` 为什么全部输出 3？」**
+  答：`var i` 是函数作用域，三个 setTimeout 的回调共享**同一个 i**；循环结束时 i=3，回调执行时读到的自然是 3。改成 `let` 后，ES 规范为每次循环迭代**创建一个新的绑定**（相当于每轮都有独立的 i），所以输出 0/1/2。等价的老写法是 IIFE 包一层把 i 作为参数传进去。
+
 ### Q6: var、let、const 的区别？⭐ 🔥
 
 **答：**
@@ -340,6 +360,15 @@ fn1(); // undefined（this 丢失）
 const fn2 = person.sayName.bind(person);
 fn2(); // 'person'
 ```
+
+**追问链：**
+
+- **「`bind` 之后的函数还能被 `new` 吗？this 还是绑定的那个吗？」⭐⭐⭐ 高频冷门题**
+  答：能 `new`，但 **`new` 的优先级高于 bind**——`new boundFn()` 时 this 指向新实例，绑定的 this 被忽略。规范里叫「BoundFunctionCreate + [[Construct]]」：构造调用时会用绑定函数保存的 target 去构造，this 由 new 决定。推论：`bind` 只能保证「普通调用」时的 this，不能阻止被当构造函数用。
+- **「箭头函数为什么不能当构造函数？」**
+  答：箭头函数没有 `[[Construct]]` 内部方法、没有 `prototype` 属性、也没有自己的 `this`（词法继承）。`new (() => {})` 直接抛 `TypeError: not a constructor`。这正是它在回调场景好用的原因——不会意外改变 this，也不会被 new 出实例。
+- **「`obj.fn()` 里的 this 是什么时候确定的？」**
+  答：**调用时**，不是定义时。所以「把方法赋给变量再调用」会丢 this（`const f = obj.fn; f()` → undefined/global）。这也是 React 类组件时代 `this.handleClick = this.handleClick.bind(this)` 存在的原因。
 
 ---
 
@@ -452,6 +481,13 @@ class Child extends Parent {
   }
 }
 ```
+
+**追问链：**
+
+- **「为什么 `super()` 之前访问 `this` 会报错？」⭐⭐⭐**
+  答：ES6 的类实例创建分两步：派生类的 `this` **由父类构造函数创建**，在 `super()` 返回之前，绑定还不存在（处于 TDZ）。所以 `this.x = 1` 写在 `super()` 之前会抛 `ReferenceError: Must call super constructor before accessing 'this'`。这是与 ES5 组合继承最本质的差异——ES5 里 `Parent.call(this)` 时 this 已经存在。
+- **「ES6 class 和寄生组合继承是两套东西吗？」**
+  答：不是，class 就是寄生组合继承的语法糖，但多了三条硬约束：① 类只能用 `new` 调用（直接 `Parent()` 抛错）；② 原型方法**不可枚举**（`for...in` 拿不到，ES5 手写会拿到）；③ 类声明不会变量提升（同样有 TDZ）。理解这三条，才不会被「class 是不是新机制」这类问题绕住。
 
 ### Q10: instanceof 的原理？如何实现？⭐⭐
 
@@ -620,6 +656,44 @@ const proxy = new Proxy(target, {
 });
 // 优势：可以监听所有操作
 ```
+
+**追问链（Proxy 题的深度全在这三问）：**
+
+- **「为什么 handler 里一定要用 `Reflect`？直接 `target[key]` 不行吗？」⭐⭐⭐**
+  答：两个前提：① `Reflect.get(target, key, receiver)` 会把 **receiver（即 proxy 自身）作为 getter 的 this** 传下去，如果对象里有 getter 且内部访问其他属性，才能继续走 proxy 的拦截；直接 `target[key]` 会让 getter 里的 this 指向原始对象，**丢掉后续拦截**（嵌套属性不再响应式，Vue 3 早期一堆 bug 就源于此）。② `Reflect.set` 会返回布尔值，能忠实反映「赋值是否成功」（比如目标属性是 `writable: false` 时），而普通赋值在严格模式下抛错，行为不一致。
+- **「Proxy 有什么代价？」**
+  答：① 每次属性访问多一层函数调用，热点路径上开销可观（Vue 3 因此对 `shallowRef`、`markRaw` 做了逃生口）；② 代理后的对象与原对象 `!==`，把 proxy 传给第三方库（尤其做 `instanceof` / identity 判断的库）可能出错；③ 某些内建对象（Map/Set/Date）需要额外绑定，直接代理会导致内部槽失效。
+- **「能撤销代理吗？」**
+  答：能，`new Proxy(target, { ... })` 配 `Proxy.revocable(target, handler)`，拿到 `{ proxy, revoke }`，调用 `revoke()` 之后所有操作抛 `TypeError`。典型用途是组件卸载后立刻让旧引用失效，防止异步回调继续写状态。
+
+---
+
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| JSON 深拷贝后日期变字符串、`NaN` 变 null | JSON 只支持有限类型 | 换 `structuredClone`，或手写递归 |
+| 深拷贝带循环引用的对象直接抛错 | `JSON.stringify` 无法处理环 | 手写递归 + WeakMap 缓存 |
+| 深拷贝后实例方法丢了 | 克隆只复制属性不复制原型 | 用工厂函数重建实例，或 `Object.create(proto)` 后拷属性 |
+| 方法传给回调后 this 变 undefined | this 是调用时确定的 | `bind`、箭头函数，或在调用处 `obj.fn()` |
+| `new` 之后 this 不是 bind 的对象 | new 优先级高于 bind | 这是规范行为；需要固定 this 就别让它被构造 |
+| `super()` 之前访问 this 报错 | 派生类 this 由父类构造创建（TDZ） | 先 `super()`，再做任何 this 操作 |
+| for 循环里 setTimeout 全输出同一个值 | `var` 共享同一绑定 | 改 `let` 或 IIFE 传参 |
+| Proxy 代理后嵌套属性不响应 | handler 里用了 `target[key]` 丢 receiver | 一律走 `Reflect.get/set(target, key, receiver)` |
+| 判空用 `if (obj)` 放过了 `0`/`''` | 隐式类型转换 | 显式 `obj != null`，或 `??` 兜默认值 |
+
+## 自测清单（能答上 8 条算过关）
+
+1. 8 种数据类型？`typeof null` 为什么是 object？怎么准确判断类型？
+2. JSON 深拷贝会丢哪五类信息？`structuredClone` 还漏什么？
+3. 手写深拷贝为什么用 WeakMap？用 Map 会怎样？
+4. 「闭包导致内存泄漏」这句话哪里不严谨？怎么用堆快照证明？
+5. `let` 在 for 循环里做了什么，让 setTimeout 输出 0/1/2？
+6. `new boundFn()` 的 this 是谁？规范依据是什么？
+7. 箭头函数为什么不能 new？它有没有 prototype？
+8. `super()` 之前为什么不能碰 this？class 与寄生组合继承的三条差异？
+9. Proxy 的 handler 为什么必须用 Reflect？不用会丢什么？
+10. 「深拷贝一定要递归到底吗」——结构共享的取舍是什么？
 
 ---
 

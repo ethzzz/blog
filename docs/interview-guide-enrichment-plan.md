@@ -19,9 +19,9 @@
 | B3 | 20-frontend-core-qa | 12.1k | ✅ 已加深（Q1/Q8/Q14/Q18 追问 + 资深面压力追问 6 类 + 自测） |
 | B3 | 07-build-tools | 9.2k | ✅ 已加深（Compiler/Compilation、Tapable、sideEffects 事故、Fast Refresh、Vite 代价与 Rspack 选型、定位方法、坑表、自测） |
 | B3 | 03-javascript-async | 9.6k | ✅ 已加深（微任务动机、渲染时机、rAF 归属、await tick 差异、Node 线程池、五种反模式、坑表、自测） |
-| B4 | 05-react | 9.7k | 待做 |
-| B4 | 02-javascript-core | 10.3k | 待做 |
-| B4 | 18-soft-skills | 10.7k | 待做 |
+| B4 | 05-react | 9.7k | ✅ 已加深（Fiber 两阶段/双缓存/Lane、Hooks 链表原理、闭包陷阱、setState 批处理、并发特性、坑表、自测） |
+| B4 | 02-javascript-core | 10.3k | ✅ 已加深（JSON 深拷贝五坑/structuredClone/WeakMap、bind+new 优先级、class TDZ、Proxy receiver、坑表、自测） |
+| B4 | 18-soft-skills | 10.7k | ✅ 已加深（数字防守追问、空窗期专题、HR 五种压价话术、反问被反问、翻车点表、自测） |
 | B5 | 01-html-css | 10.7k | 待做 |
 | B5 | 04-vue | 11.3k | 待做 |
 | B5 | 13-performance | 11.3k | 待做 |
