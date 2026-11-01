@@ -238,6 +238,26 @@ function ref(value) {
 | Map/Set | 不支持 | 支持 |
 | 性能 | 初始化开销大 | 运行时开销小 |
 
+**追问链（Vue3 响应式的三层结构必须能说清）：**
+
+- **「依赖存在哪里？为什么用 WeakMap？」⭐⭐⭐**
+  答：三级结构 `WeakMap<target, Map<key, Set<effect>>>`：
+
+  ```text
+  WeakMap
+   └─ target(Object) → Map
+        └─ key('count') → Set
+             └─ effect(fn1, fn2, ...)   ← 依赖这个属性的所有副作用
+  ```
+
+  用 WeakMap 做最外层：组件卸载后 target 不再被引用时，整棵依赖树可以被 GC 回收；用 Map 会永久持有 target，等于泄漏。这正是「为什么不用普通对象存依赖」的答案。
+- **「为什么 `trigger` 之后是异步更新？更新队列在哪？」**
+  答：`trigger` 并不直接执行 effect，而是把 effect 推进一个**微任务队列**（`Promise.then` 派发），同一轮里多个数据变化会被去重并合并成一次组件更新。这和 React 的批处理是同一个目的：避免一次交互触发 N 次渲染。所以「改完数据后立刻读 DOM 拿到旧值」是正常现象，需要 DOM 就 `await nextTick()`。
+- **「`computed` 和 `watch` 的区别，从依赖角度说？」**
+  答：`computed` 是**惰性 + 缓存**的 effect：只有被读取时才求值，并把自身标记为「干净」；依赖变化只把标记置脏（dirty），下次读取才重算。`watch` 是**立即订阅**的 effect：依赖变化就把回调推进队列执行。所以「模板里用 computed 算三遍」不会算三次，而 watch 不读也在跑。
+
+> ⚠️ 注意上面 `reactive()` 示例里的 `return reactive(result)` 是**教学简化**，真实实现用 `reactiveMap`/`readonlyMap` 缓存代理对象，保证同一个原始对象多次被访问时返回**同一个 proxy**。否则每次 `get` 都新建 proxy，会导致 `state.obj === state.obj` 为 false、`watch` 反复触发。
+
 ### Q5: ref 和 reactive 的区别？⭐⭐ 🔥
 
 **答：**
@@ -274,6 +294,15 @@ const { list } = state;      // ❌ 解构后失去响应式
 import { toRefs } from 'vue';
 const { list } = toRefs(state); // ✅ 保持响应式
 ```
+
+**追问链（这几问决定你是「用过」还是「踩过」）：**
+
+- **「`reactive` 对象整体被替换会怎样？」⭐⭐⭐**
+  答：会丢响应式。`state = reactive({...})` 拿到的是 proxy，组件里持有的是这个 proxy 的引用；如果后续 `state = { ... }` 重新赋值，模板仍指向旧 proxy，视图不更新。所以约定是「**永远不整体替换 reactive 对象，只改它的属性**」；需要整体替换就用 `ref` 包一层（`state.value = {...}`，ref 的 `.value` 是可替换的）。
+- **「什么时候必须用 `shallowRef` / `markRaw`？」**
+  答：两类场景：① **大对象且只在整体替换时更新**（如一次性加载的图表数据、地图实例），用 `shallowRef` 避免深度代理的开销，只监听 `.value` 的替换；② **不需要也不允许被代理的对象**（第三方类实例、ECharts/Three 实例、复杂二进制结构），用 `markRaw` 打标记让 Vue 跳过代理——否则 proxy 会破坏这些库的内部判断（`instanceof`、私有字段），出现「图表渲染空白」「实例方法找不到」这类玄学 bug。
+- **「`ref` 放进 `reactive` 里还要 `.value` 吗？」**
+  答：不用。`reactive` 在 get 时会对「值为 ref 的属性」自动解包，所以 `state.count` 直接可用。但**数组/Map 里的 ref 不会自动解包**，`arr[0]` 仍是 ref 对象——这是最容易让人困惑的不一致，官方文档也明确标注了。
 
 ---
 
@@ -388,6 +417,74 @@ function diffChildren(oldCh, newCh) {
 <!-- ❌ 使用 index 作为 key（列表会变化时） -->
 <li v-for="(item, index) in list" :key="index">{{ item.name }}</li>
 ```
+
+### Q7b: Vue3 的 Diff 到底怎么走？为什么要用最长递增子序列？⭐⭐⭐ 🔥
+
+**答：** Vue3 把「子节点更新」拆成**五步**，前四步都是廉价的特判，只有真正乱序时才进入 O(n) 的 map 查找 + LIS。
+
+```
+① 同步前置：i 从 0 开始，新旧头节点逐个 patch，遇到不同就停
+② 同步后置：e1/e2 从尾部往前，逐个 patch，遇到不同就停
+③ 旧节点已遍历完（i > e1）→ 剩下的新节点全是新增，挂载
+④ 新节点已遍历完（i > e2）→ 剩下的旧节点全是删除，卸载
+⑤ 乱序（最复杂）：中间段建 key→index 映射，再求 LIS 决定谁「不用动」
+```
+
+**第 ⑤ 步的关键：为什么要 LIS？**
+
+```text
+旧中间段 key：[a, b, c, d, e]
+新中间段 key：[a, e, b, c, d]      ← a 不动，b~e 整体后移
+
+做法：按新顺序遍历，为每个新节点找到它在旧序列里的位置索引 → [0, 4, 1, 2, 3]
+LIS([0,4,1,2,3]) = [0,1,2,3]（对应 a,b,c,d）
+
+含义：a/b/c/d 保持相对顺序不变 → 只有 e 需要真正移动 DOM。
+     其余节点只需 patch 内容，不需要 insertBefore。
+```
+
+```javascript
+// Vue3 源码中的乱序处理（runtime-core/src/renderer.ts 简化）
+const newIndexToOldIndexMap = new Array(toBePatched)
+
+// 1. 建立 新索引 → 旧索引 的映射，顺带把「旧节点被复用」标记出来
+for (let i = toBePatched - 1; i >= 0; i--) {
+  const nextIndex = s2 + i
+  const nextChild = c2[nextIndex]
+  const anchor = nextIndex + 1 < l2 ? c2[nextIndex + 1].el : parentAnchor
+  const key = nextChild.key
+  const oldIndex = keyToNewIndexMap.get(key)
+
+  if (oldIndex === undefined) {
+    patch(null, nextChild, container, anchor)   // 新增
+  } else {
+    newIndexToOldIndexMap[i] = oldIndex + 1      // 记录，供 LIS 使用
+    patch(c1[oldIndex], nextChild, ...)
+  }
+}
+
+// 2. 求 LIS，得到「不需要移动」的索引集合
+const increasingNewIndexSequence = getSequence(newIndexToOldIndexMap)
+
+// 3. 从后往前遍历，只移动不在 LIS 里的节点
+let j = increasingNewIndexSequence.length - 1
+for (let i = toBePatched - 1; i >= 0; i--) {
+  if (i !== increasingNewIndexSequence[j]) {
+    insert(nextChild.el, container, anchor)      // 移动
+  } else {
+    j--                                           // 在 LIS 里，跳过
+  }
+}
+```
+
+**追问链：**
+
+- **「不用 LIS，直接按新顺序全部移动行不行？」**
+  答：功能正确，但 DOM 操作次数从「最少必要」变成「几乎全量」。DOM 的 `insertBefore` 会触发样式重算与布局，成本远高于 JS 计算（LIS 是 O(n log n)，几千个节点也就毫秒级）。所以 **LIS 是用一点 CPU 换掉大量 DOM 操作**。
+- **「为什么 Vue2 的双端对比没有用到 LIS？」**
+  答：双端对比是「四种首尾组合特判 + 中间乱序时逐个查找移动」，最优场景（头尾增删、单点移动）表现极好，但中间乱序的比例一高就退化成 O(n²) 级别的查找与移动。Vue3 的 map + LIS 在乱序场景是稳定 O(n log n)，**这是「大列表重排」场景 Vue3 明显更快的核心原因**。
+- **「那 key 到底影响哪一步？」**
+  答：只影响第 ⑤ 步的 map 查找与 LIS 结果。没有 key 时只能按索引对齐（就地复用），一旦顺序变了就是「内容全错位 + 全部重渲染」；用 index 做 key 等价于没有 key（因为索引永远连续），列表插入/删除时同样会错位。
 
 ---
 
@@ -717,6 +814,36 @@ export default {
   }
 };
 ```
+
+---
+
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 改了数据视图不更新 | 整体替换了 reactive 对象 / 解构丢了响应式 | 只改属性；解构用 `toRefs`；或换 `ref` |
+| 图表/地图实例渲染空白或方法丢失 | 类实例被 Proxy 包住，内部判定失效 | `markRaw` 或 `shallowRef` |
+| 列表插入后输入框内容错位 | 用 index 当 key | 用稳定业务 id |
+| `watch` 监听不到嵌套对象变化 | 默认浅监听 | `{ deep: true }`，或用 `watch(() => obj.a, ...)` 精确监听 |
+| `watch` 里改自己被监听的值导致死循环 | 回调里写回同一个源 | 加条件判断，或用 `flush: 'post'` + 只写别的状态 |
+| 改数据后立刻取 DOM 是旧值 | 更新走微任务队列 | `await nextTick()` |
+| `v-if` 和 `v-for` 同元素，条件取不到循环变量 | `v-if` 优先级更高（Vue3） | 外层包 `<template v-for>`，或先 computed 过滤 |
+| provide 的值不是响应式 | provide 了普通值 | provide 一个 ref/reactive，或 `readonly` 包装响应式对象 |
+| keep-alive 缓存后数据不刷新 | `onActivated` 没做重新拉取 | 用 `onActivated` 触发刷新，或用 `:key` 控制缓存粒度 |
+| 大列表滚动卡顿 | 一次渲染全部节点 | 虚拟滚动（vue-virtual-scroller / vueuc） |
+
+## 自测清单（能答上 8 条算过关）
+
+1. Vue2 的 `Object.defineProperty` 方案有哪两个「监听不到」，各自的官方补丁是什么？
+2. Vue3 依赖的三级结构怎么组织？最外层为什么必须是 WeakMap？
+3. `trigger` 之后为什么不是同步更新？更新队列在哪个任务里刷？
+4. `computed` 的「惰性 + 缓存」具体靠什么标记实现？它和 watch 的依赖触发差异？
+5. `ref` 和 `reactive` 的适用边界？为什么不能整体替换 reactive？
+6. 什么对象必须 `markRaw`？不 mark 会出现什么症状？
+7. Vue3 子节点 diff 的五步分别做什么？第 ⑤ 步为什么要求 LIS？
+8. 没有 key、用 index 当 key、用业务 id 当 key，三者在 diff 结果上的差别？
+9. 父子组件 mounted 的执行顺序？父组件 onMounted 时子组件 DOM 一定就绪吗？
+10. `v-if` 与 `v-for` 同用时，Vue3 里谁优先？正确写法是什么？
 
 ---
 

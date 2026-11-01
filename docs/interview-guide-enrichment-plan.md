@@ -22,9 +22,9 @@
 | B4 | 05-react | 9.7k | ✅ 已加深（Fiber 两阶段/双缓存/Lane、Hooks 链表原理、闭包陷阱、setState 批处理、并发特性、坑表、自测） |
 | B4 | 02-javascript-core | 10.3k | ✅ 已加深（JSON 深拷贝五坑/structuredClone/WeakMap、bind+new 优先级、class TDZ、Proxy receiver、坑表、自测） |
 | B4 | 18-soft-skills | 10.7k | ✅ 已加深（数字防守追问、空窗期专题、HR 五种压价话术、反问被反问、翻车点表、自测） |
-| B5 | 01-html-css | 10.7k | 待做 |
-| B5 | 04-vue | 11.3k | 待做 |
-| B5 | 13-performance | 11.3k | 待做 |
+| B5 | 01-html-css | 10.7k | ✅ 已加深（特异性三元组与 :is/:where、z-index 层叠上下文专题、强制同步布局、现代 CSS 四问、坑表、自测） |
+| B5 | 04-vue | 11.3k | ✅ 已加深（Vue3 五步 diff + LIS 专题、依赖三级结构/WeakMap、computed 惰性、reactive 替换陷阱、markRaw、坑表、自测） |
+| B5 | 13-performance | 11.3k | ✅ 已加深（LCP 四段拆解、INP 三段治理、CLS 三来源、性能预算落地、坑表、自测） |
 | B6 | 11-backend | 12.3k | 待做 |
 | B6 | 12-typescript | 12.6k | 待做 |
 | B6 | 16-realtime | 13.8k | 待做 |

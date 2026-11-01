@@ -240,6 +240,58 @@ div#main p.intro span     /* 1 + 100 + 1 + 10 + 1 = 113 */
 .text { color: red !important; }
 ```
 
+**追问链（「1000/100/10/1」只是教学口诀，真实规则是三元组）：**
+
+- **「特异性到底怎么算？1000 这个数字是规范里的吗？」⭐⭐⭐**
+  答：不是。规范里特异性是 **(A, B, C)** 三元组逐位比较，不是十进制相加：
+
+  ```
+  A = ID 选择器个数
+  B = 类 / 属性 / 伪类个数
+  C = 标签 / 伪元素个数
+  * 与组合符（> + ~ 空格）不参与
+  ```
+
+  所以 `#nav .item a:hover` 是 (1,2,2)，`div#main p.intro span` 是 (1,1,3)——前者胜（A 相同比 B）。用「121 vs 113」这种加法在跨过 10 的边界时会算错（比如 11 个类 vs 1 个 ID，加法以为 110 > 100，实际 (0,11,0) < (1,0,0)）。
+- **「`:is()`、`:not()`、`:where()` 怎么算特异性？」**
+  答：`:is()` / `:not()` 取**括号里参数中最高的那个**特异性计入；`:where()` 恒为 **(0,0,0)**——这是它存在的唯一理由：写零特异性样式覆盖，避免靠 `!important` 打架。
+- **「`!important` 的层级还受什么影响？」**
+  答：`!important` 之间还要比来源与层（cascade layers）：**用户样式表的 important > 作者 important > 动画 > 普通声明**。所以「内联 + !important」也不是绝对无敌——它仍然输给用户（无障碍）样式表里的 important。真正该做的是把 `!important` 限制在工具类（如 `.hidden`）里。
+
+### Q8b: 为什么 `z-index` 设了很大还是不生效？⭐⭐⭐ 🔥
+
+**答：** 因为 `z-index` **只在同一个层叠上下文（stacking context）内比较**。父元素自己创建了层叠上下文，子元素的 z-index 再大也出不了父元素的层级——它只能跟「兄弟」比。
+
+```
+页面
+├─ div.a  z-index: 1        ← 自成一个层叠上下文
+│    └─ 弹窗  z-index: 9999   ← 再大也只能待在 a 内部
+└─ div.b  z-index: 2        ← 整体压在 a（连同它的弹窗）之上
+```
+
+**会新建层叠上下文的常见属性（记住这几类就够用）：**
+
+| 原因 | 典型写法 |
+|:--|:--|
+| 定位 + z-index 非 auto | `position: relative; z-index: 1` |
+| 固定/粘性定位 | `position: fixed` / `sticky` |
+| 透明度 | `opacity` 小于 1 |
+| 变换/滤镜 | `transform` / `filter` / `perspective` / `backdrop-filter` 非 none |
+| 隔离 | `isolation: isolate`（专门用来主动创建，最干净） |
+| 布局/包含 | `flex`/`grid` 子项且 z-index 非 auto、`contain: paint`、`will-change` 指定上述属性 |
+
+**正确解法（按推荐度）：**
+
+```css
+/* ✅ 方案 1：把弹窗挂到 body（React Portal / Vue Teleport）——根治 */
+<Teleport to="body"> ... </Teleport>
+
+/* ✅ 方案 2：父级用 isolation 显式管理层级，而不是禁用 transform */
+.modal { isolation: isolate; z-index: 1000; }
+
+/* ⚠️ 方案 3：调父级 z-index —— 只是把问题往上一层挪，容易连锁 */
+```
+
 ### Q9: CSS 有哪些选择器？⭐
 
 **答：**
@@ -707,6 +759,128 @@ element.style.transform = 'translateX(100px)';
 4. 使用 `will-change` 提升为合成层
 5. DOM 操作使用 `DocumentFragment`
 6. 复杂动画使用 `position: absolute` 脱离文档流
+
+**追问链（这题的高分点在「强制同步布局」）：**
+
+- **「读写交替为什么会更慢？什么操作会强制回流？」⭐⭐⭐**
+  答：浏览器本来会把样式/布局变更攒到一帧末尾统一计算。但你一旦**读取**需要最新布局的属性，浏览器就必须立刻把攒着的工作做完才能给你准确值——这叫**强制同步布局（forced synchronous layout，也叫 layout thrashing）**：
+
+  ```javascript
+  // ❌ 每一次循环都逼浏览器布局一次（N 次回流）
+  for (const el of items) {
+    el.style.width = el.offsetWidth + 10 + 'px';  // 读→写→读→写
+  }
+
+  // ✅ 读写分离：先全部读，再全部写（1 次回流）
+  const widths = items.map(el => el.offsetWidth);
+  items.forEach((el, i) => { el.style.width = widths[i] + 10 + 'px'; });
+  ```
+
+  会触发布局计算的常见读取：`offsetTop/Left/Width/Height`、`clientWidth/Height`、`scrollTop/Height`、`getComputedStyle()`、`getBoundingClientRect()`、`element.focus()`。**记住「读布局属性 = 可能回流」这一条就够用。**
+- **「`will-change` 能随便加吗？」**
+  答：不能。它会让元素**常驻**一个合成层，代价是显存与内存占用；元素多了反而拖慢合成与滚动。正确用法是「动画开始前加、结束后移除」，或干脆只用 `transform/opacity` 让浏览器自己判断提升。线上见过为了「流畅」给几百个列表项加 `will-change: transform`，结果内存暴涨、滚动更卡。
+- **「有没有不写 JS 就能减少渲染成本的办法？」**
+  答：有，CSS 侧的 `content-visibility: auto`（跳屏外内容的渲染，配合 `contain-intrinsic-size` 防滚动条抖动）、`contain: layout paint`（显式声明隔离范围）。这类属性适合长文档、超长列表，比虚拟滚动改动小得多。
+
+---
+
+## 现代 CSS（2026 面试的加分项）
+
+> 这些能力已经不是「新特性」而是「基线能力」：容器查询、`:has()`、`@layer`、`aspect-ratio`、逻辑属性。不会用不致命，但被问到「你还在写媒体查询适配组件吗」时答不上来会减分。
+
+### Q18: 容器查询和媒体查询的区别？⭐⭐
+
+```css
+/* 媒体查询：看「视口」，组件在不同布局下要各自打补丁 */
+@media (min-width: 768px) { .card { flex-direction: row; } }
+
+/* 容器查询：看「父容器实际宽度」，组件真正自适应 */
+.card-wrap { container-type: inline-size; container-name: card; }
+
+@container card (min-width: 400px) {
+  .card { flex-direction: row; }
+}
+```
+
+**关键差异**：媒体查询关心「窗口多大」，容器查询关心「我被放在多大的地方」。同一张卡片放在侧边栏（窄）和主区域（宽）时，媒体查询无能为力（窗口一样宽），容器查询能自动切换布局——**这是设计系统里「组件级响应式」唯一干净的解法**。`cqi` / `cqw` 单位同理，相对于容器宽度而非视口。
+
+### Q19: `:has()` 解决了什么问题？⭐⭐
+
+```css
+/* 父凭子贵：有图片的卡片用另一种排版（过去只能靠 JS 加类名） */
+.card:has(> img) { padding-top: 0; }
+.card:has(> img) { grid-template-rows: 120px auto; }
+
+/* 表单校验态：输入框有错误时让外层 label 变红 */
+.field:has(input:invalid) { color: #d33; }
+
+/* 数量查询的替代：只有一项时不留分割线 */
+.list:not(:has(.item ~ .item)) .item { border-bottom: none; }
+```
+
+**价值**：把「子元素状态影响父元素样式」从 JS 里收回到 CSS，减少一整套「监听 + 加类名」的胶水代码。注意性能：`:has()` 在超长列表里匹配成本较高，避免与通配符组合滥用。
+
+### Q20: `@layer` 级联层是干什么的？⭐⭐⭐
+
+```css
+/* 声明顺序决定优先级：后面的层覆盖前面的层，与选择器特异性无关 */
+@layer reset, base, components, utilities;
+
+@layer components {
+  .btn { padding: 8px 16px; }
+}
+@layer utilities {
+  .p-0 { padding: 0; }   /* 一定压过 components，哪怕 .btn 更"具体" */
+}
+```
+
+**解决的痛点**：不用再靠提高特异性或 `!important` 去覆盖第三方样式——**层顺序就是优先级**。实战价值最大的场景是「引入 UI 库样式」：把库丢进 `@layer vendor`，业务层天然能覆盖，不用写 `.el-button.el-button--primary.el-button--large` 这种拼特异的丑陋写法。
+
+### Q21: 逻辑属性（RTL 适配）怎么写？⭐⭐
+
+```css
+/* ❌ 物理属性：阿拉伯语 RTL 环境下左右全反 */
+.card { margin-left: 16px; padding-right: 8px; border-left: 2px solid; }
+
+/* ✅ 逻辑属性：自动跟随 direction 翻转 */
+.card {
+  margin-inline-start: 16px;
+  padding-inline-end: 8px;
+  border-inline-start: 2px solid;
+}
+```
+
+出海/多语言产品的必答点：`inline` 对应文字方向（LTR 左→右，RTL 右→左），`block` 对应块方向。配合 `dir="rtl"` 或 `direction: rtl` 即可整站翻转，不需要维护两套样式表。
+
+---
+
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 弹窗被父容器裁掉 / 层级压不住 | 父级有 `transform`/`opacity`/`overflow`，形成新层叠上下文或裁剪 | Teleport 到 body；或父级用 `isolation: isolate` 显式管理 |
+| 子元素 `margin-top` 把父元素一起顶下去 | margin 塌陷（父子间无 padding/border/BFC） | 父级 `overflow: hidden` / `padding-top` / `display: flow-root` |
+| 两栏用 `display:inline-block`，中间有缝 | HTML 空白字符被渲染成空格 | 父级 `font-size: 0`，或换 flex/grid |
+| 一行字超长把布局撑破 | 缺少 `min-width: 0`（flex 子项默认 `min-width: auto`） | 子项加 `min-width: 0` + `text-overflow` |
+| `height: 100%` 不生效 | 父元素高度未确定 | 父级给确定高度，或用 `min-height: 100dvh` |
+| 移动端 100vh 底部被浏览器栏遮住 | `vh` 不含动态工具栏 | 用 `100dvh`（动态视口）；老环境用 `-webkit-fill-available` |
+| 1px 边框在 2x 屏显得粗 | 物理像素与 CSS 像素比 | `transform: scaleY(0.5)` 伪元素方案，或直接用 1px（现代设备可接受） |
+| 刘海屏/小黑条遮挡 | 未适配安全区 | `padding-bottom: env(safe-area-inset-bottom)` |
+| 动画卡顿 | 动了 `width/top/left`，每帧回流 | 改用 `transform` / `opacity`，必要时 `will-change` |
+| 列表滚动抖动 | 图片无尺寸占位 | 显式 `width/height` 或 `aspect-ratio` |
+
+## 自测清单（能答上 8 条算过关）
+
+1. 特异性的真实算法是什么？为什么「1000/100/10/1」加法会出错？
+2. `:is()`、`:where()` 的特异性差异？`:where()` 存在的意义？
+3. `z-index: 9999` 无效的典型原因？列举 4 个会创建层叠上下文的属性。
+4. margin 塌陷和 margin 合并分别发生在什么关系上？三行内说清。
+5. BFC 的触发条件里，哪几个是「副作用最小」的？（提示：flow-root）
+6. 什么是强制同步布局？`offsetWidth` 为什么可能导致回流？
+7. `will-change` 为什么不能滥用？正确用法是什么？
+8. 容器查询与媒体查询的本质区别？什么场景只能用容器查询？
+9. `@layer` 如何解决「覆盖第三方组件库样式」的老大难问题？
+10. flex 子项里文字溢出，为什么必须加 `min-width: 0`？
 
 ---
 
