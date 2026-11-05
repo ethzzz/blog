@@ -39,6 +39,7 @@ export const INTERVIEW_GROUPS: InterviewGroup[] = [
 	{ name: "进阶必修", color: "#ec4899", nums: [12, 13, 14, 17] },
 	{ name: "综合面试", color: "#64748b", nums: [18] },
 	{ name: "深水区实战", color: "#0ea5e9", nums: [20, 21] },
+	{ name: "AI 工程", color: "#a855f7", nums: [22] },
 ];
 
 /** 从 slug 取专题编号：`interview-guide-12-typescript` → 12；取不到返回 0 */

@@ -1,0 +1,224 @@
+---
+title: '11 · BuildKit、多架构镜像与供应链安全（扩展篇）'
+published: 2026-11-05T19:00:00+08:00
+description: '补 Docker 路线缺的交付工程：BuildKit 缓存挂载与构建密钥、buildx 一次构建 amd64/arm64 多架构镜像、provenance/SBOM、cosign 签名与 trivy 扫描，以及非 root、distroless 与可复现构建的落地清单。'
+tags: [Docker, BuildKit, buildx, 多架构, SBOM, 供应链, 安全]
+category: Docker学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前 10 篇把镜像、Dockerfile、Compose、部署、排障与安全都过了一遍，但真实交付还差三件事：
+> **构建要快且可复现**（BuildKit 缓存 / 构建密钥）、**镜像要能跑在别人的机器上**（多架构）、
+> **产物要能证明没被换过**（签名 / SBOM / 扫描）。这一篇把它们补齐。
+
+## 1. BuildKit：现在默认，但你可能没用对
+
+Docker 23+ 默认启用 BuildKit。它带来的不只是并行构建，还有：
+
+```dockerfile
+# 语法声明：固定 frontend 版本，避免不同机器行为漂移
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+# 缓存挂载：npm 缓存放在构建缓存里，不写进镜像层
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund
+
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+四个高频特性：
+
+| 特性 | 作用 | 注意 |
+| :-- | :-- | :-- |
+| `--mount=type=cache` | 复用包管理器缓存，不落镜像层 | 缓存 key 要含 lock 文件 hash |
+| `--mount=type=secret` | 构建期读密钥，不进层历史 | 运行 `--secret id=npmrc,src=$HOME/.npmrc` |
+| `--mount=type=bind` | 只读挂载源码/脚本 | 比 `COPY` 更适合临时工具 |
+| `COPY --link` | 层独立，提升缓存命中与并行 | 需要较新 Docker |
+
+构建密钥示例（私有 npm 源）：
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm ci --no-audit --no-fund
+```
+
+```bash
+docker build --secret id=npmrc,src="$HOME/.npmrc" -t app:local .
+```
+
+**别用 `ARG` 传密钥**：`ARG` 会留在镜像历史里（`docker history` 可见），`--secret` 不会。
+
+## 2. 多架构：一次构建，amd64 + arm64 都能跑
+
+Mac M 系列、ARM 服务器、云厂商的 Graviton 都是 arm64。单架构镜像在对方机器上会报 `exec format error`。
+
+```bash
+# 一次性创建 builder（QEMU 模拟另一种架构；有条件用原生节点更快）
+docker buildx create --name multi --driver docker-container --use
+docker buildx inspect --bootstrap
+
+# 构建并直接推送 manifest list（多架构不能 --load 到本地）
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t registry.example.com/app:1.2.3 \
+  --push .
+```
+
+验证：
+
+```bash
+docker buildx imagetools inspect registry.example.com/app:1.2.3
+# 应看到 MediaType: application/vnd.oci.image.index.v1+json
+# 以及 linux/amd64、linux/arm64 两个 manifest
+```
+
+三个易错点：
+
+1. **多平台 + `--load` 会失败**：本地镜像库只能装一个架构；要么 `--push`，要么 `--output type=oci`；
+2. QEMU 模拟编译很慢，CI 里最好用原生 arm runner 或远程 builder；
+3. 语言工具链要支持交叉（Go 用 `GOARCH`，Rust 用 target，Node/Java 多为基础镜像差异）。
+
+## 3. 供应链：从「能跑」到「可证明」
+
+交付一个镜像，至少要回答四个问题：
+
+1. 它里面有什么？（SBOM）
+2. 它从哪来、怎么构建的？（provenance）
+3. 它有没有已知漏洞？（扫描）
+4. 它是不是我签的那个？（签名）
+
+### 3.1 生成 SBOM 与 provenance
+
+BuildKit 内置：
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --provenance=true --sbom=true \
+  -t registry.example.com/app:1.2.3 --push .
+```
+
+产物会作为 attestation 附在 manifest 上，可用 `docker buildx imagetools inspect` 或 `cosign` 查看。
+
+### 3.2 签名与验证（cosign）
+
+```bash
+# 生成密钥（或使用 OIDC keyless）
+cosign generate-key-pair
+
+cosign sign --key cosign.key registry.example.com/app:1.2.3
+
+# 部署/拉取前验证
+cosign verify --key cosign.pub registry.example.com/app:1.2.3
+```
+
+生产建议用 **keyless（OIDC + Fulcio/Rekor）**，避免私钥管理；至少要做到「部署流水线只接受已签名 digest」。
+
+### 3.3 漏洞扫描
+
+```bash
+trivy image --severity HIGH,CRITICAL --exit-code 1 registry.example.com/app:1.2.3
+# 或 grype / docker scout
+```
+
+扫描要卡在 CI，而不是上线后才发现。**按 digest 扫描与部署**，不要用可变的 `latest`。
+
+### 3.4 基础镜像与运行用户
+
+```dockerfile
+FROM gcr.io/distroless/nodejs22-debian12
+WORKDIR /app
+COPY --from=build /app/.next/standalone ./
+USER nonroot
+```
+
+- 优先 distroless / alpine / slim，减少攻击面；
+- 非 root 运行（`USER node` / `USER 10001`）；
+- 只读根文件系统（`--read-only`）与 `--cap-drop=ALL`；
+- 固定基础镜像 digest：`FROM node:22-alpine@sha256:...`。
+
+## 4. CI 里的一条完整流水线
+
+```yaml
+# 伪代码，按你的 CI 语法改写
+steps:
+  - checkout
+  - docker/setup-buildx-action
+  - docker/login-action           # registry 登录
+  - docker/build-push-action:
+      platforms: linux/amd64,linux/arm64
+      push: true
+      tags: registry.example.com/app:${{ github.sha }}
+      provenance: true
+      sbom: true
+      cache-from: type=registry,ref=registry.example.com/app:buildcache
+      cache-to: type=registry,ref=registry.example.com/app:buildcache,mode=max
+  - trivy scan (HIGH/CRITICAL 失败)
+  - cosign sign (keyless)
+  - 部署：按 digest 更新 Compose/K8s
+```
+
+关键点：
+
+- **不可变 tag**：用 commit sha 或版本号；`latest` 只作为别名；
+- **缓存**：CI 每次都是新机器，用 registry 缓存（`type=registry`）而不是本地缓存；
+- **部署按 digest**：`app@sha256:...`，避免 tag 被覆盖导致「回滚到同名不同内容」。
+
+## 5. 可复现构建
+
+「同样的源码，构建出同样的镜像」在现实中很难 100% 做到，但可以逼近：
+
+- 固定基础镜像 digest；
+- 锁定依赖（`package-lock.json` / `pnpm-lock.yaml` / `go.sum`）；
+- 避免在构建期执行 `apt-get update` 后不固定版本；
+- 清理时间戳/随机数（必要时用 `SOURCE_DATE_EPOCH`）；
+- 用 BuildKit 的 `--build-arg BUILDKIT_INLINE_CACHE=1` 只是缓存，不等于可复现。
+
+验收方式：两次构建比较镜像 digest（允许 attestation 引起的差异时，比较 rootfs diff）。
+
+## 6. 常见坑
+
+| 现象 | 原因 | 处理 |
+| :-- | :-- | :-- |
+| arm 机器 `exec format error` | 只推了 amd64 | buildx 多平台或原生构建 |
+| 本地 `--load` 多平台失败 | 本地库不支持 manifest list | 改 `--push` |
+| 构建缓存不命中 | 先 COPY 了全部源码 | 先 copy lock 文件安装依赖，再 copy 源码 |
+| 密钥进了镜像 | 用 `ARG`/`ENV` 传 secret | `--mount=type=secret` |
+| 镜像越来越大 | 单阶段构建、缓存目录写进层 | 多阶段 + cache mount |
+| 扫描一堆漏洞 | 基础镜像太旧/太大 | 固定 digest、定期重建、distroless |
+| 部署后行为变了 | 用了可变 tag | 按 digest 部署 |
+| 签名验证失败 | 构建机与验证机 keyless 身份不一致 | 固定 OIDC issuer/identity 策略 |
+
+## 小结
+
+- BuildKit 的价值是缓存、密钥与 attestation，不只是「并行」；
+- 多架构用 buildx + `--push`，本地 `--load` 只适合单架构；
+- 供应链四件套：SBOM、provenance、扫描、签名，全部绑定 digest；
+- 运行侧：非 root、只读、最小基础镜像、固定 digest；
+- 「按 digest 部署」是可回滚与可验证的前提。
+
+## 练习
+
+1. 给一个 Node 项目写多阶段 Dockerfile，要求依赖层可缓存、最终镜像非 root、体积 < 200MB。
+2. 用 `--mount=type=secret` 接入私有 npm 源，并验证 `docker history` 里看不到 token。
+3. 构建 amd64/arm64 双架构镜像推到本地 registry，用 `imagetools inspect` 验证两个 manifest。
+4. 开启 provenance + SBOM，用 `docker buildx imagetools inspect` 找到 attestation。
+5. 用 trivy 扫描并在 HIGH/CRITICAL 时让 CI 失败；修复一个基础镜像漏洞后重跑。
+6. 用 cosign 签名并按 digest 部署，再故意改 tag 指向另一镜像，验证部署侧仍按 digest 拉取。

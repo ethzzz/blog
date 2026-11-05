@@ -1,0 +1,234 @@
+---
+title: '16 · Proxy（原 Middleware）与请求链路：鉴权、重写与灰度（扩展篇）'
+published: 2026-11-05T18:00:00+08:00
+description: '补 Next.js 路线缺失的请求前置层：Next 16 把 middleware 改名为 proxy 并默认 Node 运行时；讲清执行时机、matcher、NextResponse 的 redirect/rewrite/headers/cookies，以及登录守卫、多租户重写、A/B、灰度与常见死循环/绕过坑。'
+tags: [Nextjs, Proxy, Middleware, 鉴权, 多租户, 灰度]
+category: Next.js学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前 15 篇讲的是页面、数据、缓存、部署，但「请求进入路由之前」还有一层：**Proxy**。
+> Next 16 把沿用多年的 `middleware.ts` 正式改名为 `proxy.ts`，并且**默认使用 Node.js 运行时**（`runtime` 配置在 Proxy 里不可用，设置会直接报错）。
+> 这一篇按 16 的写法讲，同时标注 15 及以前的差异——两个版本的项目都能对上。
+
+## 1. 它在请求链路里的位置
+
+```
+浏览器
+  → CDN / nginx
+    → Proxy（proxy.ts）        ← 本文
+      → 路由匹配（app/ 或 pages/）
+        → Server Component / Route Handler / 静态文件
+          → 响应（可能被 Proxy 改写过）
+```
+
+Proxy 在**路由渲染之前**执行，典型用途：
+
+- 鉴权失败 → 重定向到登录页（带 `next` 回跳）；
+- 多租户域名 → 重写到 `/t/[tenant]/...`；
+- 灰度 / A/B → 按 cookie 或 header 重写到不同分支；
+- 统一加安全响应头、请求 ID、地区/语言判断；
+- 旧路径 301 到新路径。
+
+**它不适合做的事**：重业务查询、长时间 IO、可靠限流（内存计数在多实例下不共享）。Proxy 应该「轻、快、可预测」。
+
+## 2. 文件约定与版本差异
+
+```ts
+// proxy.ts（与 app/ 同级；src 项目放 src/proxy.ts）
+import { NextResponse, type NextRequest } from "next/server";
+
+export function proxy(request: NextRequest) {
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/private/:path*"],
+};
+```
+
+| 版本 | 文件 | 导出 | 运行时 |
+| :-- | :-- | :-- | :-- |
+| Next ≤ 15 | `middleware.ts` | `middleware` | Edge（15.5 起可选 Node） |
+| Next 16 | `proxy.ts` | `proxy`（或 default） | **Node.js（默认，不可配 runtime）** |
+
+迁移只需要两步：文件改名、导出函数改名；逻辑基本不变。`config.matcher` 仍然有效。
+
+> Proxy 的运行边界是「独立的服务端层」：不要依赖应用里的模块级单例/全局缓存，也不要假设它和 Route Handler 共享内存。需要传信息就用 **header / cookie / rewrite URL**。
+
+## 3. `NextResponse` 的五个动作
+
+```ts
+import { NextResponse, type NextRequest } from "next/server";
+
+export function proxy(req: NextRequest) {
+  // 1) 放行，并加请求/响应头
+  const res = NextResponse.next();
+  res.headers.set("x-request-id", crypto.randomUUID());
+
+  // 2) 重定向（浏览器地址会变）
+  // return NextResponse.redirect(new URL("/login", req.url));
+
+  // 3) 内部重写（地址不变，渲染另一个路由）
+  // return NextResponse.rewrite(new URL("/t/acme" + req.nextUrl.pathname, req.url));
+
+  // 4) 直接返回 JSON（适合 API 前置拦截）
+  // return NextResponse.json({ error: "未登录" }, { status: 401 });
+
+  // 5) 读写 cookie
+  res.cookies.set("seen", "1", { httpOnly: true, sameSite: "lax", path: "/" });
+
+  return res;
+}
+```
+
+**重定向 vs 重写**：
+
+| 动作 | 浏览器地址 | 用途 |
+| :-- | :-- | :-- |
+| `redirect` | 变化 | 登录跳转、旧链接迁移 |
+| `rewrite` | 不变 | 多租户、灰度、内部路由映射 |
+
+## 4. matcher：别把所有请求都拖进来
+
+```ts
+export const config = {
+  matcher: [
+    // 除静态资源、图片优化、favicon 之外的所有路径
+    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
+  ],
+};
+```
+
+要点：
+
+- matcher 是**路径匹配**，不是完整 URL；支持 `:path*` 与正则；
+- 必须排除 `_next/static`、`_next/image`、`public` 下的大文件，否则每个静态请求都会走一遍 Proxy；
+- 用负向前瞻排除扩展名时，注意大小写；
+- 多个条件用数组（OR 关系）；
+- 匹配范围越大，冷启动与延迟影响越明显。
+
+## 5. 登录守卫：轻校验 + 权威校验
+
+```ts
+import { NextResponse, type NextRequest } from "next/server";
+import { jwtVerify } from "jose";
+
+const PUBLIC = ["/login", "/register", "/api/public"];
+
+export async function proxy(req: NextRequest) {
+  const { pathname, search } = req.nextUrl;
+  if (PUBLIC.some((p) => pathname.startsWith(p))) return NextResponse.next();
+
+  const token = req.cookies.get("session")?.value;
+  if (!token) return toLogin(req);
+
+  try {
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(process.env.JWT_SECRET!));
+    // 把必要信息透传给后续路由（不要塞敏感字段）
+    const headers = new Headers(req.headers);
+    headers.set("x-user-id", String(payload.sub));
+    return NextResponse.next({ request: { headers } });
+  } catch {
+    return toLogin(req);
+  }
+}
+
+function toLogin(req: NextRequest) {
+  const url = new URL("/login", req.url);
+  url.searchParams.set("next", req.nextUrl.pathname + req.nextUrl.search);
+  const res = NextResponse.redirect(url);
+  res.cookies.delete("session");
+  return res;
+}
+```
+
+**安全边界必须说清**：
+
+- Proxy 里的 JWT 校验只适合「挡未登录用户」；**权限判断（这个用户能不能看这条数据）必须在 Route Handler / Server Component 里再做一次**；
+- 不要把 `x-user-id` 当作可信身份直接用于写操作——客户端可以伪造请求头，除非你在 Proxy 里**覆盖**（不是追加）它，且后端只信任经过 Proxy 的入口；
+- 重定向时别丢掉 `next`，否则登录后回不到原页面；
+- 登录态失效要同时清 cookie，避免「有 cookie 但永远 401」的死循环。
+
+## 6. 多租户重写与灰度
+
+```ts
+export function proxy(req: NextRequest) {
+  const host = req.headers.get("host") ?? "";
+  const tenant = host.split(".")[0];
+
+  // acme.example.com/orders → /t/acme/orders
+  if (tenant !== "www" && tenant !== "example") {
+    const url = req.nextUrl.clone();
+    url.pathname = `/t/${tenant}${url.pathname}`;
+    return NextResponse.rewrite(url);
+  }
+
+  // 灰度：10% 用户走新首页（cookie 粘性，避免每次刷新都变）
+  const bucket = req.cookies.get("bucket")?.value ?? Math.random().toString(36).slice(2);
+  const res = bucket.startsWith("a")
+    ? NextResponse.rewrite(new URL("/home-v2", req.url))
+    : NextResponse.next();
+  res.cookies.set("bucket", bucket, { path: "/", maxAge: 60 * 60 * 24 * 30 });
+  return res;
+}
+```
+
+灰度的几个原则：
+
+- **粘性**：同一个用户多次访问要落在同一分支（cookie/用户 ID 哈希），否则体验与埋点都乱；
+- **可退出**：加 `?v=1` 或内部 header 强制指定，方便排查；
+- **不改变公开 URL**：用 rewrite，不用 redirect；
+- **缓存注意**：CDN 若缓存了重写结果，灰度比例会失真；必要时 `Cache-Control: private` 或按 cookie 分 key。
+
+## 7. Edge 与 Node：别再混着写
+
+Next 16 的 Proxy 默认 Node.js 运行时，这解决了很多历史痛点，但边界仍要清楚：
+
+| 能力 | Next ≤15 Edge | Next 16 Proxy（Node） |
+| :-- | :-- | :-- |
+| Node API（`fs`、`crypto` 原生、`Buffer`） | 受限/不可用 | 可用 |
+| 数据库直连 | 不推荐 | 技术上可行，但仍不建议 |
+| 冷启动 | 有 | 较低 |
+| 部署位置 | 可上 CDN | 通常随 Node 服务 |
+| `config.runtime` | 可设 edge/node | **不可设置，设置会报错** |
+
+就算 Node 运行时可用，也建议 Proxy 只做**轻量、无共享状态**的判断：它可能被独立部署、独立扩缩容，业务查询放这里会让「一次页面请求」变成两次数据库访问。
+
+## 8. 常见坑
+
+| 现象 | 原因 | 处理 |
+| :-- | :-- | :-- |
+| 静态资源 404/变慢 | matcher 没排除 `_next/static` | 加负向前瞻 |
+| 无限重定向 | `/login` 也被守卫拦截 | PUBLIC 白名单 + 精确匹配 |
+| 登录后回不到原页 | 重定向丢 `next` | 登录页读取并校验站内路径 |
+| 客户端伪造 `x-user-id` | 直接信任请求头 | Proxy 覆盖头 + 服务端二次鉴权 |
+| 灰度比例不准 | CDN 缓存 / 每次随机 | cookie 粘性 + 私有缓存 |
+| 本地正常线上 401 | Proxy 与 Route 读取的 cookie 域/路径不一致 | 统一 `path=/`、域名、SameSite |
+| 多实例限流失效 | 内存计数不共享 | 用 Redis/网关限流，Proxy 只做粗筛 |
+| 改完不生效 | 缓存/构建产物 | 重启 dev、清 `.next`，确认版本（15/16 文件名不同） |
+
+## 9. 测试与观测
+
+- 把「要不要拦、重写到哪」抽成纯函数 `decide(reqInfo): Action`，单测覆盖 10 个分支，Proxy 只做编排；
+- E2E 用 Playwright 验证：未登录访问 `/dashboard` → 302 到 `/login?next=...`；登录后回跳；
+- 线上加 `x-request-id` 与耗时日志，区分「Proxy 慢」还是「页面慢」；
+- 灰度上线前先 `rewrite` 到内部路径做冒烟，再放比例。
+
+## 小结
+
+- Next 16 的 `proxy.ts` 就是原来的 middleware，默认 Node 运行时，`runtime` 配置不可用；
+- Proxy 是「路由之前的轻量网络层」：鉴权挡板、重写、灰度、响应头，别放重业务；
+- `redirect` 改地址、`rewrite` 不改地址；cookie 粘性是灰度正确性的前提；
+- matcher 必须排除静态资源；
+- Proxy 的身份判断只是第一道闸，数据级权限必须在服务端再做一次。
+
+## 练习
+
+1. 把项目里的 `middleware.ts` 迁移到 `proxy.ts`，验证登录跳转、静态资源与 API 拦截三条路径。
+2. 实现「未登录访问 `/dashboard/orders?tab=2` → 登录后原样回跳」，并防止 `next` 指向外站。
+3. 用 rewrite 实现多租户：`acme.example.com` → `/t/acme`，并让站内链接保持原域名。
+4. 做一个 10% 灰度：cookie 粘性、可 `?v=2` 强制、埋点能区分分支。
+5. 给 Proxy 加 `x-request-id` 与耗时 header，在 Route Handler 里读出并写入日志。
+6. 写一个单测覆盖「公开路径 / 无 token / token 过期 / token 合法 / next 参数非法」五种情况。

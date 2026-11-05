@@ -1,0 +1,260 @@
+---
+title: '16 · Gateway API、Ingress 迁移与多集群流量（扩展篇）'
+published: 2026-11-05T23:00:00+08:00
+description: '毕业项目之后的扩展篇：从 Ingress 注解迁移到 Kubernetes Gateway API，讲清 GatewayClass/Gateway/HTTPRoute、按 header/权重/重写/超时/重试的流量规则、TLS 与多环境多集群，以及灰度迁移与回滚的检查清单。'
+tags: [Higress, GatewayAPI, Ingress, Kubernetes, 流量治理, 迁移]
+category: Higress学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前 15 篇已经把路由、服务发现、灰度、安全、可观测、Wasm 与 AI 网关走完了，核心用的是 Ingress + 注解。
+> 但 Ingress 的表达能力靠注解堆，跨实现不可移植；Kubernetes 的 **Gateway API** 正在成为下一层标准，Higress 也支持它。
+> 这一篇讲「已有 Ingress 怎么迁」「什么时候不该迁」「迁完怎么验证与回滚」。
+
+## 1. Ingress 的痛点，Gateway API 怎么解
+
+| 痛点 | Ingress（含注解） | Gateway API |
+| :-- | :-- | :-- |
+| 配置表达 | 实现自定义注解，跨网关不通用 | 标准 CRD，按角色拆分 |
+| 权责 | 一个对象混了入口、TLS、路由 | 基础设施（Gateway）与业务（HTTPRoute）分离 |
+| 匹配能力 | 主要是 host/path | method/header/query/权重/镜像 |
+| 状态 | 注解写错不报错，静默失效 | CRD schema + status conditions |
+| 扩展 | 各家注解 | filters / policy attachment（实现相关） |
+
+Higress 支持标准 Gateway API 的子集，同时保留 Ingress 与自有 CRD。**迁移不是全量替换**，常见做法是「新业务用 Gateway API，老路由保留 Ingress，逐步切流」。
+
+## 2. 三个核心对象
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: higress
+spec:
+  controllerName: higress.io/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: prod-gateway
+  namespace: infra
+spec:
+  gatewayClassName: higress
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              gateway-access: "true"
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: example-tls
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: orders
+  namespace: shop
+spec:
+  parentRefs:
+    - name: prod-gateway
+      namespace: infra
+      sectionName: http
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /orders
+      backendRefs:
+        - name: orders-svc
+          port: 8080
+```
+
+| 对象 | 谁维护 | 管什么 |
+| :-- | :-- | :-- |
+| `GatewayClass` | 平台/基础设施 | 用哪套控制器（Higress） |
+| `Gateway` | 平台/SRE | 监听端口、TLS、允许哪些命名空间挂路由 |
+| `HTTPRoute` | 业务团队 | host/path/header 匹配、后端、重写、超时、重试 |
+
+**职责分离是重点**：业务改路由不需要动 Gateway；平台换证书不动业务 YAML。`allowedRoutes` 还限制了「哪些 namespace 能挂上来」，避免业务把内网服务暴露到公网入口。
+
+## 3. Ingress → HTTPRoute 映射表
+
+| Ingress 写法 | HTTPRoute 写法 |
+| :-- | :-- |
+| `host: api.example.com` | `hostnames: ["api.example.com"]` |
+| `path: /orders` + `pathType: Prefix` | `matches[].path.type: PathPrefix` |
+| `nginx.ingress.kubernetes.io/rewrite-target` | `filters[].type: URLRewrite` |
+| `canary-weight` 注解 | 多个 `backendRefs[].weight` |
+| `canary-by-header` 注解 | `matches[].headers` + 独立 rule |
+| `proxy-read-timeout` 注解 | `timeouts.request` / `backendRequest`（实现支持情况不同） |
+| `proxy-next-upstream-tries` | `rules[].retries`（实现相关） |
+| `ssl-redirect` | 监听器 + `RequestRedirect` filter |
+| `auth-url` / 外部鉴权 | `ExtensionRef` / SecurityPolicy（实现相关） |
+| `mirror-target` | `RequestMirror` filter |
+
+> Gateway API 的核心是标准字段；但**限流、鉴权、Wasm 插件**这类能力仍靠实现扩展（Higress 的 policy / plugin CRD）。迁移时要逐条核对「这个注解在新体系里对应什么」，核对不了就先保留 Ingress。
+
+## 4. 一个完整的迁移示例
+
+原 Ingress（简化）：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orders
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /orders(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: orders-svc
+                port: { number: 8080 }
+```
+
+迁移后的 HTTPRoute：
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: orders
+  namespace: shop
+spec:
+  parentRefs:
+    - name: prod-gateway
+      namespace: infra
+      sectionName: http
+  hostnames: ["api.example.com"]
+  rules:
+    # 1) 灰度：内部测试账号走 v2
+    - matches:
+        - path: { type: PathPrefix, value: /orders }
+          headers:
+            - name: x-beta-user
+              value: "true"
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /orders
+      backendRefs:
+        - name: orders-svc-v2
+          port: 8080
+          weight: 100
+    # 2) 10% 流量到 v2，其余到 v1
+    - matches:
+        - path: { type: PathPrefix, value: /orders }
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /orders
+      backendRefs:
+        - name: orders-svc
+          port: 8080
+          weight: 90
+        - name: orders-svc-v2
+          port: 8080
+          weight: 10
+    # 3) 超时与重试（字段支持取决于实现版本）
+    # timeouts: { request: 3s, backendRequest: 2s }
+    # retries: { attempts: 2, perTryTimeout: 1s, retryOn: "5xx,reset" }
+```
+
+验证顺序：
+
+1. `kubectl get httproute orders -n shop -o yaml` 看 `status.parents[].conditions` 是否 `Accepted=True`；
+2. `curl -H 'x-beta-user: true'` 验证 header 命中；
+3. 用脚本循环 1000 次统计 90/10 比例（注意长连接会粘住，需要新建连接或按请求策略）；
+4. 观察网关访问日志与上游指标，确认没有 503/超时；
+5. 再逐步把权重推到 50/100。
+
+## 5. TLS、多环境与多集群
+
+- **TLS**：证书放 `Secret`，`cert-manager` 自动续期；Gateway 的 `certificateRefs` 指向 Secret，业务 Route 不碰证书；
+- **多环境**：`Gateway` 按环境（dev/staging/prod）建，`HTTPRoute` 用同样的业务 YAML，只改 `parentRefs`；
+- **多集群**：在入口层做 DNS/全局负载（GSLB）或多集群网关；HTTPRoute 里的 `backendRefs` 仍是本集群 Service，跨集群后端用 `ServiceImport`/实现扩展；
+- **内外网分离**：两个 Gateway（internal/public）监听不同地址，`allowedRoutes` 用标签限制，内网服务不能误挂公网入口。
+
+## 6. 灰度迁移与回滚
+
+推荐「双栈并行」：
+
+```text
+DNS / 负载均衡
+├── 90% → 旧入口（Ingress）
+└── 10% → 新入口（Gateway）
+```
+
+步骤：
+
+1. **盘点**：列出所有 Ingress 的 host/path/注解，标注「标准字段可迁」与「依赖实现扩展」；
+2. **搭 Gateway**：先只接一个测试域名，验证 TLS、路由、日志；
+3. **迁一条低风险路由**：双写 YAML（Ingress + HTTPRoute），用 header 或权重切 1%；
+4. **对比**：错误率、P99、日志字段、灰度命中；
+5. **放量**：10% → 50% → 100%，每步保留 30 分钟观察窗口；
+6. **下线 Ingress**：确认无流量后删除，保留 git 历史与回滚脚本。
+
+回滚：把权重切回 Ingress（DNS/网关权重），不要删 Gateway；配置错误时优先回滚流量，再修 YAML。
+
+## 7. 可观测与治理
+
+- **指标**：按 route/backend 维度看 QPS、4xx/5xx、P99、上游连接；
+- **日志**：访问日志里带 route 名、upstream、重试次数、响应 flag；
+- **链路**：trace 透传 `traceparent`，确认网关到上游的 span 完整；
+- **限流/鉴权**：标准 Gateway API 没有统一字段，按 Higress 的 policy/plugin 配置，并写清「哪条路由挂了哪个策略」；
+- **变更审计**：HTTPRoute 走 GitOps，禁止控制台手改（否则漂移）。
+
+## 8. 常见坑
+
+| 现象 | 原因 | 处理 |
+| :-- | :-- | :-- |
+| Route `Accepted=False` | namespace 不在 `allowedRoutes` / sectionName 不存在 | 查 status conditions |
+| 改完没生效 | 控制器未 watch 到 / 缓存延迟 | 看控制器日志与 `status`，等 1–2 分钟 |
+| 路径匹配不符预期 | `PathPrefix` 与 `Exact` 混用 | 明确 `type`，注意尾斜杠 |
+| 重写后上游 404 | `ReplacePrefixMatch` 拼错 | 用 curl 看实际 path，逐级排查 |
+| 灰度比例不准 | 长连接/客户端复用 | 新建连接测，或按请求头灰度 |
+| TLS 不生效 | Secret 命名空间/证书链错误 | 证书必须与 Gateway 同 namespace 或被 ReferenceGrant 允许 |
+| 内网服务暴露 | `allowedRoutes` 过宽 | 用 namespace 标签 + 网络策略双保险 |
+| 注解能力丢失 | 限流/鉴权/Wasm 没有对应标准字段 | 用实现扩展或暂时保留 Ingress |
+
+## 小结
+
+- Gateway API 用 GatewayClass/Gateway/HTTPRoute 拆开「入口基础设施」与「业务路由」，比 Ingress 注解可移植；
+- 迁移的核心是**逐条映射**：host/path/重写/灰度/超时/重试/鉴权/Wasm，能映射的迁，不能的先保留；
+- 双栈 + 权重灰度 + 观察窗口，是可控迁移的关键；
+- 多环境/多集群靠 Gateway 分层复用，业务 Route 只改 parentRefs；
+- 上线前看 `status.conditions`，上线后看 route 维度指标与日志。
+
+## 练习
+
+1. 把一个带 host/path 的 Ingress 迁成 HTTPRoute，验证 `status.parents[].conditions` 全为 True。
+2. 实现 header 灰度 + 10% 权重灰度两条规则，用脚本统计比例并解释长连接导致的偏差。
+3. 配置 URLRewrite 与超时/重试，用故障注入（返回 500）验证重试次数与最终状态码。
+4. 用两个 Gateway（public/internal）与 `allowedRoutes` 标签，阻止内网 namespace 挂到公网入口。
+5. 给 HTTPRoute 配 cert-manager 证书，验证自动续期后无需重启网关。
+6. 写一份迁移检查清单：逐条列出你项目里的 Ingress 注解与新体系对应关系，标出无法映射的项与替代方案。

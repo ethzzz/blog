@@ -1,0 +1,281 @@
+---
+title: '16 · 组件库 / NPM 包发布与版本治理（扩展篇）'
+published: 2026-11-05T20:00:00+08:00
+description: '补齐工程化路线最后一公里：从目录与 exports 映射、ESM/CJS 双产物、peerDependencies，到 Changesets 版本与 changelog、dist-tags 预发布、npm provenance 与发布前冒烟，给出可执行的发包清单。'
+tags: [前端工程化, npm, 组件库, Changesets, semver, 发布]
+category: 前端工程化学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前 15 篇把构建、规范、CI、Monorepo、质量门禁与交付都讲完了，但「把代码变成别人能 `npm install` 的包」这一步一直没落地。
+> 发包不是 `npm publish` 一条命令：入口映射错一个条件，用户就会遇到「类型找不到 / ESM 报错 / 打包后重复 React」。
+> 这一篇按「结构 → 产物 → 依赖 → 版本 → 发布 → 验证」走一遍。
+
+## 1. 包的结构：先决定别人怎么 import
+
+```
+my-ui/
+├── src/
+│   └── index.ts
+├── dist/
+│   ├── index.js          ESM
+│   ├── index.cjs         CJS
+│   ├── index.d.ts        ESM 类型
+│   └── index.d.cts       CJS 类型
+├── package.json
+├── tsconfig.json
+└── tsup.config.ts
+```
+
+```jsonc
+{
+  "name": "@acme/ui",
+  "version": "1.4.0",
+  "type": "module",
+  "sideEffects": ["*.css"],
+  "files": ["dist"],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./styles.css": "./dist/styles.css",
+    "./package.json": "./package.json"
+  }
+}
+```
+
+几个约定：
+
+| 字段 | 作用 | 常见错误 |
+| :-- | :-- | :-- |
+| `exports` | 现代解析入口（优先级最高） | 只写 `main`，ESM 项目拿不到 |
+| `types` | 类型入口 | 放在 `import/require` 之后，TS 找不到 |
+| `sideEffects` | 帮助 tree-shaking | 漏标 CSS，样式被摇掉 |
+| `files` | 发布白名单 | 把 `src/`、测试、sourcemap 一起发出去 |
+| `type: module` | `.js` 视为 ESM | CJS 产物必须用 `.cjs` 后缀 |
+
+**`exports` 的顺序有讲究**：`types` 必须放在最前面（TS 的自定义条件先匹配），然后 `import`、`require`、`default`。
+
+## 2. 双产物：ESM + CJS 不是复制两份
+
+用 `tsup`（esbuild）最省事：
+
+```ts
+// tsup.config.ts
+import { defineConfig } from "tsup";
+
+export default defineConfig({
+  entry: ["src/index.ts"],
+  format: ["esm", "cjs"],
+  dts: true,
+  clean: true,
+  sourcemap: true,
+  external: ["react", "react-dom"],
+  treeshake: true,
+});
+```
+
+产物命名要显式：
+
+```jsonc
+{
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  }
+}
+```
+
+如果 CJS 需要独立的类型声明（`d.cts`），确保构建工具生成或在 `exports.require.types` 指向它。**不要**让 CJS 用户拿到 ESM 的 `.d.ts`——在 `moduleResolution: node16` 的项目里会报「ESM 类型不能被 require」。
+
+## 3. 依赖边界：dependencies / peerDependencies / devDependencies
+
+| 类型 | 放什么 | 例子 |
+| :-- | :-- | :-- |
+| `dependencies` | 包运行时**自己**用、用户不需要感知 | `clsx`、`date-fns` |
+| `peerDependencies` | 用户必须提供、且要和用户版本一致 | `react`、`react-dom`、`vue` |
+| `devDependencies` | 只在本仓开发/构建用 | `typescript`、`vitest`、`tsup` |
+
+组件库把 React 写进 `dependencies` 的后果：用户项目里出现两份 React → hooks 报错、包体积翻倍。
+
+```jsonc
+{
+  "peerDependencies": {
+    "react": ">=18.0.0 <20.0.0",
+    "react-dom": ">=18.0.0 <20.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react-dom": { "optional": true }
+  }
+}
+```
+
+范围写太宽（`*`）等于没约束，写太窄（`18.2.0`）会让用户升级困难；用主版本区间 + 明确的支持矩阵。
+
+## 4. 版本与发布：交给 Changesets
+
+手改 `version` 迟早出错。Monorepo/单包都用 Changesets：
+
+```bash
+npm i -D @changesets/cli
+npx changeset init
+```
+
+每次改动提交一个 changeset：
+
+```md
+---
+"@acme/ui": minor
+---
+
+新增 Toast 组件；Button 增加 loading 状态。
+```
+
+发布流程：
+
+```bash
+npx changeset version     # 按 changeset 升版本、写 CHANGELOG
+npm install               # 更新 lock
+npx changeset publish     # 发布所有版本有变化的包 + 打 git tag
+```
+
+| 变更 | 版本 |
+| :-- | :-- |
+| 修 bug、内部重构 | patch |
+| 新增向后兼容能力 | minor |
+| 破坏性变更 | major（0.x 可 minor） |
+
+**预发布**用 dist-tags，不要占用正式版本号：
+
+```bash
+npm version 1.5.0-beta.0 --no-git-tag-version
+npm publish --tag beta
+# 用户安装：npm i @acme/ui@beta
+```
+
+正式发布后再 `npm dist-tag add @acme/ui@1.5.0 latest`，把 `latest` 指过去。
+
+## 5. 发布前的六道检查
+
+```bash
+# 1) 包里到底装了什么（最容易被忽略）
+npm pack --dry-run
+
+# 2) 入口与类型是否正确（publint + attw）
+npx publint
+npx attw --pack .
+
+# 3) 类型检查与构建
+tsc --noEmit && npm run build
+
+# 4) 产物冒烟：装到临时目录真实 import 一次
+mkdir /tmp/pkg-test && cd /tmp/pkg-test
+npm init -y && npm i /path/to/pkg.tgz
+node -e "import('@acme/ui').then(m => console.log(Object.keys(m)))"
+node -e "console.log(Object.keys(require('@acme/ui')))"   # CJS
+
+# 5) 组件库渲染冒烟（jsdom / happy-dom）
+# 6) 发布来源证明（CI 里）
+npm publish --provenance --access public
+```
+
+`npm publish` 的常见拒绝原因：
+
+| 报错 | 原因 |
+| :-- | :-- |
+| `403 Forbidden` | 没登录 / 没权限 / scoped 包未加 `--access public` |
+| `EPUBLISHCONFLICT` | 版本已存在（npm 不允许覆盖） |
+| `402 Payment Required` | 私有包但账号无付费计划 |
+| `EOTP` | 账号开了 2FA，需要一次性密码或使用 granular token |
+
+## 6. CI 发布（GitHub Actions 示意）
+
+```yaml
+name: release
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  id-token: write        # provenance / keyless
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
+      - run: npm ci
+      - run: npm run build && npx publint && npx attw --pack .
+      - uses: changesets/action@v1
+        with:
+          publish: npx changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+关键点：
+
+- 发布只在 `main` 上触发，且要求 PR 阶段已经跑过测试；
+- 用 **granular access token**（限制包范围）而不是账号级 token；
+- 开启 `--provenance`，让 npm 页面显示「由哪个仓库/commit 构建」；
+- 版本提交与 tag 由 Changesets 生成，别手打。
+
+## 7. 发布之后：废弃、回滚与支持
+
+npm **不支持覆盖已有版本**，发布错了只能：
+
+```bash
+# 标记废弃（推荐）：用户安装会看到警告
+npm deprecate @acme/ui@1.4.1 "该版本存在样式丢失问题，请升级到 1.4.2"
+
+# 撤销发布（72 小时内，且可能影响依赖它的项目）
+npm unpublish @acme/ui@1.4.1
+```
+
+策略：
+
+- 小问题 → 发 patch + `deprecate` 旧版本；
+- 破坏性问题 → 发 major + 迁移指南；
+- 安全漏洞 → 立即 patch + 公告 + 依赖方升级提醒；
+- 不要用 `unpublish` 当常规回滚，很多 CI 会因此挂掉。
+
+## 8. 常见坑
+
+| 现象 | 原因 | 处理 |
+| :-- | :-- | :-- |
+| 用户报 `Cannot find module` | `exports` 没覆盖子路径 | 加 `./xxx` 映射并测 `attw` |
+| 类型提示丢失 | `types` 条件顺序错 / 未发布 d.ts | `types` 放最前，`files` 含 dist |
+| ESM/CJS 双包冲突 | 同一包被加载两次 | 正确 `exports` + `peerDependencies` |
+| 样式被 tree-shaking 掉 | `sideEffects` 标错 | 标记 `*.css` |
+| 包体巨大 | 把 src/测试/sourcemap 发了 | `files` 白名单 + `npm pack --dry-run` |
+| React hooks 报错 | 两份 React | 移到 peerDependencies |
+| 发布成功但用户装不到新版 | dist-tag 没更新 | `npm dist-tag ls` 检查 |
+
+## 小结
+
+- 先设计 `exports` 与类型入口，再写构建；
+- ESM/CJS 双产物 + 正确的类型声明，是「库能用」的底线；
+- React/Vue 这类运行时放 `peerDependencies`；
+- 版本交给 Changesets，预发布用 dist-tags；
+- 发布前 `npm pack --dry-run` + `publint` + `attw` + 真实安装冒烟；
+- 发布后靠 deprecate/新版本回滚，别依赖 unpublish。
+
+## 练习
+
+1. 把一个内部组件库改成双产物（ESM+CJS），用 `attw --pack` 验证四种解析模式（node16 import/require、bundler）全部通过。
+2. 写 `exports` 同时暴露 `./styles.css` 与 `./package.json`，并验证打包器能正确 tree-shake。
+3. 把 React 从 `dependencies` 移到 `peerDependencies`，在示例项目中确认只有一份 React。
+4. 用 Changesets 完成一次 patch + 一次 minor：生成 CHANGELOG、打 tag、模拟 `changeset publish`。
+5. 发布一个 `beta` 预发布版本，验证 `npm i pkg@beta` 与 `latest` 互不影响，再手动把 latest 指向正式版。
+6. 故意把 `exports.types` 放错顺序，复现类型丢失，再用 `publint` 定位并修复。

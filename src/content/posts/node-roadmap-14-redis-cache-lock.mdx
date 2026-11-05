@@ -1,0 +1,265 @@
+---
+title: '14 · Redis 缓存、分布式锁与限流（扩展篇）'
+published: 2026-11-05T22:00:00+08:00
+description: '补 Node 路线缺的缓存与并发控制：Cache-Aside、TTL 抖动、穿透/击穿/雪崩、热点 key 与版本化失效，SET NX 锁与 Lua 解锁、续期与 Redlock 边界，以及固定/滑动窗口与令牌桶限流的可运行实现。'
+tags: [Nodejs, Redis, 缓存, 分布式锁, 限流, 高并发]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前面的 Node 篇有数据库、鉴权、队列与部署，但**缓存与并发控制**只在 BFF/全栈篇里被顺带提到。
+> 真实服务里，这两件事决定了「数据库会不会被打穿」「同一任务会不会被执行两次」。
+> 这一篇以 `ioredis` + Redis 7 为例，讲模式、代码与失败路径，不堆概念。
+
+## 1. 先选对缓存模式
+
+| 模式 | 读路径 | 写路径 | 适用 |
+| :-- | :-- | :-- | :-- |
+| Cache-Aside | 先查缓存，未命中查库并回填 | 更新库 + 删缓存 | 绝大多数读多写少 |
+| Read-Through | 由缓存层负责回源 | 同上 | 有统一缓存库/框架 |
+| Write-Through | 写库同时写缓存 | 同步写 | 强一致要求高、写少 |
+| Write-Behind | 先写缓存，异步落库 | 异步 | 写多、可容忍丢失 |
+
+Node 服务最常用 **Cache-Aside**：简单、失败可控。
+
+```ts
+import Redis from "ioredis";
+
+export const redis = new Redis({
+  host: process.env.REDIS_HOST ?? "127.0.0.1",
+  port: Number(process.env.REDIS_PORT ?? 6379),
+  maxRetriesPerRequest: 2,
+  enableReadyCheck: true,
+  lazyConnect: false,
+});
+
+redis.on("error", (err) => {
+  // 不要静默：缓存故障要能被观测到，但不要因此把业务打挂
+  console.error("[redis]", err.message);
+});
+```
+
+> ⚠️ 缓存**不是**数据库：连接失败、超时、序列化失败都必须能降级到查库，而不是让接口 500。给缓存操作统一包一层 `try/catch + 短超时`。
+
+## 2. Cache-Aside 的正确写法
+
+```ts
+type User = { id: number; name: string };
+const key = (id: number) => `user:v3:${id}`;
+
+export async function getUser(id: number): Promise<User | null> {
+  const cacheKey = key(id);
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached) as User;
+  } catch (e) {
+    console.warn("cache get failed", e);
+  }
+
+  const user = await db.user.findById(id);
+  if (user) {
+    try {
+      // TTL 抖动：避免同一时刻大量 key 一起过期
+      const ttl = 300 + Math.floor(Math.random() * 60);
+      await redis.set(cacheKey, JSON.stringify(user), "EX", ttl);
+    } catch (e) {
+      console.warn("cache set failed", e);
+    }
+  }
+  return user;
+}
+
+export async function updateUser(id: number, patch: Partial<User>) {
+  const updated = await db.user.update(id, patch);
+  try {
+    await redis.del(key(id));          // 删除而不是更新：避免并发写覆盖
+  } catch (e) {
+    console.warn("cache del failed", e);
+  }
+  return updated;
+}
+```
+
+**为什么更新时删缓存而不是写缓存**：两个并发请求 A（写旧值）、B（写新值）如果先写库再写缓存，顺序错乱会把旧值留在缓存里。删缓存 + 下次读回填更稳；如果必须写缓存，用版本号或延迟双删。
+
+## 3. 三个经典问题与解法
+
+| 问题 | 现象 | 解法 |
+| :-- | :-- | :-- |
+| 穿透 | 查不存在的数据，每次都打库 | 缓存空值（短 TTL）/ 布隆过滤器 / 参数校验 |
+| 击穿 | 热点 key 过期瞬间大量请求打库 | 互斥重建（本地锁/Redis 锁）/ 逻辑过期 |
+| 雪崩 | 大量 key 同时过期 / Redis 整体挂 | TTL 抖动 / 多级缓存 / 熔断降级 |
+
+**缓存空值**：
+
+```ts
+if (!user) {
+  await redis.set(cacheKey, "null", "EX", 30);   // 短 TTL，防穿透
+  return null;
+}
+// 读的时候要区分 "null" 与真值
+```
+
+**互斥重建**（单实例用内存锁即可，多实例用 Redis）：
+
+```ts
+const rebuilding = new Map<number, Promise<User | null>>();
+
+export function getUserSingleFlight(id: number) {
+  const existing = rebuilding.get(id);
+  if (existing) return existing;
+  const p = getUser(id).finally(() => rebuilding.delete(id));
+  rebuilding.set(id, p);
+  return p;
+}
+```
+
+## 4. 热点 key 与 key 设计
+
+- **命名**：`业务:实体:版本:ID`，如 `user:v3:1024`；版本号方便整体失效；
+- **大小**：单 value 控制在几十 KB；大对象拆字段或压缩；
+- **热点**：单 key QPS 过高时，本地缓存（LRU）+ Redis 两级；或把 key 打散成 `hot:{0..N}`（读时聚合）；
+- **禁止**：`KEYS *`、`FLUSHALL`、无 TTL 的业务 key、把 session 与业务数据混在一个 hash。
+
+```ts
+// 批量取：用 mget，避免 N 次 RTT
+const keys = ids.map((id) => key(id));
+const values = await redis.mget(keys);
+```
+
+## 5. 分布式锁：SET NX + Lua 解锁
+
+```ts
+import { randomUUID } from "node:crypto";
+
+const LOCK_TTL_MS = 10_000;
+
+export async function acquireLock(name: string): Promise<string | null> {
+  const token = randomUUID();
+  const ok = await redis.set(`lock:${name}`, token, "PX", LOCK_TTL_MS, "NX");
+  return ok === "OK" ? token : null;
+}
+
+// 解锁必须校验持有者，且「比较 + 删除」要原子
+const UNLOCK = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end`;
+
+export async function releaseLock(name: string, token: string) {
+  await redis.eval(UNLOCK, 1, `lock:${name}`, token);
+}
+```
+
+使用：
+
+```ts
+const token = await acquireLock("job:daily-report");
+if (!token) return;                    // 别人在跑，直接跳过
+try {
+  await doJob();                       // 业务必须幂等
+} finally {
+  await releaseLock("job:daily-report", token);
+}
+```
+
+四个必须知道的边界：
+
+1. **TTL 是兜底**：进程崩溃后锁会自动释放，但业务如果超过 TTL，锁会提前失效 → 需要续期（看门狗）或把任务拆小；
+2. **续期也要校验 token**，否则会把别人的锁续上；
+3. **Redlock 不是银弹**：多 Redis 实例的时钟/网络分区仍有争议；对强一致要求高的场景，用数据库唯一约束/事务或专业协调服务；
+4. **锁不等于幂等**：网络超时导致「锁释放了但任务其实执行了」，业务仍要幂等（唯一键/状态机）。
+
+## 6. 限流：先固定窗口，再上令牌桶
+
+### 6.1 固定窗口（简单，但有边界突刺）
+
+```ts
+export async function rateLimitFixed(key: string, limit: number, windowSec: number) {
+  const k = `rl:${key}:${Math.floor(Date.now() / 1000 / windowSec)}`;
+  const n = await redis.incr(k);
+  if (n === 1) await redis.expire(k, windowSec);
+  return n <= limit;                   // 注意 INCR 与 EXPIRE 不是原子
+}
+```
+
+`INCR` 与 `EXPIRE` 之间进程崩溃会导致 key 永不过期；用 Lua 一次完成：
+
+```lua
+local n = redis.call("incr", KEYS[1])
+if n == 1 then redis.call("expire", KEYS[1], ARGV[1]) end
+return n
+```
+
+### 6.2 滑动窗口（Redis ZSET）
+
+```ts
+const SLIDING = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call("zremrangebyscore", key, 0, now - window)
+local count = redis.call("zcard", key)
+if count >= limit then return 0 end
+redis.call("zadd", key, now, now .. ":" .. math.random())
+redis.call("pexpire", key, window)
+return 1`;
+
+export async function allowSliding(key: string, limit: number, windowMs: number) {
+  const ok = await redis.eval(SLIDING, 1, `rl:${key}`, Date.now(), windowMs, limit);
+  return ok === 1;
+}
+```
+
+### 6.3 令牌桶（允许突发）
+
+用 hash 存 `tokens` 与 `ts`，Lua 里按时间补充、扣减。适合「平均速率 + 突发容量」的 API 限流。
+
+| 算法 | 优点 | 缺点 |
+| :-- | :-- | :-- |
+| 固定窗口 | 实现最简单 | 窗口边界可能双倍放行 |
+| 滑动窗口 | 平滑 | 内存/ZSET 开销 |
+| 令牌桶 | 允许突发、可调容量 | 实现稍复杂 |
+| 漏桶 | 输出恒定 | 不允许突发 |
+
+## 7. Redis 还能做什么（边界）
+
+- **Session / 验证码**：短 TTL，天然合适；
+- **队列**：BullMQ（基于 Redis）做延迟任务、重试、并发控制；
+- **Pub/Sub**：多实例 SSE 广播（注意：不持久化，断线丢失需补拉）；
+- **排行榜**：ZSET；
+- **幂等键**：`SET NX EX` 记录请求 ID。
+
+**不适合**：作为唯一数据源、存大文件、做复杂事务、跨业务大 key 扫描。
+
+## 8. 常见坑
+
+| 现象 | 原因 | 处理 |
+| :-- | :-- | :-- |
+| 缓存与库不一致 | 先写缓存/并发写顺序乱 | 删缓存 + 版本号 + 延迟双删 |
+| 内存爆 | 大量无 TTL key / 大 value | 强制 TTL 策略、监控 bigkey |
+| Redis 挂了接口全 500 | 没有降级 | 缓存层 try/catch + 超时 + 熔断 |
+| 锁提前失效 | 业务超过 TTL | 续期看门狗 / 拆任务 / 幂等 |
+| 误删别人的锁 | 解锁没校验 token | Lua 比较后删除 |
+| 限流不准 | INCR/EXPIRE 非原子 | Lua 原子执行 |
+| 多实例 SSE 丢失 | Pub/Sub 无持久化 | 客户端带 last-event-id 补拉 |
+
+## 小结
+
+- Cache-Aside + 删缓存是默认方案，TTL 抖动与空值缓存解决大部分故障；
+- 锁的三要素：唯一 token、自动过期、原子解锁；业务幂等永远不能省；
+- 限流选算法看业务：固定窗口够用就先用，允许突发用令牌桶；
+- Redis 是加速层，不是真相源；所有缓存路径都要能降级。
+
+## 练习
+
+1. 用 Cache-Aside 实现用户详情缓存：TTL 抖动、空值缓存、更新删缓存，并用压测验证缓存命中率。
+2. 复现缓存击穿：热点 key 过期瞬间并发 100 请求，统计数据库 QPS；用 single-flight 修复后再测。
+3. 用 Lua 实现「比较 token 再删除」的解锁，并写一个测试：A 的锁过期后 B 获得锁，A 不能删掉 B 的锁。
+4. 实现滑动窗口限流中间件，要求 429 响应带 `Retry-After`，并用并发脚本验证不超限。
+5. 用 BullMQ 做一个延迟任务，要求失败重试 3 次、幂等键防重复执行。
+6. 设计一个 Redis 故障降级方案：连接超时 50ms、读失败直接查库、写失败只记日志，并验证 Redis 停掉后接口可用。

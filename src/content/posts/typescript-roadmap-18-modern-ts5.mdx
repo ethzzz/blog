@@ -1,0 +1,280 @@
+---
+title: '18 · TypeScript 5.x 现代特性与工程落地（扩展篇）'
+published: 2026-11-05T17:00:00+08:00
+description: '毕业项目之后的扩展篇：satisfies 的真实边界、const 类型参数、标准装饰器、verbatimModuleSyntax / bundler 解析、using 资源管理、NoInfer 与迁移清单，补齐 5.0–5.x 里真正影响日常代码的部分。'
+tags: [TypeScript, TS5, satisfies, 装饰器, ESM, 类型体操]
+category: TypeScript学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前 17 篇把类型系统、泛型、条件类型、声明文件与工程化走完了，基线大致停在 TS 4.x 的写法。
+> TS 5.0–5.x 加了一批**会改变日常代码**的能力：`satisfies`、`const` 类型参数、标准装饰器、`using`、新的模块解析策略。
+> 这一篇不追新语法清单，只讲哪些值得用、哪些有坑、旧项目怎么迁移。
+
+## 知识地图
+
+```
+TS 5.x 日常可用
+├── 表达式层
+│   ├── satisfies            校验通过但保留最窄推断
+│   ├── const 类型参数       让函数返回字面量而不是宽类型
+│   └── NoInfer<T>           只从指定位置推断
+├── 声明层
+│   ├── 标准装饰器（TC39）    类/方法/字段/accessor，取代 experimentalDecorators
+│   └── Symbol.metadata      装饰器元数据（5.2）
+├── 模块层
+│   ├── verbatimModuleSyntax 强制 type-only import
+│   ├── moduleResolution: bundler
+│   ├── module: preserve     同时保留 import/require
+│   └── import attributes    `with { type: "json" }`
+└── 运行时资源
+    └── using / await using  Symbol.dispose / asyncDispose（5.2）
+```
+
+## 1. `satisfies`：校验，但别把我的类型放宽
+
+`const config: Config = {...}` 的问题是**注解会决定类型**：写错一个字段能查到，但字段值的字面量信息也丢了。
+
+```ts
+type Route = { path: `/${string}`; method: "GET" | "POST" };
+
+// 注解写法：routes[0].path 被拓宽成 string，模板字面量信息丢失
+const a: Route[] = [{ path: "/users", method: "GET" }];
+
+// satisfies：仍然校验，但保留最窄推断
+const b = [{ path: "/users", method: "GET" }] satisfies Route[];
+// b[0].path 的类型是 "/users"，b[0].method 是 "GET"
+```
+
+典型用途：
+
+```ts
+const palette = {
+  primary: "#5b5ff0",
+  danger: "#e11d48",
+} satisfies Record<string, `#${string}`>;
+
+palette.primary.toUpperCase();     // 键名与字面量都还在
+// 少写一个字段、或写成 "red"，照样报错
+```
+
+**三个边界**：
+
+1. `satisfies` 不做多余属性检查的豁免——对象字面量多了字段仍然报错；
+2. 它不会把值「转换」成目标类型，运行时完全不存在；
+3. 需要「既保留字面量又导出目标类型」时，两者都写：
+
+```ts
+const config = { retries: 3, timeout: 5000 } satisfies RetryOptions;
+export type Config = typeof config;
+```
+
+## 2. `const` 类型参数：函数也能保留字面量
+
+`as const` 只能用在调用处；`<const T>` 把这件事交给函数签名，调用方不用再写。
+
+```ts
+// 普通泛型：T 被推断为 string[]
+function tuple<T extends readonly unknown[]>(items: T): T {
+  return items;
+}
+const a = tuple(["a", "b"]);        // string[]
+
+// const 类型参数：推断为 readonly ["a", "b"]
+function constTuple<const T extends readonly unknown[]>(items: T): T {
+  return items;
+}
+const b = constTuple(["a", "b"]);   // readonly ["a", "b"]
+```
+
+实际场景：
+
+```ts
+// 路由表：path 保留字面量，后面拼参数时能检查
+function defineRoutes<const T extends readonly { path: `/${string}` }[]>(routes: T): T {
+  return routes;
+}
+
+const routes = defineRoutes([
+  { path: "/users" },
+  { path: "/users/:id" },
+] as const);
+
+type Path = (typeof routes)[number]["path"];  // "/users" | "/users/:id"
+```
+
+注意：`<const T>` 会让推断结果变成 `readonly`，如果下游要求可变数组，需要 `[...arr]` 或放宽参数类型。
+
+## 3. 标准装饰器：别再背 `experimentalDecorators`
+
+TS 5.0 实现了 TC39 Stage 3 装饰器，与旧的 `experimentalDecorators` **不是同一套**：
+
+| 维度 | 旧装饰器（experimental） | 标准装饰器（TS 5.0+） |
+| :-- | :-- | :-- |
+| 开启方式 | `experimentalDecorators: true` | 默认支持，关掉旧开关 |
+| 签名 | `(target, key, descriptor)` | `(value, context)` |
+| 元数据 | `emitDecoratorMetadata` + reflect-metadata | `Symbol.metadata`（5.2） |
+| 字段装饰器 | 只能装饰原型 | 可拿到初始化函数 |
+| 适用 | NestJS / TypeORM 等旧生态 | 新库、AOP、校验 |
+
+```ts
+function logged<This, Args extends unknown[], R>(
+  method: (this: This, ...args: Args) => R,
+  context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => R>,
+) {
+  return function (this: This, ...args: Args): R {
+    console.log(`→ ${String(context.name)}`, args);
+    const result = method.call(this, ...args);
+    console.log(`← ${String(context.name)}`);
+    return result;
+  };
+}
+
+class UserService {
+  @logged
+  find(id: string) {
+    return { id, name: "皓" };
+  }
+}
+```
+
+**迁移注意**：NestJS、TypeORM、class-validator 目前仍依赖旧装饰器；项目里只要有一个这样的依赖，就继续用 `experimentalDecorators`，别混用两套。
+
+## 4. 模块层：`verbatimModuleSyntax` 与 `bundler` 解析
+
+### 4.1 类型导入必须显式
+
+```ts
+// 开启 verbatimModuleSyntax 后，这一行会被原样保留到产物里 —— 运行时找不到 User
+import { User } from "./types";
+
+// 正确：类型用 import type
+import type { User } from "./types";
+
+// 混合导入
+import { createUser, type User } from "./user";
+```
+
+为什么值得开：
+
+- 打包器/Node 的 ESM 解析不会「猜」哪个是类型，避免运行时 import 一个不存在的东西；
+- 与 `isolatedModules` 配合，保证每个文件都能被单独转译（esbuild/swc 的前提）；
+- 让「类型擦除」变成可预测的行为，而不是依赖 `importsNotUsedAsValues` 的旧语义。
+
+### 4.2 `moduleResolution: "bundler"`
+
+现代前端项目（Vite / Next / tsup）应由打包器解析路径，TS 只需要对齐规则：
+
+```jsonc
+{
+  "compilerOptions": {
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true
+  }
+}
+```
+
+| 配置 | 适用 |
+| :-- | :-- |
+| `moduleResolution: "node16"/"nodenext"` | 直接跑在 Node 的包（库、CLI） |
+| `moduleResolution: "bundler"` | Vite/Next/Webpack 等打包产物 |
+| `module: "preserve"` | 让 TS 不改造 import/require，交给运行时/打包器 |
+
+## 5. `using`：把「释放资源」交给作用域
+
+TS 5.2 的 `using` 对应显式资源管理：离开作用域自动调用 `[Symbol.dispose]()`，异步版用 `await using`。
+
+```ts
+class DbSession {
+  private closed = false;
+  query(sql: string) {
+    if (this.closed) throw new Error("session closed");
+    return `result of ${sql}`;
+  }
+  [Symbol.dispose]() {
+    this.closed = true;
+    console.log("session closed");
+  }
+}
+
+function work() {
+  using session = new DbSession();
+  session.query("select 1");
+  // 函数结束（含 return / throw）自动 close
+}
+```
+
+```ts
+class Tx {
+  async commit() {}
+  async [Symbol.asyncDispose]() {
+    console.log("rollback if not committed");
+  }
+}
+
+async function run() {
+  await using tx = new Tx();
+  await tx.commit();
+}
+```
+
+适用场景：数据库事务、文件句柄、锁、临时目录。**不要**用它替代所有 `try/finally`——只在资源有明确 dispose 语义时使用。
+
+## 6. `NoInfer` 与索引访问收紧
+
+```ts
+// 只从第一个参数推断 T，第二个参数不参与推断（TS 5.4）
+function createStore<T>(initial: T, fallback: NoInfer<T>): T {
+  return initial ?? fallback;
+}
+
+createStore({ id: 1 }, { id: 2 });      // OK
+createStore({ id: 1 }, { name: "x" });  // 报错：name 不在 T 里
+```
+
+再配合两个严格开关，能提前抓出大量运行时错误：
+
+```jsonc
+{
+  "compilerOptions": {
+    "noUncheckedIndexedAccess": true,   // arr[0] 视为 T | undefined
+    "exactOptionalPropertyTypes": true  // 可选属性不接受显式 undefined
+  }
+}
+```
+
+代价是代码里会多出一些 `!` 或判空——**先用在新项目**，旧项目逐目录开启。
+
+## 7. 迁移清单（4.x → 5.x）
+
+- [ ] 升级 `typescript` 与 `@types/*`，先跑 `tsc --noEmit` 看 breaking change。
+- [ ] 若依赖旧装饰器（NestJS/TypeORM），保留 `experimentalDecorators`，不要开标准装饰器。
+- [ ] 打开 `verbatimModuleSyntax`，把纯类型导入改成 `import type`（可先用 `@typescript-eslint/consistent-type-imports` 自动修）。
+- [ ] 前端项目改用 `moduleResolution: "bundler"` + `module: "preserve"`；Node 库用 `node16/nodenext`。
+- [ ] 用 `satisfies` 替换「为了校验而写宽注解」的地方。
+- [ ] 需要字面量推断的工厂函数改用 `<const T>`。
+- [ ] 资源类（事务/句柄/锁）评估 `using`，只改有明确 dispose 的。
+- [ ] 新项目开 `noUncheckedIndexedAccess` / `exactOptionalPropertyTypes`。
+- [ ] CI 增加 `tsc --noEmit` + 打包产物的类型冒烟（`npm pack` 后装到临时项目里 import 一次）。
+
+## 小结
+
+- `satisfies` 解决「校验通过但类型被放宽」，是 5.x 最值得马上用的特性；
+- `<const T>` 把 `as const` 收进函数签名，适合路由表、配置工厂；
+- 标准装饰器与旧装饰器是两套生态，迁移前先看依赖；
+- `verbatimModuleSyntax` + `bundler` 是前端项目最稳的模块组合；
+- `using` 只用于真正有释放语义的资源；
+- 新开关先在新项目启用，旧项目按目录推进。
+
+## 练习
+
+1. 用 `satisfies` 定义一个主题配置：键名固定（primary/danger/success），值必须是 `#${string}`，同时保留每个键的字面量类型。
+2. 写 `defineQuery<const T extends readonly string[]>(keys: T)`，让返回值保留元组字面量，并能推导出 `T[number]` 联合类型。
+3. 把一个使用旧装饰器的方法日志改成标准装饰器；再解释为什么 NestJS 项目不能直接这样改。
+4. 给项目开启 `verbatimModuleSyntax`，统计需要改成 `import type` 的文件数，并用 ESLint 自动修复。
+5. 用 `using` 实现一个「加锁 → 执行 → 自动解锁」的 helper，要求异常时也解锁。
+6. 用 `NoInfer` 改造一个「默认值不应影响推断」的函数，并写一个类型测试（`expectTypeOf` 或 `// @ts-expect-error`）验证。

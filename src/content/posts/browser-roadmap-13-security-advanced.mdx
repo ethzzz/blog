@@ -1,0 +1,232 @@
+---
+title: '13 · Web 安全进阶：CSP、Trusted Types 与第三方脚本治理（扩展篇）'
+published: 2026-11-05T21:00:00+08:00
+description: '在跨域与安全基础上再进一步：CSP 的正确落地与灰度、nonce/hash/strict-dynamic、Trusted Types 治 XSS、SRI 与第三方脚本治理、COOP/COEP 跨源隔离、iframe sandbox 与 postMessage 校验，附上线检查清单。'
+tags: [浏览器, Web安全, CSP, TrustedTypes, SRI, 跨源隔离]
+category: 浏览器与性能学习路线
+draft: false
+---
+
+> [!NOTE]
+> 06 篇讲过同源策略、CORS、CSRF 与常见 XSS。这一篇往深一层：
+> **当页面必须引入第三方脚本、必须渲染富文本、必须嵌 iframe 时，怎么把风险关进笼子。**
+> 重点不是背指令，而是「默认拒绝 + 可观测 + 可灰度」的落地方式。
+
+## 1. 威胁模型先摆清楚
+
+| 风险 | 入口 | 后果 |
+| :-- | :-- | :-- |
+| 存储型 XSS | 用户内容 / 富文本 | 窃取会话、伪造操作 |
+| 第三方脚本被篡改 | CDN、统计、客服、广告 | 全站任意代码执行 |
+| 供应链投毒 | npm 包、构建产物 | 构建期/运行期后门 |
+| 点击劫持 | 被第三方 iframe 嵌入 | 诱导点击敏感操作 |
+| 数据外带 | 恶意脚本/图片请求 | 用户数据泄漏 |
+| 跨窗口消息伪造 | `postMessage` 未校验 origin | 越权操作、注入 |
+
+防御的核心原则：**默认拒绝（deny by default）、最小权限、纵深防御**。
+
+## 2. CSP：从 Report-Only 开始，不要一刀切
+
+CSP 通过响应头告诉浏览器「哪些资源可以加载/执行」。
+
+```http
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' 'nonce-<随机值>' 'strict-dynamic';
+  style-src 'self' 'nonce-<随机值>';
+  img-src 'self' data: https:;
+  connect-src 'self' https://api.example.com;
+  frame-ancestors 'none';
+  base-uri 'self';
+  object-src 'none';
+```
+
+| 指令 | 作用 | 常见错误 |
+| :-- | :-- | :-- |
+| `default-src` | 兜底 | 只写 `script-src`，其他资源全放开 |
+| `script-src` | 脚本来源 | 用 `'unsafe-inline'` 抵消了保护 |
+| `style-src` | 样式来源 | 与 `script-src` 共用 nonce，导致样式全挂 |
+| `connect-src` | fetch/XHR/WS | 漏了 SSE/WebSocket 的域名 |
+| `frame-ancestors` | 能否被嵌 | 用 `X-Frame-Options` 代替（不覆盖多级） |
+| `base-uri` | `<base>` 限制 | 不设会被注入改基址 |
+| `object-src` | Flash/插件 | 直接 `'none'` |
+
+### 2.1 nonce：每个响应一个随机值
+
+```ts
+// Next.js middleware/proxy 或服务端模板
+const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
+const csp = [
+  `default-src 'self'`,
+  `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
+  `style-src 'self' 'nonce-${nonce}'`,
+  `img-src 'self' data: https:`,
+  `connect-src 'self'`,
+  `frame-ancestors 'none'`,
+  `object-src 'none'`,
+  `base-uri 'self'`,
+].join(";");
+
+response.headers.set("Content-Security-Policy", csp);
+response.headers.set("x-nonce", nonce);
+```
+
+```html
+<script nonce="<%= nonce %>" src="/app.js"></script>
+```
+
+`'strict-dynamic'` 的作用：只要主脚本是可信的，它动态创建的脚本也放行。代价是**不能再用域名白名单**（写了也会被忽略），必须保证入口脚本可信。
+
+### 2.2 灰度与观测
+
+```http
+Content-Security-Policy-Report-Only: ...; report-uri /csp-report; report-to csp
+```
+
+1. 先只上报不拦截，收集 1–2 周；
+2. 按页面/来源排序违规，先修「业务脚本」「内联事件」；
+3. 再切 `Content-Security-Policy`；
+4. 保留 `report-to`，持续监控新增违规。
+
+## 3. Trusted Types：从根上堵住 DOM XSS
+
+即使有 CSP，`innerHTML = userInput` 仍然能执行注入的 HTML。Trusted Types 要求所有危险 sink 接收「已策略化」的值：
+
+```http
+Content-Security-Policy: require-trusted-types-for 'script'; trusted-types app;
+```
+
+```ts
+// 注册策略：集中做清洗，其他地方不允许直接赋值
+const policy = trustedTypes.createPolicy("app", {
+  createHTML: (input: string) =>
+    DOMPurify.sanitize(input, { USE_PROFILES: { html: true } }),
+  createScriptURL: (url: string) => {
+    const u = new URL(url, location.origin);
+    if (u.origin !== location.origin) throw new Error("非法脚本源");
+    return u.href;
+  },
+});
+
+el.innerHTML = policy.createHTML(userContent);
+```
+
+落地建议：
+
+- 先找出危险 sink：`innerHTML`、`outerHTML`、`insertAdjacentHTML`、`document.write`、`eval`、`new Function`、`setTimeout(string)`；
+- 全部收敛到一个 sanitize 策略；
+- 框架（React）默认转义，但 `dangerouslySetInnerHTML` 仍是 sink；
+- 先 `Report-Only` 观察，再强制。
+
+## 4. 第三方脚本：白名单 + SRI + 隔离
+
+第三方脚本是最常见的「合法后门」。治理顺序：
+
+1. **能不自引就不引**：统计、客服、A/B 尽量走服务端或自托管；
+2. **固定版本 + SRI**（适用于静态 CDN 文件）：
+
+```html
+<script
+  src="https://cdn.example.com/lib@1.2.3/dist/lib.min.js"
+  integrity="sha384-<hash>"
+  crossorigin="anonymous"
+  defer
+></script>
+```
+
+3. **CSP 限制来源**，并给它单独的 `script-src-elem` 白名单；
+4. **iframe 隔离**：把聊天/广告放进 sandbox iframe，主页面不直接执行其 JS；
+5. **定期审计**：谁引的、版本、权限、是否还需要。
+
+SRI 的局限：只校验第一次下载的内容，脚本运行时仍可能被篡改（比如它再去加载别的脚本）；所以 CSP + 隔离仍是必需的。
+
+## 5. 跨源隔离：COOP / COEP / CORP
+
+要使用 `SharedArrayBuffer`、高精度计时、多线程 Wasm，需要「跨源隔离」：
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+Cross-Origin-Resource-Policy: same-origin
+```
+
+代价：所有跨源资源必须显式允许（CORP 或 CORS），否则加载失败。开启前先盘点图片、字体、iframe、第三方脚本。
+
+## 6. iframe 与 postMessage
+
+```html
+<iframe
+  src="https://widget.example.com"
+  sandbox="allow-scripts allow-forms"
+  referrerpolicy="no-referrer"
+  loading="lazy"
+></iframe>
+```
+
+- `sandbox` 默认禁止一切，按需加 `allow-*`；**不要同时给 `allow-scripts` 和 `allow-same-origin`**（等于拆掉沙箱）；
+- 需要嵌入时用 `frame-ancestors` 控制「谁能嵌我」；
+- `postMessage` 必须校验 `event.origin`、`event.source`，并校验消息结构：
+
+```ts
+window.addEventListener("message", (e) => {
+  if (e.origin !== "https://widget.example.com") return;
+  if (e.source !== iframe.contentWindow) return;
+  const data = schema.safeParse(e.data);
+  if (!data.success) return;
+  handle(data.data);
+});
+```
+
+## 7. 会话与 Cookie
+
+| 属性 | 作用 | 建议 |
+| :-- | :-- | :-- |
+| `HttpOnly` | JS 读不到 | 会话 cookie 必须开 |
+| `Secure` | 只走 HTTPS | 必须开 |
+| `SameSite=Lax` | 跨站 POST 不带 | 默认 Lax；需要跨站嵌入时用 `None; Secure` |
+| `__Host-` 前缀 | 锁定 domain/path/Secure | 会话 cookie 推荐 |
+| 过期与轮换 | 降低被盗窗口 | 短期 + 刷新令牌轮换 |
+
+CSRF 仍要防：SameSite 不是万能（旧浏览器、子域、GET 副作用）。高风险写操作加 CSRF token 或自定义头。
+
+## 8. 上线检查清单
+
+- [ ] CSP 先 Report-Only 跑够一周，违规有归属人。
+- [ ] `script-src` 无 `'unsafe-inline'`/`'unsafe-eval'`；style 单独策略。
+- [ ] `frame-ancestors 'none'`（或明确白名单），`object-src 'none'`，`base-uri 'self'`。
+- [ ] 富文本渲染走统一 sanitize；评估 Trusted Types。
+- [ ] 第三方脚本有版本锁定、SRI（可静态化时）、来源白名单与负责人。
+- [ ] 需要跨源隔离的页面单独开 COOP/COEP，并验证资源加载。
+- [ ] iframe 有 sandbox，postMessage 校验 origin/source/schema。
+- [ ] 会话 cookie `HttpOnly; Secure; SameSite`，敏感操作有 CSRF 防护。
+- [ ] 安全头统一在边缘/网关下发，避免某个路由漏掉。
+- [ ] 有告警：CSP 违规量、异常外连、依赖漏洞。
+
+## 9. 常见坑
+
+| 现象 | 原因 | 处理 |
+| :-- | :-- | :-- |
+| 上线 CSP 后白屏 | 内联脚本/样式被拦 | 用 nonce 或 hash，先 Report-Only |
+| nonce 不生效 | 页面被 CDN 缓存，nonce 复用 | 动态页面不缓存，或边缘注入 |
+| SRI 报错 | 文件跨域但没 `crossorigin` | 加 `crossorigin="anonymous"` |
+| postMessage 被伪造 | 只校验 data 不校验 origin | origin + source + schema 三重校验 |
+| 开了 COEP 图片全挂 | 跨源资源缺 CORP | 给资源加 CORP/CORS |
+| sandbox 失效 | 同时给 scripts 与 same-origin | 拆分成两个 iframe 或去掉 same-origin |
+| 只防了 XSS 没防 CSRF | SameSite 假设过强 | 写操作加 token/自定义头 |
+
+## 小结
+
+- CSP 的核心是「默认拒绝 + nonce/hash + 灰度观测」，不是复制一段指令；
+- Trusted Types 把 XSS 防线从「记得转义」变成「类型系统强制」；
+- 第三方脚本要版本锁定、白名单、SRI、隔离与定期审计；
+- 跨源隔离与 iframe 沙箱都有明确代价，先盘点资源再开；
+- 安全头应在统一入口下发，并配套违规告警。
+
+## 练习
+
+1. 给一个 Next.js 项目加 CSP：先 Report-Only，收集一周违规，再切强制，记录每类违规的修法。
+2. 找出项目里所有危险 sink（`innerHTML` 等），收敛到一个 sanitize 策略，并评估开启 Trusted Types 的改造量。
+3. 给第三方统计脚本加 SRI + `crossorigin`，故意改一个字节验证浏览器拒绝加载。
+4. 实现一个 sandbox iframe 的 postMessage 通信：校验 origin/source/schema，并拒绝一条伪造消息。
+5. 开启 COOP/COEP 后修复所有跨源资源（图片、字体、iframe），记录失败与修复清单。
+6. 设计一个安全头中间件：统一注入 CSP、HSTS、Referrer-Policy、X-Content-Type-Options，并写测试覆盖。
