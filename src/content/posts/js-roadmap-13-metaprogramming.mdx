@@ -1,0 +1,358 @@
+---
+title: '13 · 元编程与迭代协议：Proxy、Reflect、生成器'
+published: 2026-11-05T15:00:00+08:00
+description: '补齐 JS 路线缺失的元编程板块：属性描述符、Symbol 与内置协议、Proxy 十三种陷阱与不变量、Reflect 的 receiver 语义，以及迭代器/生成器/异步生成器，最后用它们实现响应式对象、惰性分页与负索引数组。'
+tags: [JavaScript, 元编程, Proxy, Reflect, 生成器, 迭代器, Symbol]
+category: JavaScript学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前 12 篇讲的是「怎么用 JS 写业务」，这一篇讲「怎么让 JS 按你的规则运行」。
+> Vue3 的响应式、Prisma 的查询代理、各种 ORM 的链式 API、`for await` 拉分页数据——底层都是本篇这几个能力。
+> 它不是日常必需，但读框架源码、写库、排查「为什么这个对象行为怪」时，缺了这块就只能靠猜。
+
+## 知识地图
+
+```
+元编程（Meta-programming）
+├── 内省（Introspection）       看自己：Object.keys / getOwnPropertyDescriptor / Symbol
+├── 拦截（Intercession）        改行为：Proxy / Reflect
+└── 语法层
+    ├── 属性描述符              writable / enumerable / configurable / get / set
+    ├── Symbol                 内置协议：iterator / asyncIterator / toPrimitive / toStringTag
+    └── 迭代协议                next() → { value, done }
+        ├── 同步生成器           function* / yield / yield*
+        └── 异步生成器           async function* / for await...of
+```
+
+## 1. 属性描述符：对象的「元数据」
+
+每个属性不只有值，还有四个开关：
+
+```js
+const obj = {};
+Object.defineProperty(obj, "id", {
+  value: 42,
+  writable: false,      // 不能改
+  enumerable: false,    // 不出现在 Object.keys / for...in / JSON.stringify
+  configurable: false,  // 不能删除、不能再改描述符
+});
+
+obj.id = 100;           // 静默失败（严格模式抛 TypeError）
+console.log(Object.keys(obj));              // []
+console.log(Object.getOwnPropertyDescriptor(obj, "id"));
+// { value: 42, writable: false, enumerable: false, configurable: false }
+```
+
+访问器属性用 `get/set`：
+
+```js
+const user = {
+  _age: 0,
+  get age() { return this._age; },
+  set age(v) {
+    if (!Number.isInteger(v) || v < 0) throw new RangeError("年龄不合法");
+    this._age = v;
+  },
+};
+```
+
+三个工程上的用途：
+
+- 用 `enumerable: false` 给对象挂「内部字段」，不污染序列化；
+- 用 `writable: false` 保护常量（比 `Object.freeze` 更细粒度）；
+- 用 `Object.defineProperty(obj, Symbol.toStringTag, { value: "MyType" })` 让 `Object.prototype.toString` 输出 `[object MyType]`。
+
+## 2. Symbol：不会撞名的键
+
+```js
+const ID = Symbol("id");
+const user = { [ID]: "u_1", name: "皓" };
+
+user[ID];                       // 'u_1'
+Object.keys(user);              // ['name'] —— Symbol 键默认不枚举
+JSON.stringify(user);           // '{"name":"皓"}'
+Symbol("id") === Symbol("id");  // false，每次都是新值
+Symbol.for("app.id") === Symbol.for("app.id"); // true，全局注册表
+```
+
+用途：给第三方对象挂内部标记、定义协议方法、避免字符串键冲突。
+
+**内置 well-known Symbol** 是 JS 的「隐式接口」：
+
+| Symbol | 被谁读取 | 用途 |
+| :-- | :-- | :-- |
+| `Symbol.iterator` | `for...of`、展开、解构 | 同步迭代协议 |
+| `Symbol.asyncIterator` | `for await...of` | 异步迭代协议 |
+| `Symbol.toPrimitive` | `+`、字符串拼接、`==` | 自定义类型转换 |
+| `Symbol.toStringTag` | `Object.prototype.toString` | 自定义类型标签 |
+| `Symbol.hasInstance` | `instanceof` | 自定义 instanceof 行为 |
+
+```js
+class Money {
+  constructor(cents) { this.cents = cents; }
+  [Symbol.toPrimitive](hint) {
+    if (hint === "string") return `¥${(this.cents / 100).toFixed(2)}`;
+    return this.cents / 100;
+  }
+}
+const price = new Money(1990);
+console.log(`${price}`);   // ¥19.90
+console.log(price * 2);    // 39.8
+```
+
+## 3. Proxy：拦截对象的所有基本操作
+
+```js
+const target = { name: "皓" };
+const proxy = new Proxy(target, {
+  get(t, key, receiver) {
+    if (!(key in t)) return `(未定义: ${String(key)})`;
+    return Reflect.get(t, key, receiver);
+  },
+  set(t, key, value) {
+    if (key === "age" && (typeof value !== "number" || value < 0)) {
+      throw new RangeError("age 必须是非负数");
+    }
+    return Reflect.set(t, key, value);
+  },
+  has(t, key) { return key in t; },
+  deleteProperty(t, key) {
+    if (key === "id") throw new Error("id 不可删除");
+    return Reflect.deleteProperty(t, key);
+  },
+});
+
+proxy.name;        // '皓'
+proxy.missing;     // '(未定义: missing)'
+proxy.age = -1;    // RangeError
+```
+
+常用陷阱与场景：
+
+| 陷阱 | 触发时机 | 典型用途 |
+| :-- | :-- | :-- |
+| `get` / `set` | 读写属性 | 默认值、校验、响应式 |
+| `has` | `in` | 虚拟字段 |
+| `deleteProperty` | `delete` | 保护关键字段 |
+| `ownKeys` | `Object.keys` / 展开 | 隐藏或补充键 |
+| `getOwnPropertyDescriptor` | 描述符查询 | 配合 `ownKeys` 保持一致 |
+| `apply` / `construct` | 函数调用 / `new` | 函数缓存、依赖注入 |
+| `getPrototypeOf` / `setPrototypeOf` | 原型操作 | 沙箱 |
+
+**不变量（invariants）**：Proxy 不能凭空违反目标对象的约束。例如目标属性 `configurable: false` 时，`getOwnPropertyDescriptor` 必须返回一致结果，否则直接抛 `TypeError`。写库时先读规范里的 invariant 列表，别靠试。
+
+## 4. Reflect：把「默认行为」变成函数
+
+`Reflect` 是 Proxy 陷阱的「默认实现集合」，方法名与陷阱一一对应：
+
+```js
+const obj = { a: 1 };
+Reflect.get(obj, "a");              // 1，等价于 obj.a
+Reflect.set(obj, "b", 2);           // true
+Reflect.has(obj, "a");              // true
+Reflect.ownKeys(obj);               // ['a', 'b']
+Reflect.deleteProperty(obj, "a");   // true
+```
+
+最关键的是 **receiver** 参数：
+
+```js
+const base = {
+  get name() { return this.first + " " + this.last; },
+};
+const derived = Object.create(base);
+derived.first = "三";
+derived.last = "张";
+
+Reflect.get(base, "name", derived);  // '三 张'：getter 里的 this 是 derived
+base.name;                           // 'undefined undefined'
+```
+
+在 Proxy 里必须把 `receiver` 透传给 `Reflect.get/set`，否则 getter/setter 里的 `this` 会指向目标对象而不是代理，继承与响应式都会错。
+
+## 5. 迭代协议：`for...of` 背后的契约
+
+一个对象只要实现 `[Symbol.iterator]()`，返回一个带 `next()` 的迭代器，就能被 `for...of` 消费：
+
+```js
+const range = {
+  from: 1,
+  to: 3,
+  [Symbol.iterator]() {
+    let cur = this.from;
+    const last = this.to;
+    return {
+      next() {
+        return cur <= last ? { value: cur++, done: false } : { value: undefined, done: true };
+      },
+      return() {            // for...of 提前 break 时调用，用来清理资源
+        console.log("closed");
+        return { done: true };
+      },
+    };
+  },
+};
+
+for (const n of range) {
+  if (n === 2) break;
+}
+```
+
+**迭代器 vs 可迭代对象**：迭代器是「有 next 的对象」，可迭代对象是「有 `Symbol.iterator` 的对象」。生成器函数返回的对象**两者都是**。
+
+生成器让这件事变简单：
+
+```js
+function* range(from, to) {
+  for (let i = from; i <= to; i++) yield i;
+}
+
+[...range(1, 3)];            // [1, 2, 3]
+const it = range(1, 3);
+it.next();                   // { value: 1, done: false }
+```
+
+生成器的价值是**惰性**：只有在 `next()` 时才计算下一项，所以可以表示无限序列、分页数据、树的深度遍历。
+
+```js
+function* naturals() {
+  let i = 0;
+  while (true) yield i++;
+}
+
+function* take(iterable, n) {
+  let count = 0;
+  for (const v of iterable) {
+    if (count++ >= n) return;
+    yield v;
+  }
+}
+
+console.log([...take(naturals(), 5)]);   // [0,1,2,3,4]
+```
+
+`yield*` 用来委托给另一个可迭代对象：
+
+```js
+function* flatten(tree) {
+  for (const node of tree) {
+    yield node.value;
+    if (node.children) yield* flatten(node.children);
+  }
+}
+```
+
+## 6. 异步生成器：拉分页、读流
+
+`async function*` 返回异步迭代器，用 `for await...of` 消费。它天然适合「按页拉数据」：
+
+```js
+async function* fetchPages(url) {
+  let page = 1;
+  for (;;) {
+    const res = await fetch(`${url}?page=${page}`);
+    const data = await res.json();
+    if (!data.items.length) return;
+    for (const item of data.items) yield item;
+    if (!data.hasMore) return;
+    page++;
+  }
+}
+
+for await (const item of fetchPages("/api/tasks")) {
+  if (item.done) break;     // 提前退出，生成器被 return()，上游不再请求下一页
+  console.log(item.title);
+}
+```
+
+这比「一次性拉全量再遍历」省内存，也比手写 `while (hasMore)` 更容易在 `break` 时停止。
+
+## 7. 三个能落地的例子
+
+**① 负索引数组**
+
+```js
+function negativeIndex(arr) {
+  return new Proxy(arr, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^-\d+$/.test(key)) {
+        return Reflect.get(target, target.length + Number(key), receiver);
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  });
+}
+
+const a = negativeIndex([1, 2, 3]);
+console.log(a[-1]);   // 3
+```
+
+**② 极简响应式（Vue3 思路的玩具版）**
+
+```js
+function reactive(obj, onChange) {
+  return new Proxy(obj, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver);
+      return value && typeof value === "object" ? reactive(value, onChange) : value;
+    },
+    set(target, key, value, receiver) {
+      const ok = Reflect.set(target, key, value, receiver);
+      onChange(key, value);
+      return ok;
+    },
+  });
+}
+
+const state = reactive({ count: 0 }, (k, v) => console.log(`set ${String(k)}=${v}`));
+state.count++;   // set count=1
+```
+
+真实框架还要处理依赖收集、嵌套代理缓存（同一个对象不能反复包代理）、数组方法、删除与 `ownKeys`，否则 `state.list.push()` 这类操作收不到完整通知。
+
+**③ 惰性树遍历**
+
+```js
+function* walk(node) {
+  yield node;
+  for (const child of node.children ?? []) yield* walk(child);
+}
+```
+
+## 8. 常见坑
+
+| 坑 | 说明 |
+| :-- | :-- |
+| Proxy 里的 `this` | getter 内部访问 `this` 时若未透传 `receiver`，拿到的是目标对象，不是代理 |
+| 私有字段报错 | `#field` 的访问需要 `this` 是原始对象；`Reflect.get(t, k, receiver)` 可能抛错，需特殊处理 |
+| 性能 | 每次属性访问都走陷阱，热路径别滥用；必要时在初始化后换回普通对象 |
+| 不变量 | 目标属性不可配置时，`ownKeys/descriptor` 必须与目标一致，否则 TypeError |
+| 代理不可撤销 | 需要可撤销时用 `Proxy.revocable()`，撤销后任何操作抛错 |
+| 生成器一次性 | 生成器对象只能迭代一次，第二次为空；要复用就每次调用生成函数 |
+| `return()` 未清理 | 自定义迭代器做资源释放时，记得实现 `return()`，`for...of` 的 `break` 才会调用 |
+| 异步生成器里的并发 | `for await` 是串行的；要并发处理需先收集再 `Promise.all`，注意内存 |
+
+## 小结
+
+- 属性描述符决定「属性能不能改、能不能枚举、能不能删」；
+- Symbol 提供不会撞名的键与一套内置协议，`toPrimitive`/`iterator` 是最常用的两个；
+- Proxy 拦截对象操作，Reflect 提供默认行为与正确的 `receiver`；
+- 迭代协议让自定义对象能被 `for...of`/展开消费，生成器让惰性序列变简单；
+- 异步生成器是「分页/流式」的优雅解，`break` 会停止上游请求；
+- 元编程能力越强，越要克制：能用一个普通函数解决的，不要上代理。
+
+## 练习
+
+1. 实现 `readonly(obj)`：任何写操作抛错，嵌套对象同样只读。提示：`set/deleteProperty/defineProperty` 三个陷阱都要拦，并缓存代理避免重复包装。
+2. 给对象实现「默认值」代理：读取 `undefined` 的属性返回 `0`，但 `in` 判断仍按真实属性返回 false。
+3. 用 `Symbol.iterator` 实现一个按层（BFS）遍历树的迭代器，要求 `break` 后不再继续。
+4. 用 `async function*` 实现「按游标分页」的拉取器，支持 `break` 后停止请求，并处理上游 429 重试一次。
+5. 写一个 `Money` 类，同时实现 `Symbol.toPrimitive` 与 `Symbol.toStringTag`，验证模板字符串、加法、`Object.prototype.toString` 三种行为。
+6. 解释为什么下面代码的 getter 里 `this` 不是代理，并修复：
+   ```js
+   const p = new Proxy({ get x() { return this.y; }, y: 1 }, {
+     get(t, k) { return t[k]; },
+   });
+   ```

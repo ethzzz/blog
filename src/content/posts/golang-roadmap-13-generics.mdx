@@ -1,0 +1,300 @@
+---
+title: '13 · 泛型与约束：Go 1.18+ 的类型参数'
+published: 2026-11-05T11:00:00+08:00
+description: 'Go 路线里一直缺的一篇：从 interface{} 的痛点出发，讲清类型参数、约束与 ~ 底层类型、泛型容器与函数、标准库 slices/maps、性能与取舍，并给出不该用泛型的场景。'
+tags: [Go, 泛型, 类型参数, 约束, slices]
+category: Go学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这条路线从值语义、接口、并发一路写到项目，但一直没讲 **Go 1.18 引入的泛型**——不是不重要，而是它很容易被讲成语法演示。
+> 这一篇按「先解决什么问题 → 语法 → 约束 → 标准库 → 什么时候别用」的顺序走，代码全部是可运行的 Go 1.22+ 示例。
+
+## 先看没有泛型时有多难受
+
+写一个「取切片第一个元素」的工具，Go 1.18 之前只有两条路：
+
+```go
+// 方案 A：每个类型写一遍
+func FirstInt(xs []int) (int, bool)       { if len(xs) == 0 { return 0, false }; return xs[0], true }
+func FirstString(xs []string) (string, bool) { if len(xs) == 0 { return "", false }; return xs[0], true }
+
+// 方案 B：interface{} + 类型断言，运行时才炸
+func FirstAny(xs []any) (any, bool) {
+    if len(xs) == 0 { return nil, false }
+    return xs[0], true
+}
+// 调用方：
+// v, _ := FirstAny([]any{1, 2})
+// n := v.(int)   // 断言写错 → panic；每次装箱还有分配
+```
+
+泛型把「类型」也变成参数，编译期就能检查，还不用装箱：
+
+```go
+func First[T any](xs []T) (T, bool) {
+    var zero T
+    if len(xs) == 0 {
+        return zero, false
+    }
+    return xs[0], true
+}
+
+n, ok := First([]int{1, 2})        // T 推断为 int
+s, ok := First([]string{"a"})      // T 推断为 string
+```
+
+## 1. 语法：类型参数、约束、类型推断
+
+```go
+// 类型参数写在函数名后的方括号里；any 是最宽约束
+func Map[T, R any](xs []T, fn func(T) R) []R {
+    out := make([]R, 0, len(xs))
+    for _, x := range xs {
+        out = append(out, fn(x))
+    }
+    return out
+}
+
+nums := Map([]int{1, 2, 3}, func(n int) string { return strconv.Itoa(n * 2) })
+// 编译器从 []int 与 fn 的参数推断 T=int、R=string
+```
+
+推断不是万能的。**Go 目前不支持只推断一部分类型参数**：
+
+```go
+func NewSet[T comparable]() map[T]struct{} { return map[T]struct{}{} }
+
+set := NewSet[int]()   // 没有实参可推断，必须显式写 [int]
+// set := NewSet()     // 编译错误：cannot infer T
+```
+
+## 2. 约束：能做什么，由约束决定
+
+`any` 放弃了一切操作；要做比较、算术、取底层类型，就得收紧约束。
+
+```go
+// comparable：可用 == / !=，能当 map 的键
+func Contains[T comparable](xs []T, target T) bool {
+    for _, x := range xs {
+        if x == target {
+            return true
+        }
+    }
+    return false
+}
+
+// 联合约束 + ~：允许底层类型为 int/string 的自定义类型
+type Number interface {
+    ~int | ~int64 | ~float64
+}
+
+func Sum[T Number](xs []T) T {
+    var total T
+    for _, x := range xs {
+        total += x
+    }
+    return total
+}
+
+type Celsius float64
+Sum([]Celsius{36.5, 37.0})   // ~float64 让自定义类型也能进来
+```
+
+`~` 是泛型里最容易被忽略却最常需要的符号：
+
+| 约束写法 | 接受 `type MyInt int` 吗 | 说明 |
+| :-- | :--: | :-- |
+| `int` | ❌ | 只匹配内置 `int` 本身 |
+| `~int` | ✅ | 匹配底层类型为 `int` 的所有类型 |
+| `interface{ ~int \| ~string }` | ✅ | 联合 + 底层类型 |
+
+Go 1.21 起标准库有 `cmp.Ordered`，别再自己定义 `~int | ~float64 | ~string`：
+
+```go
+import "cmp"
+
+func Max[T cmp.Ordered](xs []T) T {
+    if len(xs) == 0 {
+        panic("empty")
+    }
+    m := xs[0]
+    for _, x := range xs[1:] {
+        if x > m {
+            m = x
+        }
+    }
+    return m
+}
+```
+
+## 3. 泛型类型：容器与状态
+
+```go
+// 栈：零依赖、类型安全
+type Stack[T any] struct {
+    items []T
+}
+
+func (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }
+
+func (s *Stack[T]) Pop() (T, bool) {
+    var zero T
+    if len(s.items) == 0 {
+        return zero, false
+    }
+    v := s.items[len(s.items)-1]
+    s.items = s.items[:len(s.items)-1]
+    return v, true
+}
+
+// 集合：用 map[T]struct{} 省内存
+type Set[T comparable] map[T]struct{}
+
+func (s Set[T]) Add(v T)          { s[v] = struct{}{} }
+func (s Set[T]) Has(v T) bool     { _, ok := s[v]; return ok }
+func (s Set[T]) Len() int         { return len(s) }
+```
+
+**方法不能再引入新的类型参数**，只能使用接收者上的：
+
+```go
+// 编译错误：methods cannot have type parameters
+// func (s *Stack[T]) Map[R any](fn func(T) R) []R { ... }
+
+// 正确做法：写成独立函数
+func MapStack[T, R any](s *Stack[T], fn func(T) R) []R {
+    var out []R
+    for len(s.items) > 0 {
+        v, _ := s.Pop()
+        out = append(out, fn(v))
+    }
+    return out
+}
+```
+
+（实际项目里 `items` 是私有字段，外部函数拿不到——要么加一个 `Drain() []T`，要么把 `Map` 定义在包内。这里只想说明语法限制。）
+
+## 4. 标准库已经替你写好了
+
+Go 1.21 起，`slices` 与 `maps` 覆盖了大多数「自己写泛型工具」的需求：
+
+```go
+import (
+    "cmp"
+    "maps"
+    "slices"
+)
+
+nums := []int{3, 1, 2, 1}
+
+slices.Sort(nums)                         // [1 1 2 3]
+slices.SortFunc(nums, func(a, b int) int { return cmp.Compare(b, a) })
+slices.Contains(nums, 2)                  // true
+slices.Compact(nums)                      // 去重相邻元素（需先排序）
+slices.IndexFunc(nums, func(n int) bool { return n > 2 })
+
+m := map[string]int{"a": 1, "b": 2}
+keys := slices.Sorted(maps.Keys(m))       // 有序键
+maps.Clone(m)                             // 浅拷贝
+```
+
+结论：**先查标准库，别急着自己造**。`slices` / `maps` / `cmp` 已经覆盖了排序、查找、去重、比较、键值视图这些高频需求。
+
+## 5. 泛型 + 迭代器（Go 1.23+）
+
+Go 1.23 的 `iter.Seq[T]` 与 `range over func` 可以和泛型组合出惰性序列：
+
+```go
+import "iter"
+
+// 只取前 n 个，不预先分配整个切片
+func Take[T any](seq iter.Seq[T], n int) iter.Seq[T] {
+    return func(yield func(T) bool) {
+        count := 0
+        for v := range seq {
+            if count >= n || !yield(v) {
+                return
+            }
+            count++
+        }
+    }
+}
+
+func Naturals() iter.Seq[int] {
+    return func(yield func(int) bool) {
+        for i := 0; ; i++ {
+            if !yield(i) {
+                return
+            }
+        }
+    }
+}
+
+// for v := range Take(Naturals(), 3) { fmt.Println(v) } // 0 1 2
+```
+
+这组 API 的价值在于**把「生产序列」和「消费序列」解耦**：上游可以是分页 HTTP、文件行、数据库游标，下游用 `range` 消费，提前 `break` 会通知上游停止。
+
+## 6. 性能：泛型不是反射
+
+泛型在编译期做类型检查，运行时**不会**像 `interface{}` 那样必然装箱。但也不是零成本：
+
+- 编译器目前用 GC shape stenciling（相同内存形状的类型共享一份实例），指针类型之间可能共享代码；
+- 泛型代码会被内联/单态化的程度取决于类型与编译器版本，**不要凭感觉断言「一定更快」**；
+- 真正该关心的是：避免 `[]T` ↔ `[]any` 来回转换，那才是分配与断言的来源。
+
+```go
+func BenchmarkSumInt(b *testing.B) {
+    xs := make([]int, 1024)
+    for i := range xs { xs[i] = i }
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ { _ = Sum(xs) }
+}
+
+// go test -bench . -benchmem
+```
+
+## 7. 什么时候**不该**用泛型
+
+这不是「新特性就必须用」：
+
+| 场景 | 选择 |
+| :-- | :-- |
+| 行为抽象（不同实现做不同事） | 接口，不是泛型 |
+| 只有一两种具体类型 | 直接写两个函数，更易读 |
+| 需要运行时按类型分支 | 类型断言 / 反射，泛型帮不上 |
+| 约束复杂到要写十几行 | 先怀疑设计，是否该拆接口 |
+| 公共 API 想保持简单 | 泛型会抬高调用方理解成本 |
+
+一句话：**泛型解决「同一套逻辑、多种类型」，接口解决「同一套协议、多种行为」**。两者不是替代关系。
+
+## 8. 常见坑清单
+
+| 坑 | 说明 |
+| :-- | :-- |
+| `T` 不能直接 `nil` 比较 | 用 `var zero T` 或约束 `comparable` |
+| 类型推断失败 | 没有实参可推断时必须显式 `[T]` |
+| 方法不能新增类型参数 | 改成泛型函数或把参数放到接收者类型上 |
+| `interface{ ~int }` 不能当值用 | 含类型集的接口只能做约束 |
+| 自定义类型不满足 `int` | 用 `~int` |
+| 在泛型里做类型 switch | 不支持；改用接口/反射 |
+| 过度抽象 | 三处重复再抽象，泛型也一样 |
+
+## 小结
+
+- 泛型把「类型」变成参数，编译期检查、避免 `interface{}` 装箱；
+- 约束决定你能对 `T` 做什么：`any` → `comparable` → `~int | ~string` → `cmp.Ordered`；
+- 标准库 `slices` / `maps` / `cmp` 优先，别重复造轮子；
+- 方法不能引入新类型参数；没有实参时推断不出来；
+- 泛型与接口分工明确：一个管「类型多态」，一个管「行为多态」。
+
+## 练习
+
+1. 实现 `Filter[T any](xs []T, keep func(T) bool) []T`，要求复用底层数组、返回新切片头（提示：`xs[:0]`）。
+2. 用 `Set[T comparable]` 实现两个切片的交集、并集、差集，并保证结果顺序稳定。
+3. 写一个 `LRU[K comparable, V any]`，容量固定，`Get` 命中时把节点移到队首，`Put` 超容时淘汰队尾。
+4. 用 `iter.Seq[T]` 实现分页读取器：每次 `yield` 一个元素，上游按页拉取，`break` 后不再请求下一页。
+5. 给 `Stack[T]` 加 `Drain() iter.Seq[T]`，要求遍历过程中 `break` 不影响栈的剩余元素（提示：先拷贝或按索引产出）。
+6. 写 benchmark 对比 `Sum[int]` 与 `SumAny([]any)` 的 `ns/op` 和 `B/op`，解释差异来源。

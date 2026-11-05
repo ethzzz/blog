@@ -1,0 +1,283 @@
+---
+title: 'Python 进阶：FastAPI + asyncio 异步 Web（对照 Django）'
+published: 2026-11-05T10:00:00+08:00
+description: '补齐 Python 路线里缺失的现代异步 Web：从事件循环、协程与超时取消，到 FastAPI 的类型化路由、依赖注入、异步数据库、SSE 流式输出、测试与部署，并与前面学过的 Django 做对照。'
+tags: [Python, FastAPI, asyncio, 异步, SSE, Web]
+category: Python学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前面的 Web 篇用的是 Django：同步、 batteries-included、上手快。
+> 但真实项目里还有另一条常见路线——**FastAPI + asyncio**：类型驱动、原生异步、天生适合流式与高并发 IO。
+> NoteLab 的 AI 试验场就是 FastAPI 单体（同时服务 API 与前端产物），这一篇把这条路线补齐。
+
+## 知识地图
+
+```
+fastapi-async/
+├── app/
+│   ├── main.py            应用与 lifespan
+│   ├── deps.py           依赖注入（db / 当前用户）
+│   ├── routers/
+│   │   ├── tasks.py      CRUD
+│   │   └── chat.py       SSE 流式
+│   ├── models.py         Pydantic 请求/响应
+│   ├── db.py             async SQLAlchemy
+│   └── core/config.py    Settings
+├── tests/
+│   └── test_tasks.py     httpx.AsyncClient
+└── pyproject.toml
+```
+
+## 1. asyncio：先理解「单线程为什么能并发」
+
+异步不是多线程。事件循环在一个线程里轮流推进任务：遇到 `await`（等网络、等磁盘）就挂起当前协程，去跑别的，等 IO 就绪再回来。
+
+```python
+import asyncio, time
+
+async def fetch(name: str, delay: float) -> str:
+    print(f"{name} start")
+    await asyncio.sleep(delay)       # 模拟 IO：让出控制权
+    print(f"{name} done")
+    return name
+
+async def main() -> None:
+    start = time.perf_counter()
+    # 顺序：总耗时 = 1 + 1 = 2s
+    # await fetch("a", 1); await fetch("b", 1)
+
+    # 并发：总耗时约 1s
+    results = await asyncio.gather(fetch("a", 1), fetch("b", 1))
+    print(results, f"{time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())
+```
+
+必须记住的四件事：
+
+1. **`async def` 定义协程，调用它不会执行**，只有 `await` 或交给事件循环才会跑。
+2. **在协程里调用阻塞函数 = 阻塞整个事件循环**。`requests.get()`、`time.sleep()`、同步数据库驱动都会把全站卡住。
+3. 阻塞调用要用 `await asyncio.to_thread(fn, ...)`（IO 型）或丢进进程池（CPU 型）。
+4. 超时与取消是常态：客户端断开、上游超时都应该释放资源。
+
+```python
+# 超时：超时后协程被取消，内部的 finally/async with 仍会执行
+try:
+    async with asyncio.timeout(3):
+        data = await fetch("slow", 5)
+except TimeoutError:
+    print("超时，已取消")
+
+# Python 3.11+ 的结构化并发：任一子任务失败，其余一起取消
+async with asyncio.TaskGroup() as tg:
+    t1 = tg.create_task(fetch("a", 1))
+    t2 = tg.create_task(fetch("b", 2))
+# 退出 with 时两个任务都已完成
+print(t1.result(), t2.result())
+```
+
+> **前端对照**：`await` 很像 JS 的 `await`，但 JS 只有一个调用栈 + 微任务队列；Python 的协程可以由多个 worker 进程各跑一个事件循环。另外 Python 的 `async with` 对应的是「异步上下文管理器」，常用于连接/会话/锁。
+
+## 2. FastAPI 最小应用
+
+```bash
+pip install "fastapi[standard]" uvicorn
+# 或：uv add fastapi uvicorn
+```
+
+```python
+# app/main.py
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Task API", version="1.0.0")
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    priority: int = Field(default=3, ge=1, le=5)
+
+class Task(TaskCreate):
+    id: int
+
+@app.get("/api/tasks/{task_id}", response_model=Task)
+async def get_task(task_id: int) -> Task:
+    return Task(id=task_id, title="demo", priority=3)
+
+@app.post("/api/tasks", response_model=Task, status_code=201)
+async def create_task(req: TaskCreate) -> Task:
+    return Task(id=1, **req.model_dump())
+```
+
+运行 `uvicorn app.main:app --reload`，打开 `/docs` 就有可交互文档。这是 FastAPI 最大的体感差异：**类型标注就是接口契约**，不用再手写一遍 Swagger。
+
+**`async def` 还是 `def`？**
+
+| 端点实现 | FastAPI 行为 |
+| :-- | :-- |
+| `async def` | 直接在事件循环里执行，内部只能 `await` 异步库 |
+| `def` | 自动丢到线程池执行，可以安全调用同步库，但会占线程 |
+
+判断标准：**链路里有一个阻塞调用，就用 `def` 或整体改异步库**；全异步链路才用 `async def`。最危险的是「`async def` 里调 `requests.get()`」——看起来异步，实际把事件循环锁死。
+
+## 3. 依赖注入：把 session、当前用户抽出来
+
+```python
+# app/deps.py
+from collections.abc import AsyncIterator
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends, Header, HTTPException
+
+async def get_db() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session          # 请求结束自动关闭
+
+async def current_user(authorization: str = Header(default="")) -> str:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="请先登录")
+    return authorization.removeprefix("Bearer ")
+
+# routers/tasks.py
+@router.get("/tasks", response_model=list[Task])
+async def list_tasks(
+    done: bool | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: str = Depends(current_user),
+) -> list[Task]:
+    ...
+```
+
+`yield` 依赖在请求结束时执行清理，适合数据库会话、临时文件、锁。**不要在依赖外长期持有 session**：异步 session 不是线程安全的，也不适合跨请求复用。
+
+## 4. 异步数据库：SQLAlchemy 2.x
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+class Base(DeclarativeBase): ...
+
+class TaskRow(Base):
+    __tablename__ = "task"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(index=True)
+    done: Mapped[bool] = mapped_column(default=False)
+
+engine = create_async_engine(
+    "mysql+aiomysql://user:pass@127.0.0.1:3306/demo",
+    pool_size=10, max_overflow=20, pool_pre_ping=True,
+)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+async def create_task(db: AsyncSession, req: TaskCreate) -> TaskRow:
+    row = TaskRow(title=req.title)
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+```
+
+如果你用的是同步驱动（`pymysql` / `mysqlclient`），端点要么写成 `def`，要么用 `to_thread` 包一层——**别在 `async def` 里直接调同步驱动**。
+
+## 5. SSE 流式：AI 应用的基本功
+
+```python
+import asyncio, json
+from fastapi.responses import StreamingResponse
+
+async def token_stream(prompt: str):
+    for ch in ["你", "好", "，", "世", "界"]:
+        await asyncio.sleep(0.1)
+        yield f"data: {json.dumps({'delta': ch}, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+@router.post("/chat/stream")
+async def chat_stream(req: ChatReq) -> StreamingResponse:
+    return StreamingResponse(
+        token_stream(req.prompt),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # 让 nginx 不要缓冲
+        },
+    )
+```
+
+三个必须处理的点：
+
+1. 客户端断开时，`StreamingResponse` 会取消生成器——把上游请求放在 `try/finally` 里关闭。
+2. 反代必须关闭缓冲（nginx `proxy_buffering off`，或上面的 `X-Accel-Buffering`），否则用户看到的是「等 10 秒然后一次性出现」。
+3. 每帧格式固定 `data: ...\n\n`；错误也要推一帧 `event: error`，而不是直接断流让前端猜。
+
+## 6. 应用生命周期与统一错误
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=10)
+    yield
+    await app.state.http.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.exception_handler(ValueError)
+async def on_value_error(_: Request, e: ValueError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": str(e)})
+```
+
+`lifespan` 取代了旧的 `@app.on_event("startup")`，用来建连接池、加载配置、启动后台任务；退出时务必关闭，避免热重载泄漏连接。
+
+## 7. 测试：不启服务器也能测
+
+```python
+# tests/test_tasks.py
+import pytest
+from httpx import ASGITransport, AsyncClient
+from app.main import app
+
+@pytest.mark.asyncio
+async def test_create_rejects_blank_title():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        res = await ac.post("/api/tasks", json={"title": ""})
+    assert res.status_code == 422
+```
+
+依赖安装：`pip install pytest pytest-asyncio httpx`。数据库依赖用 `app.dependency_overrides[get_db]` 换成测试 session；不要连生产库。
+
+## 8. 部署与排障
+
+```bash
+# 生产：多进程（每个进程一个事件循环），进程数 ≈ CPU 核数
+uvicorn app.main:app --host 127.0.0.1 --port 8002 --workers 2
+```
+
+| 现象 | 常见原因 | 处理 |
+| :-- | :-- | :-- |
+| 全站偶发卡顿 | `async def` 里调了同步库 | 改异步库或 `to_thread` |
+| SSE 一次性输出 | nginx 缓冲 | `proxy_buffering off` |
+| 连接数暴涨 | session 未关闭 | 用 `yield` 依赖 / `async with` |
+| 400/500 混在一起 | 没统一异常处理 | 业务异常用 `HTTPException`，兜底 handler 只回通用文案 |
+| CPU 打满 | 在事件循环里做计算 | 进程池 / 任务队列，不要阻塞 loop |
+| 请求取消后仍在跑 | 没处理 `CancelledError` | `try/finally` 关上游、释放连接 |
+
+## 小结
+
+- asyncio 的价值是**在单线程里等待 IO**，前提是整条链路都不阻塞；
+- FastAPI 把「类型 → 校验 → 文档 → 序列化」合成一步，`async def` 与 `def` 的选择取决于链路里有没有阻塞调用；
+- 依赖注入管资源生命周期，`yield` 依赖是数据库会话的标准写法；
+- SSE 是 AI 流式应用的基础，反代缓冲与取消传播是上线必查项；
+- Django 适合「后台 + 表单 + 权限」的传统站点，FastAPI 适合「API + 流式 + 高并发 IO」的服务，两者不冲突，可以同仓共存。
+
+## 练习
+
+1. 把第 2 节的 `create_task` 改成真实落库，并加一个「同标题任务不能重复」的约束（返回 409）。
+2. 写一个 `GET /api/tasks/stream`，用 SSE 每 200ms 推送一条任务变更，客户端断开后停止推送。
+3. 用 `asyncio.gather` 并发请求两个上游接口，任一超过 2s 就整体超时并返回 504。
+4. 给 `get_db` 依赖加事务：请求成功提交，异常回滚。提示：`yield` 前后 try/except。
+5. 用 `pytest` + `httpx.AsyncClient` 测 401、422、201 三个分支，要求不启动 uvicorn。
+6. 解释为什么 `async def` 里调 `time.sleep(1)` 会拖慢其他请求，并用两个并发请求实测前后耗时。

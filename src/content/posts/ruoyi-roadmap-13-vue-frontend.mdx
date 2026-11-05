@@ -1,0 +1,326 @@
+---
+title: 'RuoYi 阶段十三：Vue 前端架构与二次开发'
+published: 2026-11-05T12:00:00+08:00
+description: '补齐 RuoYi 路线缺失的前端篇：Vue3 + Vite + Element Plus 工程结构、请求封装与 Token、后端下发动态路由、按钮级权限指令、字典、CRUD 页面骨架，以及从建表到页面上线的完整二次开发流程。'
+tags: [RuoYi, Vue3, ElementPlus, 动态路由, 权限, 二次开发]
+category: RuoYi学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前面 12 个阶段几乎都在讲后端：Shiro、用户、角色、菜单、部门、字典、日志、定时任务、代码生成、监控。
+> 但 RuoYi 是前后端分离项目，**一半的坑在 Vue 前端**：刷新 404、菜单不出现、按钮权限不生效、字典不更新，大多不是后端问题。
+> 这一篇按「请求 → 路由 → 权限 → 页面 → 二次开发流程」把前端这条线补齐。
+
+## 知识地图
+
+```
+ruoyi-ui/
+├── src/
+│   ├── api/               每个后端模块一个文件：list/get/add/update/del
+│   ├── assets/            静态资源与全局样式
+│   ├── components/        通用组件（分页、上传、字典标签、图标选择）
+│   ├── directive/         v-hasPermi / v-hasRole 权限指令
+│   ├── layout/            侧栏、顶栏、标签页、主内容区
+│   ├── router/            静态路由 + 动态路由装配
+│   ├── store/             Pinia：user / permission / app / dict
+│   ├── utils/
+│   │   ├── request.js     axios 封装、Token、错误码
+│   │   ├── auth.js        Token 存取
+│   │   └── permission.js  路由守卫
+│   └── views/             业务页面（system/user、system/role…）
+├── .env.development       开发环境变量（VUE_APP_BASE_API）
+├── .env.production
+└── vite.config.js         代理 / 别名 / 构建
+```
+
+## 1. 技术栈与版本差异
+
+| 层 | RuoYi-Vue3（当前主推） | RuoYi-Vue2（老项目常见） |
+| :-- | :-- | :-- |
+| 框架 | Vue 3 + Composition API | Vue 2 + Options API |
+| 构建 | Vite | Vue CLI（Webpack） |
+| UI | Element Plus | Element UI |
+| 状态 | Pinia | Vuex |
+| 路由 | Vue Router 4 | Vue Router 3 |
+| 请求 | Axios | Axios |
+
+读源码前先确认版本——两者的目录结构相似，但写法差别很大（`ref/reactive` vs `data/computed`、`useRouter` vs `this.$router`）。下面以 Vue3 为准。
+
+## 2. 请求层：所有后端的统一入口
+
+```js
+// src/utils/request.js（精简版）
+import axios from 'axios'
+import { getToken } from '@/utils/auth'
+import { ElMessage, ElMessageBox } from 'element-plus'
+
+const service = axios.create({
+  baseURL: import.meta.env.VITE_APP_BASE_API,   // 开发走代理，生产走 /prod-api
+  timeout: 15000,
+})
+
+service.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+service.interceptors.response.use(
+  (res) => {
+    const code = res.data.code ?? 200
+    if (code === 200) return res.data
+    if (code === 401) {
+      // 不能在这里直接跳登录：并发的 401 会跳多次
+      ElMessageBox.confirm('登录状态已过期，是否重新登录？', '提示')
+        .then(() => location.href = '/index')
+        .catch(() => {})
+      return Promise.reject(new Error('登录过期'))
+    }
+    ElMessage.error(res.data.msg || '请求失败')
+    return Promise.reject(new Error(res.data.msg || 'Error'))
+  },
+  (error) => {
+    ElMessage.error(error.message || '网络异常')
+    return Promise.reject(error)
+  },
+)
+
+export default service
+```
+
+前端视角的三个要点：
+
+1. **Token 放请求头，不放 URL**；刷新页面从 Cookie/localStorage 恢复，别只存内存。
+2. **错误提示只在一处做**，否则页面里每层 `catch` 都弹一次。
+3. **401 要防抖**：同时发 5 个请求全部 401 时，只允许弹一次重新登录。
+
+## 3. 登录后发生了什么：动态路由
+
+RuoYi 的菜单与路由由**后端下发**，不是写死在前端：
+
+```
+登录成功
+  → /getInfo          拿用户、角色、权限字符
+  → /getRouters       拿当前角色可见的菜单树
+  → 前端把菜单树转成 Vue Router 路由
+  → 侧栏根据同一棵树渲染
+```
+
+```js
+// src/store/modules/permission.js（核心转换）
+function filterAsyncRouter(routers) {
+  return routers.map((route) => {
+    const item = { ...route }
+    item.component = loadComponent(route.component)
+    if (item.children) item.children = filterAsyncRouter(item.children)
+    return item
+  })
+}
+
+function loadComponent(name) {
+  if (name === 'Layout') return Layout
+  if (name === 'ParentView') return ParentView
+  if (name === 'InnerLink') return InnerLink
+  // 后端只回 'system/user/index'，这里拼成 () => import('@/views/system/user/index.vue')
+  return () => import(`@/views/${name}.vue`)
+}
+```
+
+**刷新页面为什么不能丢路由**：路由守卫里先判断 `store.permission.routes.length === 0`，有 Token 就重新 `getInfo + getRouters` 再 `next({ ...to, replace: true })`。不做这一步，刷新后动态路由还没注册，直接 404。
+
+```js
+// src/utils/permission.js（简化）
+router.beforeEach(async (to, from, next) => {
+  const token = getToken()
+  if (!token) return to.path === '/login' ? next() : next(`/login?redirect=${to.fullPath}`)
+
+  if (store.permission.routes.length === 0) {
+    await store.user.getInfo()
+    const routes = await store.permission.generateRoutes()
+    routes.forEach((r) => router.addRoute(r))
+    return next({ ...to, replace: true })
+  }
+  next()
+})
+```
+
+## 4. 权限：路由级 + 按钮级
+
+RuoYi 的权限字符形如 `system:user:add`、`system:role:edit`。后端用 Shiro 校验，前端做两层：
+
+**路由级**：后端 `/getRouters` 只下发当前角色可见的菜单，前端不用再判断。
+
+**按钮级**：用指令控制显隐。
+
+```js
+// src/directive/permission/hasPermi.js
+import { checkPermi } from '@/utils/permission'
+
+export default {
+  mounted(el, binding) {
+    const { value } = binding
+    if (Array.isArray(value) && value.length && !checkPermi(value)) {
+      el.parentNode?.removeChild(el)
+    }
+  },
+}
+```
+
+```vue
+<template>
+  <el-button v-hasPermi="['system:user:add']" type="primary" @click="openAdd">新增</el-button>
+  <el-button v-hasPermi="['system:user:edit']" link @click="openEdit(row)">修改</el-button>
+</template>
+```
+
+```js
+// src/utils/permission.js
+import useUserStore from '@/store/modules/user'
+
+export function checkPermi(required) {
+  const { permissions } = useUserStore()
+  return required.some((p) => permissions.includes('*:*:*') || permissions.includes(p))
+}
+```
+
+**注意**：指令只是隐藏按钮，**真正的越权拦截必须由后端做**。前端权限是体验，不是安全边界。
+
+## 5. 字典：别在每个页面写死枚举
+
+RuoYi 的字典由后端统一维护（`sys_dict_type` / `sys_dict_data`），前端通过 `useDict` 拉取并缓存：
+
+```js
+const { sys_normal_disable } = useDict('sys_normal_disable')
+// [{ label: '正常', value: '0', elTagType: 'primary' }, { label: '停用', value: '1', elTagType: 'danger' }]
+```
+
+```vue
+<el-table-column label="状态" align="center" prop="status">
+  <template #default="{ row }">
+    <dict-tag :options="sys_normal_disable" :value="row.status" />
+  </template>
+</el-table-column>
+```
+
+字典缓存在 Pinia + localStorage，退出登录要清；新增字典项后旧缓存不会自动刷新——这是「改了后台，页面还是旧值」的头号原因。
+
+## 6. 一个标准 CRUD 页面的骨架
+
+RuoYi 的业务页面几乎都是同一个模板，照着改能省 80% 时间：
+
+```vue
+<template>
+  <div class="app-container">
+    <!-- 1. 搜索区 -->
+    <el-form :model="query" :inline="true">
+      <el-form-item label="名称">
+        <el-input v-model="query.name" placeholder="请输入名称" clearable @keyup.enter="getList" />
+      </el-form-item>
+      <el-form-item>
+        <el-button type="primary" @click="getList">搜索</el-button>
+        <el-button @click="resetQuery">重置</el-button>
+      </el-form-item>
+    </el-form>
+
+    <!-- 2. 操作区 -->
+    <el-row :gutter="10" class="mb8">
+      <el-col :span="1.5">
+        <el-button v-hasPermi="['biz:item:add']" type="primary" @click="openAdd">新增</el-button>
+      </el-col>
+    </el-row>
+
+    <!-- 3. 表格 + 分页 -->
+    <el-table v-loading="loading" :data="list">
+      <el-table-column label="名称" prop="name" show-overflow-tooltip />
+      <el-table-column label="状态" align="center" width="100">
+        <template #default="{ row }">
+          <dict-tag :options="sys_normal_disable" :value="row.status" />
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="160" align="center">
+        <template #default="{ row }">
+          <el-button v-hasPermi="['biz:item:edit']" link type="primary" @click="openEdit(row)">修改</el-button>
+          <el-button v-hasPermi="['biz:item:remove']" link type="danger" @click="handleDelete(row)">删除</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+    <pagination v-model:page="query.pageNum" v-model:limit="query.pageSize" :total="total" @pagination="getList" />
+
+    <!-- 4. 新增/编辑弹窗 -->
+    <el-dialog v-model="dialog.visible" :title="dialog.title" width="600px" append-to-body>
+      <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
+        <el-form-item label="名称" prop="name">
+          <el-input v-model="form.name" maxlength="120" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="submit">确定</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+```
+
+配套 `api/biz/item.js`：
+
+```js
+import request from '@/utils/request'
+
+export function listItem(query) {
+  return request({ url: '/biz/item/list', method: 'get', params: query })
+}
+export function addItem(data) {
+  return request({ url: '/biz/item', method: 'post', data })
+}
+export function updateItem(data) {
+  return request({ url: '/biz/item', method: 'put', data })
+}
+export function delItem(id) {
+  return request({ url: `/biz/item/${id}`, method: 'delete' })
+}
+```
+
+## 7. 二次开发全流程：从建表到页面上线
+
+以「公告管理」为例：
+
+1. **建表**：`biz_notice`（id/title/content/status/create_by/create_time）。
+2. **代码生成**：RuoYi 代码生成器导入表 → 配置字段 → 生成 `domain/mapper/service/controller` + Vue 页面 + 菜单 SQL。
+3. **执行菜单 SQL / 手动加菜单**：菜单类型选「菜单」，路由地址 `notice`，组件路径 `biz/notice/index`，权限字符 `biz:notice:list`；按钮子菜单分别配 `add/edit/remove/export`。
+4. **分配权限**：角色管理里勾选新菜单与按钮，重新登录（或等权限缓存刷新）。
+5. **前端补 API 文件**：把生成的 `api/biz/notice.js` 放进 `src/api`。
+6. **验证四件事**：菜单可见、列表能查、按钮显隐正确、直接敲 URL 时后端返回 403（越权被拒）。
+7. **字典/状态**：状态字段走字典，别在页面写死「0 正常 / 1 停用」。
+
+> 代码生成器生成的是**骨架**，不是成品：它不知道你的业务校验、状态机、数据范围。生成后必须手工补校验与边界。
+
+## 8. 常见问题对照表
+
+| 现象 | 根因 | 处理 |
+| :-- | :-- | :-- |
+| 刷新后 404 | 动态路由未重新注册 | 路由守卫里先 `getRouters` 再 `next({...to, replace:true})` |
+| 菜单看不到 | 角色没勾选 / 菜单状态停用 / 权限缓存 | 角色管理勾选后重新登录 |
+| 按钮不显示 | `v-hasPermi` 的权限字符与后端不一致 | 对照菜单里的权限字符，注意大小写与冒号 |
+| 接口 401 循环跳登录 | 多个请求同时 401 | 统一拦截 + 单次弹窗 + 清除 Token 后再跳 |
+| 页面空白 | 组件路径拼错（大小写/目录） | 检查 `/getRouters` 返回的 `component` 与 `views` 下的文件 |
+| 字典不更新 | 前端缓存未失效 | 退出重登或提供「刷新缓存」入口 |
+| 生产接口 404 | `VITE_APP_BASE_API` 与 nginx 前缀不一致 | 生产一般配 `/prod-api` + nginx 反代到后端 |
+| 上传/下载跨域 | 直接访问后端地址 | 统一走同源反代，前端只认相对路径 |
+
+## 小结
+
+- RuoYi 前端不是「Element Plus 拼页面」，核心是**请求封装 + 后端下发路由 + 权限指令 + 字典**这四件基础设施；
+- 刷新 404、菜单不出现、按钮权限失效，三类问题各有固定排查顺序，先看 Token/路由注册，再看权限字符；
+- 二次开发的最短路径是「建表 → 代码生成 → 菜单 → 角色授权 → 前端补 API → 四件验证」；
+- 前端权限只负责体验，接口越权必须由后端 Shiro 拦。
+
+## 练习
+
+1. 在新项目里实现「刷新页面不丢动态路由」：故意去掉守卫里的重新拉取，复现 404，再修复。
+2. 给公告管理加一个「导出 Excel」按钮，权限字符 `biz:notice:export`，验证无权限角色看不到按钮且直接调接口返回 403。
+3. 把状态字段改成字典驱动，新增一个字典类型 `biz_notice_status`，并验证修改字典后页面刷新效果。
+4. 实现 401 防抖：并发 5 个请求同时过期，只弹一次重新登录。
+5. 写一个 `v-hasRole` 指令，按角色而不是权限字符控制按钮，并说明什么时候该用它。
+6. 用 nginx 部署生产包：`/prod-api` 反代后端、`try_files` 支持 history 路由，验证刷新任意子路由不 404。

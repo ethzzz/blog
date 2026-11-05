@@ -1,0 +1,432 @@
+---
+title: 'Java 阶段十二：Spring Boot + MyBatis——把语法拼成一条业务链路'
+published: 2026-11-05T09:00:00+08:00
+description: '补齐 Java 路线最大的缺口：用一个任务 CRUD 把 Spring Boot 的分层、依赖注入、MyBatis 映射、@Transactional 事务、参数校验与统一错误处理串成可运行的业务闭环，并给出前端视角的对照与常见坑。'
+tags: [Java, SpringBoot, MyBatis, 事务, 参数校验, 后端]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> 路线总览里写过一句「已知缺口：没有独立的 Spring Boot / MyBatis 篇」。这一篇就是来补这个坑的：
+> 不再一个个讲语法点，而是用**一个能跑的任务 CRUD** 把前面 11 篇的知识拼起来——分层、依赖注入、SQL 映射、事务、校验、统一错误、测试，一条链路走完。
+>
+> 读之前至少写完阶段八（集合）和阶段十（Lambda/Stream），否则 `List<Task>`、`stream().map()` 这些会看得吃力。
+
+## 知识地图
+
+```
+task-service/
+├── pom.xml                      Maven 依赖
+├── src/main/resources/
+│   └── application.yml          数据源 / MyBatis / 端口
+└── src/main/java/com/demo/task/
+    ├── TaskApplication.java     启动类
+    ├── common/
+    │   ├── ApiResponse.java     统一响应
+    │   ├── BusinessException.java
+    │   └── GlobalExceptionHandler.java
+    ├── task/
+    │   ├── Task.java            实体（与表一一对应）
+    │   ├── TaskMapper.java      MyBatis 接口
+    │   ├── TaskService.java     业务与事务
+    │   ├── TaskController.java  HTTP 出入口
+    │   └── dto/
+    │       ├── TaskCreateReq.java
+    │       └── TaskUpdateReq.java
+    └── config/MyBatisConfig.java（可选）
+```
+
+## 1. 最小工程骨架
+
+用 [start.spring.io](https://start.spring.io) 生成，依赖选：**Spring Web / MyBatis Framework / MySQL Driver / Validation / Lombok（可选）**。JDK 21、Maven。
+
+```xml
+<!-- pom.xml 关键依赖（版本交给 Spring Boot BOM，不写死） -->
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.mybatis.spring.boot</groupId>
+    <artifactId>mybatis-spring-boot-starter</artifactId>
+    <version>3.0.4</version>
+  </dependency>
+  <dependency>
+    <groupId>com.mysql</groupId>
+    <artifactId>mysql-connector-j</artifactId>
+    <scope>runtime</scope>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-validation</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+  </dependency>
+</dependencies>
+```
+
+```yaml
+# application.yml
+server:
+  port: 8081
+
+spring:
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/demo?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+    username: demo
+    password: ${DB_PASSWORD}      # 不写明文，环境变量注入
+    hikari:
+      maximum-pool-size: 10
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true   # created_at -> createdAt
+```
+
+启动类只有一个注解：
+
+```java
+@SpringBootApplication
+@MapperScan("com.demo.task.task")        // 告诉 MyBatis 去哪找 Mapper 接口
+public class TaskApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(TaskApplication.class, args);
+    }
+}
+```
+
+**前端视角对照**：`@SpringBootApplication` 类似于 `createApp(App)`——把容器建起来，然后自动扫描同包及子包里的组件。`@MapperScan` 则告诉框架「这些接口不是普通接口，要生成实现类」。
+
+## 2. 依赖注入：不要自己 new
+
+```java
+@RestController
+@RequestMapping("/api/tasks")
+public class TaskController {
+    private final TaskService service;
+
+    // 构造器注入：只有这一个构造器时 @Autowired 可省略
+    public TaskController(TaskService service) {
+        this.service = service;
+    }
+}
+```
+
+```java
+@Service
+public class TaskService {
+    private final TaskMapper mapper;
+
+    public TaskService(TaskMapper mapper) {
+        this.mapper = mapper;
+    }
+}
+```
+
+三个注解的分工要说清：
+
+| 注解 | 位置 | 语义 |
+| :-- | :-- | :-- |
+| `@RestController` | Controller 类 | 返回值直接序列化成 JSON |
+| `@Service` | Service 类 | 业务层组件（语义标记，本质都是 Bean） |
+| `@Mapper` | Mapper 接口 | 由 MyBatis 生成代理实现 |
+
+**为什么用构造器注入**：依赖不可变（`final`）、方便单元测试直接 `new`、启动时就能暴露循环依赖。字段注入（`@Autowired` 写在字段上）写起来短，但测试必须起容器，且容易掩盖循环依赖。
+
+> Java 的 Bean 默认是**单例**。不要在 Controller/Service 里放可变成员变量保存「当前用户」之类的请求态——那是线程安全问题，不是 Spring 的问题。
+
+## 3. 建表与 MyBatis 映射
+
+```sql
+CREATE TABLE task (
+  id          BIGINT       PRIMARY KEY AUTO_INCREMENT,
+  title       VARCHAR(120) NOT NULL,
+  done        TINYINT      NOT NULL DEFAULT 0,
+  priority    INT          NOT NULL DEFAULT 3,
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+```java
+public class Task {
+    private Long id;
+    private String title;
+    private Boolean done;
+    private Integer priority;
+    private LocalDateTime createdAt;
+    private LocalDateTime updatedAt;
+    // getter / setter 省略
+}
+```
+
+Mapper 用注解写简单 SQL，复杂 SQL（动态条件、批量）再上 XML：
+
+```java
+@Mapper
+public interface TaskMapper {
+
+    @Select("SELECT * FROM task WHERE id = #{id}")
+    Task findById(@Param("id") long id);
+
+    @Select("""
+        SELECT * FROM task
+        WHERE (#{done} IS NULL OR done = #{done})
+          AND (#{keyword} IS NULL OR title LIKE CONCAT('%', #{keyword}, '%'))
+        ORDER BY priority ASC, id DESC
+        LIMIT #{limit} OFFSET #{offset}
+        """)
+    List<Task> page(@Param("done") Boolean done,
+                    @Param("keyword") String keyword,
+                    @Param("limit") int limit,
+                    @Param("offset") int offset);
+
+    @Insert("""
+        INSERT INTO task(title, done, priority)
+        VALUES(#{title}, #{done}, #{priority})
+        """)
+    @Options(useGeneratedKeys = true, keyProperty = "id")
+    int insert(Task task);
+
+    @Update("UPDATE task SET title = #{title}, done = #{done}, priority = #{priority} WHERE id = #{id}")
+    int update(Task task);
+
+    @Delete("DELETE FROM task WHERE id = #{id}")
+    int delete(@Param("id") long id);
+}
+```
+
+**`#{}` 与 `${}` 的区别必须记住**：
+
+| 写法 | 行为 | 安全性 |
+| :-- | :-- | :-- |
+| `#{name}` | 预编译占位符 `?`，走参数绑定 | 安全 |
+| `${name}` | 字符串直接拼进 SQL | **SQL 注入**，只允许用于排序字段等白名单 |
+
+排序字段这种确实拼 SQL 的场景，也要先过白名单：
+
+```java
+private static final Set<String> SORTABLE = Set.of("priority", "created_at", "id");
+
+String sort = SORTABLE.contains(req.sort()) ? req.sort() : "id";
+```
+
+## 4. 事务：`@Transactional` 的正确姿势
+
+```java
+@Service
+public class TaskService {
+
+    private final TaskMapper mapper;
+
+    public TaskService(TaskMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void complete(long id) {
+        Task task = mapper.findById(id);
+        if (task == null) throw new BusinessException(404, "任务不存在");
+        task.setDone(true);
+        mapper.update(task);
+        // 模拟后续步骤失败：前面的 update 必须一起回滚
+        if (task.getPriority() < 0) throw new IllegalStateException("数据异常");
+    }
+}
+```
+
+三个容易踩的点：
+
+1. **默认只回滚 `RuntimeException`**。受检异常（如 `IOException`）不会回滚，所以写 `rollbackFor = Exception.class` 更稳。
+2. **同类内部调用不走代理**：`this.complete()` 调用不会开事务。要么拆到另一个 Bean，要么用 `AopContext.currentProxy()`（不推荐）。
+3. **事务里别做慢操作**：调外部 HTTP、发消息、睡 3 秒，都会把数据库连接占住。把非数据库操作挪到事务外，或改用事件/消息。
+
+传播行为先记住两个最常用的：
+
+| 传播 | 场景 |
+| :-- | :-- |
+| `REQUIRED`（默认） | 有事务就加入，没有就新建 |
+| `REQUIRES_NEW` | 一定要独立事务（如写审计日志，主流程失败也要保留） |
+
+## 5. 参数校验与统一错误
+
+不要在 Controller 里手写一堆 `if (title == null)`，用 Bean Validation：
+
+```java
+public record TaskCreateReq(
+    @NotBlank(message = "标题不能为空")
+    @Size(max = 120, message = "标题最长 120 字")
+    String title,
+
+    @Min(value = 1, message = "优先级最小为 1")
+    @Max(value = 5, message = "优先级最大为 5")
+    Integer priority
+) {}
+```
+
+```java
+@PostMapping
+public ApiResponse<Task> create(@Valid @RequestBody TaskCreateReq req) {
+    return ApiResponse.ok(service.create(req));
+}
+```
+
+统一返回体与全局异常处理，避免每个接口各写一套错误格式：
+
+```java
+public record ApiResponse<T>(int code, String message, T data) {
+    public static <T> ApiResponse<T> ok(T data) {
+        return new ApiResponse<>(0, "ok", data);
+    }
+    public static <T> ApiResponse<T> fail(int code, String message) {
+        return new ApiResponse<>(code, message, null);
+    }
+}
+```
+
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    /** 参数校验失败：400 + 第一条字段错误 */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ApiResponse<Void> onInvalid(MethodArgumentNotValidException e) {
+        String msg = e.getBindingResult().getFieldErrors().stream()
+                .findFirst()
+                .map(err -> err.getField() + ": " + err.getDefaultMessage())
+                .orElse("参数不合法");
+        return ApiResponse.fail(400, msg);
+    }
+
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<ApiResponse<Void>> onBusiness(BusinessException e) {
+        return ResponseEntity.status(e.getCode())
+                .body(ApiResponse.fail(e.getCode(), e.getMessage()));
+    }
+
+    /** 兜底：不要把堆栈直接返回给前端 */
+    @ExceptionHandler(Exception.class)
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public ApiResponse<Void> onUnknown(Exception e) {
+        // 生产环境用日志记录 requestId + 堆栈，返回值只给一句话
+        return ApiResponse.fail(500, "服务器开小差了，请稍后再试");
+    }
+}
+```
+
+**前端视角**：这套结构等价于你在 Next.js 里写的 `route handler + zod + 统一 error JSON`。区别是 Java 把「校验」放进了框架层，`@Valid` 失败会在进方法前被拦下。
+
+## 6. 把接口串起来
+
+```java
+@RestController
+@RequestMapping("/api/tasks")
+public class TaskController {
+
+    private final TaskService service;
+
+    public TaskController(TaskService service) {
+        this.service = service;
+    }
+
+    @GetMapping
+    public ApiResponse<List<Task>> list(@RequestParam(required = false) Boolean done,
+                                        @RequestParam(required = false) String keyword,
+                                        @RequestParam(defaultValue = "1") int page,
+                                        @RequestParam(defaultValue = "20") int size) {
+        int limit = Math.min(Math.max(size, 1), 100);
+        int offset = Math.max(page - 1, 0) * limit;
+        return ApiResponse.ok(service.page(done, keyword, limit, offset));
+    }
+
+    @PostMapping
+    public ApiResponse<Task> create(@Valid @RequestBody TaskCreateReq req) {
+        return ApiResponse.ok(service.create(req));
+    }
+
+    @PutMapping("/{id}")
+    public ApiResponse<Task> update(@PathVariable long id,
+                                    @Valid @RequestBody TaskUpdateReq req) {
+        return ApiResponse.ok(service.update(id, req));
+    }
+
+    @DeleteMapping("/{id}")
+    public ApiResponse<Void> delete(@PathVariable long id) {
+        service.delete(id);
+        return ApiResponse.ok(null);
+    }
+}
+```
+
+分页参数必须**夹紧**（`limit` ≤ 100、`page` ≥ 1）。前端传来的数字永远不可信——这和你在 Node 里做的是同一件事。
+
+## 7. 最小测试
+
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+class TaskControllerTest {
+
+    @Autowired MockMvc mvc;
+
+    @Test
+    void create_should_reject_blank_title() throws Exception {
+        mvc.perform(post("/api/tasks")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""{"title":"  ","priority":3}"""))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.code").value(400));
+    }
+
+    @Test
+    void list_should_clamp_size() throws Exception {
+        mvc.perform(get("/api/tasks?size=100000"))
+            .andExpect(status().isOk());
+    }
+}
+```
+
+真正的项目还应加：
+
+- `@MybatisTest` + H2/Testcontainers 测 SQL 与映射；
+- 事务回滚测试（`@Transactional` 测试方法自动回滚）；
+- 用 `@MockBean`（Spring Boot 3.4+ 改为 `@MockitoBean`）隔离 Service 依赖。
+
+## 8. 上线前必须知道的坑
+
+| 坑 | 现象 | 处理 |
+| :-- | :-- | :-- |
+| `${}` 拼 SQL | 被注入 `OR 1=1` | 一律 `#{}`，排序字段白名单 |
+| 驼峰没映射 | `createdAt` 永远 null | `map-underscore-to-camel-case: true` |
+| 时区错 8 小时 | 前端显示昨天 | JDBC URL 固定 `serverTimezone=Asia/Shanghai`，统一 `LocalDateTime` |
+| 事务不生效 | 异常了数据还在 | 检查同类调用、`rollbackFor`、方法是否 `public` |
+| N+1 查询 | 列表页 100 条发 101 条 SQL | 批量查询 `IN`、联表或两级缓存 |
+| 连接池打满 | 偶发超时 | 事务里别做 HTTP/文件操作，检查连接泄漏 |
+| 异常堆栈外泄 | 暴露表名/路径 | 全局兜底只返回通用文案，细节进日志 |
+
+## 小结
+
+这一篇没有新语法，重点是把已有知识**按真实工程顺序组装**：
+
+- Spring Boot 提供容器与 HTTP 出入口；`@RestController` / `@Service` / `@Mapper` 各就各位；
+- MyBatis 用 `#{}` 把参数安全地送进 SQL，用 `@Options` 取回自增主键；
+- `@Transactional` 管的是一组数据库操作的原子性，默认只回滚运行时异常；
+- 校验放在 DTO 上、错误格式收在 `@RestControllerAdvice`，接口层只留编排；
+- 分页参数、排序字段、异常信息这三处是安全与稳定的高发区。
+
+到这里，Java 语法 → 集合/Stream → 多线程 → Web 业务闭环这条线就通了。想继续深入 Spring 生态（Shiro、代码生成、定时任务），可以直接接 [RuoYi 路线](/blog/ruoyi-roadmap/)；想补 JVM/GC，建议先用本篇的服务做一次压测，再带着数字去看监控与 GC 日志。
+
+## 练习
+
+1. 给 `task` 加一个 `due_date` 字段，要求：到期日不能早于今天；新增与更新共用同一套校验，但更新的 `title` 可以不传（部分更新）。提示：用分组校验 `@Validated(Update.class)`。
+2. 实现「批量完成」接口 `POST /api/tasks/batch-complete`，一次更新多条，要求全部成功或全部回滚，并返回逐条结果。
+3. 把 Mapper 的分页改成 MyBatis-Plus 的 `Page`，对比手写 `LIMIT/OFFSET` 的差异（代码量、总数查询、适配成本）。
+4. 写一个集成测试：创建任务 → 列表能查到 → 删除后返回 404，全程用 MockMvc。
+5. 故意把 `@Transactional` 写到同类私有方法上，观察事务是否生效，并解释原因。
+6. 用 `@ControllerAdvice` 增加一个 `MethodArgumentTypeMismatchException` 的处理：前端把 `id` 传成 `abc` 时返回 400 而不是 500。

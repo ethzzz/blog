@@ -1,0 +1,298 @@
+---
+title: '18 · React 19 与 Server Components：Actions、乐观更新与流式心智'
+published: 2026-11-05T16:00:00+08:00
+description: '毕业项目之后的进阶篇：讲清 React 19 的 Actions、useActionState、useOptimistic、use 与 ref 变化，再建立 Server Components 的心智模型——服务端/客户端边界、序列化、Server Actions、流式渲染与常见水合坑。'
+tags: [React, React19, RSC, ServerComponents, 并发, Nextjs]
+category: React学习路线
+draft: false
+---
+
+> [!NOTE]
+> 前 17 篇把 React 的组件、Hooks、状态、性能、测试与工程实战走完了，基线是 React 18 的心智。
+> 但 19 与 RSC 改变了「数据从哪来、表单怎么提交、代码跑在哪一端」这三件事——不理解边界，
+> 写出来的「服务端组件」只会变成「把 useEffect 搬到服务端」的伪优化。这一篇补上这块。
+
+## 1. React 19 带来的四个新原语
+
+| 原语 | 解决什么 | 替代了什么 |
+| :-- | :-- | :-- |
+| Actions（`<form action={fn}>`） | 表单提交与 pending/错误状态 | 手写 `onSubmit + loading` |
+| `useActionState` | 把 action 结果与 pending 接进组件 | 一堆 `useState` |
+| `useOptimistic` | 提交未完成时先展示预期结果 | 手动回滚的本地副本 |
+| `use(promise)` | 在渲染中读取 Promise/Context | `useEffect + loading` 取数 |
+
+另外还有：`ref` 可以直接作为 prop（不再需要 `forwardRef`）、ref 回调支持清理函数、`<title>/<meta>` 可写在组件里自动提升到 `<head>`、`useFormStatus` 读取父表单状态。
+
+## 2. Actions：表单提交的新写法
+
+```tsx
+// React 19：action 可以是同步/异步函数
+async function createTask(formData: FormData) {
+  "use server";                     // 在 RSC 环境里：这是 Server Action
+  const title = String(formData.get("title") ?? "").trim();
+  if (!title) throw new Error("标题不能为空");
+  await db.task.create({ data: { title } });
+  revalidatePath("/tasks");
+}
+
+export function NewTaskForm() {
+  return (
+    <form action={createTask}>
+      <input name="title" placeholder="新任务" />
+      <button type="submit">添加</button>
+    </form>
+  );
+}
+```
+
+`<form action>` 的好处：
+
+- 浏览器原生提交路径，**没有 JS 时也能工作**（渐进增强）；
+- 提交期间可以用 `useFormStatus()` 读 pending；
+- 错误由最近的 `error.tsx`/错误边界接住，不用每个表单各写一套。
+
+```tsx
+"use client";
+import { useFormStatus } from "react-dom";
+
+function SubmitButton() {
+  const { pending } = useFormStatus();   // 必须在 <form> 的子组件里调用
+  return <button disabled={pending}>{pending ? "提交中…" : "添加"}</button>;
+}
+```
+
+## 3. `useActionState`：结果、错误与 pending 一次拿到
+
+```tsx
+"use client";
+import { useActionState } from "react";
+
+type State = { ok: boolean; message: string };
+
+async function saveAction(_prev: State, formData: FormData): Promise<State> {
+  "use server";
+  const title = String(formData.get("title") ?? "").trim();
+  if (!title) return { ok: false, message: "标题不能为空" };
+  await db.task.create({ data: { title } });
+  return { ok: true, message: "已创建" };
+}
+
+export function TaskForm() {
+  const [state, action, pending] = useActionState(saveAction, { ok: true, message: "" });
+  return (
+    <form action={action}>
+      <input name="title" />
+      <button disabled={pending}>{pending ? "保存中…" : "保存"}</button>
+      {state.message && <p data-ok={state.ok}>{state.message}</p>}
+    </form>
+  );
+}
+```
+
+要点：
+
+- action 的签名是 `(prevState, formData) => newState`；
+- 返回值会作为下一次渲染的 `state`，**不要用副作用改全局变量**；
+- `pending` 是本次提交的 loading，比手动 `useState` 更可靠（自动处理并发提交）。
+
+## 4. `useOptimistic`：先给用户看到结果
+
+```tsx
+"use client";
+import { useOptimistic } from "react";
+
+export function TodoList({ todos, addTodo }: {
+  todos: { id: string; title: string; done: boolean }[];
+  addTodo: (title: string) => Promise<void>;
+}) {
+  const [optimistic, addOptimistic] = useOptimistic(
+    todos,
+    (current, newTitle: string) => [...current, { id: `tmp-${newTitle}`, title: newTitle, done: false }],
+  );
+
+  async function action(formData: FormData) {
+    const title = String(formData.get("title") ?? "").trim();
+    if (!title) return;
+    addOptimistic(title);          // 立刻显示
+    await addTodo(title);          // 失败会抛错，React 自动回滚
+  }
+
+  return (
+    <>
+      <ul>{optimistic.map((t) => <li key={t.id}>{t.title}</li>)}</ul>
+      <form action={action}>
+        <input name="title" />
+        <button>添加</button>
+      </form>
+    </>
+  );
+}
+```
+
+`useOptimistic` 只负责「临时展示」：**服务端数据回来后，以真实 props 为准**。不要把它当本地状态源长期使用。
+
+## 5. `use(promise)`：把 Suspense 用起来
+
+```tsx
+import { use } from "react";
+
+// 注意：promise 必须来自「缓存/预取」，不能在每次渲染里新建
+function Comments({ commentsPromise }: { commentsPromise: Promise<Comment[]> }) {
+  const comments = use(commentsPromise);
+  return <ul>{comments.map((c) => <li key={c.id}>{c.body}</li>)}</ul>;
+}
+
+export default function Page() {
+  return (
+    <Suspense fallback={<p>加载评论…</p>}>
+      <Comments commentsPromise={getComments()} />
+    </Suspense>
+  );
+}
+```
+
+**最大的坑**：`use(fetch(...))` 直接写在组件体内，每次渲染都会发新请求并永久挂起。Promise 必须由缓存层（React `cache`、路由 loader、或 Server Component）提供稳定引用。
+
+`use` 也可以读 Context，且可以在条件语句里调用（与 Hooks 不同）：
+
+```tsx
+function Status() {
+  const theme = use(ThemeContext);
+  return <span>{theme}</span>;
+}
+```
+
+## 6. Server Components：先把边界想清楚
+
+| | Server Component（默认） | Client Component（`"use client"`） |
+| :-- | :-- | :-- |
+| 运行位置 | 服务器 | 浏览器（也在服务端预渲染） |
+| 能否用 state/effect/事件 | ❌ | ✅ |
+| 能否直连数据库/读密钥 | ✅ | ❌ |
+| 是否打进 bundle | ❌ | ✅ |
+| 能否 `await` 数据 | ✅（组件可以是 async） | ❌（用 `use`/Effect/库） |
+
+```tsx
+// app/tasks/page.tsx —— 默认就是 Server Component
+import { db } from "@/lib/db";
+import { TaskList } from "./task-list";     // Client Component
+
+export default async function TasksPage() {
+  const tasks = await db.task.findMany({ orderBy: { id: "desc" } });
+  return (
+    <main>
+      <h1>任务</h1>
+      <TaskList initialTasks={tasks} />
+    </main>
+  );
+}
+```
+
+```tsx
+// task-list.tsx
+"use client";
+import { useState } from "react";
+
+export function TaskList({ initialTasks }: { initialTasks: Task[] }) {
+  const [tasks, setTasks] = useState(initialTasks);
+  // 交互、筛选、乐观更新都在这里
+  return <ul>{tasks.map((t) => <li key={t.id}>{t.title}</li>)}</ul>;
+}
+```
+
+**边界规则**：
+
+- `"use client"` 是**模块级**指令：该文件及其 import 的组件都会进入客户端图；
+- Client Component **可以**接收 Server Component 作为 `children`（React 允许「服务端渲染的树」作为客户端组件的插槽），但**不能**直接 import 一个 Server Component；
+- 从 Server 传给 Client 的 props 必须可序列化：`string/number/boolean/null/array/plain object`，**不能传函数、Date、Map、Set、类实例、Symbol**（Server Action 是例外：函数引用会被编译成可调用句柄）。
+
+## 7. Server Actions 与数据变更
+
+```tsx
+// app/actions.ts
+"use server";
+
+import { revalidatePath } from "next/cache";
+
+export async function toggleTask(id: string, done: boolean) {
+  const user = await requireUser();          // 身份在服务端取，不信任客户端传
+  await db.task.update({ where: { id, userId: user.id }, data: { done } });
+  revalidatePath("/tasks");
+}
+```
+
+```tsx
+"use client";
+import { toggleTask } from "@/app/actions";
+
+<button onClick={() => toggleTask(task.id, !task.done)}>
+  {task.done ? "取消" : "完成"}
+</button>
+```
+
+安全要点：
+
+1. **Action 就是公开的 HTTP 端点**，必须自己做鉴权与参数校验；
+2. 不要相信客户端传来的 `userId/tenantId`，从会话里取；
+3. 变更后调用 `revalidatePath`/`revalidateTag`，否则页面还是旧数据；
+4. 长时间任务不要塞进 Action，转后台任务并返回任务 id。
+
+## 8. 流式渲染：Suspense 不是装饰
+
+```tsx
+export default function Dashboard() {
+  return (
+    <div>
+      <Header />
+      <Suspense fallback={<StatsSkeleton />}>
+        <SlowStats />          {/* 服务端 await 3s，不阻塞 Header 与下面的内容 */}
+      </Suspense>
+      <Suspense fallback={<FeedSkeleton />}>
+        <SlowFeed />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+关键理解：**Suspense 边界决定「哪一块可以晚到」**。整页一个大 Suspense，等于没有流式；合理拆成多个，首屏框架先到，慢区块逐步替换 fallback。
+
+## 9. 常见坑
+
+| 坑 | 现象 | 处理 |
+| :-- | :-- | :-- |
+| Promise 每次渲染新建 | `use` 永久挂起 / 请求风暴 | 用 `cache()`、路由 loader 或服务端生成 |
+| 把函数传给 Client | 序列化报错 | 改用 Server Action，或把交互下沉到客户端 |
+| 传 `Date`/`Map` 给 Client | props 反序列化失败 | 序列化成 ISO 字符串/数组 |
+| 在 Server 组件里用 `useState` | 编译/运行报错 | 拆出 Client 组件 |
+| 在 Client 里读密钥 | 变量被打进 bundle | 只在 Server 代码/Server Action 里读 |
+| 忘了 revalidate | 提交成功但列表不变 | `revalidatePath` / `revalidateTag` |
+| Action 无鉴权 | 越权修改 | 服务端校验会话与资源归属 |
+| 一个 Suspense 包全页 | 首屏仍被最慢请求拖住 | 按区块拆边界 |
+
+## 10. 迁移检查清单（React 18 → 19）
+
+- [ ] 移除 `forwardRef`：`ref` 现在可作为普通 prop；ref 回调支持返回清理函数。
+- [ ] 字符串 ref（`ref="node"`）与函数组件上的 `defaultProps` 已移除，改成 `ref` 回调与默认参数。
+- [ ] `propTypes` 被忽略，类型交给 TypeScript。
+- [ ] 检查错误边界：Actions 抛错会走最近的 error boundary，确认有兜底 UI。
+- [ ] 服务端与客户端边界梳理：哪些组件需要 `"use client"`，哪些只是被误标。
+- [ ] 所有 Action 加鉴权、参数校验与 revalidate。
+- [ ] 为慢区块补 Suspense 边界与骨架。
+
+## 小结
+
+- React 19 把「表单提交 + pending + 错误 + 乐观更新」收敛成 Actions 四件套；
+- `use(promise)` 让 Suspense 变成取数手段，但 Promise 必须稳定，否则会挂起；
+- RSC 的关键不是「服务端渲染」，而是**边界**：服务端拿数据与密钥，客户端管交互；
+- 跨边界 props 必须可序列化，函数只能以 Server Action 的形式过去；
+- 流式的粒度由 Suspense 边界决定，整页一个边界等于没做。
+
+## 练习
+
+1. 用 `useActionState` 实现一个带字段级错误（标题、优先级）的表单，提交失败时保留用户输入。
+2. 用 `useOptimistic` 实现任务勾选：先本地勾上，服务端失败后回滚，并给出错误提示。
+3. 把「列表页 + 详情页」改成 Server Components：列表直连数据库、详情用 `use(promise)` + Suspense，客户端只保留「收藏」按钮。
+4. 写一个 Server Action：修改任务并 `revalidatePath`，再故意去掉 revalidate，观察列表不更新的现象。
+5. 构造一个错误：把 `Date` 对象作为 props 传给 Client Component，记录报错信息，并改成 ISO 字符串。
+6. 给一个慢页面拆出两个 Suspense 边界，用 `curl` 或浏览器 Network 观察 HTML 分块到达的顺序。

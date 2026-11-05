@@ -1,0 +1,336 @@
+---
+title: '15 · 堆与图论：TopK、BFS/DFS 与拓扑排序'
+published: 2026-11-05T14:00:00+08:00
+description: '补齐算法路线缺的两块硬骨头：手写二叉堆解决 TopK/合并有序链表/数据流中位数，再系统讲图的表示、BFS 最短路、DFS 连通块与环检测、Kahn 拓扑排序和并查集，全部配可运行模板与复杂度。'
+tags: [算法, 堆, 优先队列, 图论, BFS, DFS, 拓扑排序]
+category: 算法与手写题
+draft: false
+---
+
+> [!NOTE]
+> 前 14 篇覆盖了数组、字符串、哈希、栈、链表、树、回溯与 DP，但有两个高频板块一直缺席：
+> **堆（优先队列）**只在复杂度里被顺带提过，**图论**一次没讲。
+> 而面试里的「第 K 大」「合并 K 个有序链表」「岛屿数量」「课程表」全落在这两块。这一篇把它们补上。
+
+## 1. 堆：只维护「最值」的完全二叉树
+
+堆不是排序结构，它只保证一件事：**堆顶是最大/最小值**。插入与删除都是 `O(log n)`，取堆顶 `O(1)`。
+
+用数组存完全二叉树，下标关系固定：
+
+```
+parent(i) = (i - 1) >> 1
+left(i)   = i * 2 + 1
+right(i)  = i * 2 + 2
+```
+
+```js
+class MinHeap {
+  constructor() {
+    this.a = [];
+  }
+  get size() { return this.a.length; }
+  peek() { return this.a[0]; }
+
+  push(v) {
+    this.a.push(v);
+    let i = this.a.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.a[p] <= this.a[i]) break;
+      [this.a[p], this.a[i]] = [this.a[i], this.a[p]];
+      i = p;
+    }
+  }
+
+  pop() {
+    if (!this.a.length) return undefined;
+    const top = this.a[0];
+    const last = this.a.pop();
+    if (this.a.length) {
+      this.a[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = i * 2 + 1, r = l + 1;
+        let min = i;
+        if (l < this.a.length && this.a[l] < this.a[min]) min = l;
+        if (r < this.a.length && this.a[r] < this.a[min]) min = r;
+        if (min === i) break;
+        [this.a[i], this.a[min]] = [this.a[min], this.a[i]];
+        i = min;
+      }
+    }
+    return top;
+  }
+}
+```
+
+两个容易忽略的点：
+
+- **建堆可以 `O(n)`**：从最后一个非叶子节点向前做下沉（`i = (n >> 1) - 1`），比逐个 push 的 `O(n log n)` 快；
+- JS 没有内置优先队列。面试时可以先用数组排序写对，再说明「生产会用堆优化到 `O(n log k)`」——但 TopK 题最好直接手写堆。
+
+## 2. TopK：为什么是「大小为 K 的堆」
+
+求「第 K 大」时，维护一个**大小为 K 的最小堆**：堆里是当前最大的 K 个，堆顶就是第 K 大。新元素比堆顶大才替换，复杂度 `O(n log k)`，空间 `O(k)`。
+
+```js
+function findKthLargest(nums, k) {
+  const heap = new MinHeap();
+  for (const n of nums) {
+    if (heap.size < k) heap.push(n);
+    else if (n > heap.peek()) {
+      heap.pop();
+      heap.push(n);
+    }
+  }
+  return heap.peek();
+}
+```
+
+同一套思路的变体：
+
+| 题目 | 堆里放什么 | 比较方向 |
+| :-- | :-- | :-- |
+| 第 K 大 | K 个最大元素 | 最小堆 |
+| 第 K 小 | K 个最小元素 | 最大堆 |
+| K 个最接近的点 | 距离最小的 K 个 | 最大堆（距离） |
+| 数据流中位数 | 小半区最大堆 + 大半区最小堆 | 两堆平衡 |
+| 合并 K 个有序链表 | 每条链表的当前头节点 | 最小堆（按值） |
+
+合并 K 条链表：
+
+```js
+function mergeKLists(lists) {
+  const heap = new MinHeap();       // 元素改成 { val, node }，比较 node.val
+  // 省略：把每条链表的头节点 push 进去
+  // 每次 pop 最小值接到结果链表，再把它的 next push 回去
+}
+```
+
+**中位数**用两个堆：`low`（最大堆）存较小的一半，`high`（最小堆）存较大的一半，保证 `low.size === high.size` 或 `low.size === high.size + 1`。插入后调整堆顶，取中位数看两堆大小。
+
+## 3. 图：先选对表示法
+
+| 表示 | 空间 | 判断边 | 遍历邻居 | 适合 |
+| :-- | :-- | :-- | :-- | :-- |
+| 邻接表 | `O(V + E)` | `O(deg)` | `O(deg)` | 稀疏图，绝大多数题 |
+| 邻接矩阵 | `O(V²)` | `O(1)` | `O(V)` | 稠密图 / 小规模 / 需要快速查边 |
+| 边列表 | `O(E)` | `O(E)` | —— | Kruskal、并查集场景 |
+
+```js
+// 无向图：a - b, b - c
+const graph = new Map([
+  ["a", ["b"]],
+  ["b", ["a", "c"]],
+  ["c", ["b"]],
+]);
+
+// 有向图用 Map<string, string[]> 即可；带权图存 [to, weight]
+```
+
+## 4. BFS：无权图最短路的标准解
+
+BFS 的核心是**按层扩散**，第一次到达某点时走的就是最短步数。
+
+```js
+function bfs(graph, start, target) {
+  const queue = [start];
+  const dist = new Map([[start, 0]]);   // 入队时标记，避免重复入队
+
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur === target) return dist.get(cur);
+    for (const next of graph.get(cur) ?? []) {
+      if (dist.has(next)) continue;
+      dist.set(next, dist.get(cur) + 1);
+      queue.push(next);
+    }
+  }
+  return -1;
+}
+```
+
+三个模板级细节：
+
+1. **入队时标记 visited**，不要出队时标记——否则同一节点会被多次入队，复杂度退化；
+2. 用数组 `shift()` 是 `O(n)`，大数据量用头指针或真正队列（`head` 索引）；
+3. 需要层信息时，按当前队列长度循环一层：
+
+```js
+let level = 0;
+while (queue.length) {
+  for (let i = queue.length; i > 0; i--) {
+    const cur = queue.shift();
+    // ... 处理本层
+  }
+  level++;
+}
+```
+
+**多源 BFS**：把所有起点先入队，再一起扩散。典型题「腐烂的橘子」「01 矩阵」——从所有 0 出发找最近 1，比每个点单独 BFS 快一个量级。
+
+网格题不需要显式建图，方向数组即可：
+
+```js
+const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+function numIslands(grid) {
+  const m = grid.length, n = grid[0].length;
+  let count = 0;
+  const queue = [];
+  for (let i = 0; i < m; i++) {
+    for (let j = 0; j < n; j++) {
+      if (grid[i][j] !== "1") continue;
+      count++;
+      grid[i][j] = "0";
+      queue.length = 0;
+      queue.push([i, j]);
+      for (let h = 0; h < queue.length; h++) {
+        const [x, y] = queue[h];
+        for (const [dx, dy] of DIRS) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= m || ny >= n || grid[nx][ny] !== "1") continue;
+          grid[nx][ny] = "0";     // 入队即标记
+          queue.push([nx, ny]);
+        }
+      }
+    }
+  }
+  return count;
+}
+```
+
+## 5. DFS：连通块与环检测
+
+DFS 用递归最短，但要注意**递归深度**（链式图可能爆栈）。迭代版用显式栈。
+
+```js
+function dfs(graph, start, visited = new Set()) {
+  const stack = [start];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    for (const next of graph.get(cur) ?? []) {
+      if (!visited.has(next)) stack.push(next);
+    }
+  }
+  return visited;
+}
+```
+
+**有向图环检测**用三色标记：
+
+- `0` 未访问、`1` 正在当前递归栈里、`2` 已完成；
+- 遇到 `1` 说明回到栈上的点 → 有环。
+
+```js
+function hasCycle(graph, n) {
+  const color = new Array(n).fill(0);
+  const dfs = (u) => {
+    color[u] = 1;
+    for (const v of graph[u] ?? []) {
+      if (color[v] === 1) return true;
+      if (color[v] === 0 && dfs(v)) return true;
+    }
+    color[u] = 2;
+    return false;
+  };
+  for (let i = 0; i < n; i++) if (color[i] === 0 && dfs(i)) return true;
+  return false;
+}
+```
+
+## 6. 拓扑排序：Kahn 算法
+
+有向无环图（DAG）的线性排序，面试高频「课程表」。Kahn 用入度：
+
+```js
+function topoSort(n, edges) {
+  const graph = Array.from({ length: n }, () => []);
+  const indeg = new Array(n).fill(0);
+  for (const [from, to] of edges) {
+    graph[from].push(to);
+    indeg[to]++;
+  }
+
+  const queue = [];
+  for (let i = 0; i < n; i++) if (indeg[i] === 0) queue.push(i);
+
+  const order = [];
+  for (let h = 0; h < queue.length; h++) {
+    const u = queue[h];
+    order.push(u);
+    for (const v of graph[u]) {
+      if (--indeg[v] === 0) queue.push(v);
+    }
+  }
+
+  return order.length === n ? order : null;   // null 表示有环
+}
+```
+
+- 队列换成**最小堆**，就是「字典序最小的拓扑序」；
+- 计数不等于 `n` → 有环；
+- 需要反向依赖（谁依赖我）时，同时维护反图。
+
+## 7. 并查集：连通性问题的另一把锤子
+
+「岛屿数量 II」「冗余连接」「账户合并」用并查集比 DFS 更直接。三个操作：`find`（路径压缩）、`union`（按秩合并）、`connected`。
+
+```js
+class DSU {
+  constructor(n) {
+    this.parent = Array.from({ length: n }, (_, i) => i);
+    this.rank = new Array(n).fill(0);
+    this.count = n;
+  }
+  find(x) {
+    if (this.parent[x] !== x) this.parent[x] = this.find(this.parent[x]);
+    return this.parent[x];
+  }
+  union(a, b) {
+    const ra = this.find(a), rb = this.find(b);
+    if (ra === rb) return false;
+    if (this.rank[ra] < this.rank[rb]) this.parent[ra] = rb;
+    else if (this.rank[ra] > this.rank[rb]) this.parent[rb] = ra;
+    else { this.parent[rb] = ra; this.rank[ra]++; }
+    this.count--;
+    return true;
+  }
+}
+```
+
+## 8. 复杂度与选择题
+
+| 问题 | 首选 | 复杂度 |
+| :-- | :-- | :-- |
+| 无权图最短步数 | BFS | `O(V + E)` |
+| 连通块 / 岛屿数量 | BFS / DFS / 并查集 | `O(V + E)` |
+| 有向图环检测 | 三色 DFS / Kahn | `O(V + E)` |
+| 依赖排序 | Kahn 拓扑 | `O(V + E)` |
+| 第 K 大 / TopK | 大小为 K 的堆 | `O(n log k)` |
+| 数据流中位数 | 双堆 | `O(log n)` 插入 |
+| 动态连通（边逐条加入） | 并查集 | 近似 `O(1)` |
+| 带权最短路（非负） | Dijkstra | `O((V + E) log V)` |
+
+**先看图有没有权**：无权最短路用 BFS，不要上 Dijkstra；有权非负才用堆优化 Dijkstra；有负权边则要 Bellman-Ford（面试少考）。
+
+## 小结
+
+- 堆只维护最值，TopK 的标准解是「大小为 K 的反向堆」；
+- 图先选表示法：稀疏图用邻接表，网格题不用建图，直接方向数组；
+- BFS 按层扩散，入队即标记；多源 BFS 把所有起点一起入队；
+- DFS 适合连通块与环检测，有向图环用三色标记；
+- 拓扑排序用入度 + 队列，结果不足 n 即有环；
+- 并查集解决「动态加边」的连通性问题，路径压缩 + 按秩合并。
+
+## 练习
+
+1. 手写 `MaxHeap`，并用它实现「数据流中位数」（双堆）。
+2. 给定 `n` 个点与无向边，返回连通块数量：分别用 BFS、DFS、并查集实现，并对比代码量。
+3. 「课程表 II」：返回任意一个合法上课顺序；若无法完成返回空数组。要求分别用 Kahn 与三色 DFS 各写一遍。
+4. 「岛屿数量 II」：边逐条加入，每次输出当前岛屿数。只能用并查集。
+5. 「合并 K 个升序链表」：用最小堆实现，分析为什么不能用「两两合并」的 `O(N log K)` 直接替代（提示：常数与实现成本）。
+6. 给定网格中的多个起点，求每个格子到最近起点的距离：用多源 BFS，并证明它比「每个起点各跑一次 BFS」更优。

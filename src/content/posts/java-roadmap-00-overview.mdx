@@ -34,16 +34,16 @@ draft: false
 
 - **A. 完全没写过 Java**：01–11 顺序读，别跳。强类型与 OOP 是地基，跳了后面全是背。
 - **B. 会 JS/TS**：先看下面的"心智模型对照"表，重点 02（类型系统）、05/06（OOP）、08（集合）。
-- **C. 要写后端**：08 → 09 → 10 → 11，然后接 RuoYi 路线补 Spring Boot 与 MyBatis。
+- **C. 要写后端**：08 → 09 → 10 → 11 → 12，再接 RuoYi 路线补 Shiro、代码生成与完整业务模块。
 - **D. 面试向**：08（集合）、11（多线程），再把 JVM/GC 讲清楚。
 
-> **这个模块的已知缺口**：没有独立的 Spring Boot / MyBatis 篇，也没有毕业项目篇——项目向内容分散在 9 篇里。想走 Java Web 后端，建议读完本路线后直接接 [RuoYi 路线](/blog/ruoyi-roadmap/)（它把 Spring Boot + MyBatis + Shiro 权限串成了完整链路）。
+> **这个模块的原已知缺口（2026-11 已补）**：阶段十二补上了 Spring Boot + MyBatis 的业务闭环；毕业项目仍建议接 [RuoYi 路线](/blog/ruoyi-roadmap/)（Spring Boot + MyBatis + Shiro 权限串成完整链路），或用阶段十二的 task 服务自己扩一个完整项目。
 
 ---
 
 ## 学习路线图
 
-整个路线拆成 **11 个阶段**，前 4 个阶段是语法基础，中间 4 个是面向对象与常用 API，最后 3 个进入现代 Java 的工程实践：
+整个路线拆成 **12 个阶段**，前 4 个阶段是语法基础，中间 4 个是面向对象与常用 API，接着 3 个进入现代 Java 的工程实践，最后一个把语法拼成 Web 业务闭环：
 
 | 阶段 | 主题 | 关键概念 | 预计投入 |
 | :--: | :-- | :-- | :--: |
@@ -58,6 +58,7 @@ draft: false
 | 九 | 异常与泛型 | `try/catch/finally`、`throws`、泛型类/方法/通配符 | 1 天 |
 | 十 | Lambda 与 Stream | 函数式接口、`Stream` 三段式、`Optional` | 1 天 |
 | 十一 | 多线程入门 | `Thread` / `Runnable`、线程池、`synchronized`、`volatile` | 2 天 |
+| 十二 | Spring Boot + MyBatis | IoC/DI、Mapper 映射、`@Transactional`、`@Valid`、统一错误、MockMvc | 2–3 天 |
 
 ## 阶段索引
 
@@ -74,6 +75,7 @@ draft: false
 9. [阶段九：异常处理与泛型](/blog/posts/java-roadmap-09-exception-generics/)
 10. [阶段十：Lambda 与 Stream API](/blog/posts/java-roadmap-10-lambda-stream/)
 11. [阶段十一：多线程入门](/blog/posts/java-roadmap-11-thread-basics/)
+12. [阶段十二：Spring Boot + MyBatis——把语法拼成一条业务链路](/blog/posts/java-roadmap-12-springboot-mybatis/)
 
 ## 前端工程师的心智模型对照
 
