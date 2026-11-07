@@ -1,0 +1,517 @@
+---
+title: '15 · Express 生产级实战：从路由分层到优雅关闭'
+published: 2026-11-07T11:00:00+08:00
+description: 'Express 不只是 app.get：分层结构、zod 校验、JWT 鉴权、日志与 trace、错误中间件、限流、优雅关闭和 supertest，把一个任务 API 写到能上线。'
+tags: [Node.js, Express, 中间件, 工程化]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> 第 03 篇讲的是「Express 为什么是直线流水线」，这一篇讲「真拿它交付一个服务时，代码该怎么组织」。同样一个任务 API，我会从目录结构、装配顺序、校验、鉴权、错误、日志、限流一路写到优雅关闭和测试。照着做完，你得到的是一个能上线的 Express 服务，而不是一个 `app.get` 示例。
+
+## 这条链路解决什么问题
+
+Express 的自由度很高，但自由的反面是：项目一大就变成「一堆路由 + 到处 try/catch + 不知道错误从哪来」。
+
+这一篇用一个任务 API 把生产需要的骨架固定下来：
+
+| 环节 | 这篇怎么落 |
+| --- | --- |
+| 需求 | 登录用户创建任务、查看自己的任务 |
+| 数据 | `tasks` 表，按 `userId + createdAt` 查询 |
+| 契约 | `GET /api/tasks`、`POST /api/tasks` |
+| 关键实现 | 分层 + 校验 + 错误中间件 + 鉴权 |
+| 验证 | supertest 覆盖成功、未登录、参数错误 |
+| 上线 | 结构化日志、限流、优雅关闭 |
+
+## 1. 目录结构
+
+```text
+src/
+├── app.ts                 # 只负责装配，不 listen
+├── server.ts              # listen + 信号处理
+├── common/
+│   ├── config.ts          # 环境变量校验
+│   ├── logger.ts          # pino
+│   ├── db.ts              # Prisma 单例
+│   ├── redis.ts           # ioredis
+│   ├── errors.ts          # AppError
+│   ├── auth.ts            # requireAuth
+│   ├── validate.ts        # zod 中间件
+│   └── middleware.ts      # requestId / asyncHandler / errorHandler
+└── modules/
+    └── tasks/
+        ├── task.schema.ts
+        ├── task.repository.ts
+        ├── task.service.ts
+        └── task.controller.ts
+```
+
+**为什么把 `app.ts` 和 `server.ts` 分开**：`app.ts` 导出 `createApp()`，测试可以只拿 app 跑 supertest，不用真的占端口；`server.ts` 才负责 listen 和信号处理。
+
+## 2. 应用装配顺序
+
+中间件顺序错了，行为就会怪。推荐顺序：
+
+```ts
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import pinoHttp from 'pino-http';
+import { config } from './common/config.js';
+import { logger } from './common/logger.js';
+import { errorHandler, notFound, requestId } from './common/middleware.js';
+import { tasksRouter } from './modules/tasks/task.controller.js';
+
+export function createApp() {
+  const app = express();
+
+  app.use(requestId);
+  app.use(pinoHttp({ logger, genReqId: req => (req as any).id }));
+
+  app.use(helmet());
+  app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
+  app.use(express.json({ limit: '1mb' }));
+
+  app.use('/api/tasks', tasksRouter);
+
+  app.use(notFound);
+  app.use(errorHandler);
+
+  return app;
+}
+```
+
+顺序的理由：
+
+1. **requestId 最先**：后面所有日志都能带上它；
+2. **日志在业务前**：请求进来就能记录；
+3. **helmet / cors 在路由前**：安全头和跨域要覆盖所有响应；
+4. **body 解析在路由前**：控制器才能拿到 `req.body`；
+5. **404 在路由后**：前面都没匹配才兜底；
+6. **错误中间件最后**：它必须接住前面所有层抛出的错误。
+
+## 3. 配置、日志、错误
+
+`common/config.ts`：启动即校验，坏配置不要等到运行时才炸。
+
+```ts
+import { z } from 'zod';
+
+const schema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().default(3000),
+  DATABASE_URL: z.string(),
+  REDIS_URL: z.string(),
+  JWT_SECRET: z.string().min(32),
+  WEB_ORIGIN: z.string().default('http://localhost:5173'),
+});
+
+export const config = schema.parse(process.env);
+```
+
+`common/logger.ts`：
+
+```ts
+import pino from 'pino';
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+  redact: {
+    paths: ['req.headers.authorization', 'req.headers.cookie', 'password'],
+    censor: '[REDACTED]',
+  },
+});
+```
+
+`common/errors.ts`：
+
+```ts
+export class AppError extends Error {
+  constructor(
+    public code: string,
+    public status: number,
+    message: string,
+    public details?: unknown,
+  ) {
+    super(message);
+  }
+}
+```
+
+`common/middleware.ts`：
+
+```ts
+import type { NextFunction, Request, Response } from 'express';
+import { randomUUID } from 'node:crypto';
+import { ZodError } from 'zod';
+import { AppError } from './errors.js';
+import { logger } from './logger.js';
+
+export function requestId(req: Request, res: Response, next: NextFunction) {
+  const id = req.header('x-request-id') ?? randomUUID();
+  (req as any).id = id;
+  res.setHeader('x-request-id', id);
+  next();
+}
+
+export function notFound(req: Request, res: Response) {
+  res.status(404).json({
+    code: 'NOT_FOUND',
+    message: `Route ${req.method} ${req.path} not found`,
+  });
+}
+
+export function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+export function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  if (res.headersSent) return next(err);
+
+  if (err instanceof ZodError) {
+    res.status(400).json({
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request',
+      details: err.flatten(),
+    });
+    return;
+  }
+
+  if (err instanceof AppError) {
+    res.status(err.status).json({
+      code: err.code,
+      message: err.message,
+      details: err.details,
+    });
+    return;
+  }
+
+  logger.error({ err, requestId: (req as any).id }, 'unhandled error');
+  res.status(500).json({ code: 'INTERNAL_ERROR', message: 'Internal error' });
+}
+```
+
+**注意**：Express 4 不会自动捕获 async 函数里的 rejected Promise，所以控制器统一用 `asyncHandler` 包一层；Express 5 有改进，但显式包装仍然更可控。
+
+## 4. 分层：Router → Controller → Service → Repository
+
+`common/db.ts` 和 `common/redis.ts` 先备好（单例，不要每个请求 new）：
+
+```ts
+import { PrismaClient } from '@prisma/client';
+export const prisma = new PrismaClient();
+```
+
+```ts
+import Redis from 'ioredis';
+import { config } from './config.js';
+export const redis = new Redis(config.REDIS_URL);
+```
+
+先建表（表结构细节见第 05 篇）：
+
+```prisma
+model Task {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt
+  title     String
+  done      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+```
+
+`task.repository.ts`：只做数据访问，不关心 HTTP。
+
+```ts
+import { prisma } from '../../common/db.js';
+
+export const taskRepository = {
+  list(userId: bigint) {
+    return prisma.task.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+    });
+  },
+
+  create(userId: bigint, input: { title: string; done?: boolean }) {
+    return prisma.task.create({
+      data: { userId, title: input.title, done: input.done ?? false },
+    });
+  },
+
+  find(userId: bigint, id: bigint) {
+    return prisma.task.findFirst({ where: { id, userId } });
+  },
+};
+```
+
+`task.service.ts`：业务规则在这里，比如「找不到就抛 404」。
+
+```ts
+import { AppError } from '../../common/errors.js';
+import { taskRepository } from './task.repository.js';
+
+export const taskService = {
+  list(userId: bigint) {
+    return taskRepository.list(userId);
+  },
+
+  create(userId: bigint, input: { title: string; done?: boolean }) {
+    return taskRepository.create(userId, input);
+  },
+
+  async get(userId: bigint, id: bigint) {
+    const task = await taskRepository.find(userId, id);
+    if (!task) throw new AppError('TASK_NOT_FOUND', 404, 'Task not found');
+    return task;
+  },
+};
+```
+
+`task.controller.ts`：只做 HTTP 适配、校验、调用 service。
+
+```ts
+import { Router } from 'express';
+import { z } from 'zod';
+import { asyncHandler } from '../../common/middleware.js';
+import { requireAuth } from '../../common/auth.js';
+import { validate } from '../../common/validate.js';
+import { taskService } from './task.service.js';
+
+export const tasksRouter = Router();
+tasksRouter.use(requireAuth);
+
+const createSchema = z.object({
+  title: z.string().min(1).max(200),
+  done: z.boolean().optional(),
+});
+
+tasksRouter.get('/', asyncHandler(async (req: any, res) => {
+  const items = await taskService.list(req.user.id);
+  res.json({ code: 'OK', data: items });
+}));
+
+tasksRouter.post('/', validate(createSchema), asyncHandler(async (req: any, res) => {
+  const task = await taskService.create(req.user.id, req.validated);
+  res.status(201).json({ code: 'OK', data: task });
+}));
+```
+
+**为什么分层**：Controller 不写业务，Service 不拼 SQL，Repository 不碰 HTTP。这样换 ORM、加缓存、写单测都不用动其他层。
+
+## 5. 校验：zod 中间件
+
+```ts
+import type { NextFunction, Request, Response } from 'express';
+import type { ZodType } from 'zod';
+import { AppError } from './errors.js';
+
+export function validate(schema: ZodType) {
+  return (req: Request, _res: Response, next: NextFunction) => {
+    const result = schema.safeParse(req.body);
+    if (!result.success) {
+      return next(
+        new AppError('VALIDATION_ERROR', 400, 'Invalid body', result.error.flatten()),
+      );
+    }
+    (req as any).validated = result.data;
+    next();
+  };
+}
+```
+
+**为什么不在控制器里手写 if**：校验规则会变，集中在 schema 里；错误格式也统一，前端不用猜。
+
+## 6. 鉴权：JWT 中间件
+
+```ts
+import jwt from 'jsonwebtoken';
+import type { NextFunction, Request, Response } from 'express';
+import { config } from './config.js';
+import { AppError } from './errors.js';
+
+export function requireAuth(req: Request, _res: Response, next: NextFunction) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return next(new AppError('UNAUTHORIZED', 401, 'Login required'));
+
+  try {
+    const payload = jwt.verify(token, config.JWT_SECRET) as any;
+    (req as any).user = {
+      id: BigInt(payload.sub),
+      roles: payload.roles ?? [],
+    };
+    next();
+  } catch {
+    next(new AppError('UNAUTHORIZED', 401, 'Invalid token'));
+  }
+}
+```
+
+**注意**：鉴权只负责「你是谁」，不负责「你能不能操作这条数据」。资源归属要在 service/repository 里查 `userId`，不能只信前端传的 id。
+
+## 7. 日志与 trace
+
+`pino-http` 会自动记录方法、路径、状态码、耗时；配合 `requestId`，一次请求的所有日志能串起来。
+
+```ts
+app.use(pinoHttp({
+  logger,
+  genReqId: req => (req as any).id,
+  customLogLevel: (_req, res, err) => {
+    if (err || res.statusCode >= 500) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    return 'info';
+  },
+}));
+```
+
+**为什么**：线上排查不是「看哪行报错」，而是「把一次请求从入口到 DB 串起来」。requestId 是这条线的针。
+
+## 8. 限流与幂等
+
+限流（Redis 固定窗口，生产可换令牌桶）：
+
+```ts
+import { redis } from './redis.js';
+import { AppError } from './errors.js';
+
+export function rateLimit(limit: number, windowSec: number) {
+  return async (req: any, _res: any, next: any) => {
+    const who = req.user?.id?.toString() ?? req.ip;
+    const bucket = Math.floor(Date.now() / (windowSec * 1000));
+    const key = `rl:${who}:${bucket}`;
+
+    const current = await redis.incr(key);
+    if (current === 1) await redis.expire(key, windowSec);
+
+    if (current > limit) {
+      return next(new AppError('RATE_LIMITED', 429, 'Too many requests'));
+    }
+    next();
+  };
+}
+```
+
+幂等（写接口带 `Idempotency-Key`）：
+
+```ts
+const key = req.header('Idempotency-Key');
+if (key) {
+  const cacheKey = `idem:${req.user.id}:${key}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) return res.json(JSON.parse(cached));
+
+  const result = await taskService.create(req.user.id, req.validated);
+  await redis.set(cacheKey, JSON.stringify({ code: 'OK', data: result }), 'EX', 600);
+  return res.status(201).json({ code: 'OK', data: result });
+}
+```
+
+**为什么**：网络重试、用户连点、网关重放都会产生重复写；幂等键是业务层的保险。
+
+## 9. 优雅关闭
+
+```ts
+import { createApp } from './app.js';
+import { prisma } from './common/db.js';
+import { redis } from './common/redis.js';
+import { logger } from './common/logger.js';
+
+const app = createApp();
+const server = app.listen(Number(process.env.PORT ?? 3000));
+
+async function shutdown(signal: string) {
+  logger.info({ signal }, 'shutting down');
+  server.close(async () => {
+    await prisma.$disconnect();
+    await redis.quit();
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    logger.error('force exit after 10s');
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+```
+
+**为什么**：滚动发布时进程会收到 SIGTERM。如果不停止接新请求、不处理在途请求，就会丢请求；不释放 DB/Redis 连接，重启会留下半开连接。
+
+## 10. 测试：只测 app，不占端口
+
+```ts
+import request from 'supertest';
+import { describe, expect, it } from 'vitest';
+import { createApp } from '../src/app.js';
+
+const app = createApp();
+
+describe('tasks', () => {
+  it('未登录返回 401', async () => {
+    await request(app).get('/api/tasks').expect(401);
+  });
+
+  it('参数错误返回 400', async () => {
+    await request(app)
+      .post('/api/tasks')
+      .set('Authorization', 'Bearer test-token')
+      .send({ title: '' })
+      .expect(400);
+  });
+});
+```
+
+**为什么**：`createApp()` 不 listen，supertest 直接拿 app 跑，测试快且不冲突端口。真实项目再配一个测试库和 seed，覆盖成功路径。
+
+## 11. 常见坑
+
+- **async 错误没进错误中间件**：Express 4 需要 `asyncHandler` 或 `next(err)`；
+- **错误中间件写在路由前面**：接不到后面的错误，必须最后注册；
+- **`next()` 之后还写响应**：`headers already sent`；
+- **body 没限大小**：一个超大 JSON 就能把内存打高；
+- **CORS 带 cookie 用了 `*`**：浏览器会拒绝，必须写具体 origin；
+- **在请求里做同步重计算**：阻塞事件循环，所有请求一起慢；
+- **没有 404 兜底**：前端拿到 HTML 错误页，不是统一 JSON；
+- **没有优雅关闭**：发布时丢请求；
+- **限流用 `req.ip` 但没配 `trust proxy`**：拿到的都是代理 IP。
+
+## 小结
+
+- Express 的核心不是 `app.get`，是**中间件顺序 + 分层 + 统一错误**。
+- 校验、鉴权、限流、幂等都应该是中间件/服务层的能力，不要散落在控制器里。
+- `app.ts` 只装配、`server.ts` 管进程，测试才能快。
+- 生产必须补：日志 trace、404、错误边界、优雅关闭。
+
+## 练习
+
+1. 按本文结构实现 `GET /api/tasks` 和 `POST /api/tasks`，用 supertest 覆盖 401/400/201。
+2. 给 `POST` 加 `Idempotency-Key`，连续提交两次只创建一条。
+3. 加一个 Redis 限流：同一用户 60 秒最多 30 次创建。
+4. 模拟 SIGTERM：发起一个慢请求，确认进程等在途请求完成再退出。
+
+## 验收清单
+
+- [ ] 能画出中间件顺序，并解释为什么错误中间件在最后
+- [ ] 控制器里没有 SQL，service 里没有 `req/res`
+- [ ] 参数错误返回统一 400，未登录返回 401
+- [ ] 资源查询带 `userId`，不能越权读别人的任务
+- [ ] 日志带 requestId，能串起一次请求
+- [ ] 有限流和幂等
+- [ ] SIGTERM 能优雅退出
+- [ ] supertest 覆盖成功、未登录、参数错误

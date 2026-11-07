@@ -1,0 +1,468 @@
+---
+title: '16 · Koa 生产级实战：洋葱模型、错误边界与优雅关闭'
+published: 2026-11-07T12:00:00+08:00
+description: 'Koa 不只是一层 async 包装：Context、洋葱模型、Router、zod 校验、错误边界、响应包装、JWT、优雅关闭和 supertest，完整搭一个能上线的任务 API。'
+tags: [Node.js, Koa, 中间件, 洋葱模型]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> 第 03 篇讲的是「Koa 为什么是洋葱模型」，这一篇讲「用 Koa 交付服务时，代码怎么组织」。同样一个任务 API，我会从 Context、装配顺序、Router、校验、错误边界、响应包装一路写到优雅关闭和测试。重点不是 API 列表，而是**为什么这一层要放在这个位置**。
+
+## 这条链路解决什么问题
+
+Koa 比 Express 少了很多内置能力：没有 body 解析、没有路由、没有错误兜底。好处是你可以按需拼装，坏处是**顺序和边界必须自己想清楚**。
+
+这一篇用一个任务 API 固定一套可复用的骨架：
+
+| 环节 | 这篇怎么落 |
+| --- | --- |
+| 需求 | 登录用户创建任务、查看自己的任务 |
+| 数据 | `tasks` 表，按 `userId + createdAt` 查询 |
+| 契约 | `GET /api/tasks`、`POST /api/tasks` |
+| 关键实现 | Context + 洋葱中间件 + Router + 错误边界 |
+| 验证 | supertest + `app.callback()` |
+| 上线 | 日志、响应包装、优雅关闭 |
+
+## 1. 目录结构
+
+```text
+src/
+├── app.ts                 # createApp()，不 listen
+├── server.ts              # listen + 信号处理
+├── common/
+│   ├── config.ts
+│   ├── logger.ts
+│   ├── db.ts
+│   ├── redis.ts
+│   ├── errors.ts
+│   ├── auth.ts            # requireAuth
+│   ├── validate.ts        # zod 中间件
+│   └── middleware.ts      # requestLogger / errorBoundary / responseWrapper
+└── modules/
+    └── tasks/
+        ├── task.repository.ts
+        ├── task.service.ts
+        └── task.router.ts
+```
+
+**为什么 `createApp()` 不 listen**：测试直接拿 `app.callback()` 交给 supertest，不用占端口；`server.ts` 才负责进程生命周期。
+
+## 2. 应用装配顺序
+
+Koa 的顺序比 Express 更敏感，因为「回程」逻辑依赖洋葱层次。推荐：
+
+```ts
+import Koa from 'koa';
+import bodyParser from 'koa-bodyparser';
+import cors from '@koa/cors';
+import helmet from 'koa-helmet';
+import { config } from './common/config.js';
+import { errorBoundary, requestLogger, responseWrapper } from './common/middleware.js';
+import { tasksRouter } from './modules/tasks/task.router.js';
+
+export function createApp() {
+  const app = new Koa();
+
+  app.use(requestLogger);
+  app.use(errorBoundary);
+  app.use(responseWrapper);
+
+  app.use(helmet());
+  app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
+  app.use(bodyParser({ enableTypes: ['json'] }));
+
+  app.use(tasksRouter.routes());
+  app.use(tasksRouter.allowedMethods());
+
+  app.use(async ctx => {
+    if (ctx.status === 404) ctx.throw(404, 'Not found');
+  });
+
+  return app;
+}
+```
+
+顺序的理由：
+
+1. **requestLogger 最外层**：能记录所有请求，包括被错误边界接住的；
+2. **errorBoundary 在业务外层**：`try/catch` 包住 `await next()`，才能接住下游所有异常；
+3. **responseWrapper 在业务外层**：`await next()` 回来后统一包 `{ code, data }`；
+4. **bodyParser 在 router 前**：路由里才能拿 `ctx.request.body`；
+5. **router 在 404 前**：先匹配路由，再兜底；
+6. **allowedMethods**：自动处理 405/501。
+
+## 3. Context 与洋葱模型
+
+Koa 把 `req/res` 收进 `ctx`，并拆成 `ctx.request`、`ctx.response`、`ctx.state`：
+
+```ts
+app.use(async (ctx, next) => {
+  const start = Date.now();
+  ctx.state.requestId = ctx.get('x-request-id') || crypto.randomUUID();
+  ctx.set('x-request-id', ctx.state.requestId);
+
+  await next(); // 进入内层
+
+  console.log(ctx.method, ctx.path, ctx.status, Date.now() - start);
+});
+```
+
+洋葱的关键是 `await next()`：
+
+```text
+请求 ──▶ 日志 ──▶ 错误边界 ──▶ 响应包装 ──▶ 路由
+响应 ◀── 日志 ◀── 错误边界 ◀── 响应包装 ◀── 路由
+```
+
+**如果忘了 `await next()`**，内层根本不会执行，请求会停在这一层——这是 Koa 最常见的错误。
+
+## 4. Router：把路由从 app 里拆出去
+
+`task.schema.ts`：
+
+```ts
+import { z } from 'zod';
+
+export const createTaskSchema = z.object({
+  title: z.string().min(1).max(200),
+  done: z.boolean().optional(),
+});
+```
+
+```ts
+import Router from '@koa/router';
+import { requireAuth } from '../../common/auth.js';
+import { validate } from '../../common/validate.js';
+import { taskService } from './task.service.js';
+import { createTaskSchema } from './task.schema.js';
+
+export const tasksRouter = new Router({ prefix: '/api/tasks' });
+
+tasksRouter.use(requireAuth);
+
+tasksRouter.get('/', async ctx => {
+  ctx.body = await taskService.list(ctx.state.user.id);
+});
+
+tasksRouter.post('/', validate(createTaskSchema), async ctx => {
+  ctx.status = 201;
+  ctx.body = await taskService.create(ctx.state.user.id, ctx.state.validated);
+});
+```
+
+**为什么用 `@koa/router`**：Koa 本身没有路由，`app.use` 只能拿到 `ctx.path` 自己 if-else；Router 把路径、方法、参数解析、405 都收敛了。
+
+## 5. 校验：zod 中间件
+
+```ts
+import type { Next } from 'koa';
+import type { Context } from 'koa';
+import type { ZodType } from 'zod';
+
+export function validate(schema: ZodType) {
+  return async (ctx: Context, next: Next) => {
+    const result = schema.safeParse(ctx.request.body);
+    if (!result.success) {
+      ctx.throw(400, 'Invalid body', {
+        code: 'VALIDATION_ERROR',
+        details: result.error.flatten(),
+      });
+    }
+    ctx.state.validated = result.data;
+    await next();
+  };
+}
+```
+
+`ctx.throw(400, message, props)` 会生成一个带 `status = 400` 的错误，并把 `props` 挂到 error 上；外层的 errorBoundary 统一转成 JSON。
+
+**为什么不在控制器里写 if**：校验规则会变，集中在 schema；错误格式统一；控制器只处理「校验通过之后」的逻辑。
+
+## 6. 错误边界：只写一次
+
+```ts
+import type { Context, Next } from 'koa';
+import { logger } from './logger.js';
+
+export async function errorBoundary(ctx: Context, next: Next) {
+  try {
+    await next();
+  } catch (err: any) {
+    const status = err.status ?? 500;
+
+    ctx.status = status;
+    ctx.body = {
+      code: err.code ?? (status >= 500 ? 'INTERNAL_ERROR' : 'REQUEST_ERROR'),
+      message: err.expose ? err.message : 'Internal error',
+      details: err.details,
+      requestId: ctx.state.requestId,
+    };
+
+    if (status >= 500) {
+      ctx.app.emit('error', err, ctx);
+    }
+  }
+}
+```
+
+```ts
+app.on('error', err => {
+  logger.error({ err }, 'koa application error');
+});
+```
+
+**为什么**：Koa 不会像 Express 那样有「四参数错误中间件」，它的错误处理就是外层 `try/catch`。把这个边界放在最外层，业务代码里就可以放心 `ctx.throw`。
+
+## 7. 鉴权：把用户挂到 `ctx.state`
+
+```ts
+import jwt from 'jsonwebtoken';
+import type { Context, Next } from 'koa';
+import { config } from './config.js';
+
+export async function requireAuth(ctx: Context, next: Next) {
+  const token = ctx.headers.authorization?.replace('Bearer ', '');
+  if (!token) ctx.throw(401, 'Login required', { code: 'UNAUTHORIZED' });
+
+  try {
+    const payload = jwt.verify(token, config.JWT_SECRET) as any;
+    ctx.state.user = {
+      id: BigInt(payload.sub),
+      roles: payload.roles ?? [],
+    };
+  } catch {
+    ctx.throw(401, 'Invalid token', { code: 'UNAUTHORIZED' });
+  }
+
+  await next();
+}
+```
+
+**注意**：鉴权只确认身份；资源归属要在 service/repository 里用 `userId` 过滤，不能只信 URL 里的 id。
+
+## 8. 响应包装与日志
+
+统一响应体：
+
+```ts
+import type { Context, Next } from 'koa';
+import { Stream } from 'node:stream';
+
+export async function responseWrapper(ctx: Context, next: Next) {
+  await next();
+
+  if (
+    ctx.body !== undefined &&
+    ctx.body !== null &&
+    typeof ctx.body === 'object' &&
+    !Buffer.isBuffer(ctx.body) &&
+    !(ctx.body instanceof Stream) &&
+    !('code' in ctx.body)
+  ) {
+    ctx.body = { code: 'OK', data: ctx.body };
+  }
+}
+```
+
+日志：
+
+```ts
+export async function requestLogger(ctx: Context, next: Next) {
+  const start = Date.now();
+  const requestId = ctx.get('x-request-id') || crypto.randomUUID();
+
+  ctx.state.requestId = requestId;
+  ctx.set('x-request-id', requestId);
+
+  await next();
+
+  logger.info({
+    requestId,
+    method: ctx.method,
+    path: ctx.path,
+    status: ctx.status,
+    ms: Date.now() - start,
+  }, 'request');
+}
+```
+
+**为什么要排除 Stream/Buffer**：文件下载、图片响应不能被包成 `{ code, data }`；否则内容就坏了。
+
+## 9. 业务层：Repository + Service
+
+`common/errors.ts`：
+
+```ts
+export class AppError extends Error {
+  expose: boolean;
+
+  constructor(
+    public code: string,
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+    this.expose = status < 500;
+  }
+}
+```
+
+```ts
+// task.repository.ts
+import { prisma } from '../../common/db.js';
+
+export const taskRepository = {
+  list(userId: bigint) {
+    return prisma.task.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+    });
+  },
+
+  create(userId: bigint, input: { title: string; done?: boolean }) {
+    return prisma.task.create({
+      data: { userId, title: input.title, done: input.done ?? false },
+    });
+  },
+
+  find(userId: bigint, id: bigint) {
+    return prisma.task.findFirst({ where: { id, userId } });
+  },
+};
+```
+
+```ts
+// task.service.ts
+import { AppError } from '../../common/errors.js';
+import { taskRepository } from './task.repository.js';
+
+export const taskService = {
+  list(userId: bigint) {
+    return taskRepository.list(userId);
+  },
+
+  create(userId: bigint, input: { title: string; done?: boolean }) {
+    return taskRepository.create(userId, input);
+  },
+
+  async get(userId: bigint, id: bigint) {
+    const task = await taskRepository.find(userId, id);
+    if (!task) throw new AppError('TASK_NOT_FOUND', 404, 'Task not found');
+    return task;
+  },
+};
+```
+
+**为什么和 Express 篇一样分层**：框架换了，业务边界不该换。Controller/Router 只做协议适配，Service 管规则，Repository 管数据。
+
+## 10. 优雅关闭
+
+```ts
+import { createApp } from './app.js';
+import { prisma } from './common/db.js';
+import { logger } from './common/logger.js';
+
+const app = createApp();
+const server = app.listen(Number(process.env.PORT ?? 3000));
+
+async function shutdown(signal: string) {
+  logger.info({ signal }, 'shutting down');
+
+  server.close(async () => {
+    await prisma.$disconnect();
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    logger.error('force exit after 10s');
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+```
+
+**为什么**：滚动发布时进程收到 SIGTERM；不 `server.close()` 就会继续接新请求，不释放 DB 连接就会留下半开连接。
+
+## 11. 测试：`app.callback()`
+
+```ts
+import request from 'supertest';
+import { describe, expect, it } from 'vitest';
+import { createApp } from '../src/app.js';
+
+const app = createApp();
+const server = app.callback();
+
+describe('tasks', () => {
+  it('未登录返回 401', async () => {
+    await request(server).get('/api/tasks').expect(401);
+  });
+
+  it('参数错误返回 400', async () => {
+    await request(server)
+      .post('/api/tasks')
+      .set('Authorization', 'Bearer test-token')
+      .send({ title: '' })
+      .expect(400);
+  });
+});
+```
+
+**为什么用 `app.callback()`**：Koa 的 `listen()` 返回 http server，supertest 可以直接吃；`createApp()` 不 listen，测试不占端口。
+
+## 12. 常见坑
+
+- **忘记 `await next()`**：洋葱断掉，内层不执行；
+- **errorBoundary 不在最外层**：接不住下游错误；
+- **bodyParser 放在 router 后**：`ctx.request.body` 是 undefined；
+- **`ctx.body = ...` 写成 `return ...`**：返回值不会被自动当响应；
+- **`ctx.throw` 和 `throw new Error` 混用**：后者没有 `status`，会被当成 500；
+- **响应包装包住 Stream/Buffer**：下载和图片坏掉；
+- **CORS 带 cookie 用 `*`**：浏览器拒绝；
+- **没有 `allowedMethods`**：405 变成 404；
+- **没有 404 兜底**：返回默认 HTML；
+- **没有优雅关闭**：发布丢请求。
+
+## 13. Express 和 Koa 怎么选
+
+| | Express | Koa |
+| --- | --- | --- |
+| 模型 | 直线流水线 | 洋葱（去程 + 回程） |
+| 异步 | 回调 `next()` | `await next()` |
+| 内置能力 | body 解析、静态资源等 | 很少，按需装 |
+| 回程逻辑 | 靠事件/中间件 hack | 天然支持 |
+| 错误处理 | 四参数中间件 | 外层 try/catch |
+| 生态 | 最大 | 较小但够用 |
+| 适合 | 小项目、快速交付、生态依赖多 | 需要精细控制中间件、统一回程逻辑 |
+
+我的建议：**先学 Express 建立「中间件顺序」的直觉，再用 Koa 理解「回程」；两者都写过，再看 Nest 的 Guard/Interceptor 就不会觉得是魔法。**
+
+## 小结
+
+- Koa 的核心是 `ctx` + 洋葱：外层 `await next()`，回程做日志、包装、错误处理。
+- 错误边界只写一次，业务里放心 `ctx.throw`。
+- Router、bodyParser、校验、鉴权按顺序装配，顺序错了行为就怪。
+- 响应包装要排除 Stream/Buffer；优雅关闭要关 server + DB。
+- 分层和 Express 一样：Router/Controller → Service → Repository。
+
+## 练习
+
+1. 用 Koa 实现 `GET /api/tasks` 和 `POST /api/tasks`，用 supertest 覆盖 401/400/201。
+2. 给响应包装加一个 `requestId` 字段，确认所有 JSON 响应都带上。
+3. 加一个下载接口，返回 `Stream`，确认响应包装没有破坏文件内容。
+4. 模拟 SIGTERM：发起慢请求，确认进程等在途请求完成再退出。
+
+## 验收清单
+
+- [ ] 能画出洋葱顺序，并解释为什么 errorBoundary 在最外层
+- [ ] 每个中间件都正确 `await next()`
+- [ ] 参数错误 400、未登录 401、未知路由 404、方法不允许 405
+- [ ] 响应统一 `{ code, data }`，但 Stream/Buffer 不被包装
+- [ ] 资源查询带 `userId`，不能越权
+- [ ] 日志带 requestId
+- [ ] SIGTERM 能优雅退出
+- [ ] supertest 覆盖成功、未登录、参数错误
