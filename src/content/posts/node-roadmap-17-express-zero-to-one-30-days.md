@@ -1,8 +1,8 @@
 ---
 title: '17 · Express 企业级服务 0→1：30 天逐日执行路线（持续更新）'
 published: 2026-11-09T18:00:00+08:00
-updated: 2026-11-09T18:00:00+08:00
-description: '把「社区社群全栈：从 0 到 1」拆成 30 天可执行清单：每天 2 小时、一个 commit、一次验证输出。本文是持续更新的工程手册，Day 1 已补齐从空目录到 /health 的完整代码。'
+updated: 2026-11-09T21:10:00+08:00
+description: '把「社区社群全栈：从 0 到 1」拆成 30 天可执行清单：每天 2 小时、一个 commit、一次验证输出。本文是持续更新的工程手册，Day 1–2 已补齐完整代码。'
 tags: [Node.js, Express, 从0到1, 30天计划]
 category: Node全栈学习路线
 draft: false
@@ -30,7 +30,7 @@ draft: false
 5. **变更级**：如果是改已有文件，给出修改后的完整文件；只给 diff 时，必须保证 diff 能直接应用。
 6. **验收级**：每个代码块后面要有可复制的验证命令和预期输出，不能只写「应该能跑」。
 
-当前完成度：**Day 1 已给出完整代码**。Day 2–24 目前还是任务清单，后续每执行一天，就把当天涉及的文件代码补进对应小节，而不是另开一篇。
+当前完成度：**Day 1–2 已给出完整代码**。Day 3–24 目前还是任务清单，后续每执行一天，就把当天涉及的文件代码补进对应小节，而不是另开一篇。
 
 ---
 
@@ -40,7 +40,8 @@ draft: false
 |---|---|---|
 | v0.1 | 2026-11-07 | 初版：范围冻结、30 天逐日清单、周验收与讲解要求 |
 | v0.2 | 2026-11-09 | 收录到博客；Day 1 补齐 package.json / tsconfig / docker-compose / app.ts / server.ts 完整代码；新增「代码必须完整」规则 |
-| v0.3 | 待更新 | 按天补齐 Day 2–24 的完整代码 |
+| v0.3 | 2026-11-09 | 补齐 Day 2：config / logger / errors / middleware / app / server 完整代码与验收 |
+| v0.4 | 待更新 | 按天补齐 Day 3–24 的完整代码 |
 | v1.0 | 待定 | 完整可运行、可演示、可压测、可部署 |
 
 ---
@@ -326,24 +327,396 @@ git commit -m "chore: bootstrap node service"
 
 **今天目标**：所有错误返回统一 JSON，所有日志能按一次请求串起来。
 
-**具体做什么**
-1. `.env` + `.env.example`：`PORT`、`DATABASE_URL`、`REDIS_URL`、`JWT_SECRET`、`WEB_ORIGIN`。
-2. `src/common/config.ts`：用 zod 启动即校验环境变量。
-3. `src/common/logger.ts`：pino，脱敏 `authorization` / `cookie` / `password`。
-4. `src/common/errors.ts`：`AppError(code,status,message,details)`。
-5. `src/common/middleware.ts`：
-   - `requestId`：生成或透传 `x-request-id`；
-   - `asyncHandler`：把 rejected Promise 交给错误中间件；
-   - `notFound`：统一 404；
-   - `errorHandler`：`AppError` → 业务码；`ZodError` → 400；其他 → 500。
-6. 在 `app.ts` 按顺序挂：requestId → json → 路由 → notFound → errorHandler。
+> [!TIP]
+> 今天不需要新增依赖：Day 1 已经装了 `dotenv`、`zod`、`pino`。
+
+### 1. 准备环境变量
+
+先把 `.env` 挡在 Git 外面。`.gitignore` 完整内容如下：
+
+```text
+node_modules/
+dist/
+coverage/
+.idea/
+.env
+.env.*
+!.env.example
+```
+
+`.env.example` 完整内容如下（可以提交，作为团队模板）：
+
+```ini
+NODE_ENV=development
+PORT=3000
+DATABASE_URL="mysql://root:root@127.0.0.1:3306/community"
+REDIS_URL="redis://127.0.0.1:6379"
+JWT_SECRET="replace-with-a-random-string-at-least-32-chars"
+WEB_ORIGIN="http://localhost:5173"
+LOG_LEVEL=info
+```
+
+`.env` 完整内容如下（**只放本地，不要提交**）：
+
+```ini
+NODE_ENV=development
+PORT=3000
+DATABASE_URL="mysql://root:root@127.0.0.1:3306/community"
+REDIS_URL="redis://127.0.0.1:6379"
+JWT_SECRET="dev-only-change-me-0123456789abcdef"
+WEB_ORIGIN="http://localhost:5173"
+LOG_LEVEL=debug
+```
+
+生成方式：
+
+```bash
+cp .env.example .env
+```
+
+> [!TIP]
+> 这里的账号、密码、库名要和 Day 1 的 `docker-compose.yml` 保持一致；如果你改过 compose，`.env` 也要同步改。
+
+> [!WARNING]
+> `JWT_SECRET` 至少 32 个字符；示例值只能用于本地。`.env` 必须命中 `.gitignore`，否则第一次 `git add .` 就会把密钥提交进去。
+
+### 2. 写 src/common/config.ts
+
+路径：`src/common/config.ts`。完整内容如下：
+
+```ts
+import 'dotenv/config';
+import { z } from 'zod';
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().int().positive().default(3000),
+  DATABASE_URL: z.url(),
+  REDIS_URL: z.url(),
+  JWT_SECRET: z.string().min(32),
+  WEB_ORIGIN: z.url(),
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+});
+
+const parsed = envSchema.safeParse(process.env);
+
+if (!parsed.success) {
+  console.error('Invalid environment variables:');
+  console.error(parsed.error.issues);
+  process.exit(1);
+}
+
+export const config = parsed.data;
+export type Config = typeof config;
+```
+
+**为什么启动即校验**：坏配置不要等到第一次请求才炸。`z.coerce.number()` 负责把字符串端口转成数字，`z.url()` 负责校验连接串格式。
+
+### 3. 写 src/common/logger.ts
+
+路径：`src/common/logger.ts`。完整内容如下：
+
+```ts
+import pino from 'pino';
+import { config } from './config.js';
+
+export const logger = pino({
+  level: config.LOG_LEVEL,
+  timestamp: pino.stdTimeFunctions.isoTime,
+  redact: {
+    paths: [
+      'req.headers.authorization',
+      'req.headers.cookie',
+      'password',
+      '*.password',
+      'token',
+      '*.token',
+    ],
+    censor: '[REDACTED]',
+  },
+});
+```
+
+**为什么用 pino**：结构化 JSON 可以直接按字段检索；`redact` 保证密码、Cookie、Authorization 不会进日志。
+
+### 4. 写 src/common/errors.ts
+
+路径：`src/common/errors.ts`。完整内容如下：
+
+```ts
+export class AppError extends Error {
+  constructor(
+    public readonly code: string,
+    public readonly status: number,
+    message: string,
+    public readonly details?: unknown,
+  ) {
+    super(message);
+    this.name = 'AppError';
+  }
+}
+```
+
+**为什么要有 AppError**：业务代码只表达「错误码 + HTTP 状态 + 可展示消息」，不用在 controller 里拼响应。
+
+### 5. 写 src/common/middleware.ts
+
+路径：`src/common/middleware.ts`。完整内容如下：
+
+```ts
+import { randomUUID } from 'node:crypto';
+import type {
+  ErrorRequestHandler,
+  NextFunction,
+  Request,
+  RequestHandler,
+  Response,
+} from 'express';
+import { ZodError } from 'zod';
+import { AppError } from './errors.js';
+import { logger } from './logger.js';
+
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+export const requestId: RequestHandler = (req, res, next) => {
+  const incoming = req.header('x-request-id');
+  const id = incoming && REQUEST_ID_PATTERN.test(incoming) ? incoming : randomUUID();
+
+  res.locals.requestId = id;
+  res.setHeader('x-request-id', id);
+  next();
+};
+
+type AsyncRoute = (req: Request, res: Response, next: NextFunction) => Promise<unknown>;
+
+export function asyncHandler(handler: AsyncRoute): RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve()
+      .then(() => handler(req, res, next))
+      .catch(next);
+  };
+}
+
+export const notFound: RequestHandler = (req, _res, next) => {
+  next(new AppError('NOT_FOUND', 404, `Route not found: ${req.method} ${req.originalUrl}`));
+};
+
+export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  const requestId = String(res.locals.requestId ?? '');
+
+  if (err instanceof AppError) {
+    logger.warn({ err, requestId }, 'request failed');
+    res.status(err.status).json({
+      code: err.code,
+      message: err.message,
+      details: err.details ?? null,
+      requestId,
+    });
+    return;
+  }
+
+  if (err instanceof ZodError) {
+    logger.warn({ err, requestId }, 'validation failed');
+    res.status(400).json({
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request data',
+      details: err.issues,
+      requestId,
+    });
+    return;
+  }
+
+  if (err instanceof SyntaxError && 'body' in err) {
+    logger.warn({ err, requestId }, 'invalid json body');
+    res.status(400).json({
+      code: 'INVALID_JSON',
+      message: 'Request body is not valid JSON',
+      requestId,
+    });
+    return;
+  }
+
+  logger.error({ err, requestId }, 'unhandled error');
+  res.status(500).json({
+    code: 'INTERNAL_ERROR',
+    message: 'Internal server error',
+    requestId,
+  });
+};
+```
+
+四个中间件分别解决什么：
+
+- `requestId`：优先透传合法的 `x-request-id`，没有就生成 UUID；同时写回响应头。
+- `asyncHandler`：把同步异常和 rejected Promise 都交给 `next()`，统一进错误中间件。
+- `notFound`：所有未命中路由统一变成 `AppError('NOT_FOUND', 404, ...)`。
+- `errorHandler`：`AppError` → 业务码，`ZodError` → 400，坏的 JSON body → 400，其他 → 500。
+
+> [!NOTE]
+> Express 5 已经能自动捕获 async handler 的 rejected Promise。`asyncHandler` 保留下来是为了统一写法，也方便以后换回 Express 4 或接入自定义包装。
+
+### 6. 更新 src/app.ts
+
+路径：`src/app.ts`。完整内容如下（整体替换 Day 1 的版本）：
+
+```ts
+import express from 'express';
+import type { Express } from 'express';
+import { errorHandler, notFound, requestId } from './common/middleware.js';
+
+export function createApp(): Express {
+  const app = express();
+
+  app.use(requestId);
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  app.use(notFound);
+  app.use(errorHandler);
+
+  return app;
+}
+```
+
+挂载顺序不能乱：
+
+- `requestId` 必须最前，后面所有日志和错误响应才能拿到同一个 id；
+- `express.json()` 在路由之前；
+- `notFound` 必须在所有路由之后；
+- `errorHandler` 必须最后，而且必须是 4 个参数，否则 Express 不会把它当错误中间件。
+
+### 7. 更新 src/server.ts
+
+路径：`src/server.ts`。完整内容如下：
+
+```ts
+import { config } from './common/config.js';
+import { logger } from './common/logger.js';
+import { createApp } from './app.js';
+
+const app = createApp();
+
+app.listen(config.PORT, () => {
+  logger.info({ port: config.PORT }, 'API listening');
+});
+```
+
+**为什么用 `config.PORT`**：端口来源只保留 `.env` 一处，不在代码里散落 `process.env`。
+
+### 8. 启动并验收
+
+```bash
+pnpm dev
+```
+
+另开一个终端，按顺序验收。
+
+**验收 1：健康检查带 requestId**
+
+```bash
+curl -i -H "x-request-id: test-123" http://127.0.0.1:3000/health
+```
+
+预期（重点是响应头里的 `x-request-id: test-123`）：
+
+```http
+HTTP/1.1 200 OK
+x-request-id: test-123
+Content-Type: application/json; charset=utf-8
+
+{"status":"ok"}
+```
+
+**验收 2：404 返回 JSON，不是 HTML**
+
+```bash
+curl -i http://127.0.0.1:3000/nope
+```
+
+预期：
+
+```http
+HTTP/1.1 404 Not Found
+x-request-id: <uuid>
+Content-Type: application/json; charset=utf-8
+
+{"code":"NOT_FOUND","message":"Route not found: GET /nope","details":null,"requestId":"<uuid>"}
+```
+
+**验收 3：未捕获异常返回 500 JSON，并且日志能用 requestId 找到**
+
+临时在 `src/app.ts` 的 `/health` 后面加一个测试路由（验证完删除）：
+
+```ts
+app.get('/boom', asyncHandler(async () => {
+  throw new Error('boom');
+}));
+```
+
+同时把 `asyncHandler` 加进 import：
+
+```ts
+import { asyncHandler, errorHandler, notFound, requestId } from './common/middleware.js';
+```
+
+重启后：
+
+```bash
+curl -i http://127.0.0.1:3000/boom
+```
+
+预期：
+
+```http
+HTTP/1.1 500 Internal Server Error
+x-request-id: <uuid>
+Content-Type: application/json; charset=utf-8
+
+{"code":"INTERNAL_ERROR","message":"Internal server error","requestId":"<uuid>"}
+```
+
+终端日志里会出现同一条 `requestId` 的 `unhandled error`，并带 `err.stack`。用这个 id 去日志里搜，就能把一次请求串起来。
+
+**验收 4：坏的 JSON body 返回 400**
+
+```bash
+curl -i -X POST -H "Content-Type: application/json" -d '{bad' http://127.0.0.1:3000/health
+```
+
+预期：
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+
+{"code":"INVALID_JSON","message":"Request body is not valid JSON","requestId":"<uuid>"}
+```
+
+**验收 5：坏配置启动即失败**
+
+```bash
+JWT_SECRET=short pnpm dev
+```
+
+预期进程直接退出，并打印 `Invalid environment variables`，而不是带病启动。PowerShell 下等价写法是 `$env:JWT_SECRET='short'; pnpm dev`。
 
 **达到什么效果**
+
 - `curl -i /health` 响应头有 `x-request-id`。
 - `curl /nope` 返回 `{code:"NOT_FOUND"}`，不是 HTML。
-- 加一个临时 `/boom` 抛错：返回 500 JSON，日志里能用 requestId 找到这条。
+- 临时 `/boom` 返回 500 JSON，日志里能用 requestId 找到这条。
+- 坏的 JSON body 返回 400，不是 500。
+- `JWT_SECRET` 不合法时服务启动失败。
 
 **产出**：commit `feat: unify config logging errors and trace`。
+
+```bash
+git add .
+git commit -m "feat: unify config logging errors and trace"
+```
 
 ## Day 3：Prisma、迁移、种子
 
