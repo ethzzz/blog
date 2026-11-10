@@ -1,256 +1,155 @@
 ---
-title: '23 · 社区服务 0→1：阶段二 · 全栈企业化重定位（P0–P2 计划）'
-published: 2026-11-10T19:00:00+08:00
-updated: 2026-11-10T19:00:00+08:00
-description: '按 2026 求职市场重定位：保留 Express 公共 API，新增 Next.js 前台、NestJS 管理/BFF、Redis/RabbitMQ/OpenAPI/OTel/K8s，并给出 P0a/P0b/P1/P2a/P2b 时间线。'
-tags: [Node.js, 全栈, 求职, 架构规划]
-category: Node全栈学习路线
+title: '后端系列 · 总览：Express + NestJS 企业级社区 API'
+published: 2026-11-10T10:10:00+08:00
+updated: 2026-11-10T10:10:00+08:00
+description: '后端系列总览：Express 公共 API + NestJS 管理/BFF 的服务边界、数据归属、API/事件契约、技术选型与 P0a–P2b 交付范围。'
+tags: [社区全栈, 后端, Express, NestJS]
+category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 阶段二总览（系列第 7 篇）。上一篇：[22 毕业验收](/blog/posts/node-roadmap-22-community-graduation/)；阶段一总览：[17 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[Node.js 全栈开发路线](/blog/node-roadmap/)。
+> 后端系列总览。共享总览：[社区全栈实战 · 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；前端系列：[前端总览](/blog/posts/community-fullstack-fe-00-overview/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-阶段一的 6 篇解决的是「Express 社区后端怎么从 0 到 1」。这一篇是路线调整：**不推倒阶段一，而是把项目升级成能投全栈岗位的完整产品**，同时补上 NestJS、Redis、RabbitMQ、OpenAPI、OpenTelemetry、K8s 这些市场高频信号。
-
----
-
-## 1. 为什么调整
-
-2026 年全栈/Node 岗位的共性要求大致是：
-
-- 前端：React / Next.js / SSR / 前后端联调
-- 后端：TypeScript、Express 或 NestJS、REST、MySQL/PostgreSQL、Redis
-- 异步：消息队列、重试、幂等、Outbox
-- 工程：OpenAPI、测试、CI/CD、Docker/K8s
-- 可观测：Pino、OpenTelemetry、Prometheus/Grafana、Sentry
-- 加分：搜索、AI/LLM、支付、文件上传
-
-阶段一已经覆盖了 Express + Prisma + MySQL + 认证 + 内容 + 通知 + Docker/CI 的后端闭环，但缺三块：
-
-1. **可演示的全栈前端**：没有 Next.js，简历上还是「后端项目」。
-2. **NestJS 企业信号**：管理/BFF 没有，JD 高频项缺失。
-3. **工程深度**：OpenAPI、OpenTelemetry、RabbitMQ、K8s 还没落地。
-
-阶段二的目标不是「库越多越好」，而是：**用一个完整产品讲清楚低耦合、可观测、可部署、可迭代**。
+后端不推倒重来：**Express 继续做公共社区 API，NestJS 只做管理/BFF**。这样既保留已有资产，又能覆盖企业招聘里高频的 NestJS、DI、Guard、Swagger、消息队列和可观测性。
 
 ---
 
-## 2. 阶段一保留什么
+## 1. 后端系列目录
 
-阶段一不重写，以下资产继续用：
-
-- Express 5 公共 API
-- Prisma 6.19.3 + MySQL 8
-- Zod 校验、Pino 日志、统一错误、requestId
-- BullMQ 通知任务
-- Docker / Nginx / CI 骨架
-- 已发布的 6 篇系列文章和代码
-
-**阶段二只加东西，不推翻阶段一。**
+| 篇 | 主题 | 目标 |
+|---|---|---|
+| 后端总览 | 边界、契约、选型 | 先读本篇 |
+| [P0a](/blog/posts/node-roadmap-18-community-week-1/) | Express 最小可演示 | 认证 + 发帖 + feed |
+| [P0b](/blog/posts/node-roadmap-19-community-week-2/) | 完整主链路与工程化 | 评论/点赞/关注/通知/OpenAPI/CI |
+| [P1](/blog/posts/node-roadmap-20-community-week-3/) | NestJS 管理/BFF + 异步治理 | 审核/举报/RabbitMQ/可观测 |
+| [P2a](/blog/posts/node-roadmap-21-community-week-4/) | 可观测、容器化与上线 | Docker/Nginx/指标/压测 |
+| [P2b](/blog/posts/node-roadmap-22-community-graduation/) | K8s、搜索与毕业验收 | Helm/Meilisearch/AI 后端 |
 
 ---
 
-## 3. 阶段二目标架构
-
-```text
-community/
-  apps/
-    api/          # Express 5 公共社区 API（阶段一迁入）
-    admin-api/    # NestJS 12 管理/BFF（审核、举报、用户管理、审计）
-    web/          # Next.js App Router 社区前台 + 管理后台
-  packages/
-    shared/       # Zod 契约、事件类型、错误码、API client
-  infra/
-    docker/       # 本地全栈 compose
-    k8s/          # Helm/manifests
-    otel/         # OpenTelemetry collector 配置
-  docs/
-    adr/          # 架构决策记录
-```
-
-**边界**
+## 2. 服务边界与数据归属
 
 | 服务 | 负责 | 数据 |
 |---|---|---|
-| `apps/api` | 认证、用户、帖子、评论、点赞、关注、feed、通知、举报创建 | 核心社区表 + `reports` |
-| `apps/admin-api` | 审核、举报处理、用户封禁、Dashboard、审计 | `moderation_records`、`admin_audit_logs` |
-| `apps/web` | 社区前台 + 管理后台页面 | 不直接连库 |
+| `apps/api`（Express） | 认证、用户、帖子、评论、点赞、关注、feed、通知、举报创建 | 核心社区表 + `reports` |
+| `apps/admin-api`（NestJS） | 审核、举报处理、用户封禁、Dashboard、审计 | `moderation_records`、`admin_audit_logs` |
+| `packages/shared` | Zod 契约、事件类型、错误码 | 无数据库 |
 
-- 管理端通过内部 API 操作核心内容，不跨服务直接改表。
-- 跨服务事件走 Outbox → RabbitMQ；站内通知继续用 BullMQ。
-- `packages/shared` 统一契约，前端 API client 从 OpenAPI 生成，避免类型漂移。
+**跨服务调用**：管理端通过公共 API 的内部接口操作核心内容，不直接改表：
+
+```text
+GET  /internal/posts?status=
+GET  /internal/posts/:id
+POST /internal/posts/:id/status
+GET  /internal/users?query=
+POST /internal/users/:id/status
+GET  /internal/reports?status=
+POST /internal/reports/:id/resolve
+```
+
+内部接口用 `X-Internal-Token` 鉴权，仅内网可达；管理端不把内部接口暴露到公网。
+
+**回退方案**：如果 P1 时间紧张，允许共享 MySQL，但保留 Prisma schema 边界和内部接口契约，不回退到「管理端直接 import 核心 repository」。
 
 ---
 
-## 4. 技术选型
+## 3. API 契约
+
+### 公共 API（Express）
+
+| 模块 | 路径 |
+|---|---|
+| 认证 | `POST /api/v1/auth/register`、`login`、`refresh`、`logout` |
+| 用户 | `GET/PATCH /api/v1/users/me`、`POST/DELETE /api/v1/users/:id/follow` |
+| 帖子 | `GET/POST /api/v1/posts`、`GET/DELETE /api/v1/posts/:id` |
+| 评论 | `GET/POST /api/v1/posts/:postId/comments` |
+| 点赞 | `POST/DELETE /api/v1/posts/:postId/like` |
+| feed | `GET /api/v1/feed` |
+| 通知 | `GET /api/v1/notifications`、`POST /read`、`GET /stream`（SSE） |
+| 举报 | `POST /api/v1/reports` |
+| 运维 | `/health`、`/ready`、`/metrics` |
+
+### 管理 API（NestJS）
+
+| 模块 | 路径 |
+|---|---|
+| Dashboard | `GET /api/v1/admin/dashboard/stats` |
+| 帖子审核 | `GET /api/v1/admin/posts`、`POST /:id/approve`、`POST /:id/reject` |
+| 评论审核 | `GET /api/v1/admin/comments`、`POST /:id/approve`、`POST /:id/reject` |
+| 举报 | `GET /api/v1/admin/reports`、`POST /:id/resolve` |
+| 用户 | `GET /api/v1/admin/users`、`POST /:id/ban`、`POST /:id/unban` |
+| 审计 | `GET /api/v1/admin/audit-logs` |
+| 运维 | `/health`、`/ready`、`/metrics` |
+
+---
+
+## 4. 事件与异步
+
+| 事件 | 生产者 | 消费者 | 传输 | 用途 |
+|---|---|---|---|---|
+| `post.created` | api | admin-api | RabbitMQ | 审核队列 |
+| `post.published` | api | search-indexer | RabbitMQ | 搜索索引 |
+| `report.created` | api | admin-api | RabbitMQ | 举报队列 |
+| `comment.created` | api | notification | BullMQ | 站内通知 |
+| `like.created` | api | notification | BullMQ | 站内通知 |
+| `follow.created` | api | notification | BullMQ | 站内通知 |
+
+- 所有副作用先写 `outbox_events`；outbox worker 按类型路由。
+- RabbitMQ 负责跨服务事件；BullMQ 负责站内通知、延迟与重试。
+- 消费者用 `event_id` / `jobId` 做幂等。
+- P0a/P0b 先只启用 BullMQ；RabbitMQ 在 P1 接入。
+
+---
+
+## 5. 技术选型
 
 | 决策 | 选择 | 理由 |
 |---|---|---|
-| 公共 API | 保留 Express 5 | 阶段一资产可用；面试可讲「为什么不全用 NestJS」 |
-| 管理/BFF | 新增 NestJS 12 | 模块/DI/Guard/Pipe/Interceptor/Swagger 覆盖企业 JD |
-| 前端 | 新增 Next.js App Router | 全栈岗位核心要求，复用前端优势 |
-| ORM | 保留 Prisma 6.19.3 | 不引入第二套 ORM；TypeORM 作为面试知识补 |
-| 数据库 | 保留 MySQL 8 | 国内 JD 覆盖足够；PostgreSQL 差异作为面试知识补 |
-| 缓存/限流/SSE | 新增 ioredis | Redis 是后端 JD 高频项 |
-| 事件/任务 | BullMQ + RabbitMQ | BullMQ 做任务，RabbitMQ 做跨服务事件 |
-| API 文档 | OpenAPI/Swagger | 契约共享、前端生成 client |
-| 可观测 | OpenTelemetry + Prometheus/Grafana + Sentry | 从「能跑」到「能排障」 |
-| 测试 | Vitest/Supertest/Playwright/Testcontainers | 单元/集成/E2E 都有证据 |
-| 部署 | Docker + GitHub Actions + K8s/Helm | 覆盖 Docker/K8s/CI 高频要求 |
-| 搜索 | Meilisearch（P2b） | 比 Elasticsearch 轻，能演示搜索闭环 |
-| AI | LLM 流式/RAG（P2b） | 差异化加分，不阻塞主线 |
+| 公共 API | Express 5 | 保留阶段一资产；面试可讲取舍 |
+| 管理/BFF | NestJS 12 | 模块/DI/Guard/Pipe/Interceptor/Swagger |
+| ORM | Prisma 6.19.3 | 固定版本，避免 latest 装到 8 RC |
+| 数据库 | MySQL 8 | 国内 JD 覆盖足够 |
+| 缓存/限流 | ioredis | Redis 高频项 |
+| 任务/事件 | BullMQ + RabbitMQ | 任务与跨服务事件分开 |
+| API 文档 | OpenAPI/Swagger | 前端生成 client |
+| 可观测 | OpenTelemetry + Prometheus/Grafana + Sentry | 能排障 |
+| 测试 | Vitest/Supertest/Testcontainers | 单元/集成 |
+| 部署 | Docker/Nginx/K8s | 上线与演示 |
 
-**明确不引入**：TypeORM、GraphQL、MongoDB、Service Mesh、同时维护多套 ORM。项目故事要聚焦，不是库展览。
+关键依赖：
 
-**关键依赖**
+```text
+apps/api: jsonwebtoken cookie-parser cors helmet ioredis bullmq
+          zod-to-openapi swagger-ui-express prom-client
+          @opentelemetry/* @sentry/node vitest supertest testcontainers
 
-| 服务 | 主要依赖 |
-|---|---|
-| `apps/api` | `jsonwebtoken`、`cookie-parser`、`cors`、`helmet`、`ioredis`、`bullmq`、`zod-to-openapi`、`swagger-ui-express`、`prom-client`、`@opentelemetry/*`、`@sentry/node`、`vitest`、`supertest`、`testcontainers` |
-| `apps/admin-api` | `@nestjs/core`、`@nestjs/common`、`@nestjs/config`、`@nestjs/swagger`、`@nestjs/jwt`、`@nestjs/passport`、`@nestjs/throttler`、`@nestjs/terminus`、`@nestjs/microservices`、`amqplib`、`@nestjs/testing` |
-| `apps/web` | `next`、`react`、`react-dom`、`@tanstack/react-query`、`tailwindcss`、`shadcn/ui`、`openapi-typescript` |
-
-> NestJS 12 已支持 ESM、Vitest + SWC、Zod 直连；但 `nest-cli` 对 TypeScript 7 的 programmatic API 支持仍需先做 1 天 spike。若不兼容，`admin-api` 单独用 SWC 或 TS 5.9，公共 API 继续 TS 7。
+apps/admin-api: @nestjs/core @nestjs/common @nestjs/config @nestjs/swagger
+                @nestjs/jwt @nestjs/passport @nestjs/throttler
+                @nestjs/terminus @nestjs/microservices amqplib
+```
 
 ---
 
-## 5. 时间线
+## 6. 阶段范围
 
-以 2026-11-10 为起点：
-
-| 阶段 | 时间 | 目标 |
+| 阶段 | 后端范围 | 验收 |
 |---|---|---|
-| P0a | 2026-11-10–11-24（2 周） | monorepo + Next.js 最小可演示 |
-| P0b | 2026-11-24–12-08（2 周） | 评论/点赞/关注/通知 + Redis/BullMQ/OpenAPI/测试/CI |
-| P1 | 2026-12-08–2027-01-12（5 周） | NestJS 管理/BFF + RabbitMQ + 可观测性 |
-| P2a | 2027-01-12–01-29（2.5 周） | K8s/Helm + 压测 + 回滚 + ADR |
-| 春节 | 2027-02-05–02-12 | 暂停重交付，面试复盘/简历/博客 |
-| P2b | 2027-02-20–03-10（3 周，可选） | Meilisearch + AI 差异化 |
-| 金三银四 | 2027-03–04 | 主投递窗口 |
-
-**关键原则：P0a 结束（11/24）就开始投简历，不等 P2。**
+| P0a | monorepo、Prisma、认证、发帖、feed | 浏览器能登录、发帖、看 feed |
+| P0b | 评论、点赞、关注、通知、SSE、Redis/BullMQ、OpenAPI、测试、CI | 完整主链路 + CI 绿 |
+| P1 | NestJS 管理/BFF、审核/举报/用户/审计、RabbitMQ、OTel | 管理端可审核，trace 跨服务 |
+| P2a | Docker、Nginx/SSE、指标、优雅关闭、压测、回滚 | 一条命令上线 + 压测报告 |
+| P2b | K8s/Helm、Meilisearch、AI 后端支持 | 集群部署 + 搜索/AI 可用 |
 
 ---
 
-## 6. 每阶段范围与验收
-
-### P0a（11/10–11/24）：最小可演示
-
-**范围**
-
-- Monorepo 迁移，现有 Express API 保持可用。
-- 垂直切片：认证、feed、帖子列表/详情、发帖。
-- Next.js：登录/注册、feed、帖子详情、发帖、个人页。
-- Docker Compose：web/api/mysql/redis。
-
-**验收**
-
-- 浏览器完成 注册 → 登录 → feed → 详情 → 发帖。
-- 刷新页面登录态不丢；至少一条帖子在 feed 可见。
-- `docker compose up` 后 web/api/mysql/redis 都可用。
-- **从 11/24 开始投递**，不等全部做完。
-
-### P0b（11/24–12/08）：工程化补齐
-
-**范围**
-
-- 评论/点赞/关注/通知/SSE。
-- JWT/refresh Cookie/CORS/Helmet；Redis 限流/缓存/SSE Pub/Sub；BullMQ 通知。
-- OpenAPI；Vitest/Supertest；Dockerfile；GitHub Actions。
-
-**验收**
-
-- 完整社区主链路；SSE 通知 1 秒内到达；断线可重连。
-- `pnpm -r typecheck`、`test`、`build` 全绿；CI 绿。
-- OpenAPI 页面可访问，前端 client 不漂移。
-
-### P1（12/08–01/12）：企业工程信号
-
-**范围**
-
-- NestJS 管理/BFF：AuthGuard、PermissionsGuard、Pipe、Interceptor、ExceptionFilter、Swagger。
-- 管理端：审核、举报、用户封禁、Dashboard、审计日志。
-- RabbitMQ 跨服务事件 + 消费者幂等；BullMQ 补重试/积压监控。
-- OpenTelemetry + Prometheus/Grafana + Sentry；trace 跨服务。
-- Playwright E2E；Testcontainers 集成测试。
-
-**验收**
-
-- 管理端可审核帖子、处理举报、封禁用户，操作写入审计。
-- 审核通过后 feed 出现，拒绝后不出现。
-- 一条请求的 trace 能从 web/api 追到 admin-api/RabbitMQ 消费者。
-- Grafana 有延迟/错误率/队列积压面板；Sentry 能收到错误。
-
-### P2a（01/12–01/29）：上线与压测
-
-**范围**
-
-- K8s/Helm + 本地 k3d 或云 k3s；探针、HPA、Ingress。
-- k6 压测；回滚演练；ADR；10 分钟演示。
-
-**验收**
-
-- 一条命令部署到集群；`/health`、`/ready`、`/metrics` 正常。
-- 有压测报告和 5 分钟回滚步骤。
-- 能不看稿讲 10 分钟：需求→架构→取舍→演示→如果重来。
-
-### P2b（02/20–03/10，可选）：差异化
-
-**范围**
-
-- Meilisearch 搜索；Outbox/RabbitMQ 同步索引。
-- AI 助手/内容审核：LLM 流式 + RAG。
-
-**验收**
-
-- 搜索可用，索引延迟可接受。
-- AI 演示可开关、可 fallback。
-- 做不完不影响投递；金三银四前完成即可。
-
----
-
-## 7. 求职节奏
-
-| 时间 | 动作 |
-|---|---|
-| 2026-11-24 | 开始投递；简历写 P0a demo + 阶段一 Express |
-| 2026-12-08 | P0 完成，更新简历（全栈 + Redis/BullMQ/OpenAPI/CI） |
-| 2026-12-08–2027-01-12 | P1 边做边面（NestJS/OTel/RabbitMQ） |
-| 2027-01-29 | P2a 收尾，春节前完成一轮投递 |
-| 2027-02-05–02-12 | 春节暂停重交付，面试复盘 |
-| 2027-02-20–03-10 | P2b 加分，准备金三银四 |
-| 2027-03–04 | 金三银四主战场 |
-
-**不要把 P2 当作投递前置条件。** 项目是持续更新的简历资产，不是“做完才能找工作”的一次性作品。
-
----
-
-## 8. 风险与裁剪线
+## 7. 风险与回退
 
 | 风险 | 缓解 |
 |---|---|
-| NestJS + TypeScript 7 / nest-cli 兼容性 | 先做 1 天 spike；用 SWC 或 admin-api 单独 TS 5.9 |
-| Monorepo 迁移破坏现有 API | 先 `git mv` 不改逻辑；每步跑 typecheck/build |
+| NestJS 与 TS 7 / nest-cli 兼容性 | 先做 1 天 spike；用 SWC 或 admin-api 单独 TS 5.9 |
 | 两套后端维护成本 | NestJS 只做管理/BFF；共享契约；不复制公共 API |
-| 管理端数据拆分复杂 | 回退共享 MySQL，但保留 schema 边界和内部接口 |
-| P0a 2 周偏紧 | 只做垂直切片；宁可推迟评论/点赞，不要推迟投递 |
-| K8s 学习曲线 | 本地 k3d + Helm，不做多集群 |
-| AI 成本/不稳定 | P2b 可选；默认 mock/可关闭 |
+| 管理端数据拆分复杂 | 回退共享 MySQL，但保留边界和内部接口 |
+| 消息链路过度设计 | P1 先做一条 RabbitMQ 事件闭环，再扩 |
 
-**裁剪线**：P0a/P0b/P1 必须完成；P2a 保 K8s + 压测 + ADR；P2b 可砍。
-
----
-
-## 9. 后续文章
-
-阶段二按里程碑追加实施记录，不提前写未实现的内容：
-
-| 篇 | 主题 | 状态 |
-|---|---|---|
-| 24 | P0：Next.js 前台 + 公共 API 工程化 | 待更新 |
-| 25 | P1：NestJS 管理/BFF + RabbitMQ + 可观测性 | 待更新 |
-| 26 | P2：K8s + 搜索 + AI | 待更新 |
-| 27+ | 会员/支付、图片/附件、推荐等业务扩展 | 待更新 |
-
-阶段一 6 篇继续作为 Express 核心教程；阶段二只追加，不重写。这样既保留已有内容，也符合「编号只增不改、阶段只追加」的规则。
+下一步：从 [后端 P0a](/blog/posts/node-roadmap-18-community-week-1/) 开始；前端对应 [前端总览](/blog/posts/community-fullstack-fe-00-overview/)。

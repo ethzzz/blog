@@ -76,6 +76,14 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 		name: "进阶方向",
 		modules: [
 			{
+				title: "社区全栈实战",
+				abbr: "社",
+				desc: "Express 公共 API + NestJS 管理/BFF + Next.js 前台：后端/前端双系列完整社区项目",
+				url: "/community-fullstack-roadmap/",
+				category: "社区全栈实战",
+				chips: ["Next.js", "NestJS", "社区"],
+			},
+			{
 				title: "Node.js 全栈开发",
 				abbr: "Node",
 				desc: "前端向后端延伸的最短路径：NestJS / 数据库 / 部署",

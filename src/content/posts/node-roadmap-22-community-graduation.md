@@ -1,130 +1,149 @@
 ---
-title: '22 · 社区服务 0→1：毕业验收与后续阶段路线图'
-published: 2026-11-09T22:35:00+08:00
-updated: 2026-11-10T19:00:00+08:00
-description: '完整项目验收清单、冒烟脚本、可插拔扩展（搜索/会员/图片）以及阶段二/三的追加方式。'
-tags: [Node.js, 项目验收, 架构演进, 社区服务]
-category: Node全栈学习路线
+title: '后端 P2b：K8s、搜索与毕业验收'
+published: 2026-11-10T11:00:00+08:00
+updated: 2026-11-10T11:00:00+08:00
+description: '后端最后阶段：K8s/Helm 部署、Meilisearch 索引同步、AI 助手后端支持与完整项目毕业验收。'
+tags: [社区全栈, 后端, K8s, Meilisearch]
+category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 阶段一第 6 篇（共 6 篇，阶段一完）。上一篇：[第 4 周：上线](/blog/posts/node-roadmap-21-community-week-4/)；下一篇：[阶段二总览：全栈企业化与 P0–P2 计划](/blog/posts/node-roadmap-23-community-fullstack-plan/)；返回：[总览、架构与系列索引](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[Node.js 全栈开发路线](/blog/node-roadmap/)。
+> 后端 P2b。上一篇：[后端 P2a](/blog/posts/node-roadmap-21-community-week-4/)；前端对应篇：[前端 P2b](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)；共享总览：[社区全栈实战 · 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
+
+P2b 是后端收尾：K8s/Helm、搜索索引、AI 后端支持和毕业验收。搜索和 AI 是加分项，做不完不影响 P0/P1 的投递价值。
 
 ---
 
-## 毕业验收：完整项目清单
+## 1. 目标与范围
 
-> [!IMPORTANT]
-> Day 3–24 是增量片段，不是 24 份完整文件。按顺序落地后，你的目录应该和 1.5.6 的最终目录一致；下面这份清单用来判断「是不是真的做完了」。
+- Helm/manifests 部署 api/admin-api/web/worker。
+- 探针、HPA、Ingress、ConfigMap/Secret、迁移 Job。
+- Meilisearch 索引同步。
+- AI 助手/内容审核后端接口（可选）。
+- 毕业验收清单。
 
-### 1. 业务能力
+---
 
-- [ ] 注册 / 登录 / 刷新 / 登出
-- [ ] 旧 refresh 重放返回 401
-- [ ] RBAC：未登录 401、无权限 403
-- [ ] 用户资料 / 关注 / 取关
-- [ ] 发帖 / 帖子列表 / 详情 / 软删除
-- [ ] 评论 / 回复 / 事务计数
-- [ ] 点赞 / 取消点赞 / 并发幂等
-- [ ] 关注流 / 游标分页
-- [ ] 通知列表 / 已读 / SSE
-- [ ] 审核 / 举报 / 后台列表
-- [ ] 审计记录 `moderation_records`
+## 2. K8s 清单
 
-### 2. 数据与索引
-
-- [ ] `users`、`refresh_tokens`、`roles`、`permissions`、`user_roles`、`role_permissions`
-- [ ] `posts`、`comments`、`likes`、`follows`
-- [ ] `notifications`、`reports`、`moderation_records`
-- [ ] `outbox_events`、`idempotency_keys`
-- [ ] 点赞唯一约束、关注复合主键、refresh hash 唯一
-- [ ] 列表查询都有对应复合索引
-
-### 3. 异步与高并发
-
-- [ ] 业务事务内写 Outbox
-- [ ] Outbox worker 能追平 pending
-- [ ] 通知消费者按 `eventId` 幂等
-- [ ] SSE 心跳 + 断线清理
-- [ ] 依赖挂掉返回 503/504，进程不崩
-- [ ] 100 并发压测报告
-- [ ] 5 分钟内回滚
-
-### 4. 工程化
-
-- [ ] `.env` 不进 Git，`.env.example` 完整
-- [ ] `pnpm lint` / `typecheck` / `test` / `build` 全绿
-- [ ] Docker 多阶段构建
-- [ ] Nginx 反代 + SSE 不缓冲
-- [ ] CI 阻断类型错误/测试失败
-- [ ] `/health`、`/ready`、`/metrics`
-- [ ] SIGTERM 优雅关闭
-- [ ] README 能让他人从零跑起来
-- [ ] 3 篇 ADR
-- [ ] 10 分钟演示
-
-### 5. 最终冒烟脚本
-
-路径：`scripts/smoke.sh`。完整内容如下：
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-BASE_URL=${BASE_URL:-http://127.0.0.1:3000}
-
-curl -fsS "$BASE_URL/health" >/dev/null
-curl -fsS "$BASE_URL/ready" >/dev/null
-curl -fsS "$BASE_URL/api/v1/posts?limit=1" >/dev/null
-
-echo "smoke ok: $BASE_URL"
+```text
+infra/k8s/helm/community/
+  Chart.yaml
+  values.yaml
+  templates/
+    deployment-api.yaml
+    deployment-admin-api.yaml
+    deployment-web.yaml
+    service.yaml
+    ingress.yaml
+    hpa.yaml
+    configmap.yaml
+    secret.yaml
+    migrate-job.yaml
 ```
 
-```bash
-chmod +x scripts/smoke.sh
-./scripts/smoke.sh
+Deployment 关键配置：
+
+```yaml
+readinessProbe:
+  httpGet: { path: /ready, port: 3000 }
+  initialDelaySeconds: 5
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /health, port: 3000 }
+  initialDelaySeconds: 10
+  periodSeconds: 10
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { cpu: 500m, memory: 512Mi }
 ```
 
-如果这五组都打勾，你得到的就不是一个「能跑的 demo」，而是一个**边界清楚、可测试、可部署、可讲清楚取舍**的社区服务。
+- 迁移用独立 Job，应用启动不跑 migrate。
+- Secret 用 `kubectl create secret` 或 External Secrets，不把 `.env` 打进镜像。
+- 本地演示用 k3d/kind；云上用 k3s 或托管 K8s，不做多集群。
 
 ---
 
-## 可插拔扩展：把核心服务长成完整社区
+## 3. Meilisearch 索引
 
-> 30 天主线覆盖社区核心闭环。下面三块是常见的下一阶段业务，放进主线会让范围失控，但架构已经给它们留好了位置。
+索引消费者订阅 `post.published` / `post.updated` / `post.deleted`：
 
-### 搜索
+```ts
+await meili.index('posts').addDocuments([
+  {
+    id: post.id.toString(),
+    title: post.title,
+    content: post.content,
+    authorId: post.authorId.toString(),
+    createdAt: post.createdAt.toISOString(),
+  },
+]);
+```
 
-- 先上 MySQL `FULLTEXT`，数据量上来再换 Meilisearch。
-- 发帖/审核通过后通过 Outbox 发 `post.published` 事件，由索引消费者同步，不让搜索拖慢发帖。
-- 代码落点：`modules/search`；接口 `GET /api/v1/search/posts?q=`。
-- 关键约束：索引可重建，MySQL 是真相源。
+查询接口：
 
-### 会员与支付
+```text
+GET /api/v1/search/posts?q=keyword&limit=20
+```
 
-- 表：`plans`、`orders`、`entitlements`；订单带 `Idempotency-Key` 唯一键。
-- 支付回调必须验签 + 幂等；回调成功只写一次权益。
-- 代码落点：`modules/memberships`；不要和发帖/评论事务耦合。
-- 关键约束：支付失败不能让内容主链路回滚。
-
-### 图片与附件
-
-- 客户端直传 MinIO/OSS，服务端只保存 URL 和元数据。
-- 表：`post_media`；上传前限制 MIME、大小和数量。
-- 代码落点：`modules/media`；帖子创建只接收已上传的 URL。
-- 关键约束：不在 API 进程里转发大文件，避免占满内存和带宽。
-
-这三块都遵循同一条规则：**核心模块不直接依赖扩展模块，扩展模块通过事件或 service 接口接入**。这就是「低耦合、可迭代」在代码里的具体含义。
+- MySQL 是真相源，索引可重建。
+- 消费端维护 `processed_events` 幂等。
+- 先只索引 `published` 帖子。
 
 ---
 
-## 下一步：阶段二怎么接
+## 4. AI 助手后端（可选）
 
-阶段一（Express 核心）到这里收尾。2026-11-10 起进入阶段二：全栈企业化。
+```text
+POST /api/v1/ai/chat
+body: { message: string, postId?: string }
+response: text/event-stream
+```
 
-- [23 · 阶段二总览：全栈企业化与 P0–P2 计划](/blog/posts/node-roadmap-23-community-fullstack-plan/)：先读这篇，明确保留什么、新增什么、按什么节奏做。
-- 24–26 · P0a/P0b、P1、P2 实施记录：随里程碑推进追加。
-- 27+ · 搜索、会员/支付、图片/附件等业务扩展：等 P2 后再按业务需要追加。
+- 检索：用帖子标题/正文做关键词或向量召回。
+- 流式：SSE 返回 token；客户端可中断。
+- 审核：对评论/帖子做敏感内容分类，命中则进人工审核。
+- 默认提供 mock/开关，没配 API Key 也能演示。
 
-具体追加规则见总览的「后续阶段怎么追加」。新文章继续用 Node全栈学习路线 分类。
+---
+
+## 5. 毕业验收清单
+
+### 业务
+
+- [ ] 注册/登录/刷新/登出；旧 refresh 重放 401
+- [ ] 发帖/列表/详情/软删除；pending 不进 feed
+- [ ] 评论 + 计数同事务；点赞幂等；关注幂等
+- [ ] 关注流游标分页不重不漏
+- [ ] 通知 + SSE；自己操作自己不通知
+- [ ] 审核/举报/用户封禁/审计
+
+### 工程
+
+- [ ] `pnpm -r typecheck` / `test` / `build` 全绿
+- [ ] OpenAPI 可访问；前端 client 不漂移
+- [ ] 一条命令部署；`/health`、`/ready`、`/metrics` 正常
+- [ ] trace 跨服务；Grafana 有面板；Sentry 有错误
+- [ ] 压测报告 + 5 分钟回滚
+- [ ] 搜索可用；AI 可开关/fallback
+
+### 面试
+
+- [ ] 能讲清为什么公共 API 留 Express、管理端用 NestJS
+- [ ] 能讲清 Outbox + RabbitMQ + BullMQ 的分工
+- [ ] 能讲清游标分页、点赞幂等、计数一致性
+- [ ] 能讲清 K8s 探针/HPA/迁移 Job
+- [ ] 能不看稿演示 10 分钟
+
+---
+
+## 6. 常见坑
+
+- **迁移放应用启动**：多副本并发迁移；必须用 Job。
+- **Secret 进镜像**：`.env` 和 Secret 不能打进镜像。
+- **索引不一致**：以 MySQL 为准，提供重建脚本。
+- **AI 阻塞主线**：默认 mock/可关闭，不能影响核心链路。
+- **K8s 过度设计**：先单集群 + Helm，不做多集群/Service Mesh。
+
+到这里，后端系列闭环完成。回到 [共享总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 看两套系列的联调顺序，或继续 [前端 P2b](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)。

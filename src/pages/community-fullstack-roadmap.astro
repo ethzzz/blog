@@ -1,0 +1,150 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug, url } from "@utils/url-utils";
+
+const allPosts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === "社区全栈实战" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+
+const sortedPosts = allPosts.sort(
+	(a, b) => a.data.published.valueOf() - b.data.published.valueOf(),
+);
+
+const sharedPost = sortedPosts.find((post) => post.data.tags.includes("总览"));
+const backendPosts = sortedPosts.filter((post) => post.data.tags.includes("后端"));
+const frontendPosts = sortedPosts.filter((post) => post.data.tags.includes("前端"));
+const totalPosts = backendPosts.length + frontendPosts.length + (sharedPost ? 1 : 0);
+---
+
+<MainGridLayout title="社区全栈实战">
+	<div class="onload-animation">
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">社区全栈实战</h1>
+			<p class="text-75 text-lg">
+				一个完整社区项目，拆成后端 / 前端两套系列 · 共 {totalPosts} 篇
+			</p>
+		</div>
+
+		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white dark:text-black/70 font-bold text-xl">
+					社
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">社区全栈实战 · 双系列</h2>
+					<p class="text-75 text-sm mb-2">
+						Express 公共 API + NestJS 管理/BFF + Next.js 前台：后端按 P0a/P0b/P1/P2a/P2b 推进，前端按同阶段对齐联调。
+					</p>
+					<div class="flex flex-wrap gap-2 text-xs">
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Next.js</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">NestJS</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Express</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">MySQL</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Redis</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">RabbitMQ</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">K8s</span>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		{sharedPost && (
+			<a href={getPostUrlBySlug(sharedPost.slug)}
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between gap-4">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white dark:text-black/70">
+								总览
+							</span>
+							<span class="text-sm text-50">{sharedPost.data.published.toLocaleDateString("zh-CN")}</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">
+							{sharedPost.data.title}
+						</h2>
+						<p class="text-75 text-sm line-clamp-2">{sharedPost.data.description}</p>
+					</div>
+					<div class="text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M5 12h14M12 5l7 7-7 7"/>
+						</svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+			<section>
+				<div class="flex items-center justify-between mb-3">
+					<h2 class="text-lg font-bold text-90 flex items-center gap-2">
+						<span class="inline-block w-1 h-4 rounded-md bg-[var(--primary)]"></span>
+						后端系列
+					</h2>
+					<span class="text-xs text-50">{backendPosts.length} 篇</span>
+				</div>
+				<div class="space-y-3">
+					{backendPosts.map((post, index) => (
+						<a href={getPostUrlBySlug(post.slug)}
+						   class="block card-base card-shadow p-4 hover:shadow-lg transition-all group">
+							<div class="flex items-start gap-3">
+								<div class="flex-shrink-0 w-8 h-8 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-sm group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+									{index + 1}
+								</div>
+								<div class="flex-1 min-w-0">
+									<h3 class="text-base font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-1">
+										{post.data.title}
+									</h3>
+									<p class="text-75 text-sm line-clamp-2">{post.data.description}</p>
+								</div>
+							</div>
+						</a>
+					))}
+				</div>
+			</section>
+
+			<section>
+				<div class="flex items-center justify-between mb-3">
+					<h2 class="text-lg font-bold text-90 flex items-center gap-2">
+						<span class="inline-block w-1 h-4 rounded-md bg-[var(--primary)]"></span>
+						前端系列
+					</h2>
+					<span class="text-xs text-50">{frontendPosts.length} 篇</span>
+				</div>
+				<div class="space-y-3">
+					{frontendPosts.map((post, index) => (
+						<a href={getPostUrlBySlug(post.slug)}
+						   class="block card-base card-shadow p-4 hover:shadow-lg transition-all group">
+							<div class="flex items-start gap-3">
+								<div class="flex-shrink-0 w-8 h-8 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-sm group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+									{index + 1}
+								</div>
+								<div class="flex-1 min-w-0">
+									<h3 class="text-base font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-1">
+										{post.data.title}
+									</h3>
+									<p class="text-75 text-sm line-clamp-2">{post.data.description}</p>
+								</div>
+							</div>
+						</a>
+					))}
+				</div>
+			</section>
+		</div>
+
+		<div class="card-base card-shadow p-5 text-sm text-75">
+			<p class="font-bold text-90 mb-2">阅读顺序</p>
+			<p class="mb-2">
+				先读总览，再按 P0a → P0b → P1 → P2a → P2b 推进。后端和前端可以并行：同一阶段先定 API 契约，再各自实现，最后联调。
+			</p>
+			<p>
+				相关路线：<a class="link text-[var(--primary)]" href={url("/node-roadmap/")}>Node.js 全栈开发</a>
+				·
+				<a class="link text-[var(--primary)]" href={url("/nextjs-roadmap/")}>Next.js 全栈实战</a>
+			</p>
+		</div>
+	</div>
+</MainGridLayout>
