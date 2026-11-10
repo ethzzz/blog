@@ -2,7 +2,7 @@
 title: '后端 00：Express + NestJS 企业级社区 API'
 published: 2026-11-10T10:10:00+08:00
 updated: 2026-11-10T10:10:00+08:00
-description: '后端系列总览：Express 公共 API + NestJS 管理/BFF 的服务边界、数据归属、API/事件契约、技术选型与 01–05–19–21 交付范围。'
+description: '后端系列总览：Express 公共 API + NestJS 管理/BFF 的服务边界、数据归属、API/事件契约、技术选型与 01–21 交付范围。'
 tags: [社区全栈, 后端, Express, NestJS]
 category: 社区全栈实战
 draft: false
@@ -20,7 +20,7 @@ draft: false
 | 篇 | 主题 | 目标 |
 |---|---|---|
 | 后端总览 | 边界、契约、选型 | 先读本篇 |
-| [01–05](/blog/posts/node-roadmap-18-community-week-1/) | Express 最小可演示 | 认证 + 发帖 + feed |
+| [01–05](/blog/posts/node-roadmap-18-community-week-1/) | 从空目录到最小 API | 初始化、配置、Prisma、认证、发帖/feed |
 | [06–10](/blog/posts/node-roadmap-19-community-week-2/) | 完整主链路与工程化 | 评论/点赞/关注/通知/OpenAPI/CI |
 | [11–15](/blog/posts/node-roadmap-20-community-week-3/) | NestJS 管理/BFF + 异步治理 | 审核/举报/RabbitMQ/可观测 |
 | [16–18](/blog/posts/node-roadmap-21-community-week-4/) | 可观测、容器化与上线 | Docker/Nginx/指标/压测 |
@@ -135,7 +135,7 @@ apps/admin-api: @nestjs/core @nestjs/common @nestjs/config @nestjs/swagger
 
 | 阶段 | 后端范围 | 验收 |
 |---|---|---|
-| 01–05 | monorepo、Prisma、认证、发帖、feed | 浏览器能登录、发帖、看 feed |
+| 01–05 | 从空目录初始化、配置/日志、Prisma、认证、发帖/feed | 空目录能起 `/health`，浏览器能登录、发帖、看 feed |
 | 06–10 | 评论、点赞、关注、通知、SSE、Redis/BullMQ、OpenAPI、测试、CI | 完整主链路 + CI 绿 |
 | 11–15 | NestJS 管理/BFF、审核/举报/用户/审计、RabbitMQ、OTel | 管理端可审核，trace 跨服务 |
 | 16–18 | Docker、Nginx/SSE、指标、优雅关闭、压测、回滚 | 一条命令上线 + 压测报告 |

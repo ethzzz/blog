@@ -1,35 +1,36 @@
 ---
-title: '后端 01–05：Express 公共 API 最小可演示'
+title: '后端 01–05：从空目录到可演示社区 API'
 published: 2026-11-10T10:20:00+08:00
 updated: 2026-11-10T10:20:00+08:00
-description: '按天推进 01–05：Day 1 monorepo + Prisma，Day 2 认证，Day 3 发帖，Day 4 关注流，Day 5 Docker Compose 与验收。每天都有命令、完整代码和验收。'
+description: 'Day 1–5 从空目录开始：初始化 monorepo 与 Express、配置/日志/错误、Prisma 领域模型、JWT 认证、发帖/关注/feed，完整 0→1。'
 tags: [社区全栈, 后端, Express, Prisma]
 category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 后端 01–05，按旧 Day 1/Day 2 的格式重写。上一篇：[后端总览](/blog/posts/node-roadmap-23-community-fullstack-plan/)；下一篇：[后端 06–10](/blog/posts/node-roadmap-19-community-week-2/)；前端对应篇：[前端 01–03](/blog/posts/community-fullstack-fe-01-p0a-app-shell/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
+> 后端 01–05。上一篇：[后端 00](/blog/posts/node-roadmap-23-community-fullstack-plan/)；下一篇：[后端 06–10](/blog/posts/node-roadmap-19-community-week-2/)；前端对应篇：[前端 01–03](/blog/posts/community-fullstack-fe-01-p0a-app-shell/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-01–05 用 5 天做出「能登录、能发帖、能看关注流」的公共 API。每天结束必须有一个 commit 和一次验收，不要跳步。
+这一篇从**空目录**开始，不假设你已经有 Express 骨架。5 天后你会得到：能启动、能登录、能发帖、能看关注流的公共 API。每天一个 commit、一次验收。
 
 ---
 
-## Day 1：monorepo、Prisma 模型、种子
+## Day 1：空目录到 `/health`
 
-**今天目标**：把现有 Express 骨架迁入 `apps/api`，建好核心领域表，跑通迁移和种子。
+**今天目标**：从空目录建 monorepo，起 Express 服务，返回 `/health`，并用 Docker Compose 起 MySQL/Redis。
 
-### 1. 建 monorepo
+### 1. 建目录
+
+工作目录：任意空目录。
 
 ```bash
-mkdir -p apps packages/shared/src infra/docker
-git mv src apps/api/src
-git mv prisma apps/api/prisma
-git mv package.json apps/api/package.json
-git mv tsconfig.json apps/api/tsconfig.json
+mkdir community
+cd community
+mkdir -p apps/api/src packages/shared/src infra/docker
+pnpm init
 ```
 
-根目录新建 `package.json`：
+根 `package.json` 改成：
 
 ```json
 {
@@ -50,28 +51,393 @@ git mv tsconfig.json apps/api/tsconfig.json
 packages:
   - apps/*
   - packages/*
-allowBuilds:
-  '@prisma/client': true
-  '@prisma/engines': true
-  argon2: true
-  esbuild: true
-  prisma: true
 ```
 
-`apps/api/package.json` 保持原来的 `type: module`、`dev`、`build`、`start` 和依赖；把 `name` 改成 `api`。
-
-验收：
+### 2. 初始化 apps/api
 
 ```bash
+cd apps/api
+pnpm init
+pnpm add express zod pino dotenv
+pnpm add -D typescript tsx @types/node @types/express
+```
+
+`apps/api/package.json` 改成：
+
+```json
+{
+  "name": "api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "pino": "^10.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
+```
+
+`apps/api/tsconfig.json`：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "sourceMap": true
+  },
+  "include": ["src"]
+}
+```
+
+### 3. 写 app.ts 与 server.ts
+
+`apps/api/src/app.ts`：
+
+```ts
+import express from 'express';
+import type { Express } from 'express';
+
+export function createApp(): Express {
+  const app = express();
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  return app;
+}
+```
+
+`apps/api/src/server.ts`：
+
+```ts
+import { createApp } from './app.js';
+
+const port = Number(process.env.PORT ?? 3000);
+const app = createApp();
+
+app.listen(port, () => {
+  console.log(`API listening on http://127.0.0.1:${port}`);
+});
+```
+
+> NodeNext 下源码里的相对导入要写 `.js`，部署后才能正确解析。
+
+### 4. 写 Docker Compose
+
+`infra/docker/docker-compose.yml`：
+
+```yaml
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: community-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: community
+    ports: ["3306:3306"]
+    volumes: ["mysql-data:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: community-redis
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+
+volumes:
+  mysql-data:
+  redis-data:
+```
+
+### 5. 启动验收
+
+```bash
+cd ../..
 pnpm install
-pnpm --filter api typecheck
+docker compose -f infra/docker/docker-compose.yml up -d
 pnpm dev:api
+```
+
+另开终端：
+
+```bash
 curl -i http://127.0.0.1:3000/health
 ```
 
-### 2. 写 prisma/schema.prisma
+预期：`200 {"status":"ok"}`；`docker compose ps` 两个容器 Up。
 
-路径：`apps/api/prisma/schema.prisma`。01–05 先建这些核心模型（06–10/11–15 再补通知、治理、Outbox）：
+**常见错误**：`pnpm --filter api` 找不到包（`apps/api/package.json` 的 name 不是 `api`）；端口被占用；ESM 导入漏了 `.js`。
+
+**产出**：commit `chore: bootstrap monorepo and express health`。
+
+---
+
+## Day 2：配置、日志、错误、requestId
+
+**今天目标**：坏配置启动即失败；所有错误返回统一 JSON；日志能按 requestId 串起来。
+
+### 1. 环境变量
+
+`.env.example`：
+
+```ini
+NODE_ENV=development
+PORT=3000
+DATABASE_URL="mysql://root:root@127.0.0.1:3306/community"
+REDIS_URL="redis://127.0.0.1:6379"
+JWT_SECRET="replace-with-a-random-string-at-least-32-chars"
+JWT_REFRESH_TTL_DAYS=7
+WEB_ORIGIN="http://localhost:3001"
+LOG_LEVEL=info
+```
+
+```bash
+cp .env.example .env
+```
+
+`.gitignore` 必须包含 `.env`。
+
+### 2. config.ts
+
+`apps/api/src/common/config.ts`：
+
+```ts
+import 'dotenv/config';
+import { z } from 'zod';
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().int().positive().default(3000),
+  DATABASE_URL: z.url(),
+  REDIS_URL: z.url(),
+  JWT_SECRET: z.string().min(32),
+  JWT_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(7),
+  WEB_ORIGIN: z.url(),
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+});
+
+const parsed = envSchema.safeParse(process.env);
+if (!parsed.success) {
+  console.error('Invalid environment variables:', parsed.error.issues);
+  process.exit(1);
+}
+
+export const config = parsed.data;
+export type Config = typeof config;
+```
+
+### 3. logger.ts
+
+`apps/api/src/common/logger.ts`：
+
+```ts
+import pino from 'pino';
+import { config } from './config.js';
+
+export const logger = pino({
+  level: config.LOG_LEVEL,
+  timestamp: pino.stdTimeFunctions.isoTime,
+  redact: {
+    paths: ['req.headers.authorization', 'req.headers.cookie', 'password', '*.password', 'token', '*.token'],
+    censor: '[REDACTED]',
+  },
+});
+```
+
+### 4. errors.ts
+
+`apps/api/src/common/errors.ts`：
+
+```ts
+export class AppError extends Error {
+  constructor(
+    public readonly code: string,
+    public readonly status: number,
+    message: string,
+    public readonly details?: unknown,
+  ) {
+    super(message);
+    this.name = 'AppError';
+  }
+}
+```
+
+### 5. middleware.ts
+
+`apps/api/src/common/middleware.ts`：
+
+```ts
+import { randomUUID } from 'node:crypto';
+import type {
+  ErrorRequestHandler,
+  NextFunction,
+  Request,
+  RequestHandler,
+  Response,
+} from 'express';
+import { ZodError } from 'zod';
+import { AppError } from './errors.js';
+import { logger } from './logger.js';
+
+const REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
+
+export const requestId: RequestHandler = (req, res, next) => {
+  const incoming = req.header('x-request-id');
+  const id = incoming && REQUEST_ID.test(incoming) ? incoming : randomUUID();
+  res.locals.requestId = id;
+  res.setHeader('x-request-id', id);
+  next();
+};
+
+type AsyncRoute = (req: Request, res: Response, next: NextFunction) => Promise<unknown>;
+
+export function asyncHandler(handler: AsyncRoute): RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve()
+      .then(() => handler(req, res, next))
+      .catch(next);
+  };
+}
+
+export const notFound: RequestHandler = (req, _res, next) => {
+  next(new AppError('NOT_FOUND', 404, `Route not found: ${req.method} ${req.originalUrl}`));
+};
+
+export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  const requestId = String(res.locals.requestId ?? '');
+
+  if (err instanceof AppError) {
+    logger.warn({ err, requestId }, 'request failed');
+    res.status(err.status).json({
+      code: err.code,
+      message: err.message,
+      details: err.details ?? null,
+      requestId,
+    });
+    return;
+  }
+
+  if (err instanceof ZodError) {
+    logger.warn({ err, requestId }, 'validation failed');
+    res.status(400).json({
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request data',
+      details: err.issues,
+      requestId,
+    });
+    return;
+  }
+
+  logger.error({ err, requestId }, 'unhandled error');
+  res.status(500).json({
+    code: 'INTERNAL_ERROR',
+    message: 'Internal server error',
+    requestId,
+  });
+};
+```
+
+### 6. 更新 app.ts 与 server.ts
+
+`app.ts`：
+
+```ts
+import express from 'express';
+import type { Express } from 'express';
+import { errorHandler, notFound, requestId } from './common/middleware.js';
+
+export function createApp(): Express {
+  const app = express();
+
+  app.use(requestId);
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  app.use(notFound);
+  app.use(errorHandler);
+
+  return app;
+}
+```
+
+`server.ts`：
+
+```ts
+import { config } from './common/config.js';
+import { logger } from './common/logger.js';
+import { createApp } from './app.js';
+
+const app = createApp();
+
+app.listen(config.PORT, () => {
+  logger.info({ port: config.PORT }, 'API listening');
+});
+```
+
+### 7. 验收
+
+```bash
+curl -i -H "x-request-id: test-123" http://127.0.0.1:3000/health
+curl -i http://127.0.0.1:3000/nope
+JWT_SECRET=short pnpm exec tsx src/server.ts
+```
+
+预期：健康检查有 `x-request-id`；404 是 JSON；坏配置启动退出（`pnpm dev` 的 watch 父进程会驻留，验证用非 watch）。
+
+**产出**：commit `feat: unify config logging errors and trace`。
+
+---
+
+## Day 3：Prisma 模型与 seed
+
+**今天目标**：建核心领域表，生成 Prisma Client，写入管理员和普通用户。
+
+### 1. 安装
+
+在 `apps/api`：
+
+```bash
+pnpm add @prisma/client@6.19.3 argon2
+pnpm add -D prisma@6.19.3
+pnpm exec prisma init --datasource-provider mysql
+```
+
+> 必须锁 6.19.3。Prisma 的 `latest` 可能是 8 RC，且 7+ 移除了 schema 里的 `datasource.url`。
+
+### 2. schema.prisma
+
+`apps/api/prisma/schema.prisma`：
 
 ```prisma
 generator client {
@@ -83,51 +449,28 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum UserStatus {
-  active
-  banned
-  deleted
-}
-
-enum PostStatus {
-  draft
-  pending
-  published
-  rejected
-  deleted
-}
-
-enum CommentStatus {
-  pending
-  published
-  rejected
-  deleted
-}
-
-enum LikeTargetType {
-  post
-  comment
-}
+enum UserStatus { active banned deleted }
+enum PostStatus { draft pending published rejected deleted }
+enum CommentStatus { pending published rejected deleted }
+enum LikeTargetType { post comment }
 
 model User {
-  id           BigInt        @id @default(autoincrement())
-  email        String        @unique @db.VarChar(255)
-  passwordHash String        @map("password_hash") @db.VarChar(255)
-  nickname     String        @db.VarChar(64)
-  bio          String?       @db.VarChar(255)
-  avatarUrl    String?       @map("avatar_url") @db.VarChar(512)
-  status       UserStatus    @default(active)
-  createdAt    DateTime      @default(now()) @map("created_at")
-  updatedAt    DateTime      @updatedAt @map("updated_at")
-
+  id           BigInt     @id @default(autoincrement())
+  email        String     @unique @db.VarChar(255)
+  passwordHash String     @map("password_hash") @db.VarChar(255)
+  nickname     String     @db.VarChar(64)
+  bio          String?    @db.VarChar(255)
+  avatarUrl    String?    @map("avatar_url") @db.VarChar(512)
+  status       UserStatus @default(active)
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
   refreshTokens RefreshToken[]
   roles         UserRole[]
   posts         Post[]
   comments      Comment[]
   likes         Like[]
-  following     Follow[]      @relation("follower")
-  followers     Follow[]      @relation("followee")
-
+  following     Follow[]   @relation("follower")
+  followers     Follow[]   @relation("followee")
   @@index([createdAt])
   @@map("users")
 }
@@ -141,9 +484,7 @@ model RefreshToken {
   userAgent String?   @map("user_agent") @db.VarChar(255)
   ip        String?   @db.VarChar(64)
   createdAt DateTime  @default(now()) @map("created_at")
-
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-
   @@index([userId])
   @@map("refresh_tokens")
 }
@@ -152,7 +493,6 @@ model Role {
   id              BigInt           @id @default(autoincrement())
   code            String           @unique @db.VarChar(64)
   name            String           @db.VarChar(64)
-  createdAt       DateTime         @default(now()) @map("created_at")
   userRoles       UserRole[]
   rolePermissions RolePermission[]
   @@map("roles")
@@ -162,7 +502,6 @@ model Permission {
   id        BigInt           @id @default(autoincrement())
   code      String           @unique @db.VarChar(64)
   name      String           @db.VarChar(64)
-  createdAt DateTime         @default(now()) @map("created_at")
   roles     RolePermission[]
   @@map("permissions")
 }
@@ -173,7 +512,6 @@ model UserRole {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
   @@id([userId, roleId])
-  @@index([roleId])
   @@map("user_roles")
 }
 
@@ -183,7 +521,6 @@ model RolePermission {
   role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
   permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
   @@id([roleId, permissionId])
-  @@index([permissionId])
   @@map("role_permissions")
 }
 
@@ -198,10 +535,8 @@ model Post {
   createdAt    DateTime   @default(now()) @map("created_at")
   updatedAt    DateTime   @updatedAt @map("updated_at")
   deletedAt    DateTime?  @map("deleted_at")
-
   author       User       @relation(fields: [authorId], references: [id])
   comments     Comment[]
-
   @@index([authorId, createdAt])
   @@index([status, createdAt])
   @@map("posts")
@@ -214,15 +549,9 @@ model Comment {
   parentId  BigInt?       @map("parent_id")
   content   String        @db.VarChar(2000)
   status    CommentStatus @default(published)
-  likeCount Int           @default(0) @map("like_count")
   createdAt DateTime      @default(now()) @map("created_at")
-  deletedAt DateTime?     @map("deleted_at")
-
   post      Post          @relation(fields: [postId], references: [id], onDelete: Cascade)
   author    User          @relation(fields: [authorId], references: [id])
-  parent    Comment?      @relation("comment_replies", fields: [parentId], references: [id])
-  replies   Comment[]     @relation("comment_replies")
-
   @@index([postId, createdAt])
   @@map("comments")
 }
@@ -233,11 +562,8 @@ model Like {
   targetType LikeTargetType @map("target_type")
   targetId   BigInt         @map("target_id")
   createdAt  DateTime       @default(now()) @map("created_at")
-
   user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-
   @@unique([userId, targetType, targetId])
-  @@index([targetType, targetId])
   @@map("likes")
 }
 
@@ -245,19 +571,17 @@ model Follow {
   followerId BigInt   @map("follower_id")
   followeeId BigInt   @map("followee_id")
   createdAt  DateTime @default(now()) @map("created_at")
-
   follower   User     @relation("follower", fields: [followerId], references: [id], onDelete: Cascade)
   followee   User     @relation("followee", fields: [followeeId], references: [id], onDelete: Cascade)
-
   @@id([followerId, followeeId])
   @@index([followeeId])
   @@map("follows")
 }
 ```
 
-### 3. 写 db 单例
+### 3. db.ts
 
-路径：`apps/api/src/common/db.ts`：
+`apps/api/src/common/db.ts`：
 
 ```ts
 import { PrismaClient } from '@prisma/client';
@@ -277,9 +601,9 @@ if (config.NODE_ENV !== 'production') {
 }
 ```
 
-### 4. 写 seed
+### 4. seed.ts
 
-路径：`apps/api/prisma/seed.ts`：
+`apps/api/prisma/seed.ts`：
 
 ```ts
 import { PrismaClient } from '@prisma/client';
@@ -288,19 +612,13 @@ import argon2 from 'argon2';
 const prisma = new PrismaClient();
 
 async function main() {
-  const permissions = [
+  for (const item of [
     { code: 'admin:access', name: '访问后台' },
     { code: 'post:review', name: '审核帖子' },
     { code: 'report:handle', name: '处理举报' },
     { code: 'user:ban', name: '封禁用户' },
-  ];
-
-  for (const item of permissions) {
-    await prisma.permission.upsert({
-      where: { code: item.code },
-      update: { name: item.name },
-      create: item,
-    });
+  ]) {
+    await prisma.permission.upsert({ where: { code: item.code }, update: { name: item.name }, create: item });
   }
 
   const adminRole = await prisma.role.upsert({
@@ -316,12 +634,7 @@ async function main() {
 
   for (const permission of await prisma.permission.findMany()) {
     await prisma.rolePermission.upsert({
-      where: {
-        roleId_permissionId: {
-          roleId: adminRole.id,
-          permissionId: permission.id,
-        },
-      },
+      where: { roleId_permissionId: { roleId: adminRole.id, permissionId: permission.id } },
       update: {},
       create: { roleId: adminRole.id, permissionId: permission.id },
     });
@@ -337,6 +650,17 @@ async function main() {
     where: { userId_roleId: { userId: admin.id, roleId: adminRole.id } },
     update: {},
     create: { userId: admin.id, roleId: adminRole.id },
+  });
+
+  const user = await prisma.user.upsert({
+    where: { email: 'user@test.com' },
+    update: { passwordHash },
+    create: { email: 'user@test.com', passwordHash, nickname: 'User' },
+  });
+  await prisma.userRole.upsert({
+    where: { userId_roleId: { userId: user.id, roleId: userRole.id } },
+    update: {},
+    create: { userId: user.id, roleId: userRole.id },
   });
 
   console.log('Seed done');
@@ -360,62 +684,35 @@ main()
 }
 ```
 
-### 5. 执行迁移
+### 5. 迁移与验收
 
 ```bash
 pnpm --filter api exec prisma migrate dev --name init
 pnpm --filter api exec prisma db seed
 ```
 
-**验收**
-
-- `pnpm --filter api exec prisma migrate status` 正常
+- `prisma migrate status` 正常
 - Prisma Studio 能看到 users/roles/posts 等表
-- `admin@test.com` 存在并绑定 admin 角色
+- `admin@test.com` / `user@test.com` 存在
 
-**常见错误**
-
-- `11–15001`：MySQL 没起，先 `docker compose ps`。
-- `prisma` 版本装错：固定 `6.19.3`，不要裸装 latest。
-- `prisma db seed` 不执行：`package.json` 的 `prisma.seed` 没配。
-
-**产出**：commit `feat: add monorepo and prisma schema`。
-
-```bash
-git add .
-git commit -m "feat: add monorepo and prisma schema"
-```
+**产出**：commit `feat: add prisma schema and seed`。
 
 ---
 
-## Day 2：注册、登录、刷新、登出
+## Day 4：注册、登录、刷新、登出
 
 **今天目标**：完整认证闭环，refresh 轮换，旧 refresh 不能重放。
 
-### 1. 安装依赖
+### 1. 安装
 
 ```bash
 pnpm --filter api add jsonwebtoken cookie-parser cors
 pnpm --filter api add -D @types/jsonwebtoken @types/cookie-parser @types/cors
 ```
 
-`config.ts` 增加：
-
-```ts
-JWT_ACCESS_TTL: z.string().default('15m'),
-JWT_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(7),
-```
-
-`.env` 同步加：
-
-```ini
-JWT_ACCESS_TTL=15m
-JWT_REFRESH_TTL_DAYS=7
-```
-
 ### 2. token.service.ts
 
-路径：`apps/api/src/modules/auth/token.service.ts`：
+`apps/api/src/modules/auth/token.service.ts`：
 
 ```ts
 import { createHash, randomBytes } from 'node:crypto';
@@ -425,8 +722,8 @@ import { config } from '../../common/config.js';
 
 export type AccessPayload = { sub: string; roles: string[] };
 
-export function signAccessToken(payload: AccessPayload): string {
-  const expiresIn = config.JWT_ACCESS_TTL as SignOptions['expiresIn'];
+export function signAccessToken(payload: AccessPayload) {
+  const expiresIn = '15m' as SignOptions['expiresIn'];
   return jwt.sign(payload, config.JWT_SECRET, { expiresIn, algorithm: 'HS256' });
 }
 
@@ -444,7 +741,7 @@ export function createRefreshToken() {
   return { token, tokenHash: hashToken(token) };
 }
 
-export function hashToken(token: string): string {
+export function hashToken(token: string) {
   return createHash('sha256').update(token).digest('hex');
 }
 ```
@@ -467,7 +764,7 @@ export {};
 
 ### 3. auth.service.ts
 
-路径：`apps/api/src/modules/auth/auth.service.ts`：
+`apps/api/src/modules/auth/auth.service.ts`：
 
 ```ts
 import argon2 from 'argon2';
@@ -476,9 +773,7 @@ import { prisma } from '../../common/db.js';
 import { AppError } from '../../common/errors.js';
 import { createRefreshToken, hashToken, signAccessToken } from './token.service.js';
 
-function refreshExpiresAt() {
-  return new Date(Date.now() + config.JWT_REFRESH_TTL_DAYS * 86_400_000);
-}
+const refreshExpiresAt = () => new Date(Date.now() + config.JWT_REFRESH_TTL_DAYS * 86_400_000);
 
 export async function register(input: { email: string; password: string; nickname: string }) {
   const email = input.email.trim().toLowerCase();
@@ -491,9 +786,7 @@ export async function register(input: { email: string; password: string; nicknam
   if (!role) throw new AppError('ROLE_NOT_INITIALIZED', 500, 'Run seed first');
 
   const user = await prisma.$transaction(async (tx) => {
-    const created = await tx.user.create({
-      data: { email, passwordHash, nickname: input.nickname.trim() },
-    });
+    const created = await tx.user.create({ data: { email, passwordHash, nickname: input.nickname.trim() } });
     await tx.userRole.create({ data: { userId: created.id, roleId: role.id } });
     return created;
   });
@@ -536,7 +829,7 @@ export async function refresh(input: { refreshToken: string }) {
   const stored = await prisma.refreshToken.findUnique({
     where: { tokenHash: hashToken(input.refreshToken) },
   });
-  if (!stored) throw new AppError('INVALID_REFRESH_TOKEN', 401, 'Refresh token is invalid');
+  if (!stored) throw new AppError('INVALID_REFRESH_TOKEN', 401, 'Refresh token invalid');
   if (stored.revokedAt) {
     await prisma.refreshToken.updateMany({
       where: { userId: stored.userId, revokedAt: null },
@@ -583,9 +876,9 @@ export async function logout(refreshToken: string) {
 }
 ```
 
-### 4. auth.controller.ts 与 routes
+### 4. controller 与 routes
 
-路径：`apps/api/src/modules/auth/auth.controller.ts`：
+`apps/api/src/modules/auth/auth.controller.ts`：
 
 ```ts
 import type { Request, Response } from 'express';
@@ -593,10 +886,10 @@ import { config } from '../../common/config.js';
 import { AppError } from '../../common/errors.js';
 import { login, logout, refresh, register } from './auth.service.js';
 
-const REFRESH_COOKIE = 'refresh_token';
+const COOKIE = 'refresh_token';
 
-function setRefreshCookie(res: Response, token: string) {
-  res.cookie(REFRESH_COOKIE, token, {
+function setCookie(res: Response, token: string) {
+  res.cookie(COOKIE, token, {
     httpOnly: true,
     sameSite: 'lax',
     secure: config.NODE_ENV === 'production',
@@ -611,27 +904,27 @@ export async function registerHandler(req: Request, res: Response) {
 
 export async function loginHandler(req: Request, res: Response) {
   const result = await login({ ...req.body, userAgent: req.header('user-agent'), ip: req.ip });
-  setRefreshCookie(res, result.refreshToken);
+  setCookie(res, result.refreshToken);
   res.status(200).json({ accessToken: result.accessToken, user: result.user });
 }
 
 export async function refreshHandler(req: Request, res: Response) {
-  const refreshToken = req.cookies[REFRESH_COOKIE] ?? req.body?.refreshToken;
-  if (!refreshToken) throw new AppError('REFRESH_TOKEN_REQUIRED', 401, 'Refresh token required');
-  const result = await refresh({ refreshToken });
-  setRefreshCookie(res, result.refreshToken);
+  const token = req.cookies[COOKIE] ?? req.body?.refreshToken;
+  if (!token) throw new AppError('REFRESH_TOKEN_REQUIRED', 401, 'Refresh token required');
+  const result = await refresh({ refreshToken: token });
+  setCookie(res, result.refreshToken);
   res.status(200).json({ accessToken: result.accessToken });
 }
 
 export async function logoutHandler(req: Request, res: Response) {
-  const refreshToken = req.cookies[REFRESH_COOKIE] ?? req.body?.refreshToken;
-  if (refreshToken) await logout(refreshToken);
-  res.clearCookie(REFRESH_COOKIE, { path: '/api/v1/auth' });
+  const token = req.cookies[COOKIE] ?? req.body?.refreshToken;
+  if (token) await logout(token);
+  res.clearCookie(COOKIE, { path: '/api/v1/auth' });
   res.status(204).send();
 }
 ```
 
-路径：`apps/api/src/modules/auth/auth.routes.ts`：
+`apps/api/src/modules/auth/auth.routes.ts`：
 
 ```ts
 import { Router } from 'express';
@@ -639,16 +932,15 @@ import { asyncHandler } from '../../common/middleware.js';
 import { loginHandler, logoutHandler, refreshHandler, registerHandler } from './auth.controller.js';
 
 export const authRouter = Router();
-
 authRouter.post('/register', asyncHandler(registerHandler));
 authRouter.post('/login', asyncHandler(loginHandler));
 authRouter.post('/refresh', asyncHandler(refreshHandler));
 authRouter.post('/logout', asyncHandler(logoutHandler));
 ```
 
-### 5. 写 common/auth.ts
+### 5. common/auth.ts
 
-路径：`apps/api/src/common/auth.ts`：
+`apps/api/src/common/auth.ts`：
 
 ```ts
 import type { RequestHandler } from 'express';
@@ -658,11 +950,7 @@ import { AppError } from './errors.js';
 export const requireAuth: RequestHandler = (req, _res, next) => {
   const header = req.header('authorization');
   const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
-  if (!token) {
-    next(new AppError('UNAUTHORIZED', 401, 'Authentication required'));
-    return;
-  }
-
+  if (!token) return next(new AppError('UNAUTHORIZED', 401, 'Authentication required'));
   try {
     req.user = verifyAccessToken(token);
     next();
@@ -674,21 +962,17 @@ export const requireAuth: RequestHandler = (req, _res, next) => {
 export const optionalAuth: RequestHandler = (req, _res, next) => {
   const header = req.header('authorization');
   const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
-  if (!token) {
-    next();
-    return;
-  }
-
+  if (!token) return next();
   try {
     req.user = verifyAccessToken(token);
   } catch {
-    // 匿名请求也允许继续；需要登录的接口由 requireAuth 拦截
+    // 匿名请求继续；需要登录的接口由 requireAuth 拦截
   }
   next();
 };
 ```
 
-`app.ts` 挂载：
+### 6. app.ts 挂载
 
 ```ts
 import cookieParser from 'cookie-parser';
@@ -701,7 +985,7 @@ app.use(cookieParser());
 app.use('/api/v1/auth', authRouter);
 ```
 
-### 5. 验收
+### 7. 验收
 
 ```bash
 curl -i -X POST http://127.0.0.1:3000/api/v1/auth/register \
@@ -715,25 +999,19 @@ curl -i -c /tmp/cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/login \
 curl -i -b /tmp/cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/refresh
 ```
 
-预期：注册 201、登录 200、刷新 200；旧 refresh 重放 401。
-
-**常见错误**
-
-- Cookie 收不到：`path` 必须是 `/api/v1/auth`。
-- 401：`JWT_SECRET` 不一致或 token 过期。
-- CORS：前端带 Cookie 时 `credentials: true` + 明确 origin。
+注册 201、登录 200、刷新 200；旧 refresh 重放 401。
 
 **产出**：commit `feat: add auth with refresh rotation`。
 
 ---
 
-## Day 3：发帖、帖子列表、详情
+## Day 5：发帖、关注、feed
 
-**今天目标**：登录用户能发帖，列表只显示 published，作者能看自己的 pending。
+**今天目标**：登录用户能发帖；列表只显示 published；关注后 feed 能看到对方帖子。
 
-### 1. posts.service.ts
+### 1. posts 模块
 
-路径：`apps/api/src/modules/posts/posts.service.ts`：
+`apps/api/src/modules/posts/posts.service.ts`：
 
 ```ts
 import type { Prisma } from '@prisma/client';
@@ -747,9 +1025,11 @@ const select = {
 
 type PostRow = Prisma.PostGetPayload<{ select: typeof select }>;
 
-function toPost(post: PostRow) {
-  return { ...post, id: post.id.toString(), authorId: post.authorId.toString() };
-}
+const toPost = (post: PostRow) => ({
+  ...post,
+  id: post.id.toString(),
+  authorId: post.authorId.toString(),
+});
 
 export async function createPost(authorId: bigint, input: { title?: string; content: string }) {
   const post = await prisma.post.create({
@@ -779,31 +1059,24 @@ export async function getPost(id: bigint, viewerId?: bigint) {
 }
 ```
 
-### 2. posts.routes.ts
-
-路径：`apps/api/src/modules/posts/posts.routes.ts`：
+`apps/api/src/modules/posts/posts.routes.ts`：
 
 ```ts
 import { Router } from 'express';
 import { optionalAuth, requireAuth } from '../../common/auth.js';
 import { asyncHandler } from '../../common/middleware.js';
-import { AppError } from '../../common/errors.js';
 import { createPost, getPost, listPublishedPosts } from './posts.service.js';
 
 export const postsRouter = Router();
 
-function userId(req: { user?: { sub: string } }) {
-  if (!req.user) throw new AppError('UNAUTHORIZED', 401, 'Authentication required');
-  return BigInt(req.user.sub);
-}
+const userId = (req: { user?: { sub: string } }) => BigInt(req.user!.sub);
 
 postsRouter.get('/', asyncHandler(async (_req, res) => {
   res.json({ items: await listPublishedPosts() });
 }));
 
 postsRouter.get('/:id', optionalAuth, asyncHandler(async (req, res) => {
-  const id = BigInt(req.params.id ?? '');
-  res.json(await getPost(id, req.user ? userId(req) : undefined));
+  res.json(await getPost(BigInt(req.params.id ?? ''), req.user ? userId(req) : undefined));
 }));
 
 postsRouter.post('/', requireAuth, asyncHandler(async (req, res) => {
@@ -811,47 +1084,18 @@ postsRouter.post('/', requireAuth, asyncHandler(async (req, res) => {
 }));
 ```
 
-`app.ts` 挂载：
+### 2. 关注
 
-```ts
-import { postsRouter } from './modules/posts/posts.routes.js';
-app.use('/api/v1/posts', postsRouter);
-```
-
-### 3. 验收
-
-```bash
-curl -i -X POST http://127.0.0.1:3000/api/v1/posts \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"title":"第一条","content":"hello"}'
-```
-
-预期：201，`status: pending`。列表看不到 pending；作者带 token 能看详情。
-
-**产出**：commit `feat: add posts`。
-
----
-
-## Day 4：关注关系与关注流
-
-**今天目标**：关注/取关幂等，feed 游标分页不重不漏。
-
-### 1. users 关注接口
-
-路径：`apps/api/src/modules/users/users.service.ts`：
+`apps/api/src/modules/users/users.service.ts`：
 
 ```ts
 import { prisma } from '../../common/db.js';
 import { AppError } from '../../common/errors.js';
 
 export async function follow(followerId: bigint, followeeId: bigint) {
-  if (followerId === followeeId) {
-    throw new AppError('CANNOT_FOLLOW_SELF', 400, 'You cannot follow yourself');
-  }
+  if (followerId === followeeId) throw new AppError('CANNOT_FOLLOW_SELF', 400, 'Cannot follow yourself');
   const target = await prisma.user.findUnique({ where: { id: followeeId } });
   if (!target || target.status !== 'active') throw new AppError('USER_NOT_FOUND', 404, 'User not found');
-
   const result = await prisma.follow.createMany({
     data: [{ followerId, followeeId }],
     skipDuplicates: true,
@@ -865,7 +1109,7 @@ export async function unfollow(followerId: bigint, followeeId: bigint) {
 }
 ```
 
-路由 `apps/api/src/modules/users/users.routes.ts`：
+`apps/api/src/modules/users/users.routes.ts`：
 
 ```ts
 import { Router } from 'express';
@@ -885,9 +1129,9 @@ usersRouter.delete('/:id/follow', asyncHandler(async (req, res) => {
 }));
 ```
 
-### 2. feed.repository.ts
+### 3. feed
 
-路径：`apps/api/src/modules/feed/feed.repository.ts`：
+`apps/api/src/modules/feed/feed.repository.ts`：
 
 ```ts
 import { Prisma } from '@prisma/client';
@@ -929,9 +1173,7 @@ export async function findFollowingFeed(input: {
 }
 ```
 
-### 3. feed.routes.ts
-
-路径：`apps/api/src/modules/feed/feed.routes.ts`：
+`apps/api/src/modules/feed/feed.routes.ts`：
 
 ```ts
 import { Router } from 'express';
@@ -944,19 +1186,25 @@ export const feedRouter = Router();
 feedRouter.get('/', requireAuth, asyncHandler(async (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 20), 50);
   const rows = await findFollowingFeed({ userId: BigInt(req.user!.sub), limit });
-  res.json({ items: rows.slice(0, limit).map((row) => ({
-    ...row,
-    id: String(row.id),
-    author_id: String(row.author_id),
-  })), nextCursor: rows.length > limit ? String(rows[limit - 1]?.created_at) : null });
+  res.json({
+    items: rows.slice(0, limit).map((row) => ({
+      ...row,
+      id: String(row.id),
+      author_id: String(row.author_id),
+    })),
+    nextCursor: rows.length > limit ? String(rows[limit - 1]?.created_at) : null,
+  });
 }));
 ```
 
 `app.ts` 挂载：
 
 ```ts
+import { postsRouter } from './modules/posts/posts.routes.js';
 import { usersRouter } from './modules/users/users.routes.js';
 import { feedRouter } from './modules/feed/feed.routes.js';
+
+app.use('/api/v1/posts', postsRouter);
 app.use('/api/v1/users', usersRouter);
 app.use('/api/v1/feed', feedRouter);
 ```
@@ -964,7 +1212,7 @@ app.use('/api/v1/feed', feedRouter);
 ### 4. 验收
 
 1. 用 `admin@test.com` 发一条帖子，Prisma Studio 改成 `published`。
-2. 用 `a@test.com` 关注 admin。
+2. 用 `a@test.com` 登录，关注 admin。
 3. 请求 feed：
 
 ```bash
@@ -974,76 +1222,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 预期：能看到 admin 的 published 帖子；重复关注只一行；关注自己 400。
 
-**产出**：commit `feat: add follow and following feed`。
+### 5. 01–05 完成标准
 
----
-
-## Day 5：Docker Compose 与端到端验收
-
-**今天目标**：一条命令起 MySQL/Redis/API，完整跑通注册→登录→发帖→feed。
-
-### 1. 写 docker-compose
-
-路径：`infra/docker/docker-compose.yml`：
-
-```yaml
-services:
-  mysql:
-    image: mysql:8.0
-    container_name: community-mysql
-    environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: community
-    ports: ["3306:3306"]
-    volumes: ["mysql-data:/var/lib/mysql"]
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    container_name: community-redis
-    ports: ["6379:6379"]
-    volumes: ["redis-data:/data"]
-
-volumes:
-  mysql-data:
-  redis-data:
-```
-
-01–05 只把 MySQL/Redis 放进 Compose；API 本地跑。多阶段 Dockerfile 在 16–18 再做。
-
-### 2. 启动与验收
-
-```bash
-cp .env.example .env
-docker compose -f infra/docker/docker-compose.yml up -d
-pnpm --filter api exec prisma migrate deploy
-pnpm --filter api exec prisma db seed
-pnpm dev:api
-```
-
-完整验收：
-
-```bash
-curl -i http://127.0.0.1:3000/health
-curl -i -X POST http://127.0.0.1:3000/api/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email":"a@test.com","password":"Passw0rd!","nickname":"A"}'
-```
-
-01–05 完成标准：
-
-- [ ] monorepo 下 `pnpm --filter api typecheck` 通过
+- [ ] 空目录能起 monorepo + Express `/health`
+- [ ] 配置坏值启动失败；404 是 JSON；日志有 requestId
+- [ ] Prisma 迁移/种子成功
 - [ ] 注册/登录/刷新/登出闭环
-- [ ] 发帖 pending、列表只显示 published
-- [ ] 关注/取关幂等
-- [ ] feed 能返回关注对象的 published 帖子
-- [ ] Docker Compose 后 MySQL/Redis/API 可用
-- [ ] 至少 5 个 commit，每天一个
+- [ ] 发帖 pending；列表只显示 published
+- [ ] 关注幂等；feed 能返回关注对象的帖子
+- [ ] 每天一个 commit
 
-**产出**：commit `feat: dockerize api and verify p0a`。
+**产出**：commit `feat: add posts follow and feed`。
 
 下一步：[后端 06–10](/blog/posts/node-roadmap-19-community-week-2/)，补评论、点赞、通知、SSE、OpenAPI 和 CI。
