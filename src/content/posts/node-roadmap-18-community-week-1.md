@@ -15,7 +15,7 @@ draft: false
 
 这 5 天按顺序做：Day 1 起服务，Day 2 配置/日志/错误，Day 3 Prisma，Day 4 认证，Day 5 发帖和 feed。做完一天就提交一次，出问题好回退。
 
-我本地是 Node 24 + pnpm 12，下面的命令在 Git Bash 里跑过；PowerShell 需要把环境变量写法换一下。
+我本地是 Node 24 + pnpm 12，下面的命令在 Git Bash 里跑过；PowerShell 不只要改环境变量，`mkdir -p`、`cp`、`curl -i` 这些写法也不一样。建议直接开 Git Bash 跑；只用 PowerShell 的话，下面会标出等价写法。
 
 ---
 
@@ -33,6 +33,11 @@ cd community
 mkdir -p apps/api/src packages/shared/src infra/docker
 pnpm init
 ```
+
+> [!TIP]
+> PowerShell 里的 `mkdir` 是 `New-Item` 的别名，不支持 `-p`，也不能一次接多个路径。等价命令：
+> `New-Item -ItemType Directory -Force -Path apps/api/src, packages/shared/src, infra/docker`
+> 后面的 `cp` 用 `Copy-Item`，`curl -i` 用 `curl.exe -i`。
 
 根 `package.json` 改成：
 
