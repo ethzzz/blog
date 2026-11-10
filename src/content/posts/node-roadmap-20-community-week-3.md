@@ -1,115 +1,222 @@
 ---
-title: '后端 P1：NestJS 管理/BFF 与异步治理'
+title: '后端 11–15：NestJS 管理/BFF 与异步治理'
 published: 2026-11-10T10:40:00+08:00
 updated: 2026-11-10T10:40:00+08:00
-description: '后端第三阶段：用 NestJS 12 做管理/BFF，补审核、举报、用户管理、审计、RabbitMQ 事件和 OpenTelemetry 可观测性。'
+description: 'Day 11–15：NestJS 管理/BFF、Guard/Pipe/Interceptor/Filter/Swagger、审核举报、RabbitMQ 事件和 OpenTelemetry 可观测性。'
 tags: [社区全栈, 后端, NestJS, RabbitMQ]
 category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 后端 P1。上一篇：[后端 P0b](/blog/posts/node-roadmap-19-community-week-2/)；下一篇：[后端 P2a](/blog/posts/node-roadmap-21-community-week-4/)；前端对应篇：[前端 P1](/blog/posts/community-fullstack-fe-03-p1-admin/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
+> 后端 11–15。上一篇：[后端 06–10](/blog/posts/node-roadmap-19-community-week-2/)；下一篇：[后端 16–18](/blog/posts/node-roadmap-21-community-week-4/)；前端对应篇：[前端 07–09](/blog/posts/community-fullstack-fe-03-p1-admin/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-P0b 之后公共 API 已经完整。P1 用 NestJS 做**管理/BFF**，把审核、举报、用户管理、审计和看板接起来，同时补 RabbitMQ 和可观测性。NestJS 只占后端约 1/3，不重写公共 API。
-
----
-
-## 1. 目标与范围
-
-- 新增 `apps/admin-api`（NestJS 12）。
-- 审核帖子/评论、处理举报、封禁/解封用户、Dashboard、审计。
-- RabbitMQ 消费 `post.created` / `report.created`。
-- OpenTelemetry + Prometheus/Grafana + Sentry。
-- Playwright E2E + Testcontainers 集成测试。
+06–10 之后公共 API 已完整。11–15 用 NestJS 做管理/BFF，补审核、举报、用户管理、审计、RabbitMQ 和可观测性。NestJS 只做管理端，不重写公共 API。
 
 ---
 
-## 2. 先做兼容性 spike
+## Day 11：NestJS 脚手架与兼容性 spike
 
-NestJS 依赖装饰器和 `emitDecoratorMetadata`。当前项目用 TypeScript 7，`nest-cli` 对 TS 7 的 programmatic API 支持需要先验证：
+**今天目标**：`apps/admin-api` 能启动，Prisma + Swagger + 一个 Guard 能跑。
+
+### 1. 创建应用
 
 ```bash
 pnpm dlx @nestjs/cli@12 new admin-api --package-manager pnpm --skip-git
+mv admin-api apps/admin-api
 ```
 
-验证三件事：
+先验证 TypeScript 7 兼容性：
 
-1. `nest build` / `nest start` 能跑。
-2. Prisma + Swagger + 一个 Guard 能正常注入。
-3. ESM/装饰器没有运行时错误。
-
-不兼容时的回退：`admin-api` 单独用 SWC 构建或 TS 5.9，`apps/api` 继续 TS 7。
-
----
-
-## 3. 目录与模块
-
-```text
-apps/admin-api/src/
-  main.ts
-  app.module.ts
-  common/
-    guards/jwt-auth.guard.ts
-    guards/permissions.guard.ts
-    decorators/permissions.decorator.ts
-    pipes/zod-validation.pipe.ts
-    interceptors/trace.interceptor.ts
-    filters/http-exception.filter.ts
-    clients/api-client.ts
-    prisma/prisma.module.ts
-  modules/
-    auth/
-    dashboard/
-    moderation/
-    reports/
-    admin-users/
-    audit/
-    events/
-    health/
-    metrics/
+```bash
+cd apps/admin-api
+pnpm build
+pnpm start
 ```
 
-模块职责：
+如果 `nest build` 对 TS 7 报错，改用 SWC 构建或让 `admin-api` 单独使用 TS 5.9；`apps/api` 继续 TS 7。
 
-| 模块 | 接口 |
-|---|---|
-| `auth` | JWT 验签、权限装饰器 |
-| `dashboard` | `GET /admin/dashboard/stats` |
-| `moderation` | `GET /admin/posts`、`approve/reject` |
-| `reports` | `GET /admin/reports`、`resolve` |
-| `admin-users` | `GET /admin/users`、`ban/unban` |
-| `audit` | `GET /admin/audit-logs` |
-| `events` | RabbitMQ 消费者 |
-| `health`/`metrics` | Terminus / prom-client |
+### 2. 安装依赖
 
----
+```bash
+pnpm --filter admin-api add @nestjs/config @nestjs/swagger @nestjs/jwt @nestjs/passport passport-jwt @nestjs/throttler @nestjs/terminus @nestjs/microservices amqplib @prisma/client
+pnpm --filter admin-api add -D prisma @types/passport-jwt @types/amqplib
+```
 
-## 4. 关键 NestJS 写法
+### 3. Prisma：治理库
 
-Guard + 自定义装饰器：
+`apps/admin-api/prisma/schema.prisma`：
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("ADMIN_DATABASE_URL")
+}
+
+enum ReportStatus {
+  pending
+  resolved
+  rejected
+}
+
+model Report {
+  id        BigInt       @id @default(autoincrement())
+  targetType String      @map("target_type") @db.VarChar(32)
+  targetId  BigInt       @map("target_id")
+  reason    String       @db.VarChar(255)
+  status    ReportStatus @default(pending)
+  handledBy BigInt?      @map("handled_by")
+  createdAt DateTime     @default(now()) @map("created_at")
+  @@index([status, createdAt])
+  @@map("reports")
+}
+
+model ModerationRecord {
+  id         BigInt   @id @default(autoincrement())
+  targetType String   @map("target_type") @db.VarChar(32)
+  targetId   BigInt   @map("target_id")
+  action     String   @db.VarChar(32)
+  operatorId BigInt   @map("operator_id")
+  reason     String?  @db.VarChar(255)
+  createdAt  DateTime @default(now()) @map("created_at")
+  @@index([targetType, targetId])
+  @@map("moderation_records")
+}
+
+model ProcessedEvent {
+  eventId    String   @id @map("event_id") @db.VarChar(64)
+  createdAt  DateTime @default(now()) @map("created_at")
+  @@map("processed_events")
+}
+```
+
+```bash
+pnpm --filter admin-api exec prisma migrate dev --name init_admin
+```
+
+### 4. AppModule + PrismaModule
+
+`src/prisma/prisma.module.ts`：
 
 ```ts
+import { Global, Module } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+
+@Global()
+@Module({
+  providers: [{ provide: PrismaClient, useFactory: () => new PrismaClient() }],
+  exports: [PrismaClient],
+})
+export class PrismaModule {}
+```
+
+`src/app.module.ts`：
+
+```ts
+import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { PrismaModule } from './prisma/prisma.module';
+
+@Module({
+  imports: [ConfigModule.forRoot({ isGlobal: true }), PrismaModule],
+})
+export class AppModule {}
+```
+
+`src/main.ts`：
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.setGlobalPrefix('api/v1');
+  await app.listen(Number(process.env.ADMIN_PORT ?? 3001));
+}
+void bootstrap();
+```
+
+**验收**：`pnpm --filter admin-api start` 后 `GET http://127.0.0.1:3001/api/v1/health` 返回 200（Day 12 加 health）。
+
+**产出**：commit `feat: bootstrap nestjs admin api`。
+
+---
+
+## Day 12：Guard、Pipe、Interceptor、Filter、Swagger
+
+**今天目标**：管理接口有统一鉴权、校验、错误和文档。
+
+### 1. 权限装饰器与 Guard
+
+`src/common/decorators/permissions.decorator.ts`：
+
+```ts
+import { SetMetadata } from '@nestjs/common';
+export const PERMISSIONS_KEY = 'permissions';
+export const RequirePermissions = (...permissions: string[]) =>
+  SetMetadata(PERMISSIONS_KEY, permissions);
+```
+
+`src/common/guards/jwt-auth.guard.ts`：
+
+```ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import jwt from 'jsonwebtoken';
+
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  canActivate(context: ExecutionContext) {
+    const request = context.switchToHttp().getRequest();
+    const header = request.headers.authorization;
+    const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
+    if (!token) throw new UnauthorizedException('Authentication required');
+    request.user = jwt.verify(token, process.env.JWT_SECRET!);
+    return true;
+  }
+}
+```
+
+`src/common/guards/permissions.guard.ts`：
+
+```ts
+import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { PERMISSIONS_KEY } from '../decorators/permissions.decorator';
+
 @Injectable()
 export class PermissionsGuard implements CanActivate {
   constructor(private readonly reflector: Reflector) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  canActivate(context: ExecutionContext) {
     const required = this.reflector.getAllAndOverride<string[]>(PERMISSIONS_KEY, [
       context.getHandler(),
       context.getClass(),
     ]) ?? [];
     const user = context.switchToHttp().getRequest().user;
-    return required.every((permission) => user?.permissions?.includes(permission));
+    const granted = user?.permissions ?? [];
+    if (!required.every((permission) => granted.includes(permission))) {
+      throw new ForbiddenException('Permission denied');
+    }
+    return true;
   }
 }
 ```
 
-Zod Pipe：
+> Access token 里要带 `permissions`。公共 API 登签发 token 时补上；或者管理端调用内部接口拿权限。短 TTL + 重新登录即可生效。
+
+### 2. Zod Pipe
 
 ```ts
+import { Injectable, PipeTransform } from '@nestjs/common';
+import type { ZodType } from 'zod';
+
 @Injectable()
-export class ZodValidationPipe implements PipeTransform {
+export class ZodPipe implements PipeTransform {
   constructor(private readonly schema: ZodType) {}
   transform(value: unknown) {
     return this.schema.parse(value);
@@ -117,88 +224,277 @@ export class ZodValidationPipe implements PipeTransform {
 }
 ```
 
-统一异常：
+### 3. 统一异常与 trace
 
 ```ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException } from '@nestjs/common';
+
 @Catch()
-export class HttpExceptionFilter implements ExceptionFilter {
+export class AllExceptionsFilter implements ExceptionFilter {
   catch(error: unknown, host: ArgumentsHost) {
-    const res = host.switchToHttp().getResponse();
+    const response = host.switchToHttp().getResponse();
     const status = error instanceof HttpException ? error.getStatus() : 500;
-    res.status(status).json({
+    response.status(status).json({
       code: error instanceof HttpException ? error.name : 'INTERNAL_ERROR',
       message: error instanceof Error ? error.message : 'Internal error',
-      requestId: res.locals.requestId,
+      requestId: response.locals.requestId,
     });
   }
 }
 ```
 
-Interceptor 记录耗时/traceId，Filter 统一错误 JSON；Swagger 用 `@nestjs/swagger` 自动生成。
-
----
-
-## 5. 数据归属与内部 API
-
-- 管理端拥有 `moderation_records`、`admin_audit_logs`。
-- 帖子/用户数据在公共 API；管理端通过内部 API 读取/修改。
-- 内部接口用 `X-Internal-Token`，不暴露公网。
-- 审核通过：管理端写审计 + 调 `POST /internal/posts/:id/status`；公共 API 更新状态并发 `post.published`。
-
-如果时间紧张，允许共享 MySQL，但保留 Prisma schema 边界和内部接口契约。
-
----
-
-## 6. RabbitMQ 消费者
-
-NestJS 微服务消费者：
+`main.ts` 注册：
 
 ```ts
-@Controller()
-export class ModerationEventsController {
-  constructor(private readonly dashboard: DashboardService) {}
+app.useGlobalFilters(new AllExceptionsFilter());
+```
 
-  @EventPattern('post.created')
-  async onPostCreated(payload: { postId: string }) {
-    await this.dashboard.invalidatePendingCount();
+### 4. Swagger
+
+```ts
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+
+const config = new DocumentBuilder()
+  .setTitle('Community Admin API')
+  .setVersion('1.0')
+  .addBearerAuth()
+  .build();
+SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, config));
+```
+
+**验收**：`/docs` 可打开；无 token 请求 401；普通用户 403。
+
+**产出**：commit `feat: add nest guards pipes filters swagger`。
+
+---
+
+## Day 13：审核、举报、用户、审计、Dashboard
+
+**今天目标**：管理端能审核帖子、处理举报、封禁用户，并写审计。
+
+### 1. 内部 API 客户端
+
+`src/common/clients/api-client.ts`：
+
+```ts
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class ApiClient {
+  private readonly base = process.env.API_INTERNAL_URL ?? 'http://127.0.0.1:3000';
+  private readonly token = process.env.INTERNAL_API_TOKEN ?? '';
+
+  private async request(path: string, init: RequestInit = {}) {
+    const response = await fetch(`${this.base}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Token': this.token,
+        ...init.headers,
+      },
+    });
+    if (!response.ok) throw new Error(`internal api ${response.status}`);
+    return response.json();
+  }
+
+  listPosts(status: string) {
+    return this.request(`/internal/posts?status=${status}`);
+  }
+
+  setPostStatus(id: string, status: string) {
+    return this.request(`/internal/posts/${id}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    });
+  }
+
+  listReports(status: string) {
+    return this.request(`/internal/reports?status=${status}`);
+  }
+
+  resolveReport(id: string) {
+    return this.request(`/internal/reports/${id}/resolve`, { method: 'POST' });
   }
 }
 ```
 
-- 消费者维护 `processed_events(event_id unique)` 做幂等。
-- traceparent 从 message header 继续传播。
-- P1 先做一条事件闭环（`post.created`），不要一次接所有事件。
+公共 API 需要提供这些内部接口，并用 `INTERNAL_API_TOKEN` 校验。
+
+### 2. ModerationService
+
+```ts
+@Injectable()
+export class ModerationService {
+  constructor(private readonly prisma: PrismaClient, private readonly api: ApiClient) {}
+
+  listPendingPosts() {
+    return this.api.listPosts('pending');
+  }
+
+  async approve(postId: string, operatorId: bigint) {
+    await this.api.setPostStatus(postId, 'published');
+    await this.prisma.moderationRecord.create({
+      data: { targetType: 'post', targetId: BigInt(postId), action: 'approve', operatorId },
+    });
+  }
+
+  async reject(postId: string, operatorId: bigint, reason?: string) {
+    await this.api.setPostStatus(postId, 'rejected');
+    await this.prisma.moderationRecord.create({
+      data: { targetType: 'post', targetId: BigInt(postId), action: 'reject', operatorId, reason },
+    });
+  }
+}
+```
+
+控制器：
+
+```ts
+@Controller('admin/posts')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+@RequirePermissions('post:review')
+export class ModerationController {
+  constructor(private readonly service: ModerationService) {}
+
+  @Get()
+  list() { return this.service.listPendingPosts(); }
+
+  @Post(':id/approve')
+  approve(@Param('id') id: string, @Req() req: any) {
+    return this.service.approve(id, BigInt(req.user.sub));
+  }
+
+  @Post(':id/reject')
+  reject(@Param('id') id: string, @Req() req: any) {
+    return this.service.reject(id, BigInt(req.user.sub));
+  }
+}
+```
+
+### 3. 举报、用户、审计、Dashboard
+
+- `ReportsController`：`GET /admin/reports`、`POST /admin/reports/:id/resolve`，写 `moderation_records`。
+- `AdminUsersController`：`GET /admin/users`、`POST /admin/users/:id/ban|unban`，调用内部 API。
+- `AuditController`：`GET /admin/audit-logs`，只读。
+- `DashboardController`：`GET /admin/dashboard/stats`，聚合待审核/举报/用户/帖子。
+
+**验收**：管理端审核通过后 feed 出现；拒绝后不出现；每次操作有审计记录。
+
+**产出**：commit `feat: add moderation reports users audit`。
 
 ---
 
-## 7. 可观测性
+## Day 14：RabbitMQ 事件总线
 
-- OpenTelemetry SDK：HTTP + RabbitMQ instrumentation。
-- Prometheus：HTTP 耗时、错误率、队列积压、outbox 延迟。
-- Grafana：至少两张面板（API 延迟/错误率、队列/outbox）。
-- Sentry：管理端错误 + release/environment 标签。
+**今天目标**：管理端消费 `post.created` / `report.created`，消费幂等。
+
+### 1. 安装与连接
+
+```bash
+pnpm --filter admin-api add @nestjs/microservices amqplib amqp-connection-manager
+```
+
+`main.ts` 连接 RabbitMQ：
+
+```ts
+app.connectMicroservice({
+  transport: Transport.RMQ,
+  options: {
+    urls: [process.env.RABBITMQ_URL ?? 'amqp://127.0.0.1:5672'],
+    queue: 'admin.events',
+    queueOptions: { durable: true },
+  },
+});
+await app.startAllMicroservices();
+```
+
+### 2. 消费者
+
+```ts
+@Controller()
+export class EventsController {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly dashboard: DashboardService,
+  ) {}
+
+  @EventPattern('post.created')
+  async onPostCreated(payload: { eventId: string }) {
+    const processed = await this.prisma.processedEvent.findUnique({
+      where: { eventId: payload.eventId },
+    });
+    if (processed) return;
+
+    await this.prisma.processedEvent.create({ data: { eventId: payload.eventId } });
+    await this.dashboard.invalidate();
+  }
+}
+```
+
+公共 API 的 outbox worker 把 `post.created` / `report.created` 发到 RabbitMQ exchange；站内通知仍走 BullMQ。
+
+**验收**：发一条帖子后，管理端 `processed_events` 多一条；重复投递不重复处理；trace 能串起来（Day 15）。
+
+**产出**：commit `feat: add rabbitmq admin consumer`。
 
 ---
 
-## 8. 验收清单
+## Day 15：OpenTelemetry、指标、E2E 与验收
 
-- [ ] 管理端可审核帖子、处理举报、封禁用户
-- [ ] 审核通过后 feed 出现，拒绝后不出现
-- [ ] 每次审核写 `moderation_records` / `admin_audit_logs`
-- [ ] 普通用户访问管理接口 403
-- [ ] `post.created` 事件能被 RabbitMQ 消费
-- [ ] 一条请求的 trace 能从 web/api 追到 admin-api/消费者
-- [ ] Grafana 有延迟/错误率/队列面板；Sentry 收到错误
-- [ ] Playwright / Testcontainers 测试通过
+**今天目标**：trace 跨服务、Grafana 有面板、Sentry 有错误、管理端 E2E 通过。
 
----
+### 1. OpenTelemetry
 
-## 9. 常见坑
+```bash
+pnpm --filter admin-api add @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node @opentelemetry/exporter-trace-otlp-http
+```
 
-- **TS 7 / nest-cli**：先 spike，不兼容就 SWC 或 TS 5.9。
-- **装饰器元数据**：`experimentalDecorators` / `emitDecoratorMetadata` 要开。
-- **权限只信 JWT**：权限变更要短 TTL 或重新签发。
-- **跨服务直接改表**：管理端只走内部 API。
-- **RabbitMQ 重复消费**：`event_id` 唯一键，不要只靠内存去重。
+`src/otel.ts`：
 
-下一步：[后端 P2a](/blog/posts/node-roadmap-21-community-week-4/)，做 Docker/Nginx/指标/压测。
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+
+const sdk = new NodeSDK({
+  serviceName: 'community-admin-api',
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://127.0.0.1:4318/v1/traces',
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+```
+
+在 `main.ts` 第一行 `import './otel.js';`。公共 API 也接同一套；Nginx/HTTP/RabbitMQ header 传 traceparent。
+
+### 2. 指标与健康
+
+```bash
+pnpm --filter admin-api add prom-client @nestjs/terminus @sentry/node
+```
+
+- `/metrics` 暴露 HTTP 耗时、错误率、队列积压。
+- `/health`、`/ready` 用 Terminus 检查 MySQL/RabbitMQ。
+- Sentry 在 `main.ts` 初始化，错误 Filter 上报。
+
+### 3. E2E / Testcontainers
+
+- Playwright 跑管理端审核/举报。
+- Testcontainers 起 MySQL/RabbitMQ 做集成测试。
+- CI 增加 admin-api 的 typecheck/test/build。
+
+### 4. 验收
+
+- [ ] 管理端审核/举报/封禁可用
+- [ ] 审核通过 feed 出现，拒绝不出现
+- [ ] 普通用户 403
+- [ ] trace 从 web/api 追到 admin-api/消费者
+- [ ] Grafana 有延迟/错误率/队列面板
+- [ ] Sentry 收到错误
+- [ ] E2E / Testcontainers 通过
+
+**产出**：commit `feat: add otel metrics and admin e2e`。
+
+下一步：[后端 16–18](/blog/posts/node-roadmap-21-community-week-4/)，做 Docker/Nginx/指标/压测与回滚。

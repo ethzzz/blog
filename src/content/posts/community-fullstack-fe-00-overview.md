@@ -1,8 +1,8 @@
 ---
-title: '前端系列 · 总览：Next.js 社区前台与后台'
+title: '前端 00：Next.js 社区前台与后台'
 published: 2026-11-10T11:10:00+08:00
 updated: 2026-11-10T11:10:00+08:00
-description: '前端系列总览：Next.js App Router 页面地图、RSC/TanStack Query 数据层、登录态、OpenAPI client、SSE 与 P0a–P2b 交付范围。'
+description: '前端系列总览：Next.js App Router 页面地图、RSC/TanStack Query 数据层、登录态、OpenAPI client、SSE 与 01–03–13–15 交付范围。'
 tags: [社区全栈, 前端, Next.js]
 category: 社区全栈实战
 draft: false
@@ -20,11 +20,11 @@ draft: false
 | 篇 | 主题 | 目标 |
 |---|---|---|
 | 前端总览 | 页面地图、数据层、契约优先 | 先读本篇 |
-| [P0a](/blog/posts/community-fullstack-fe-01-p0a-app-shell/) | App Router、登录态与 feed 首屏 | 登录、feed、详情、发帖 |
-| [P0b](/blog/posts/community-fullstack-fe-02-p0b-content-loop/) | 发帖、评论、点赞与通知 | 完整社区交互 |
-| [P1](/blog/posts/community-fullstack-fe-03-p1-admin/) | 管理后台、审核与看板 | 审核/举报/用户 |
-| [P2a](/blog/posts/community-fullstack-fe-04-p2a-quality/) | 性能、E2E 与部署 | 可上线 |
-| [P2b](/blog/posts/community-fullstack-fe-05-p2b-search-ai/) | 搜索与 AI 助手交互 | 差异化 |
+| [01–03](/blog/posts/community-fullstack-fe-01-p0a-app-shell/) | App Router、登录态与 feed 首屏 | 登录、feed、详情、发帖 |
+| [04–06](/blog/posts/community-fullstack-fe-02-p0b-content-loop/) | 发帖、评论、点赞与通知 | 完整社区交互 |
+| [07–09](/blog/posts/community-fullstack-fe-03-p1-admin/) | 管理后台、审核与看板 | 审核/举报/用户 |
+| [10–12](/blog/posts/community-fullstack-fe-04-p2a-quality/) | 性能、E2E 与部署 | 可上线 |
+| [13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/) | 搜索与 AI 助手交互 | 差异化 |
 
 ---
 
@@ -117,11 +117,11 @@ playwright
 
 | 阶段 | 前端范围 | 验收 |
 |---|---|---|
-| P0a | App Router、登录、feed、帖子详情、发帖 | 浏览器完成主链路 |
-| P0b | 评论、点赞、关注、通知/SSE、乐观更新 | 完整社区交互 |
-| P1 | 管理后台、审核、举报、用户、看板 | 管理员可操作 |
-| P2a | 性能、E2E、部署 | 可上线、可演示 |
-| P2b | 搜索、AI 助手 | 差异化体验 |
+| 01–03 | App Router、登录、feed、帖子详情、发帖 | 浏览器完成主链路 |
+| 04–06 | 评论、点赞、关注、通知/SSE、乐观更新 | 完整社区交互 |
+| 07–09 | 管理后台、审核、举报、用户、看板 | 管理员可操作 |
+| 10–12 | 性能、E2E、部署 | 可上线、可演示 |
+| 13–15 | 搜索、AI 助手 | 差异化体验 |
 
 ---
 
@@ -132,4 +132,4 @@ playwright
 - 每个页面至少覆盖：加载、空态、错误、未登录。
 - 联调时先看 Network：401 是登录态，403 是权限，404 是资源/路由。
 
-下一步：[前端 P0a](/blog/posts/community-fullstack-fe-01-p0a-app-shell/)，先把登录、feed、详情、发帖跑通。
+下一步：[前端 01–03](/blog/posts/community-fullstack-fe-01-p0a-app-shell/)，先把登录、feed、详情、发帖跑通。

@@ -1,31 +1,25 @@
 ---
-title: '后端 P2b：K8s、搜索与毕业验收'
+title: '后端 19–21：K8s、搜索与毕业验收'
 published: 2026-11-10T11:00:00+08:00
 updated: 2026-11-10T11:00:00+08:00
-description: '后端最后阶段：K8s/Helm 部署、Meilisearch 索引同步、AI 助手后端支持与完整项目毕业验收。'
+description: 'Day 19–21：K8s/Helm 部署、Meilisearch 索引、AI 助手后端支持，以及完整项目毕业验收。'
 tags: [社区全栈, 后端, K8s, Meilisearch]
 category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 后端 P2b。上一篇：[后端 P2a](/blog/posts/node-roadmap-21-community-week-4/)；前端对应篇：[前端 P2b](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)；共享总览：[社区全栈实战 · 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
+> 后端 19–21。上一篇：[后端 16–18](/blog/posts/node-roadmap-21-community-week-4/)；前端对应篇：[前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)；共享总览：[00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-P2b 是后端收尾：K8s/Helm、搜索索引、AI 后端支持和毕业验收。搜索和 AI 是加分项，做不完不影响 P0/P1 的投递价值。
-
----
-
-## 1. 目标与范围
-
-- Helm/manifests 部署 api/admin-api/web/worker。
-- 探针、HPA、Ingress、ConfigMap/Secret、迁移 Job。
-- Meilisearch 索引同步。
-- AI 助手/内容审核后端接口（可选）。
-- 毕业验收清单。
+19–21 是后端收尾：K8s/Helm、搜索、AI 后端支持和毕业验收。搜索和 AI 是加分项，做不完不影响前面阶段的投递价值。
 
 ---
 
-## 2. K8s 清单
+## Day 19：K8s/Helm 部署
+
+**今天目标**：一条命令把 api/admin-api/web 部署到集群，探针和迁移 Job 正常。
+
+### 1. Helm 结构
 
 ```text
 infra/k8s/helm/community/
@@ -59,18 +53,38 @@ resources:
   limits: { cpu: 500m, memory: 512Mi }
 ```
 
-- 迁移用独立 Job，应用启动不跑 migrate。
-- Secret 用 `kubectl create secret` 或 External Secrets，不把 `.env` 打进镜像。
-- 本地演示用 k3d/kind；云上用 k3s 或托管 K8s，不做多集群。
+### 2. 迁移与 Secret
+
+- 迁移用独立 Job：`npx prisma migrate deploy`，不要放在应用启动时，否则多副本并发迁移。
+- 数据库/Redis/RabbitMQ 连接串放 Secret；ConfigMap 放非敏感配置。
+- Ingress 配 TLS、`client_max_body_size`、SSE 超时。
+- HPA 按 CPU/内存扩缩；本地演示用 k3d/kind，云上用 k3s 或托管 K8s，不做多集群。
+
+**验收**：`helm upgrade --install community ./infra/k8s/helm/community -f values-dev.yaml` 后 `/health`、`/ready`、`/metrics` 正常；迁移 Job 成功。
+
+**产出**：commit `build: add helm chart for community`。
 
 ---
 
-## 3. Meilisearch 索引
+## Day 20：Meilisearch 索引与 AI 后端
 
-索引消费者订阅 `post.published` / `post.updated` / `post.deleted`：
+**今天目标**：搜索可用；AI 助手后端可流式返回，没配 Key 时能 fallback。
+
+### 1. Meilisearch 索引
+
+```bash
+pnpm --filter api add meilisearch
+```
+
+索引消费者订阅 `post.published`：
 
 ```ts
-await meili.index('posts').addDocuments([
+const client = new MeiliSearch({
+  host: process.env.MEILI_HOST ?? 'http://127.0.0.1:7700',
+  apiKey: process.env.MEILI_KEY,
+});
+
+await client.index('posts').addDocuments([
   {
     id: post.id.toString(),
     title: post.title,
@@ -81,7 +95,7 @@ await meili.index('posts').addDocuments([
 ]);
 ```
 
-查询接口：
+搜索接口：
 
 ```text
 GET /api/v1/search/posts?q=keyword&limit=20
@@ -91,9 +105,7 @@ GET /api/v1/search/posts?q=keyword&limit=20
 - 消费端维护 `processed_events` 幂等。
 - 先只索引 `published` 帖子。
 
----
-
-## 4. AI 助手后端（可选）
+### 2. AI 后端
 
 ```text
 POST /api/v1/ai/chat
@@ -101,49 +113,73 @@ body: { message: string, postId?: string }
 response: text/event-stream
 ```
 
+最小实现：
+
+```ts
+aiRouter.post('/chat', requireAuth, async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  const stream = await llm.chat({ messages: [{ role: 'user', content: req.body.message }] });
+  for await (const token of stream) {
+    res.write(token);
+  }
+  res.end();
+});
+```
+
 - 检索：用帖子标题/正文做关键词或向量召回。
 - 流式：SSE 返回 token；客户端可中断。
-- 审核：对评论/帖子做敏感内容分类，命中则进人工审核。
-- 默认提供 mock/开关，没配 API Key 也能演示。
+- 审核：对评论/帖子做敏感内容分类，命中进人工审核。
+- 默认 mock/开关，没配 API Key 也能演示。
+
+**验收**：搜索页能查到 published 帖子；AI 流式输出可停止；无 Key 时 fallback 不白屏。
+
+**产出**：commit `feat: add search and ai backend support`。
 
 ---
 
-## 5. 毕业验收清单
+## Day 21：毕业验收与演示
 
-### 业务
+**今天目标**：确认「企业级项目」真的成立，并准备 10 分钟演示。
+
+### 1. 业务验收
 
 - [ ] 注册/登录/刷新/登出；旧 refresh 重放 401
 - [ ] 发帖/列表/详情/软删除；pending 不进 feed
 - [ ] 评论 + 计数同事务；点赞幂等；关注幂等
-- [ ] 关注流游标分页不重不漏
+- [ ] feed 游标不重不漏
 - [ ] 通知 + SSE；自己操作自己不通知
 - [ ] 审核/举报/用户封禁/审计
+- [ ] 搜索/AI 可开关
 
-### 工程
+### 2. 工程验收
 
 - [ ] `pnpm -r typecheck` / `test` / `build` 全绿
 - [ ] OpenAPI 可访问；前端 client 不漂移
 - [ ] 一条命令部署；`/health`、`/ready`、`/metrics` 正常
 - [ ] trace 跨服务；Grafana 有面板；Sentry 有错误
 - [ ] 压测报告 + 5 分钟回滚
-- [ ] 搜索可用；AI 可开关/fallback
+- [ ] 3 篇 ADR
 
-### 面试
+### 3. 10 分钟演示
 
-- [ ] 能讲清为什么公共 API 留 Express、管理端用 NestJS
-- [ ] 能讲清 Outbox + RabbitMQ + BullMQ 的分工
-- [ ] 能讲清游标分页、点赞幂等、计数一致性
-- [ ] 能讲清 K8s 探针/HPA/迁移 Job
-- [ ] 能不看稿演示 10 分钟
+```text
+0:00-1:00  问题与范围
+1:00-3:00  注册/登录/refresh
+3:00-5:00  发帖/审核/评论/点赞
+5:00-7:00  feed 游标 + 通知 SSE
+7:00-9:00  管理端审核/举报 + trace
+9:00-10:00 取舍与如果重来
+```
 
----
+### 4. 面试能讲什么
 
-## 6. 常见坑
+- 为什么公共 API 留 Express、管理端用 NestJS
+- 为什么 Outbox + RabbitMQ + BullMQ 并存
+- 为什么 feed 用游标、点赞用唯一约束
+- 为什么 K8s 先单集群、迁移用 Job
+- 如果重来：先补测试和压测，再补功能
 
-- **迁移放应用启动**：多副本并发迁移；必须用 Job。
-- **Secret 进镜像**：`.env` 和 Secret 不能打进镜像。
-- **索引不一致**：以 MySQL 为准，提供重建脚本。
-- **AI 阻塞主线**：默认 mock/可关闭，不能影响核心链路。
-- **K8s 过度设计**：先单集群 + Helm，不做多集群/Service Mesh。
-
-到这里，后端系列闭环完成。回到 [共享总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 看两套系列的联调顺序，或继续 [前端 P2b](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)。
+到这里，后端 01–21 闭环完成。回到 [00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 检查两套系列的对齐，或继续 [前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)。

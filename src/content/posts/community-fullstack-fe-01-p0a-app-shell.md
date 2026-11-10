@@ -1,21 +1,25 @@
 ---
-title: '前端 P0a：App Router、登录态与 feed 首屏'
+title: '前端 01–03：App Router、登录态与 feed 首屏'
 published: 2026-11-10T11:20:00+08:00
 updated: 2026-11-10T11:20:00+08:00
-description: '前端第一阶段：Next.js App Router 骨架、登录/注册、refresh Cookie、feed 首屏、帖子详情与发帖。'
+description: 'Day 1–3：Next.js App Router 骨架、登录/注册、refresh Cookie、feed 首屏、帖子详情与发帖。'
 tags: [社区全栈, 前端, Next.js, App Router]
 category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 前端 P0a。上一篇：[前端总览](/blog/posts/community-fullstack-fe-00-overview/)；下一篇：[前端 P0b](/blog/posts/community-fullstack-fe-02-p0b-content-loop/)；后端对应篇：[后端 P0a](/blog/posts/node-roadmap-18-community-week-1/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
+> 前端 01–03。上一篇：[前端 00](/blog/posts/community-fullstack-fe-00-overview/)；下一篇：[前端 04–06](/blog/posts/community-fullstack-fe-02-p0b-content-loop/)；后端对应篇：[后端 01–05](/blog/posts/node-roadmap-18-community-week-1/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-P0a 的目标是让浏览器完整跑通：**注册 → 登录 → feed → 帖子详情 → 发帖**。评论/点赞/通知留给 P0b，不要阻塞 11/24 的投递节点。
+这三天让浏览器完整跑通：注册 → 登录 → feed → 帖子详情 → 发帖。评论/点赞/通知放 04–06，不要阻塞演示。
 
 ---
 
-## 1. 初始化
+## Day 1：脚手架、API client、登录/注册
+
+**今天目标**：Next.js 能启动，登录/注册能调通后端，刷新后登录态不丢。
+
+### 1. 初始化
 
 ```bash
 pnpm dlx create-next-app@latest apps/web \
@@ -25,24 +29,19 @@ pnpm dlx create-next-app@latest apps/web \
 目录：
 
 ```text
-apps/web/
-  src/
-    app/
-      (auth)/login/page.tsx
-      (auth)/register/page.tsx
-      (public)/feed/page.tsx
-      (public)/posts/[id]/page.tsx
-      (public)/posts/new/page.tsx
-      (public)/layout.tsx
-      layout.tsx
-      api/auth/login/route.ts
-      api/auth/refresh/route.ts
-      api/auth/logout/route.ts
-    components/
-    lib/api.ts
-    lib/auth.ts
+apps/web/src/
+  app/
+    (auth)/login/page.tsx
+    (auth)/register/page.tsx
+    (public)/layout.tsx
+    api/auth/login/route.ts
+    api/auth/refresh/route.ts
+    api/auth/logout/route.ts
+    layout.tsx
+  lib/
+    api.ts
+    auth.ts
   middleware.ts
-  next.config.ts
 ```
 
 环境变量：
@@ -52,9 +51,7 @@ NEXT_PUBLIC_API_BASE=http://127.0.0.1:3000
 API_BASE_INTERNAL=http://127.0.0.1:3000
 ```
 
----
-
-## 2. API client
+### 2. API client
 
 `src/lib/api.ts`：
 
@@ -83,16 +80,11 @@ export async function apiFetch<T>(
 }
 ```
 
-P0a 可以先用 `NEXT_PUBLIC_API_BASE` 直连；P2a 再改成 Nginx 同源 `/api`。
+### 3. 登录/注册 route handler
 
----
-
-## 3. 登录与 refresh
-
-Route handler 负责把后端 refresh Cookie 透传给浏览器：
+`src/app/api/auth/login/route.ts`：
 
 ```ts
-// app/api/auth/login/route.ts
 export async function POST(request: Request) {
   const body = await request.json();
   const upstream = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/auth/login`, {
@@ -109,23 +101,74 @@ export async function POST(request: Request) {
 }
 ```
 
-- accessToken 放内存/`sessionStorage`；refresh 永远不进 JS。
-- 401 时先调 `/api/auth/refresh`，成功重放一次请求，失败跳登录。
-- 不要在 client 里直接读 refresh Cookie。
+同样写 `refresh` / `logout` route handler。accessToken 放内存/sessionStorage；refresh 只走 httpOnly Cookie。
+
+### 4. 登录页
+
+```tsx
+'use client';
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [error, setError] = useState('');
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const response = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: form.get('email'),
+        password: form.get('password'),
+      }),
+    });
+
+    if (!response.ok) {
+      setError('邮箱或密码错误');
+      return;
+    }
+
+    const data = await response.json();
+    sessionStorage.setItem('accessToken', data.accessToken);
+    router.push('/feed');
+  }
+
+  return (
+    <form onSubmit={submit} className="mx-auto max-w-sm space-y-3 py-20">
+      <h1 className="text-2xl font-bold">登录</h1>
+      <input name="email" type="email" placeholder="邮箱" className="w-full rounded border p-2" />
+      <input name="password" type="password" placeholder="密码" className="w-full rounded border p-2" />
+      {error && <p className="text-sm text-red-500">{error}</p>}
+      <button className="w-full rounded bg-black py-2 text-white">登录</button>
+    </form>
+  );
+}
+```
+
+注册页同理，调 `/api/v1/auth/register`，成功后跳登录。
+
+**验收**：注册 201、登录 200、刷新页面登录态不丢；未登录访问 `/feed` 跳 `/login`。
+
+**产出**：commit `feat: add next app shell and auth`。
 
 ---
 
-## 4. feed 首屏
+## Day 2：feed、帖子详情、发帖
 
-Server Component 首屏取数：
+**今天目标**：feed 首屏可渲染；帖子详情可访问；登录用户能发帖。
+
+### 1. feed 首屏
+
+`src/app/(public)/feed/page.tsx`：
 
 ```tsx
-// app/(public)/feed/page.tsx
 export default async function FeedPage() {
-  const data = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/feed?limit=20`, {
+  const response = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/feed?limit=20`, {
     headers: { cookie: (await cookies()).toString() },
     cache: 'no-store',
-  }).then((res) => res.json());
+  });
+  const data = await response.json();
 
   return (
     <main className="mx-auto max-w-2xl py-8">
@@ -149,21 +192,18 @@ export default async function FeedPage() {
 }
 ```
 
-- 空态、加载、错误三态必须有。
-- 游标分页：客户端「加载更多」把 `nextCursor` 传给后端，不要用页码。
+### 2. 帖子详情
 
----
-
-## 5. 帖子详情与发帖
-
-详情页：
+`src/app/(public)/posts/[id]/page.tsx`：
 
 ```tsx
 export default async function PostPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const post = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/posts/${id}`, {
+  const response = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/posts/${id}`, {
     cache: 'no-store',
-  }).then((res) => res.json());
+  });
+  if (!response.ok) notFound();
+  const post = await response.json();
 
   return (
     <article className="mx-auto max-w-2xl py-8">
@@ -175,7 +215,9 @@ export default async function PostPage({ params }: { params: Promise<{ id: strin
 }
 ```
 
-发帖页用 Client Component + 表单校验：
+### 3. 发帖
+
+`src/app/(public)/posts/new/page.tsx`：
 
 ```tsx
 'use client';
@@ -186,20 +228,21 @@ export default function NewPostPage() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
+    const token = sessionStorage.getItem('accessToken');
     await apiFetch('/api/v1/posts', {
       method: 'POST',
       body: JSON.stringify({ content }),
-    }, getAccessToken());
+    }, token ?? undefined);
     router.push('/feed');
   }
 
   return (
-    <form onSubmit={submit} className="mx-auto max-w-2xl py-8 space-y-4">
+    <form onSubmit={submit} className="mx-auto max-w-2xl space-y-3 py-8">
       <textarea
         value={content}
         onChange={(event) => setContent(event.target.value)}
-        className="w-full rounded border p-3"
         rows={8}
+        className="w-full rounded border p-3"
         placeholder="写点什么..."
       />
       <button className="rounded bg-black px-4 py-2 text-white">发布</button>
@@ -208,48 +251,56 @@ export default function NewPostPage() {
 }
 ```
 
-发布成功后帖子默认 `pending`，所以 feed 里暂时看不到；这是预期行为，不要误以为接口失败。
+发帖默认 `pending`，feed 暂时看不到，这是预期行为。
 
----
+### 4. 登录保护
 
-## 6. 登录保护
-
-`middleware.ts`：
+`src/middleware.ts`：
 
 ```ts
 export function middleware(request: NextRequest) {
   const hasSession = request.cookies.has('refresh_token');
-  if (!hasSession && /^\/(feed|posts\/new|admin)/.test(request.nextUrl.pathname)) {
+  if (!hasSession && /^\/(feed|posts\/new)/.test(request.nextUrl.pathname)) {
     return NextResponse.redirect(new URL('/login', request.url));
   }
   return NextResponse.next();
 }
 
-export const config = { matcher: ['/feed/:path*', '/posts/new', '/admin/:path*'] };
+export const config = { matcher: ['/feed/:path*', '/posts/new'] };
 ```
 
-前端隐藏菜单不等于权限；管理后台最终仍要服务端校验。
+**验收**：feed 首屏能渲染；详情 200；发帖 201；未登录跳登录。
+
+**产出**：commit `feat: add feed post detail and create`。
 
 ---
 
-## 7. 验收清单
+## Day 3：三态、错误处理、联调验收
 
-- [ ] 注册 201、登录 200、刷新 200
+**今天目标**：页面有加载/空态/错误态；前后端联调无 CORS/Cookie 问题。
+
+### 1. 三态
+
+- 每个列表页有 `loading.tsx`、空态、错误提示。
+- 401 时先调 `/api/auth/refresh`，成功重放一次，失败跳登录。
+- 403 显示无权限，不要当 401。
+- 404 用 `notFound()`，不要渲染空白页。
+
+### 2. CORS/Cookie
+
+- 后端 `cors({ origin: config.WEB_ORIGIN, credentials: true })`。
+- 前端 fetch `credentials: 'include'`。
+- refresh Cookie `path=/api/v1/auth`、`httpOnly`、生产 `secure`。
+
+### 3. 验收清单
+
+- [ ] 注册 → 登录 → feed → 详情 → 发帖
 - [ ] 刷新页面登录态不丢
-- [ ] feed 首屏能渲染；空态有提示
-- [ ] 帖子详情可访问；pending 只有作者可见
-- [ ] 发帖成功后跳转 feed；帖子 pending
+- [ ] 空 feed 有提示
+- [ ] 401 能刷新一次并恢复
 - [ ] 未登录访问 `/feed` 跳登录
 - [ ] 浏览器无 CORS/Cookie 报错
 
----
+**产出**：commit `fix: handle auth states and errors`。
 
-## 8. 常见坑
-
-- **Cookie 不回传**：fetch 必须 `credentials: 'include'`，后端 CORS 要 `credentials: true`。
-- **refresh 死循环**：401 → refresh 失败要停止，不要无限重试。
-- **RSC 里用浏览器 API**：Server Component 不能用 `localStorage`/`window`。
-- **直连后端**：P0a 允许；上线前改同源 `/api`，避免 CORS。
-- **pending 看不到**：发帖默认待审核，不是 bug。
-
-下一步：[前端 P0b](/blog/posts/community-fullstack-fe-02-p0b-content-loop/)，补评论、点赞、关注和通知。
+下一步：[前端 04–06](/blog/posts/community-fullstack-fe-02-p0b-content-loop/)，补评论、点赞、关注和通知。

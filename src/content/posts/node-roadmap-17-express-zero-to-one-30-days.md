@@ -1,8 +1,8 @@
 ---
-title: '社区全栈实战 · 总览：后端/前端双系列与 P0–P2 时间线'
+title: '社区全栈实战 · 00 总览：后端/前端双系列与 21+15 天路线'
 published: 2026-11-10T10:00:00+08:00
 updated: 2026-11-10T10:00:00+08:00
-description: '一个完整社区项目拆成后端/前端两套系列：Express 公共 API + NestJS 管理/BFF + Next.js 前台，按 P0a/P0b/P1/P2a/P2b 推进并覆盖求职时间线。'
+description: '一个完整社区项目拆成后端/前端两套系列：Express 公共 API + NestJS 管理/BFF + Next.js 前台，按后端 01–21、前端 01–15 的天数顺序推进并覆盖求职时间线。'
 tags: [社区全栈, 总览]
 category: 社区全栈实战
 draft: false
@@ -24,7 +24,7 @@ draft: false
 - 业务：社区/社群核心闭环——人、内容、关系、信息流、通知、治理。
 - 形态：模块化单体起步，按真实边界拆出管理服务；不是一上来就微服务。
 - 目标岗位：全栈工程师（Node + React/Next），兼顾 Node 后端。
-- 时间预算：2–3 个月，P0a 结束就开始投递。
+- 时间预算：2–3 个月，后端 01–05 / 前端 01–03 结束就开始投递。
 
 **项目故事**：为什么公共 API 保留 Express、为什么管理端用 NestJS、为什么用 Outbox + RabbitMQ、为什么前端不直接连库。面试时能讲清这些取舍，比列一堆库更有价值。
 
@@ -43,22 +43,22 @@ draft: false
 | 篇 | 主题 | 链接 |
 |---|---|---|
 | 后端总览 | 服务边界、数据归属、技术选型 | [阅读](/blog/posts/node-roadmap-23-community-fullstack-plan/) |
-| P0a | Express 公共 API 最小可演示 | [阅读](/blog/posts/node-roadmap-18-community-week-1/) |
-| P0b | 完整社区主链路与工程化 | [阅读](/blog/posts/node-roadmap-19-community-week-2/) |
-| P1 | NestJS 管理/BFF 与异步治理 | [阅读](/blog/posts/node-roadmap-20-community-week-3/) |
-| P2a | 可观测、容器化与上线 | [阅读](/blog/posts/node-roadmap-21-community-week-4/) |
-| P2b | K8s、压测与毕业验收 | [阅读](/blog/posts/node-roadmap-22-community-graduation/) |
+| 01–05 | Express 公共 API 最小可演示 | [阅读](/blog/posts/node-roadmap-18-community-week-1/) |
+| 06–10 | 完整社区主链路与工程化 | [阅读](/blog/posts/node-roadmap-19-community-week-2/) |
+| 11–15 | NestJS 管理/BFF 与异步治理 | [阅读](/blog/posts/node-roadmap-20-community-week-3/) |
+| 16–18 | 可观测、容器化与上线 | [阅读](/blog/posts/node-roadmap-21-community-week-4/) |
+| 19–21 | K8s、压测与毕业验收 | [阅读](/blog/posts/node-roadmap-22-community-graduation/) |
 
 ### 前端系列
 
 | 篇 | 主题 | 链接 |
 |---|---|---|
 | 前端总览 | 页面地图、数据层、契约优先 | [阅读](/blog/posts/community-fullstack-fe-00-overview/) |
-| P0a | App Router、登录态与 feed 首屏 | [阅读](/blog/posts/community-fullstack-fe-01-p0a-app-shell/) |
-| P0b | 发帖、评论、点赞与通知 | [阅读](/blog/posts/community-fullstack-fe-02-p0b-content-loop/) |
-| P1 | 管理后台、审核与数据看板 | [阅读](/blog/posts/community-fullstack-fe-03-p1-admin/) |
-| P2a | 性能、E2E 与部署 | [阅读](/blog/posts/community-fullstack-fe-04-p2a-quality/) |
-| P2b | 搜索与 AI 助手交互 | [阅读](/blog/posts/community-fullstack-fe-05-p2b-search-ai/) |
+| 01–03 | App Router、登录态与 feed 首屏 | [阅读](/blog/posts/community-fullstack-fe-01-p0a-app-shell/) |
+| 04–06 | 发帖、评论、点赞与通知 | [阅读](/blog/posts/community-fullstack-fe-02-p0b-content-loop/) |
+| 07–09 | 管理后台、审核与数据看板 | [阅读](/blog/posts/community-fullstack-fe-03-p1-admin/) |
+| 10–12 | 性能、E2E 与部署 | [阅读](/blog/posts/community-fullstack-fe-04-p2a-quality/) |
+| 13–15 | 搜索与 AI 助手交互 | [阅读](/blog/posts/community-fullstack-fe-05-p2b-search-ai/) |
 
 ---
 
@@ -107,7 +107,7 @@ draft: false
 | 可观测 | Pino + OpenTelemetry + Prometheus/Grafana + Sentry |
 | 测试 | Vitest/Supertest + Playwright + Testcontainers |
 | 部署 | Docker + GitHub Actions + K8s/Helm |
-| 搜索/AI | Meilisearch + LLM 流式/RAG（P2b） |
+| 搜索/AI | Meilisearch + LLM 流式/RAG（后端 19–21 / 前端 13–15） |
 
 **不引入**：TypeORM、GraphQL、MongoDB、Service Mesh、同时维护多套 ORM。
 
@@ -115,16 +115,16 @@ draft: false
 
 ## 5. 时间线
 
-| 阶段 | 时间 | 后端交付 | 前端交付 |
+| 后端 / 前端 | 时间 | 后端交付 | 前端交付 |
 |---|---|---|---|
-| P0a | 11/10–11/24 | Express 最小 API | 登录、feed、帖子详情、发帖 |
-| P0b | 11/24–12/08 | 评论/点赞/关注/通知 + Redis/BullMQ/OpenAPI/测试/CI | 评论、点赞、通知、乐观更新 |
-| P1 | 12/08–01/12 | NestJS 管理/BFF + RabbitMQ + 可观测性 | 管理后台、审核、举报、看板 |
-| P2a | 01/12–01/29 | Docker/Nginx/指标/压测/回滚 | 性能、E2E、部署 |
+| 01–05 / 01–03 | 11/10–11/24 | Express 最小 API | 登录、feed、帖子详情、发帖 |
+| 06–10 / 04–06 | 11/24–12/08 | 评论/点赞/关注/通知 + Redis/BullMQ/OpenAPI/测试/CI | 评论、点赞、通知、乐观更新 |
+| 11–15 / 07–09 | 12/08–01/12 | NestJS 管理/BFF + RabbitMQ + 可观测性 | 管理后台、审核、举报、看板 |
+| 16–18 / 10–12 | 01/12–01/29 | Docker/Nginx/指标/压测/回滚 | 性能、E2E、部署 |
 | 春节 | 02/05–02/12 | 暂停重交付 | 暂停重交付 |
-| P2b | 02/20–03/10 | K8s/搜索/AI 后端支持 | 搜索、AI 助手交互 |
+| 19–21 / 13–15 | 02/20–03/10 | K8s/搜索/AI 后端支持 | 搜索、AI 助手交互 |
 
-**P0a 结束（11/24）就开始投递**，P2 不作为投递前置条件。
+**后端 01–05 / 前端 01–03 结束（11/24）就开始投递**，后面的阶段不作为投递前置条件。
 
 ---
 

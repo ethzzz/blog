@@ -1,68 +1,78 @@
 ---
-title: '前端 P2a：性能、E2E 与部署'
+title: '前端 10–12：性能、E2E 与部署'
 published: 2026-11-10T11:50:00+08:00
 updated: 2026-11-10T11:50:00+08:00
-description: '前端第四阶段：Next.js 性能优化、Playwright E2E、Docker/Nginx/K8s Ingress 部署与生产环境检查。'
+description: 'Day 10–12：Next.js 性能优化、Playwright E2E、Docker/Nginx/K8s Ingress 部署与生产检查。'
 tags: [社区全栈, 前端, Next.js, Playwright]
 category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 前端 P2a。上一篇：[前端 P1](/blog/posts/community-fullstack-fe-03-p1-admin/)；下一篇：[前端 P2b](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)；后端对应篇：[后端 P2a](/blog/posts/node-roadmap-21-community-week-4/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
+> 前端 10–12。上一篇：[前端 07–09](/blog/posts/community-fullstack-fe-03-p1-admin/)；下一篇：[前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)；后端对应篇：[后端 16–18](/blog/posts/node-roadmap-21-community-week-4/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-P2a 让前端从「能跑」变成「能上线」：性能、E2E、部署和生产检查。功能不再增加，重点是把体验和交付质量固定下来。
-
----
-
-## 1. 目标与范围
-
-- RSC/流式/缓存策略优化。
-- 首屏与交互性能检查。
-- Playwright E2E 主链路。
-- Docker/Nginx/K8s Ingress 部署。
-- 生产环境变量、错误页、404。
+这三天不增加功能，把前端从「能跑」变成「能上线」：性能、E2E、部署和生产检查。
 
 ---
 
-## 2. 性能
+## Day 10：性能与缓存
 
-- 首屏用 Server Component，避免把大列表塞进 client bundle。
-- 列表分页/游标加载，不一次性拉全量。
-- 图片用 `next/image`，设置尺寸和 lazy。
+**今天目标**：首屏不白屏、列表不拉全量、client bundle 可控。
+
+### 1. RSC 与加载态
+
+- 首屏列表/详情用 Server Component。
 - 路由级 `loading.tsx`，避免白屏。
-- 大组件用 `dynamic(() => import(...), { ssr: false })` 只在必要时使用。
-- 构建后看 `next build` 输出的 First Load JS；超过预算的页面要拆。
+- 大组件按需加载：
 
 ```tsx
-// app/(public)/feed/loading.tsx
-export default function Loading() {
-  return <div className="mx-auto max-w-2xl py-8">加载中...</div>;
-}
+const Editor = dynamic(() => import('@/components/editor'), { ssr: false });
 ```
 
----
+### 2. 列表与图片
 
-## 3. 缓存与刷新
+- feed/评论用游标分页，不一次性拉全量。
+- 图片用 `next/image`，设置宽高和 lazy。
+- 长列表用虚拟滚动（可选）。
 
-- 公开列表可短 TTL；登录态/管理端用 `cache: 'no-store'`。
-- 点赞/评论后局部刷新，不要 `router.refresh()` 整页。
+### 3. 缓存策略
+
+- 公开列表可短 TTL；登录态/管理端 `cache: 'no-store'`。
+- 点赞/评论后局部刷新，不要整页 `router.refresh()`。
 - SSE 通知直接更新 Query cache，减少轮询。
 
----
-
-## 4. Playwright E2E
-
-安装：
+### 4. 构建检查
 
 ```bash
-pnpm add -D @playwright/test
-pnpm exec playwright install
+pnpm --filter web build
 ```
 
-主链路用例：
+看 First Load JS；超过预算的页面拆组件/动态导入。
+
+**验收**：feed 首屏有 loading；列表不一次拉全量；构建输出没有异常大的 chunk。
+
+**产出**：commit `perf: optimize next rendering and bundles`。
+
+---
+
+## Day 11：Playwright E2E
+
+**今天目标**：注册→登录→发帖→评论→点赞→管理端审核主链路自动化。
+
+### 1. 安装
+
+```bash
+pnpm --filter web add -D @playwright/test
+pnpm --filter web exec playwright install
+```
+
+### 2. 用例
+
+`apps/web/e2e/community.spec.ts`：
 
 ```ts
+import { test, expect } from '@playwright/test';
+
 test('register -> login -> post -> feed', async ({ page }) => {
   await page.goto('/register');
   await page.getByLabel('邮箱').fill('e2e@test.com');
@@ -81,13 +91,23 @@ test('register -> login -> post -> feed', async ({ page }) => {
 });
 ```
 
-至少覆盖：注册/登录、发帖、评论、点赞、关注、管理端审核。测试数据用独立账号，测试结束清理。
+至少覆盖：注册/登录、发帖、评论、点赞、关注、管理端审核。用独立测试账号，测试后清理。
+
+### 3. 验收
+
+- [ ] 主链路 E2E 通过
+- [ ] 失败时截图/录像
+- [ ] CI 可选 nightly 跑 E2E
+
+**产出**：commit `test: add playwright e2e`。
 
 ---
 
-## 5. 部署
+## Day 12：部署与生产检查
 
-### Docker
+**今天目标**：前端容器化，Nginx/K8s Ingress 同源反代，生产环境可访问。
+
+### 1. Dockerfile
 
 ```dockerfile
 FROM node:22-alpine AS build
@@ -106,33 +126,24 @@ COPY --from=build /app/node_modules ./node_modules
 CMD ["pnpm", "start"]
 ```
 
-### Nginx / K8s
+### 2. 同源反代
 
-- 前端和 API 同源：`/api/` 反代到 api/admin-api，`/` 反代到 web。
+- `/api/` → api
+- `/admin-api/` → admin-api
+- `/` → web
 - SSE location 单独关闭 buffering。
-- K8s Ingress 配置 TLS、超时和 body size。
-- 环境变量通过 ConfigMap/Secret 注入，不把 `.env` 打进镜像。
 
----
+K8s Ingress 配 TLS、超时、body size；环境变量用 ConfigMap/Secret。
 
-## 6. 生产检查
+### 3. 生产检查
 
-- [ ] 404/500 页面有品牌和返回入口
+- [ ] 404/500 页面有返回入口
 - [ ] `NEXT_PUBLIC_*` 只放非敏感配置
 - [ ] refresh Cookie `Secure` + `SameSite`
-- [ ] 管理端 403 页面明确提示
+- [ ] 管理端 403 页面明确
 - [ ] 首屏无布局抖动；图片有尺寸
-- [ ] E2E 主链路通过
 - [ ] 部署后 `/feed`、`/login`、`/admin` 可访问
 
----
+**产出**：commit `build: dockerize web and add ingress`。
 
-## 7. 常见坑
-
-- **client bundle 过大**：把表格/编辑器等重组件按需加载。
-- **缓存登录态**：用户相关请求不要长缓存。
-- **E2E 依赖真实数据**：用独立账号/固定 fixture，测试可重复。
-- **前端直连后端**：生产走同源反代，避免 CORS 和 Cookie 问题。
-- **环境变量泄漏**：`NEXT_PUBLIC_*` 会进浏览器，不能放密钥。
-
-下一步：[前端 P2b](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)，做搜索和 AI 助手交互。
+下一步：[前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)，做搜索与 AI 助手。

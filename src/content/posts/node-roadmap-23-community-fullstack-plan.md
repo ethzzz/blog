@@ -1,8 +1,8 @@
 ---
-title: '后端系列 · 总览：Express + NestJS 企业级社区 API'
+title: '后端 00：Express + NestJS 企业级社区 API'
 published: 2026-11-10T10:10:00+08:00
 updated: 2026-11-10T10:10:00+08:00
-description: '后端系列总览：Express 公共 API + NestJS 管理/BFF 的服务边界、数据归属、API/事件契约、技术选型与 P0a–P2b 交付范围。'
+description: '后端系列总览：Express 公共 API + NestJS 管理/BFF 的服务边界、数据归属、API/事件契约、技术选型与 01–05–19–21 交付范围。'
 tags: [社区全栈, 后端, Express, NestJS]
 category: 社区全栈实战
 draft: false
@@ -20,11 +20,11 @@ draft: false
 | 篇 | 主题 | 目标 |
 |---|---|---|
 | 后端总览 | 边界、契约、选型 | 先读本篇 |
-| [P0a](/blog/posts/node-roadmap-18-community-week-1/) | Express 最小可演示 | 认证 + 发帖 + feed |
-| [P0b](/blog/posts/node-roadmap-19-community-week-2/) | 完整主链路与工程化 | 评论/点赞/关注/通知/OpenAPI/CI |
-| [P1](/blog/posts/node-roadmap-20-community-week-3/) | NestJS 管理/BFF + 异步治理 | 审核/举报/RabbitMQ/可观测 |
-| [P2a](/blog/posts/node-roadmap-21-community-week-4/) | 可观测、容器化与上线 | Docker/Nginx/指标/压测 |
-| [P2b](/blog/posts/node-roadmap-22-community-graduation/) | K8s、搜索与毕业验收 | Helm/Meilisearch/AI 后端 |
+| [01–05](/blog/posts/node-roadmap-18-community-week-1/) | Express 最小可演示 | 认证 + 发帖 + feed |
+| [06–10](/blog/posts/node-roadmap-19-community-week-2/) | 完整主链路与工程化 | 评论/点赞/关注/通知/OpenAPI/CI |
+| [11–15](/blog/posts/node-roadmap-20-community-week-3/) | NestJS 管理/BFF + 异步治理 | 审核/举报/RabbitMQ/可观测 |
+| [16–18](/blog/posts/node-roadmap-21-community-week-4/) | 可观测、容器化与上线 | Docker/Nginx/指标/压测 |
+| [19–21](/blog/posts/node-roadmap-22-community-graduation/) | K8s、搜索与毕业验收 | Helm/Meilisearch/AI 后端 |
 
 ---
 
@@ -50,7 +50,7 @@ POST /internal/reports/:id/resolve
 
 内部接口用 `X-Internal-Token` 鉴权，仅内网可达；管理端不把内部接口暴露到公网。
 
-**回退方案**：如果 P1 时间紧张，允许共享 MySQL，但保留 Prisma schema 边界和内部接口契约，不回退到「管理端直接 import 核心 repository」。
+**回退方案**：如果 11–15 时间紧张，允许共享 MySQL，但保留 Prisma schema 边界和内部接口契约，不回退到「管理端直接 import 核心 repository」。
 
 ---
 
@@ -98,7 +98,7 @@ POST /internal/reports/:id/resolve
 - 所有副作用先写 `outbox_events`；outbox worker 按类型路由。
 - RabbitMQ 负责跨服务事件；BullMQ 负责站内通知、延迟与重试。
 - 消费者用 `event_id` / `jobId` 做幂等。
-- P0a/P0b 先只启用 BullMQ；RabbitMQ 在 P1 接入。
+- 01–05/06–10 先只启用 BullMQ；RabbitMQ 在 11–15 接入。
 
 ---
 
@@ -135,11 +135,11 @@ apps/admin-api: @nestjs/core @nestjs/common @nestjs/config @nestjs/swagger
 
 | 阶段 | 后端范围 | 验收 |
 |---|---|---|
-| P0a | monorepo、Prisma、认证、发帖、feed | 浏览器能登录、发帖、看 feed |
-| P0b | 评论、点赞、关注、通知、SSE、Redis/BullMQ、OpenAPI、测试、CI | 完整主链路 + CI 绿 |
-| P1 | NestJS 管理/BFF、审核/举报/用户/审计、RabbitMQ、OTel | 管理端可审核，trace 跨服务 |
-| P2a | Docker、Nginx/SSE、指标、优雅关闭、压测、回滚 | 一条命令上线 + 压测报告 |
-| P2b | K8s/Helm、Meilisearch、AI 后端支持 | 集群部署 + 搜索/AI 可用 |
+| 01–05 | monorepo、Prisma、认证、发帖、feed | 浏览器能登录、发帖、看 feed |
+| 06–10 | 评论、点赞、关注、通知、SSE、Redis/BullMQ、OpenAPI、测试、CI | 完整主链路 + CI 绿 |
+| 11–15 | NestJS 管理/BFF、审核/举报/用户/审计、RabbitMQ、OTel | 管理端可审核，trace 跨服务 |
+| 16–18 | Docker、Nginx/SSE、指标、优雅关闭、压测、回滚 | 一条命令上线 + 压测报告 |
+| 19–21 | K8s/Helm、Meilisearch、AI 后端支持 | 集群部署 + 搜索/AI 可用 |
 
 ---
 
@@ -150,6 +150,6 @@ apps/admin-api: @nestjs/core @nestjs/common @nestjs/config @nestjs/swagger
 | NestJS 与 TS 7 / nest-cli 兼容性 | 先做 1 天 spike；用 SWC 或 admin-api 单独 TS 5.9 |
 | 两套后端维护成本 | NestJS 只做管理/BFF；共享契约；不复制公共 API |
 | 管理端数据拆分复杂 | 回退共享 MySQL，但保留边界和内部接口 |
-| 消息链路过度设计 | P1 先做一条 RabbitMQ 事件闭环，再扩 |
+| 消息链路过度设计 | 11–15 先做一条 RabbitMQ 事件闭环，再扩 |
 
-下一步：从 [后端 P0a](/blog/posts/node-roadmap-18-community-week-1/) 开始；前端对应 [前端总览](/blog/posts/community-fullstack-fe-00-overview/)。
+下一步：从 [后端 01–05](/blog/posts/node-roadmap-18-community-week-1/) 开始；前端对应 [前端总览](/blog/posts/community-fullstack-fe-00-overview/)。

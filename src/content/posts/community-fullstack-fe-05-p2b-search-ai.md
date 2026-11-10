@@ -1,31 +1,25 @@
 ---
-title: '前端 P2b：搜索与 AI 助手交互'
+title: '前端 13–15：搜索与 AI 助手交互'
 published: 2026-11-10T12:00:00+08:00
 updated: 2026-11-10T12:00:00+08:00
-description: '前端最后阶段：Meilisearch 搜索页、AI 助手流式对话、中断/重试/降级，以及前端毕业验收。'
+description: 'Day 13–15：Meilisearch 搜索页、AI 助手流式对话、中断/重试/降级，以及前端毕业验收。'
 tags: [社区全栈, 前端, 搜索, AI]
 category: 社区全栈实战
 draft: false
 ---
 
 > [!NOTE]
-> 前端 P2b。上一篇：[前端 P2a](/blog/posts/community-fullstack-fe-04-p2a-quality/)；共享总览：[社区全栈实战 · 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；后端对应篇：[后端 P2b](/blog/posts/node-roadmap-22-community-graduation/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
+> 前端 13–15。上一篇：[前端 10–12](/blog/posts/community-fullstack-fe-04-p2a-quality/)；后端对应篇：[后端 19–21](/blog/posts/node-roadmap-22-community-graduation/)；共享总览：[00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-P2b 是加分项：搜索和 AI 助手。它们能让项目在面试里有记忆点，但不能拖累核心链路；默认要可开关、可 fallback。
-
----
-
-## 1. 目标与范围
-
-- `/search` 搜索页：关键词、结果列表、空态。
-- 防抖 + 取消请求 + URL 同步。
-- AI 助手流式对话：发送、停止、错误/重试。
-- 无 API Key 时 mock/降级。
-- E2E/手工验收。
+最后三天做搜索和 AI 助手。它们是加分项，必须可开关、可 fallback，不能拖累核心链路。
 
 ---
 
-## 2. 搜索页
+## Day 13：搜索页
+
+**今天目标**：关键词搜索有结果/空态，防抖 + 取消请求 + URL 同步。
+
+### 1. 搜索页
 
 ```tsx
 'use client';
@@ -34,23 +28,26 @@ export default function SearchPage() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     if (!query.trim()) {
       setResults([]);
       return;
     }
+
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       setLoading(true);
+      setError('');
       try {
         const data = await apiFetch(
           `/api/v1/search/posts?q=${encodeURIComponent(query)}`,
           { signal: controller.signal },
         );
         setResults(data.items);
-      } catch (error) {
-        if ((error as Error).name !== 'AbortError') throw error;
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') setError('搜索失败，请重试');
       } finally {
         setLoading(false);
       }
@@ -70,8 +67,9 @@ export default function SearchPage() {
         placeholder="搜索帖子..."
         className="w-full rounded border p-3"
       />
-      {loading && <p className="mt-4 text-sm text-gray-500">搜索中...</p>}
-      {!loading && query && results.length === 0 && (
+      {loading && <p className="mt-4 text-sm">搜索中...</p>}
+      {error && <p className="mt-4 text-sm text-red-500">{error}</p>}
+      {!loading && query && results.length === 0 && !error && (
         <p className="mt-4 text-sm text-gray-500">没有找到相关帖子。</p>
       )}
       <ul className="mt-4 space-y-3">
@@ -86,13 +84,25 @@ export default function SearchPage() {
 }
 ```
 
-- 300ms 防抖；请求可取消。
-- URL 同步 `?q=`，方便分享/刷新。
-- 搜索后端未上线时用 mock 结果，页面不阻塞。
+### 2. URL 同步
+
+用 `useSearchParams` 初始化 `query`，输入变化时 `router.replace('/search?q=...')`，方便分享/刷新。
+
+### 3. 后端未上线时
+
+用 mock 结果或 MSW，页面不阻塞；搜索接口失败不影响 feed/发帖。
+
+**验收**：输入有结果/空态；快速输入不闪回旧结果；请求可取消。
+
+**产出**：commit `feat: add search page`。
 
 ---
 
-## 3. AI 助手流式对话
+## Day 14：AI 助手流式对话
+
+**今天目标**：AI 回复逐字出现，可停止；无 Key/失败有 fallback。
+
+### 1. 对话组件
 
 ```tsx
 'use client';
@@ -107,7 +117,11 @@ export function AiChat() {
     if (!input.trim() || streaming) return;
     const question = input;
     setInput('');
-    setMessages((items) => [...items, { role: 'user', content: question }, { role: 'assistant', content: '' }]);
+    setMessages((items) => [
+      ...items,
+      { role: 'user', content: question },
+      { role: 'assistant', content: '' },
+    ]);
     setStreaming(true);
 
     const controller = new AbortController();
@@ -138,7 +152,10 @@ export function AiChat() {
       }
     } catch (error) {
       if ((error as Error).name !== 'AbortError') {
-        setMessages((items) => [...items, { role: 'assistant', content: 'AI 暂时不可用，请稍后再试。' }]);
+        setMessages((items) => [
+          ...items,
+          { role: 'assistant', content: 'AI 暂时不可用，请稍后再试。' },
+        ]);
       }
     } finally {
       setStreaming(false);
@@ -158,7 +175,11 @@ export function AiChat() {
         </p>
       ))}
       <div className="flex gap-2">
-        <input value={input} onChange={(event) => setInput(event.target.value)} className="flex-1 rounded border p-2" />
+        <input
+          value={input}
+          onChange={(event) => setInput(event.target.value)}
+          className="flex-1 rounded border p-2"
+        />
         <button onClick={send} disabled={streaming}>发送</button>
         {streaming && <button onClick={stop}>停止</button>}
       </div>
@@ -167,39 +188,56 @@ export function AiChat() {
 }
 ```
 
-- 后端 SSE 返回纯文本 token 或 `data:` 事件，前端按约定解析。
-- 停止按钮 abort 请求；后端要处理客户端断开。
-- 无 Key/超时：显示 fallback 文案，不能让页面崩。
+- 停止按钮 abort 请求；后端要停止生成/清理连接。
+- 无 Key/超时显示 fallback，不让页面崩。
+
+### 2. 开关与降级
+
+```ini
+NEXT_PUBLIC_AI_ENABLED=false
+```
+
+关闭时隐藏 AI 入口；搜索/AI 失败不影响核心页面。
+
+**验收**：流式逐字输出；停止有效；无 Key fallback 不白屏。
+
+**产出**：commit `feat: add ai chat streaming`。
 
 ---
 
-## 4. 降级与开关
+## Day 15：前端毕业验收
 
-- 环境变量 `NEXT_PUBLIC_AI_ENABLED=false` 时隐藏入口。
-- 搜索/AI 失败不影响 feed、发帖、评论。
-- 错误信息面向用户，不暴露内部堆栈。
-- 埋点：搜索词、AI 首 token 延迟、错误率（可选）。
+**今天目标**：确认前端完整可演示，能配合后端讲 10 分钟。
 
----
+### 验收清单
 
-## 5. 验收清单
-
-- [ ] `/search` 输入关键词有结果/空态，无重复请求
-- [ ] 搜索请求可取消，快速输入不闪回旧结果
-- [ ] AI 流式输出逐字出现，可停止
-- [ ] 无 Key/后端失败有 fallback，不白屏
-- [ ] 搜索/AI 不阻塞核心页面
+- [ ] 注册/登录/刷新/登出
+- [ ] feed/详情/发帖/评论/点赞/关注
+- [ ] 通知 SSE 实时到达
+- [ ] 管理端审核/举报/用户
+- [ ] 搜索可用；AI 可开关
 - [ ] 移动端布局可用
-- [ ] E2E 或手工验收记录
+- [ ] E2E 主链路通过
+- [ ] 部署后 `/feed`、`/admin`、`/search` 可访问
 
----
+### 10 分钟前端演示
 
-## 6. 常见坑
+```text
+0:00-1:00  页面地图与技术栈
+1:00-3:00  登录态/refresh Cookie
+3:00-5:00  feed 游标 + 乐观点赞
+5:00-7:00  发帖/评论/通知 SSE
+7:00-9:00  管理端审核 + 搜索
+9:00-10:00 性能/部署/如果重来
+```
 
-- **搜索每敲一个字都请求**：必须防抖 + abort。
-- **流式不更新**：reader 循环里要累加并 setState。
-- **停止无效**：abort 后后端要停止生成/清理连接。
-- **AI 阻塞主线**：入口可关闭，失败可降级。
-- **搜索索引延迟**：UI 提示「结果可能有延迟」，或提供重建入口。
+### 面试能讲什么
 
-到这里，前端系列完成。回到 [共享总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 检查两套系列的阶段对齐，准备演示和投递。
+- RSC 与 Client Component 的边界
+- 登录态为什么 refresh 放 httpOnly Cookie
+- 乐观更新为什么要回滚
+- SSE 与轮询的取舍
+- 搜索防抖/取消请求
+- AI 流式的中断与 fallback
+
+到这里，前端 01–15 闭环完成。回到 [00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 检查两套系列，准备演示和投递。
