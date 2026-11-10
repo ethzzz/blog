@@ -215,7 +215,7 @@ curl -i http://127.0.0.1:3000/health
 
 ### 1. 环境变量
 
-`.env.example`：
+路径：`apps/api/.env.example`。复制一份到 `apps/api/.env`：
 
 ```ini
 NODE_ENV=development
@@ -229,10 +229,11 @@ LOG_LEVEL=info
 ```
 
 ```bash
-cp .env.example .env
+cp apps/api/.env.example apps/api/.env
 ```
 
-`.gitignore` 必须包含 `.env`。
+> [!IMPORTANT]
+> `.env` 放在 `apps/api/` 下，不是仓库根目录。`pnpm --filter api dev` 的工作目录是 `apps/api`，`dotenv/config` 和 Prisma 都从这里读。根目录 `.gitignore` 加 `apps/api/.env`。
 
 ### 2. config.ts
 

@@ -46,12 +46,19 @@ apps/web/src/
   middleware.ts
 ```
 
-环境变量：
+路径：`apps/web/.env.local`（本地私有，Next.js 会自动加载）。给团队留模板时，再放一份 `apps/web/.env.example`：
 
 ```ini
 NEXT_PUBLIC_API_BASE=http://127.0.0.1:3000
 API_BASE_INTERNAL=http://127.0.0.1:3000
 ```
+
+```bash
+cp apps/web/.env.example apps/web/.env.local
+```
+
+> [!NOTE]
+> API 占用了 3000，Next.js 默认也是 3000。把 `apps/web/package.json` 的 `dev` 改成 `next dev -p 3001`，和 `WEB_ORIGIN` 对齐。
 
 ### 2. API client
 
