@@ -11,7 +11,11 @@ draft: false
 > [!NOTE]
 > 后端 01–05。上一篇：[后端 00](/blog/posts/node-roadmap-23-community-fullstack-plan/)；下一篇：[后端 06–10](/blog/posts/node-roadmap-19-community-week-2/)；前端对应篇：[前端 01–03](/blog/posts/community-fullstack-fe-01-p0a-app-shell/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-这一篇从**空目录**开始，不假设你已经有 Express 骨架。5 天后你会得到：能启动、能登录、能发帖、能看关注流的公共 API。每天一个 commit、一次验收。
+先把环境跑起来。下面从空目录开始，建目录、装依赖、起一个能返回 `/health` 的 Express 服务，再用 Docker Compose 把 MySQL 和 Redis 拉起来。第一天不碰业务表，先把“服务能启动”这件事确认掉。
+
+这 5 天按顺序做：Day 1 起服务，Day 2 配置/日志/错误，Day 3 Prisma，Day 4 认证，Day 5 发帖和 feed。做完一天就提交一次，出问题好回退。
+
+我本地是 Node 24 + pnpm 12，下面的命令在 Git Bash 里跑过；PowerShell 需要把环境变量写法换一下。
 
 ---
 
@@ -421,7 +425,7 @@ JWT_SECRET=short pnpm exec tsx src/server.ts
 
 ## Day 3：Prisma 模型与 seed
 
-**今天目标**：建核心领域表，生成 Prisma Client，写入管理员和普通用户。
+**今天目标**：建领域表，生成 Prisma Client，写入管理员和普通用户。
 
 ### 1. 安装
 
@@ -701,7 +705,7 @@ pnpm --filter api exec prisma db seed
 
 ## Day 4：注册、登录、刷新、登出
 
-**今天目标**：完整认证闭环，refresh 轮换，旧 refresh 不能重放。
+**今天目标**：把注册、登录、刷新、登出这条线走通，refresh 轮换，旧 refresh 不能重放。
 
 ### 1. 安装
 
@@ -1227,10 +1231,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - [ ] 空目录能起 monorepo + Express `/health`
 - [ ] 配置坏值启动失败；404 是 JSON；日志有 requestId
 - [ ] Prisma 迁移/种子成功
-- [ ] 注册/登录/刷新/登出闭环
+- [ ] 注册 → 登录 → 刷新 → 登出全走通
 - [ ] 发帖 pending；列表只显示 published
 - [ ] 关注幂等；feed 能返回关注对象的帖子
-- [ ] 每天一个 commit
+- [ ] 每天提交一次，提交信息能看出当天做了什么
 
 **产出**：commit `feat: add posts follow and feed`。
 

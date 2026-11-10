@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 后端 06–10。上一篇：[后端 01–05](/blog/posts/node-roadmap-18-community-week-1/)；下一篇：[后端 11–15](/blog/posts/node-roadmap-20-community-week-3/)；前端对应篇：[前端 04–06](/blog/posts/community-fullstack-fe-02-p0b-content-loop/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-01–05 已经能登录、发帖、看 feed。06–10 把社区互动补完整：评论、点赞、通知、SSE，并把 OpenAPI、测试和 CI 落下来。每天一个可验证的闭环。
+Day 1–5 的服务已经能登录、发帖、看 feed。接下来把评论、点赞、通知和 SSE 补上，再把 OpenAPI、测试和 CI 接进仓库。功能不复杂，麻烦的是事务和幂等，下面按天拆开做。
 
 ---
 
@@ -663,7 +663,7 @@ data: {"id":"...","type":"like",...}
 
 ## Day 10：OpenAPI、测试、CI
 
-**今天目标**：接口有文档、核心链路有测试、提交即跑 CI。
+**今天目标**：接口有文档、主链路有测试、提交即跑 CI。
 
 ### 1. OpenAPI
 
@@ -784,7 +784,7 @@ describe('likes', () => {
 });
 ```
 
-> 测试里生成 token 的完整 helper（注册/登录、resetDb、seedRoles）见仓库 `tests/helpers.ts`；关键是把测试库和开发库分开，`fileParallelism: false` 避免互相污染。
+> 测试里生成 token 的完整 helper（注册/登录、resetDb、seedRoles）见仓库 `tests/helpers.ts`；这里先把测试库和开发库分开，`fileParallelism: false` 避免互相污染。
 
 ### 3. CI
 

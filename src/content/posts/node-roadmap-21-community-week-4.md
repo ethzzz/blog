@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 后端 16–18。上一篇：[后端 11–15](/blog/posts/node-roadmap-20-community-week-3/)；下一篇：[后端 19–21](/blog/posts/node-roadmap-22-community-graduation/)；前端对应篇：[前端 10–12](/blog/posts/community-fullstack-fe-04-p2a-quality/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-11–15 之后功能完整。16–18 把服务跑上线：一条命令起全栈、Nginx 不缓冲 SSE、有指标、能优雅重启、有压测和回滚。
+功能写完后，接下来处理上线的事：镜像、Nginx、指标和优雅关闭。先把服务装进容器，再压一轮，最后演练回滚。顺序别反，不然出了问题不知道该怪哪一层。
 
 ---
 
@@ -212,7 +212,7 @@ docker compose up --build -d
 curl -i http://127.0.0.1:3000/health
 ```
 
-镜像部署用 `helm rollback` 或切回上一版 tag。验收：5 分钟内回到上一版，核心接口正常。
+镜像部署用 `helm rollback` 或切回上一版 tag。验收：5 分钟内回到上一版，主要接口正常。
 
 ### 3. ADR
 

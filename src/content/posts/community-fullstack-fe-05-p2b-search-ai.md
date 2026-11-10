@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 前端 13–15。上一篇：[前端 10–12](/blog/posts/community-fullstack-fe-04-p2a-quality/)；后端对应篇：[后端 19–21](/blog/posts/node-roadmap-22-community-graduation/)；共享总览：[00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-最后三天做搜索和 AI 助手。它们是加分项，必须可开关、可 fallback，不能拖累核心链路。
+最后做搜索和 AI 助手。这两块是加分项，入口要能关，失败要能降级，别让它们影响登录、feed 和发帖。
 
 ---
 
@@ -90,7 +90,7 @@ export default function SearchPage() {
 
 ### 3. 后端未上线时
 
-用 mock 结果或 MSW，页面不阻塞；搜索接口失败不影响 feed/发帖。
+用 mock 结果或 MSW，页面先不受影响；搜索接口失败不影响 feed/发帖。
 
 **验收**：输入有结果/空态；快速输入不闪回旧结果；请求可取消。
 
@@ -197,7 +197,7 @@ export function AiChat() {
 NEXT_PUBLIC_AI_ENABLED=false
 ```
 
-关闭时隐藏 AI 入口；搜索/AI 失败不影响核心页面。
+关闭时隐藏 AI 入口；搜索/AI 失败不影响主页面。
 
 **验收**：流式逐字输出；停止有效；无 Key fallback 不白屏。
 
@@ -240,4 +240,4 @@ NEXT_PUBLIC_AI_ENABLED=false
 - 搜索防抖/取消请求
 - AI 流式的中断与 fallback
 
-到这里，前端 01–15 闭环完成。回到 [00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 检查两套系列，准备演示和投递。
+前端 01–15 到这里就做完了。回到 [00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 对一下两套系列，准备演示和投递。

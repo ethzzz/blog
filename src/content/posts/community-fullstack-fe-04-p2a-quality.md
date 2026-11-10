@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 前端 10–12。上一篇：[前端 07–09](/blog/posts/community-fullstack-fe-03-p1-admin/)；下一篇：[前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)；后端对应篇：[后端 16–18](/blog/posts/node-roadmap-21-community-week-4/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-这三天不增加功能，把前端从「能跑」变成「能上线」：性能、E2E、部署和生产检查。
+功能先停一停，处理性能和上线。首屏不要白屏，列表不要一次拉全量，最后用 Playwright 把主链路跑一遍，再装进容器。
 
 ---
 

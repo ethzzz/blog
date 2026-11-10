@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 后端 11–15。上一篇：[后端 06–10](/blog/posts/node-roadmap-19-community-week-2/)；下一篇：[后端 16–18](/blog/posts/node-roadmap-21-community-week-4/)；前端对应篇：[前端 07–09](/blog/posts/community-fullstack-fe-03-p1-admin/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-06–10 之后公共 API 已完整。11–15 用 NestJS 做管理/BFF，补审核、举报、用户管理、审计、RabbitMQ 和可观测性。NestJS 只做管理端，不重写公共 API。
+公共 API 到这里已经够用了。接下来单独加一个 `apps/admin-api`，用 NestJS 做审核、举报、用户管理和审计。NestJS 只负责管理端，公共 API 不动，避免为了用框架而重写。
 
 ---
 

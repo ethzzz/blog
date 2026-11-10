@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 前端 04–06。上一篇：[前端 01–03](/blog/posts/community-fullstack-fe-01-p0a-app-shell/)；下一篇：[前端 07–09](/blog/posts/community-fullstack-fe-03-p1-admin/)；后端对应篇：[后端 06–10](/blog/posts/node-roadmap-19-community-week-2/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-01–03 只能看和发。04–06 把互动补齐：评论、点赞、关注、通知/SSE，并加上乐观更新和游标分页。
+前三天只能看和发。接下来补评论、点赞、关注和通知。互动多起来之后，乐观更新和 SSE 的细节才是容易出错的地方。
 
 ---
 

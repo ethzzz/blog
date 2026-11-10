@@ -11,7 +11,9 @@ draft: false
 > [!NOTE]
 > 前端 01–03。上一篇：[前端 00](/blog/posts/community-fullstack-fe-00-overview/)；下一篇：[前端 04–06](/blog/posts/community-fullstack-fe-02-p0b-content-loop/)；后端对应篇：[后端 01–05](/blog/posts/node-roadmap-18-community-week-1/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-这三天让浏览器完整跑通：注册 → 登录 → feed → 帖子详情 → 发帖。评论/点赞/通知放 04–06，不要阻塞演示。
+先把 Next.js 跑起来，接上后端登录，再做 feed、帖子详情和发帖。三天做完，浏览器里应该能完成注册、登录、看帖、发帖这条线。评论和点赞先不碰。
+
+下面用 pnpm，npm/yarn 也能跑，命令自己换一下。
 
 ---
 

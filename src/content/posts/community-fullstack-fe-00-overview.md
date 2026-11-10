@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 前端系列总览。共享总览：[社区全栈实战 · 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；后端系列：[后端总览](/blog/posts/node-roadmap-23-community-fullstack-plan/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-前端不是「给接口套几个页面」，而是完整产品的一半：登录态、feed、发帖、评论、通知、管理后台、性能与部署。技术栈用 Next.js App Router，数据层用 RSC + TanStack Query，接口 client 从 OpenAPI 生成。
+前端最后会有两套页面：社区前台和管理后台。前台负责登录、feed、发帖、评论和通知，后台负责审核、举报和用户管理。技术栈用 Next.js App Router，接口 client 从 OpenAPI 生成，避免手写类型和后端对不上。
 
 ---
 
@@ -100,7 +100,7 @@ POST /api/auth/logout  → 清 Cookie
 | 测试 | Playwright |
 | 部署 | Docker + Nginx/K8s Ingress |
 
-关键依赖：
+依赖清单：
 
 ```text
 next react react-dom
@@ -128,7 +128,7 @@ playwright
 ## 7. 与后端联调
 
 - 同一阶段先对齐 API 契约，再各自实现。
-- 后端未完成时用 MSW/mock 或 OpenAPI mock，不阻塞前端。
+- 后端未完成时用 MSW/mock 或 OpenAPI mock，前端可以先做。
 - 每个页面至少覆盖：加载、空态、错误、未登录。
 - 联调时先看 Network：401 是登录态，403 是权限，404 是资源/路由。
 

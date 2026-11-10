@@ -11,22 +11,22 @@ draft: false
 > [!NOTE]
 > 这是「社区全栈实战」总览。后端系列：[后端总览](/blog/posts/node-roadmap-23-community-fullstack-plan/)；前端系列：[前端总览](/blog/posts/community-fullstack-fe-00-overview/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-这个项目不是「一个 Express 后端 + 若干文章」，而是一个完整的全栈产品：**Next.js 前台 + Express 公共 API + NestJS 管理/BFF**。为了便于学习和投递，文章拆成两套系列：
+这个项目最后会是一个能跑起来的社区产品：Next.js 前台、Express 公共 API、NestJS 管理端。文章按后端和前端拆成两套，方便按岗位挑着看，也方便后面继续加内容：
 
 - **后端系列**：Express 公共 API、NestJS 管理/BFF、Redis、RabbitMQ、OpenAPI、可观测性、K8s。
 - **前端系列**：Next.js App Router、登录态、feed、发帖、评论、通知、管理后台、性能与部署。
-- **共享总览**：你正在读的这一篇，负责架构、契约、阶段节奏和两套系列的阅读顺序。
+- **共享总览**：就是这篇，先把架构、契约和阅读顺序定下来。
 
 ---
 
 ## 1. 项目定位
 
-- 业务：社区/社群核心闭环——人、内容、关系、信息流、通知、治理。
+- 业务：社区主流程——人、内容、关系、信息流、通知、治理。
 - 形态：模块化单体起步，按真实边界拆出管理服务；不是一上来就微服务。
 - 目标岗位：全栈工程师（Node + React/Next），兼顾 Node 后端。
 - 时间预算：2–3 个月，后端 01–05 / 前端 01–03 结束就开始投递。
 
-**项目故事**：为什么公共 API 保留 Express、为什么管理端用 NestJS、为什么用 Outbox + RabbitMQ、为什么前端不直接连库。面试时能讲清这些取舍，比列一堆库更有价值。
+**项目故事**：面试时大概率会问：公共 API 为什么还用 Express？管理端为什么单独拆 NestJS？通知为什么绕一层 Outbox？这些取舍在文章里都有对应的理由，不是临时编的。
 
 ---
 

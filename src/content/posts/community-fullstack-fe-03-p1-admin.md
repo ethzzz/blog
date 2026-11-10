@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 前端 07–09。上一篇：[前端 04–06](/blog/posts/community-fullstack-fe-02-p0b-content-loop/)；下一篇：[前端 10–12](/blog/posts/community-fullstack-fe-04-p2a-quality/)；后端对应篇：[后端 11–15](/blog/posts/node-roadmap-20-community-week-3/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-这三天做管理后台：权限、表格、表单、审核流程。后台不是多几个按钮，而是「服务端守卫 + 后端权限 + 审计」三件套。
+管理后台单独做一套布局。权限要在服务端校验，表格和表单只是表面；后端接口仍然要再查一次权限，不能只靠前端隐藏菜单。
 
 ---
 

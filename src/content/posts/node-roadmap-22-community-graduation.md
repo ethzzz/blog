@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 后端 19–21。上一篇：[后端 16–18](/blog/posts/node-roadmap-21-community-week-4/)；前端对应篇：[前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)；共享总览：[00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-19–21 是后端收尾：K8s/Helm、搜索、AI 后端支持和毕业验收。搜索和 AI 是加分项，做不完不影响前面阶段的投递价值。
+最后三天做部署和加分项：K8s、搜索、AI 后端。K8s 先保证能部署和演示，不追求多集群；搜索和 AI 可以裁剪，前面 18 天的内容才是主线。
 
 ---
 
@@ -37,7 +37,7 @@ infra/k8s/helm/community/
     migrate-job.yaml
 ```
 
-Deployment 关键配置：
+Deployment 里至少要有这些配置：
 
 ```yaml
 readinessProbe:
@@ -182,4 +182,4 @@ aiRouter.post('/chat', requireAuth, async (req, res) => {
 - 为什么 K8s 先单集群、迁移用 Job
 - 如果重来：先补测试和压测，再补功能
 
-到这里，后端 01–21 闭环完成。回到 [00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 检查两套系列的对齐，或继续 [前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)。
+后端 01–21 到这里就做完了。回到 [00 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/) 对一下前后端进度，或者继续看 [前端 13–15](/blog/posts/community-fullstack-fe-05-p2b-search-ai/)。

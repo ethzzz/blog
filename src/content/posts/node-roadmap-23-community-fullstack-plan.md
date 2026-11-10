@@ -11,7 +11,7 @@ draft: false
 > [!NOTE]
 > 后端系列总览。共享总览：[社区全栈实战 · 总览](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；前端系列：[前端总览](/blog/posts/community-fullstack-fe-00-overview/)；合集：[社区全栈实战](/blog/community-fullstack-roadmap/)。
 
-后端不推倒重来：**Express 继续做公共社区 API，NestJS 只做管理/BFF**。这样既保留已有资产，又能覆盖企业招聘里高频的 NestJS、DI、Guard、Swagger、消息队列和可观测性。
+后端分成两个服务：公共 API 继续用 Express，管理端单独用 NestJS。这样不用重写已经跑通的代码，也能把 NestJS、Guard、Swagger、消息队列这些企业项目里常见的东西练到。
 
 ---
 
@@ -32,11 +32,11 @@ draft: false
 
 | 服务 | 负责 | 数据 |
 |---|---|---|
-| `apps/api`（Express） | 认证、用户、帖子、评论、点赞、关注、feed、通知、举报创建 | 核心社区表 + `reports` |
+| `apps/api`（Express） | 认证、用户、帖子、评论、点赞、关注、feed、通知、举报创建 | 社区主表 + `reports` |
 | `apps/admin-api`（NestJS） | 审核、举报处理、用户封禁、Dashboard、审计 | `moderation_records`、`admin_audit_logs` |
 | `packages/shared` | Zod 契约、事件类型、错误码 | 无数据库 |
 
-**跨服务调用**：管理端通过公共 API 的内部接口操作核心内容，不直接改表：
+**跨服务调用**：管理端通过公共 API 的内部接口操作帖子/用户数据，不直接改表：
 
 ```text
 GET  /internal/posts?status=
@@ -50,7 +50,7 @@ POST /internal/reports/:id/resolve
 
 内部接口用 `X-Internal-Token` 鉴权，仅内网可达；管理端不把内部接口暴露到公网。
 
-**回退方案**：如果 11–15 时间紧张，允许共享 MySQL，但保留 Prisma schema 边界和内部接口契约，不回退到「管理端直接 import 核心 repository」。
+**回退方案**：如果 11–15 时间紧张，允许共享 MySQL，但保留 Prisma schema 边界和内部接口契约，不回退到「管理端直接 import 公共 API 的 repository」。
 
 ---
 
@@ -117,7 +117,7 @@ POST /internal/reports/:id/resolve
 | 测试 | Vitest/Supertest/Testcontainers | 单元/集成 |
 | 部署 | Docker/Nginx/K8s | 上线与演示 |
 
-关键依赖：
+依赖清单：
 
 ```text
 apps/api: jsonwebtoken cookie-parser cors helmet ioredis bullmq
@@ -150,6 +150,6 @@ apps/admin-api: @nestjs/core @nestjs/common @nestjs/config @nestjs/swagger
 | NestJS 与 TS 7 / nest-cli 兼容性 | 先做 1 天 spike；用 SWC 或 admin-api 单独 TS 5.9 |
 | 两套后端维护成本 | NestJS 只做管理/BFF；共享契约；不复制公共 API |
 | 管理端数据拆分复杂 | 回退共享 MySQL，但保留边界和内部接口 |
-| 消息链路过度设计 | 11–15 先做一条 RabbitMQ 事件闭环，再扩 |
+| 消息链路过度设计 | 11–15 先做一条 RabbitMQ 事件链路，再扩 |
 
 下一步：从 [后端 01–05](/blog/posts/node-roadmap-18-community-week-1/) 开始；前端对应 [前端总览](/blog/posts/community-fullstack-fe-00-overview/)。
