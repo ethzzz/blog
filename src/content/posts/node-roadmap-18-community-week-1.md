@@ -1,7 +1,7 @@
 ---
 title: '18 · 社区服务 0→1：第 1 周（Day 1–6）地基与认证'
 published: 2026-11-09T22:31:00+08:00
-updated: 2026-11-09T22:31:00+08:00
+updated: 2026-11-10T16:30:00+08:00
 description: '从空目录到认证闭环：Express 启动、配置/日志/错误、Prisma 完整领域模型、注册登录刷新、RBAC、关注和 5 个测试。'
 tags: [Node.js, Express, Prisma, 认证]
 category: Node全栈学习路线
@@ -648,9 +648,20 @@ git commit -m "feat: unify config logging errors and trace"
 ### 1. 安装与初始化
 
 ```bash
-pnpm add @prisma/client argon2
-pnpm add -D prisma
+pnpm add @prisma/client@6.19.3 argon2
+pnpm add -D prisma@6.19.3
 pnpm exec prisma init --datasource-provider mysql
+```
+
+> [!WARNING]
+> 这里必须锁定版本。Prisma 的 `latest` 目前可能指向 `8.0.0-rc`，裸装 `pnpm add -D prisma` 会装到 RC；而且 Prisma 7+ 移除了 schema 里的 `datasource.url`，改成 `prisma.config.ts` + driver adapter。本文所有代码按 `6.19.3` 编写，`prisma` 和 `@prisma/client` 必须同版本。
+
+如果已经装错版本，重新执行：
+
+```bash
+pnpm add @prisma/client@6.19.3
+pnpm add -D prisma@6.19.3
+pnpm exec prisma generate
 ```
 
 说明：`argon2` 今天就要用，因为 seed 要创建可登录的 admin 用户；Day 4 不再重复安装。
@@ -978,8 +989,12 @@ model IdempotencyKey {
 }
 ```
 
+> [!NOTE]
+> 这份 schema 是 Prisma 6.19.3 的写法：`generator client { provider = "prisma-client-js" }` 加 `datasource db { url = env("DATABASE_URL") }`。从 Prisma 7 起，`datasource.url` 不再允许写在 schema 里，需要 `prisma.config.ts` 和 driver adapter；所以在没有完整迁移方案前，不要直接升级 Prisma 主版本。
+
 几个关键决策：
 
+- **版本固定**：`prisma` 和 `@prisma/client` 都锁在 `6.19.3`，避免 CLI/client 版本错配导致 `PrismaClient` 找不到。
 - **BigInt 主键**：对外统一转成字符串，避免 JavaScript 精度丢失。
 - **软删除**：帖子/评论用 `status + deletedAt`，不物理删除，方便审计和恢复。
 - **唯一约束**：`likes` 的 `(userId, targetType, targetId)`、`follows` 的复合主键、`refresh_tokens.token_hash`，都是幂等的最后一道防线。
@@ -1009,6 +1024,8 @@ if (config.NODE_ENV !== 'production') {
 ```
 
 **为什么挂到 globalThis**：`tsx watch` 热重载会重复执行模块，不挂全局会不断创建新的连接池。
+
+**为什么用 `datasourceUrl`**：Prisma 6.19.3 支持在 `PrismaClient` 构造函数里覆盖连接串；Prisma 7 起需要改用 driver adapter。这里和 schema 里的 `env("DATABASE_URL")` 保持一致。
 
 ### 4. 写 prisma/seed.ts
 

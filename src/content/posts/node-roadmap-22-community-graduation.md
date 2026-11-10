@@ -1,7 +1,7 @@
 ---
 title: '22 · 社区服务 0→1：毕业验收与后续阶段路线图'
 published: 2026-11-09T22:35:00+08:00
-updated: 2026-11-09T22:35:00+08:00
+updated: 2026-11-10T19:00:00+08:00
 description: '完整项目验收清单、冒烟脚本、可插拔扩展（搜索/会员/图片）以及阶段二/三的追加方式。'
 tags: [Node.js, 项目验收, 架构演进, 社区服务]
 category: Node全栈学习路线
@@ -9,7 +9,7 @@ draft: false
 ---
 
 > [!NOTE]
-> 本系列第 6/6 篇。上一篇：[第 4 周：上线](/blog/posts/node-roadmap-21-community-week-4/)；返回：[总览、架构与系列索引](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[Node.js 全栈开发路线](/blog/node-roadmap/)。
+> 阶段一第 6 篇（共 6 篇，阶段一完）。上一篇：[第 4 周：上线](/blog/posts/node-roadmap-21-community-week-4/)；下一篇：[阶段二总览：全栈企业化与 P0–P2 计划](/blog/posts/node-roadmap-23-community-fullstack-plan/)；返回：[总览、架构与系列索引](/blog/posts/node-roadmap-17-express-zero-to-one-30-days/)；合集：[Node.js 全栈开发路线](/blog/node-roadmap/)。
 
 ---
 
@@ -121,8 +121,10 @@ chmod +x scripts/smoke.sh
 
 ## 下一步：阶段二怎么接
 
-- 23 · 搜索：先 MySQL FULLTEXT，再 Meilisearch；通过 Outbox 同步索引。
-- 24 · 会员/支付：plans / orders / entitlements，订单幂等 + 回调验签。
-- 25 · 图片/附件：客户端直传 MinIO/OSS，服务端只存 URL。
+阶段一（Express 核心）到这里收尾。2026-11-10 起进入阶段二：全栈企业化。
+
+- [23 · 阶段二总览：全栈企业化与 P0–P2 计划](/blog/posts/node-roadmap-23-community-fullstack-plan/)：先读这篇，明确保留什么、新增什么、按什么节奏做。
+- 24–26 · P0a/P0b、P1、P2 实施记录：随里程碑推进追加。
+- 27+ · 搜索、会员/支付、图片/附件等业务扩展：等 P2 后再按业务需要追加。
 
 具体追加规则见总览的「后续阶段怎么追加」。新文章继续用 Node全栈学习路线 分类。
