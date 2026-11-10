@@ -162,6 +162,21 @@ requestIdleCallback(workLoop);
 - **「Lane 模型解决了什么？」**
   答：优先级。React 15 用 `expirationTime`（单一数值，比较粗暴），React 17+ 换成 31 位 bitmask 的 lanes：一次更新可以打多个 lane（比如 transition + 默认），`entangle` 保证同一批更新一起提交；高优更新（用户输入）可以打断低优渲染（大列表渲染）并复用已完成的工作。
 
+#### 追问：Fiber 优先级到底是「5 级」还是 Lane？
+
+面试里很容易答成「5 级：立即/用户交互/普通/低延迟/非必要」，但这只是 **Scheduler 的优先级**，不是 Fiber 内部的全貌。
+
+| 层 | 表示 | 作用 |
+|---|---|---|
+| Scheduler | 5 个优先级（Immediate / UserBlocking / Normal / Low / Idle） | 决定时间切片顺序 |
+| Fiber | Lane（31 位 bitmask） | 表示更新优先级，可合并、可打断 |
+
+更准确的答法：
+
+> "Scheduler 层有 5 个优先级，用来决定时间切片；Fiber 内部用 Lane 表示更细的优先级，按位运算合并。`startTransition` 走 transition lane，可被高优先级打断；commit 阶段同步、不可中断。"
+
+**追问**：5 级和 Lane 怎么对应？→ 大致对应，但不是一一映射；`SyncLane` 通常同步执行，不走 Scheduler；一个更新可以同时带多个 lane。**别说成「Fiber 只有 5 级」**。
+
 ---
 
 ## Hooks

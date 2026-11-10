@@ -693,6 +693,66 @@ app.use(async (ctx) => {
 
 ---
 
+### Q13: Express / Koa 的中间件，除了分类还要能讲什么？⭐⭐⭐
+
+面试里只答「应用级/路由级/错误处理/内置/第三方」只能算第一层。继续问执行顺序、`next()`、异步错误、洋葱模型，才是分水岭。
+
+**Express：线性流水线**
+
+```js
+app.use((req, res, next) => {
+  console.log('A before');
+  next();
+  console.log('A after');
+});
+
+app.use((req, res, next) => {
+  console.log('B');
+  next();
+});
+
+// A before → B → A after
+```
+
+- `next()` 同步调用下一个中间件，返回后继续执行当前中间件下半段；
+- 不调用 `next()` 就停住，请求挂起；
+- 错误中间件必须 4 个参数 `(err, req, res, next)`；
+- Express 4 不会自动捕获 async 错误：`try/catch` + `next(err)`，或统一用 `asyncHandler` 包装；Express 5 有改进。
+
+```js
+const asyncHandler = fn => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+```
+
+**Koa：洋葱模型**
+
+```js
+app.use(async (ctx, next) => {
+  console.log('A before');
+  await next();
+  console.log('A after');
+});
+
+app.use(async (ctx, next) => {
+  console.log('B before');
+  await next();
+  console.log('B after');
+});
+
+// A before → B before → B after → A after
+```
+
+- `await next()` 等下游全部完成再回到当前层，适合耗时统计、响应包装、事务；
+- 错误处理是外层 `try/catch` 包 `await next()`，没有 Express 的四参数中间件；
+- 忘了 `await next()`，洋葱直接断掉。
+
+**追问防线**
+
+- **「Express 和 Koa 怎么选？」** → 小项目 Express 生态大；需要回程逻辑用 Koa；大团队要 DI/约定用 Nest。
+- **「Nest 的 Guard/Interceptor 和中间件什么关系？」** → 都是中间件思想的变体：Guard 管鉴权（返回 boolean），Interceptor 管前后横切，Pipe 管校验，Filter 管异常。
+- **「为什么错误中间件要 4 个参数？」** → Express 靠 `fn.length === 4` 识别错误处理签名。
+- **「`next()` 之后还能写代码吗？」** → 能，会等下游同步执行完再回来；但此时响应可能已经发出，别再写响应。
+
 ## 数据库与 ORM
 
 ### Q13: Node.js 连接数据库的方案？⭐⭐
