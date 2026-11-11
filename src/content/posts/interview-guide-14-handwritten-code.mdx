@@ -12,6 +12,16 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 达标标准 | 自测问题 |
+|:--|:--|:--|
+| 浅（说清概念） | 能默写主干，讲清每行在做什么 | ① 防抖与节流的语义差别，各自典型场景？② 深拷贝为什么要用 `WeakMap` 而不是 `Map`？③ 发布订阅里 `on` / `off` / `once` / `emit` 各自职责？ |
+| 中（讲机制） | 白板能写对，并解释关键设计选择 | ① `Promise.all` 为什么按索引赋值而不是 `push`？② 并发控制器里 `Promise.race` 起什么作用？③ 柯里化为什么依赖 `fn.length`，什么情况下它会失效？ |
+| 深（讲取舍） | 能指出手写实现与原生的差距、边界与失败模式 | ① `Promise.all` 一个失败就 reject，其余任务真的停了吗？② 深拷贝遇到 Map / Set / 属性描述符 / 循环引用分别怎么处理，`structuredClone` 能替代吗？③ 并发池的 race 版实现有哪些真实 bug，怎么重写？ |
+
+---
+
 ## 函数类
 
 ### T1: 手写防抖（debounce）⭐ 🔥
@@ -645,6 +655,26 @@ new LazyLoad();  // 自动接管页面所有 img[data-src]
 // scroll 高频触发性能差，getBoundingClientRect 强制同步布局；
 // IntersectionObserver 由浏览器异步计算，不阻塞主线程。
 ```
+
+---
+
+## 深水区追问（2026 补充）
+
+**Q：`Promise.all` 只要一个失败就 reject，其余任务真的停了吗？**
+
+答：没有。`Promise.all` 只是**提前返回**，其余 promise 照样在事件循环里跑完——请求照发、副作用照做，只是结果被丢弃。要真停，任务本身必须可取消：把 `AbortController.signal` 传进 `fetch`，或者把任务定义成「接受 signal 的函数」而不是裸 promise；裸 promise 一旦创建就无法取消，这是 Promise 的设计前提，面试要说破。另外两个边界：空的可迭代对象要立即 resolve 空数组（别写成永远 pending）；元素可能是 thenable，`then` 本身可能抛错，所以必须走 `Promise.resolve(p)` 包装而不是手动调 `p.then`，否则异常逃出 `executor` 变成未捕获异常。
+
+**Q：深拷贝怎么处理 Map / Set / Date / 属性描述符？`structuredClone` 能直接替代吗？**
+
+答：顺序是「先判类型再递归」：`Date` 用时间戳重建，`RegExp` 要带上 `source` 与 `flags`，`Map` / `Set` 必须 `new` 之后逐个 `set` / `add`（当普通对象递归只会得到空对象），`ArrayBuffer` 与 TypedArray 用 `slice`。要保真到属性描述符（getter、不可枚举、Symbol 键、`writable`），得用 `Object.getOwnPropertyDescriptors` + `Object.defineProperties`——普通赋值会把 getter 直接求值成静态值。循环引用靠「先 `map.set(target, result)` 再递归子节点」解决，顺序反过来就栈溢出。`structuredClone` 覆盖了绝大多数内置类型和循环引用，但遇到函数、Symbol、Proxy、DOM 节点会直接抛 DataCloneError，所以配置对象里带函数时仍得手写。
+
+**Q：`asyncPool` 里 `Promise.race(executing)` 的写法有什么问题？**
+
+答：三个真实缺陷：① `executing.delete` 写在 `task.then` 里，而 `race` 可能先一步返回，下一轮 `size` 判断就失真，偶发超并发；② 单个任务失败被 `results[i] = e` 吞掉，调用方既拿不到 reject 语义，也没法实现「失败即停」；③ 派发完毕后的 `await Promise.all(executing)` 对空集合立即 resolve，若还有未登记的尾任务就会提前返回。更稳的是**消费者模型**：先起 `limit` 个 worker，各自循环从共享索引取任务并 `await`，取完自然退出——不需要 `race`，并发上限由 worker 数量天然保证，错误传播也顺手。
+
+**Q：LRU 怎么做到 O(1)？为什么只用数组或只用 Map 都不行？**
+
+答：`Map` 的迭代顺序是插入顺序，所以命中后 `delete` 再 `set` 一次就把键移到「最新」端，淘汰时取 `keys().next().value`——容量不大时这一个 Map 就够，读写都是 O(1)。要严格 O(1) 且避免删除带来的迭代器开销，用**哈希表 + 双向链表**：表头最新、表尾最旧，命中时把节点摘下插到表头，淘汰时删表尾，全靠哨兵节点省掉边界判断。只用数组不行——命中后要移动元素，退化成 O(n)；只用 Map 但不做「重插」也不行，那只是 FIFO，不是 LRU。加分点：这招成立的依据是规范保证 Map 迭代顺序，别用普通对象模拟。
 
 ---
 

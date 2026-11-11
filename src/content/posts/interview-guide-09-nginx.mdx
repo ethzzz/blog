@@ -12,6 +12,14 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 目标 | 本模块的三个问题 |
+|:--|:--|:--|
+| 浅（能说清概念） | 说清它在链路里的位置和职责 | ① 反向代理与正向代理的差别在哪？② location 的匹配优先级怎么排？③ SPA 的 history 路由为什么必须配 `try_files`？ |
+| 中（能讲机制与代码） | 能写出可用的配置块并解释每个指令 | ① `proxy_pass` 末尾带不带斜杠分别怎么改写 URI？② `nginx -s reload` 为什么能不中断连接？③ upstream 的 `max_fails` / `fail_timeout` / `backup` 怎么配合故障转移？ |
+| 深（能讲取舍与线上） | 能给出组合方案与踩坑后的定位手段 | ① 静态资源缓存、压缩、CDN 该怎么组合才不互相打架？② SSE 或大文件下载为什么要动 `proxy_buffering`？③ 限流的 key 该用 IP 还是用户，怎么防伪造？ |
+
 ## Nginx 基础
 
 ### Q1: Nginx 是什么？主要用途？⭐
@@ -536,6 +544,24 @@ netstat -anp | grep nginx
 | reload 后配置没生效 | 只改了文件没 reload，或 `nginx -t` 报错被忽略 | 改配置后必跑 `nginx -t` 再 `nginx -s reload` |
 | Gzip 开了但 JS 还是没压缩 | `gzip_types` 没包含 `application/javascript`，或响应走了代理缓冲 | 补类型；确认 `gzip_vary on` 兼容 CDN |
 | 图片等二进制被压缩损坏 | gzip_types 里加了 image 类型（svg 除外） | 只压缩文本类资源 |
+
+## 深水区追问（2026 补充）
+
+**Q：`rewrite`、`try_files`、`error_page` 触发的「内部重定向」会不会重新匹配 location？举一个因此死循环的配置。**
+
+答：会。`try_files` 的最后一个参数、`rewrite ... last`、`error_page` 都属于内部重定向，会**重新走一遍 location 匹配并按新 location 再执行 rewrite 阶段**；只有 `rewrite ... break` 是「不再重新匹配，就在当前 location 里继续」。典型死循环：`location /` 里 `try_files $uri /index.html`，又配了 `location = /index.html` 里同样 `try_files $uri /index.html`，内部跳转互相指回去，error.log 报 `rewrite or internal redirection cycle`、对外 500（Nginx 内部循环上限 10 次）。另一个易忽略点：`error_page 404 /index.html` 在 SPA 里能当兜底，但它会把 404 状态改写成 200，等于对搜索引擎和监控撒谎——需要保留状态码就写 `error_page 404 =404 /index.html`。
+
+**Q：开源版 Nginx 的 upstream 有主动健康检查吗？`max_fails` 到底在数什么？**
+
+答：开源版只有**被动**健康检查：只有在真实请求转发失败（连接拒绝、超时，或被 `proxy_next_upstream` 列为可重试的错误）时才计一次失败，累计到 `max_fails` 后在该 `fail_timeout` 内摘除节点，时间到再放行一次试探（半开）。由此推出三个常被问错的点：① 没有流量就不会探测，一个已经挂掉但无人访问的节点不会被标记；② `proxy_next_upstream` 默认不包含 `http_500`，业务 500 不会摘节点，要显式加；③ `backup` 只在主组全部不可用时启用。真正要主动探测得用商业版 `health_check`，或上 OpenResty。
+
+**Q：`proxy_buffering` 什么时候必须关？关了之后 `proxy_cache` 还能用吗？**
+
+答：默认 `on` —— Nginx 先把上游响应读进内存缓冲（超出 `proxy_buffers` 就落临时文件）再发给客户端，好处是尽早释放上游连接、便于压缩与缓存；坏处是**流式响应被攒住**：SSE 表现为「半天没输出然后一次性喷出来」，大文件下载会占满磁盘。所以 SSE / 长轮询 / 流式接口要 `proxy_buffering off`（或在应用侧返回 `X-Accel-Buffering: no`），同时给够 `proxy_read_timeout`。缓存与流式互斥：`proxy_cache` 需要完整响应才能落盘，同一个 location 想既缓存又逐块转发就只能拆成两条 location。
+
+**Q：gzip 和 brotli 怎么选？为什么 `gzip_static` 往往比开 `gzip` 更划算？**
+
+答：动态 `gzip` 是**每个请求现场压缩**，级别越高 CPU 越贵，高并发下先打满 CPU 再打满带宽；`gzip_static on` 直接发送构建期生成的 `.gz`，零 CPU 开销，`brotli_static` 同理发 `.br`（体积比 gzip 再小 15%~20%，但浏览器基本只在 HTTPS 下协商 brotli）。实践组合：构建期同时产出 `.br` 与 `.gz`，Nginx 用 `brotli_static` / `gzip_static` 直出，动态 `gzip` 只兜底小文本；`gzip_vary on` 必须开，否则 CDN 会把未压缩副本缓存下来发给支持压缩的客户端。另外 `gzip_types` 只放文本类型，图片/字体再压只会浪费 CPU 甚至撑大体积。
 
 ## 自测清单（能答上 8 条算过关）
 

@@ -12,6 +12,14 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 目标 | 本模块的三个问题 |
+|:--|:--|:--|
+| 浅（能说清概念） | 用一句话区分工具职责，不说错名词 | ① Webpack 从入口到产物落盘要经过哪几步？② Loader 与 Plugin 的职责边界在哪？③ Vite 开发态凭什么可以跳过打包？ |
+| 中（能讲机制与代码） | 能写出配置、能解释每个参数在干什么 | ① 插件里什么时候拿 `compiler`、什么时候拿 `compilation`？② `usedExports` 与 `sideEffects` 分别在哪一层做删除？③ `contenthash` 配 `moduleIds: deterministic` 是怎么稳住缓存的？ |
+| 深（能讲取舍与线上） | 说得清代价、失效边界与事故现场 | ① Vite 生产构建并不比 Webpack 快，那「Vite 快」该怎么讲才不被追问穿？② 发版后旧 HTML 去请求已删除的 chunk 报错，链路是什么、怎么兜？③ 存量 Webpack 大仓迁 Rspack 的成本项有哪些？ |
+
 ## Webpack 核心
 
 ### Q1: Webpack 的构建流程？⭐⭐ 🔥
@@ -615,6 +623,24 @@ module.exports = {
 | Vite 大依赖报 CJS 错误 | 未走预构建 | `optimizeDeps.include` 显式声明 |
 | HMR 改样式无效但改逻辑有效 | CSS 被 `MiniCssExtractPlugin` 抽离（dev 也开） | dev 用 `style-loader`，仅 prod 抽取 |
 | 构建内存 OOM | 大项目 sourcemap + 并行压缩 | 调 `--max-old-space-size`、拆分 chunk、关 dev sourcemap |
+
+## 深水区追问（2026 补充）
+
+**Q：Vite 的 dev 走 esbuild 转换、prod 走 Rollup 打包，这种双管线会带来哪些「dev 正常、build 炸」的差异？**
+
+答：五个高危差异：① dev 不做 Tree Shaking 与副作用分析，未被引用的死代码照样被求值，所以「build 后某个模块整段消失」的问题在 dev 永远复现不了；② 常量替换语义不同（`define` / `import.meta.env` 在 dev 是即时替换，prod 由打包器做静态替换），`typeof process !== "undefined"` 这类判断在两端结论可能相反；③ CJS 互操作：dev 能靠运行时包装跑通 `require` 动态调用，prod 是静态 ESM 分析，直接报「X is not exported」；④ 压缩差异：dev 不压缩，语法/作用域问题被掩盖，prod 开启 minify 后才暴露（典型是循环依赖导致的变量暂时为 `undefined`）；⑤ CSS 层叠顺序：dev 按导入顺序注入 `style`，prod 提取合并成单文件，两者顺序可能不同，表现为样式覆盖关系翻转。所以「本地看着对」不能作为发布依据，至少要跑一次 `vite build && vite preview`。
+
+**Q：`manualChunks` 为什么容易切出「chunk 之间互相 import」？按什么维度划分才稳？**
+
+答：`manualChunks` 是**静态规则**，它不感知模块图，只按包名/路径把模块塞进某个 chunk。你把 `react` 放进 `vendor`，而业务 chunk 又反向被 `vendor` 里的某个工具函数依赖时，两个 chunk 就形成环——运行时表现为 `Cannot access before initialization`，或者干脆多出一份重复代码。稳定划分的三个维度：① 按**更新频率**（runtime / vendor / 业务），vendor 只放「很久不变且不被业务反向依赖」的库；② 按**加载边界**（路由懒加载点），chunk 边界尽量与路由边界重合，别把同屏渲染的组件拆到两个 chunk；③ 按**体积与命中率**取舍，宁可 vendor 大一点也不要切碎——碎片化会放大请求数与 HTTP 开销。另外 `runtimeChunk: 'single'` 必开，否则每次发版 runtime 跟着业务 chunk 变，hash 全抖。
+
+**Q：`/*#__PURE__*/` 注解是干什么的？`export default` 一个大对象为什么删不掉？**
+
+答：Terser/Rollup 默认把「函数调用」当成有副作用——`const x = createThing()` 即使结果没人用也不能删。`/*#__PURE__*/` 就是告诉压缩器「这次调用无副作用，结果没人用就整句删掉」；库作者通常用 babel/rollup 插件在构建期自动打标，所以你看源码里没有、产物里到处都是。而 `export default { a, b }` 是一个**整体对象字面量**：属性不是独立导出，打包器无法在模块级切掉单个属性，只能整块保留（同理 `enum`、`namespace`、装饰器编译出的 IIFE 也都会让 DCE 失效）。工程结论：库要按具名导出写，消费者才能按需摇；`export default` 只适合「本来就要整体用」的模块。
+
+**Q：Module Federation 的「运行时共享」和 npm 依赖共享有什么本质差别？版本冲突时怎么选？**
+
+答：npm 共享是**编译期**确定一份代码，MF 共享是**运行时**从共享作用域里挑一份已加载的模块。差异集中在三点：① 版本仲裁——`shared` 里声明 `singleton: true` 后，宿主与远程按 semver 选出「能满足所有消费者的最高版本」，选不出来就各用各的，于是同一页面加载两份 React，报 `Invalid hook call`；② 构建顺序解耦——remote 可以先发布、host 后接入，但 remote 未发布或契约变更时运行时报错，需要 `strictVersion` 之类的显式拒载策略；③ Context / 全局状态必须落在单例里，否则跨应用 `Provider` 不生效。所以「是否需要独立部署」才是 MF 的判断标准：monorepo 内多个包共享依赖，用 workspace 统一版本 + 构建缓存更简单；只有多团队独立发版时才值得引入 MF 的复杂度。
 
 ## 自测清单（能答上 8 条算过关）
 

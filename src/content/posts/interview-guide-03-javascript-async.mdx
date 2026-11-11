@@ -12,6 +12,16 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 目标 | 必须能回答 |
+|:--|:--|:--|
+| 浅 | 说清概念 | 微任务和宏任务各有哪些？`await` 之后的代码算哪一类任务？Node 的循环和浏览器差在哪？ |
+| 中 | 讲机制/代码 | 一道嵌套 Promise 的输出题，能逐行说出「为什么是这个顺序」吗？`Promise.all` 失败时其他任务停了没有？并发控制器怎么保证不超限？ |
+| 深 | 讲取舍/线上 | 长任务拆到什么粒度才真的降 INP？Worker 的 `postMessage` 成本在什么量级？取消一个请求，怎么保证整条 `await` 链都退出？ |
+
+---
+
 ## 事件循环 (Event Loop)
 
 ### 面试现场：为什么「一句话答案」不够
@@ -704,6 +714,24 @@ Promise.all([a(), b()]).catch(() => {}); // a 失败后 b 仍在跑、仍占资�
 | `setTimeout(fn, 0)` 实际等了 4ms+ | 浏览器嵌套层级钳制、后台标签页节流 | 精确调度用 postMessage/MessageChannel 替代 |
 | Node 里服务偶发卡顿 | nextTick 递归饿死 I/O / 同步 fs 阻塞 | 检查 nextTick 递归，替换为异步 fs API |
 | 定时器越走越偏 | setTimeout 漂移累积 | 用「下一次基于目标时间戳重算」的自校正定时器 |
+
+## 深水区追问（2026 补充）
+
+**Q：INP 到底测什么？把长任务拆开就一定能降 INP 吗？**
+
+INP 测的是**一次交互的全链路**：输入延迟（从用户操作到事件回调开始跑）+ 处理时长（回调本身与随后的渲染工作）+ 呈现延迟（到下一帧真的画出来），报告时取会话里最差的那次（近似 P98），良好线 200ms、需改进线 500ms。所以只拆「计算」不一定有用：慢在**输入回调里的同步 setState + 大树重渲**，得靠让渲染可让路（React 的 transition、Vue 的异步队列分片）；慢在**首帧之前的排队**（上一个长任务还没跑完，事件根本轮不到处理），才需要把那个长任务切到 50ms 以内并让出。拆得太细也有代价：每次让出都有调度开销，总时长变长，还可能把一次 16ms 的绘制拆成两帧。
+
+**Q：Worker 什么时候真的值得用？`postMessage` 的成本是什么量级？**
+
+成本分三块：**线程启动**（几十毫秒，别每次任务新建一个）、**消息拷贝**（`postMessage` 走结构化克隆，深拷贝整棵对象，几 MB 的 JSON 就是 10ms 级）、**调度往返**（一个来回至少一个宏任务）。所以适合「一次大计算」——大 JSON 解析、图片/视频帧处理、加解密、本地搜索建索引；不适合「每帧几十条小消息」，那时消息开销会超过计算本身。省拷贝的三条路：`Transferable`（`ArrayBuffer` / `OffscreenCanvas` 转移所有权，零拷贝但源线程失去引用）、`SharedArrayBuffer`（需要 COOP/COEP 响应头做跨源隔离）、把结果改成增量流而不是整包回传。
+
+**Q：`AbortController` 真的能「取消」一个 Promise 吗？**
+
+不能，Promise 本身没有取消语义。`fetch(url, { signal })` 在 abort 后以 `AbortError` reject，底层请求由浏览器中止并释放连接——这是**请求被取消**，不是 Promise 被取消。推论：① 已排队的 `.then` 仍会按 rejection 走完，链上要么不吞错、要么显式识别 `signal.aborted`；② 非 fetch 的异步（定时器、自定义 Promise）只能自己做「abort 时 reject 竞速」，或在每个 `await` 之后调用 `signal.throwIfAborted()` 主动退出；③ 组合多个信号用 `AbortSignal.any([...])`，加超时用 `AbortSignal.timeout(ms)`，不要手写 `Promise.race` + 定时器（那样定时器不会被清掉，还可能在页面卸载后触发）。
+
+**Q：异步错误有哪几种「静默丢失」的形态？**
+
+五种常见：① `async` 函数里 `throw` 只是把返回的 Promise 置为 rejected，调用方既不 `await` 也不 `.catch`，就只剩一个 `unhandledrejection`；② `try/catch` **包不住** `setTimeout` 回调里的抛错——那是新的宏任务，调用栈早已断开；③ `finally` 里的 `return` 会覆盖前面 `return` 的值，连带把 `try` 里抛的错误一起吞掉；④ `Promise.all` 第一个 rejection 之后，其余任务的 rejection 变成无人接管的孤儿（控制台刷红字但业务无感知）；⑤ `for await...of` 里 `break` / `throw` 会隐式调用迭代器的 `return()`，如果清理逻辑写在那里且自己又抛错，原始错误就被替换了。
 
 ## 自测清单（能答上 8 条算过关）
 

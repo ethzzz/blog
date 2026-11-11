@@ -12,6 +12,16 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 目标 | 必须能回答 |
+|:--|:--|:--|
+| 浅 | 说清概念 | Fiber 为什么需要可中断？Hooks 为什么不能写在条件里？`setState` 到底是同步还是异步？ |
+| 中 | 讲机制/代码 | render 与 commit 阶段分别能做什么、为什么这么切？闭包陷阱的根因与三种解法？`useEffect` 与 `useLayoutEffect` 各在哪一帧执行？ |
+| 深 | 讲取舍/线上 | RSC 与 SSR 差在哪、划的界线是什么？并发渲染下哪些「渲染期假设」会失效？React Compiler 优化不了什么代码？ |
+
+---
+
 ## React 基础
 
 ### Q1: React 的核心思想是什么？⭐
@@ -779,6 +789,24 @@ const style = useMemo(() => ({ color: 'red' }), []);
 | Context 一改整棵树都重渲染 | Provider value 每次新建对象 | value 用 useMemo，或按域拆多个 Context |
 | SSR 报 `window is not defined` | 渲染期访问浏览器 API | 移到 useEffect / 动态 import `ssr: false` |
 | StrictMode 下 effect 执行两次 | 开发期故意双调用以暴露副作用 | 清理函数写完整，别关 StrictMode |
+
+## 深水区追问（2026 补充）
+
+**Q：RSC 和 SSR 是两件事，区别到底在哪？**
+
+SSR 是**同一棵组件树渲染两遍**：服务端产出 HTML，客户端把同一份组件代码再跑一遍做 hydration，所以组件代码仍然要进客户端 bundle。RSC 是**两种组件**：服务端组件只在服务端执行（可以直接 `async/await` 查库、读文件，但不能用 hooks、不能绑事件），产出的是序列化的 RSC payload（Flight 格式）流式下发；客户端组件才打进 bundle 并参与 hydration。所谓 `'use client'` 划的是**模块边界**而不是某个组件——一个文件标了它，这个文件引用的东西统统进客户端图。收益是服务端组件的依赖不进 bundle；代价是两套运行模型，且跨边界的 props 必须可序列化。
+
+**Q：`useSyncExternalStore` 解决的是什么「撕裂」？为什么 `useEffect` 订阅会出问题？**
+
+并发渲染允许一次渲染**中途被打断、丢弃、重来**。用 `useEffect` + `useState` 订阅外部 store 时，effect 在提交之后才跑，而 store 可能在渲染过程中已经变了：同一次提交里 A 组件是在渲染早期读到 v1、B 组件是重渲染后读到 v2，最终 UI 内部不一致——这就是 tearing。`useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)` 在**渲染期间同步读快照**，并在 store 变化时强制同步重渲染，保证一次提交内所有读取都来自同一版本。两个坑：`getSnapshot` 必须返回**稳定引用**（每次 new 一个对象会无限重渲）；SSR 必须提供 `getServerSnapshot`，否则服务端渲染直接报错。
+
+**Q：并发渲染下，哪些「写在渲染函数里的假设」会失效？**
+
+① 渲染可能执行多次或被丢弃，所以**不能在 render 里改外部变量、发请求、写 ref**（被丢弃的那次也会留下痕迹）；② StrictMode 双调用只是把这个风险提前暴露，生产环境一样会因为打断而重放；③ `useState(fn)` 的初始化函数必须是纯的，它可能在渲染被丢弃时白跑；④ transition 里的更新可能被后续高优更新**整体覆盖**，不要在里面做「读完 DOM 再写状态」的时序依赖；⑤ 需要唯一 id 用 `useId`，不要用 `Math.random()`（hydration 对不上）。一句话：渲染阶段只做「从 props/state 算出 UI」，其余全部挪到 effect 或事件回调。
+
+**Q：React Compiler 的取舍在哪？哪些代码它不会（也不该）优化？**
+
+它做的是**编译期自动插 memo 缓存**：把 `useMemo` / `useCallback` / `memo` 的职责收归编译器，前提是组件满足 Rules of React（渲染纯、props 与 state 不可变、hook 无条件调用）。一旦检测到违反（渲染期改 props、render 里读 `ref.current`、依赖里藏了可变捕获），该组件会 **bailout**：不优化但照常运行，也可以显式写 `"use no memo"` 跳过。代价不在运行时而在工程侧：构建时间变长、调试栈里多出缓存调用、旧代码混用时容易出现「编译器认为没变、手写 useMemo 认为变了」的心智负担。它能消掉的是「重复渲染」，消不掉「一次渲染本身很贵」——那还是得靠虚拟化、拆组件、少 DOM。
 
 ## 自测清单（能答上 8 条算过关）
 

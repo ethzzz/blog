@@ -12,6 +12,16 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 目标 | 必须能回答 |
+|:--|:--|:--|
+| 浅 | 说清概念 | 8 种数据类型怎么分？闭包捕获的到底是什么？`this` 在哪一刻才确定？ |
+| 中 | 讲机制/代码 | 一次函数调用会创建哪些环境记录，`let` 的暂时性死区靠什么实现？属性描述符的 `configurable` 为什么不可逆？Proxy 的 handler 丢了 receiver 会连锁出什么问题？ |
+| 深 | 讲取舍/线上 | 事件委托在哪些事件上根本不可用？`WeakRef` 能解决哪类「缓存不该持有的对象」？结构共享比全量深拷贝省的是什么成本？ |
+
+---
+
 ## 数据类型
 
 ### Q1: JavaScript 有哪些数据类型？⭐ 🔥
@@ -681,6 +691,24 @@ const proxy = new Proxy(target, {
 | for 循环里 setTimeout 全输出同一个值 | `var` 共享同一绑定 | 改 `let` 或 IIFE 传参 |
 | Proxy 代理后嵌套属性不响应 | handler 里用了 `target[key]` 丢 receiver | 一律走 `Reflect.get/set(target, key, receiver)` |
 | 判空用 `if (obj)` 放过了 `0`/`''` | 隐式类型转换 | 显式 `obj != null`，或 `??` 兜默认值 |
+
+## 深水区追问（2026 补充）
+
+**Q：执行上下文里「变量环境」和「词法环境」为什么要分开？`let` 的暂时性死区是怎么实现的？**
+
+规范里一个执行上下文有两套环境记录：`var` 声明与函数声明进**变量环境**，`let` / `const` / `class` 进**词法环境**（块级作用域的每一层是一个独立词法环境，用 outer 指针串成作用域链）。暂时性死区不是「变量不存在」，而是**绑定已创建、状态却是 uninitialized**：进入块时名字就登记进词法环境，直到声明语句执行才置为已初始化，此间任何读取都抛 `ReferenceError`——所以 `typeof x` 也会抛（与真正未声明的变量不同，后者返回 `'undefined'`）。`for (let i ...)` 能每次迭代拿到新绑定，靠的正是「每轮迭代复制一份词法环境」的规范约定，不是运行时魔法。
+
+**Q：属性描述符里哪些开关一旦设下就回不去？`Object.freeze` 冻的是多深？**
+
+`configurable: false` 是**单向门**：不能改回 true，也不能把数据属性改成访问器属性，只能在 `writable` 仍为 true 时改 `value`、或把 `writable` 从 true 改成 false。`writable: false` 同理不可逆。三个实用推论：① 一旦用 `defineProperty` 装了 getter/setter，就没有 `value` 可读了，想同时保留得自己维护闭包变量；② `enumerable: false` 的属性会从 `Object.keys`、展开运算符、`JSON.stringify`、`for...in` 里全部消失，但 `in` 与直接访问仍拿得到——这是「拷贝完少字段」的隐藏原因；③ `Object.freeze` 只冻结**自有属性**，嵌套对象照样能改，深冻结要递归（Vue 的 `readonly` 也是浅层，内层在访问时才递归包装）。
+
+**Q：`WeakRef` / `FinalizationRegistry` 能干什么？为什么不能拿它当缓存？**
+
+`WeakRef.deref()` 返回目标或 `undefined`，适合做「有就用、没有就算了」的大对象旁路（例如已解析的图片位图、编译后的模板）。不能当 LRU 用的原因是**回收时机完全由引擎决定**：内存充裕时可能一直不回收，内存紧张时刚 `deref()` 出来的引用下次访问就可能变 `undefined`；`FinalizationRegistry` 的回调更**不保证执行**，不能在里面做关键清理。可控缓存靠显式淘汰策略（大小/时间上限），`WeakRef` 只能用来「省内存」，不能用来「保证命中」。
+
+**Q：事件委托的边界在哪？哪些事件根本委托不了？**
+
+四类边界：① **不冒泡**的事件——`focus` / `blur`（要么用捕获阶段，要么改用 `focusin` / `focusout`）、`mouseenter` / `mouseleave`、`load` / `error`（img 的 error 不冒泡，只能在捕获阶段接）；② **被中断**——子树里任何一处 `stopPropagation()` 都会让委托层收不到，第三方组件内部调了你就会失灵；③ **Shadow DOM**——跨宿主边界时事件会 retarget，`event.target` 已被改写，要用 `composedPath()` 找真实节点；④ **成本反转**——每次点击都要在深树祖先上跑 `closest()` / `matches()`，列表项少而层级深时直接绑反而更快。另外委托挂到 `document` 时，Portal 到 body 之外的弹层、iframe 内部的点击都收不到。
 
 ## 自测清单（能答上 8 条算过关）
 

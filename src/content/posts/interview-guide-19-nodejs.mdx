@@ -12,6 +12,16 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 这一层要能说出什么 | 三个自测问题 |
+|:--|:--|:--|
+| 浅 | 说清概念 | ① Node 为什么单线程还能扛高并发，它的边界在哪？② CJS 与 ESM 的三个关键差异是什么？③ Stream 四种类型分别对应什么场景？ |
+| 中 | 讲机制与代码 | ① 事件循环六个阶段里 `process.nextTick` 与微任务插在哪？② `pipe` 的背压靠哪两个信号协作？③ cluster 与 worker_threads 各自的内存与通信成本？ |
+| 深 | 讲取舍与线上 | ① 线上偶发 2s 卡顿，怎么证明是事件循环被阻塞而不是下游慢？② 滚动发布时那批 502 从哪来、按什么顺序退出才不丢请求？③ BFF 聚合接口的下游超时与降级怎么设计？ |
+
+---
+
 ## Node.js 基础
 
 ### Q1: Node.js 是什么？特点和适用场景？⭐ 🔥
@@ -1273,6 +1283,38 @@ http.createServer(async (req, res) => {
 // 4. 内存泄漏：服务端不能持有请求级数据到全局
 // 5. 性能：缓存渲染结果、流式 SSR、部分 hydration
 ```
+
+---
+
+## 深水区追问（2026 补充）
+
+**Q：线上接口偶发 2 秒卡顿，怎么证明是事件循环被阻塞，而不是下游慢？**
+
+A：先分层拿证据再改代码：① 看"是不是所有接口一起慢"——同一时刻所有路由的 P99 同时抬高，是主线程被占；只有某一个接口慢，就去看它依赖的下游；② 在自己进程里加事件循环延迟指标，P99 长期超过几十毫秒就说明有同步代码在占主线程：
+
+```javascript
+const { monitorEventLoopDelay } = require('perf_hooks');
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+setInterval(() => {
+  console.log('loop p99(ms)', (h.percentile(99) / 1e6).toFixed(1));
+  h.reset();
+}, 10000).unref();
+```
+
+③ 定位到具体代码用 `node --prof` 加 `--prof-process`，或 `clinic flame` 看火焰图里最宽的同步块。常见元凶是解析几十 MB 的 JSON、正则灾难性回溯、`fs` 同步 API、加解密、模板渲染——单次只有几十毫秒，但并发下会串成雪崩。
+
+**Q：`pipe` 的背压到底靠什么实现？哪些写法会让它悄悄失效？**
+
+A：靠一对信号：`write()` 返回 `false` 表示已超过 `highWaterMark`（字节流默认 16KB，对象模式默认 16 条），`pipe` 收到 false 就 `pause()` 上游，等可写流触发 `drain` 再 `resume()`。所以背压成立的前提是"写入方真的等 drain"。会失效的写法：① 在 `data` 事件里自己调 `ws.write()` 却不看返回值——等于完全没有背压，内存随流量线性上涨；② 把 `Transform` 写成 `async _transform()`——Node 的 transform 是回调式的，不调 `cb()` 整条链会卡死或退化成内部缓冲；③ 中间插一层"先 collect 再处理"（每块都 `Buffer.concat` 到完整文件）——等于手动把流变成了全量内存；④ 用了 `pipeline` 却没 catch，报错后上游没被销毁、继续灌数据。验证方法：压测时同时看 `rs.isPaused()` 和进程 RSS，RSS 一路上涨就说明背压没生效。
+
+**Q：cluster 多个 worker 共享同一个端口，请求为什么分布不均？**
+
+A：因为共享端口这件事并不是内核直接做的。Linux 上 `cluster` 默认 `SCHED_RR`：由 primary 进程 `accept` 连接再分发给 worker，高并发短连接下排队发生在 primary 的单核上，这一核先打满；改成 `cluster.schedulingPolicy = cluster.SCHED_NONE` 才由各 worker 自己 `accept`、交给内核调度。更常见的"不均"来自长连接：WebSocket / SSE 一旦建立就不再重新分配，某个 worker 恰好接下几个热门房间就长期偏重，`pm2 list` 上表现为"一个实例 CPU 打满、其余几乎空闲"。结论：短请求靠 cluster 够用；长连接的均衡要在网关侧做"按连接数最少调度"，别指望 cluster；纯计算任务用 worker_threads 更便宜（省掉每进程 30MB 起的内存与端口协调）。
+
+**Q：滚动发布时那几十个 502 从哪来？优雅退出该按什么顺序做？**
+
+A：502 通常不是"退出太慢"，而是"流量还没摘干净进程就没了"。K8s 里 Pod 进入 Terminating 与 Endpoints 摘除是并行发生的，kube-proxy / Ingress 生效有几百毫秒到几秒延迟，这段时间新连接还会打到正在退出的进程；同时 keep-alive 长连接不会因为 SIGTERM 自己断开。正确顺序：① 收到 SIGTERM 先把 readiness 置为失败（或在 `preStop` 里 sleep 几秒），等流量真正摘除；② `server.close()` 停止接受新连接，等存量请求跑完；③ 主动给 keep-alive 连接回 `Connection: close`，并设一个硬超时（如 15s）到点强杀；④ 依次关连接池、清定时器、flush 日志，最后 `process.exit(0)`。PM2 部署时 `kill_timeout` 必须大于这个硬超时，否则 PM2 提前 SIGKILL，正在收尾的请求照样 502。
 
 ---
 

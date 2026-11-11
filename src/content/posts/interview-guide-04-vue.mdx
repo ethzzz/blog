@@ -12,6 +12,16 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 目标 | 必须能回答 |
+|:--|:--|:--|
+| 浅 | 说清概念 | Vue2 和 Vue3 的响应式分别怎么做？`ref` 和 `reactive` 该选哪个？`key` 影响 diff 的哪一步？ |
+| 中 | 讲机制/代码 | 依赖的三级结构怎么组织、最外层为什么是 WeakMap？Vue3 子节点 diff 的第 ⑤ 步为什么要求 LIS？`trigger` 之后为什么不是同步更新？ |
+| 深 | 讲取舍/线上 | Proxy 代理不到哪些对象、为什么那些必须 `markRaw`？SSR 直出后 hydration mismatch 一般来自哪几类代码？`v-memo` 与 `shallowRef` 各自省掉的是什么成本？ |
+
+---
+
 ## Vue 基础
 
 ### Q1: Vue 的优缺点？⭐
@@ -831,6 +841,36 @@ export default {
 | provide 的值不是响应式 | provide 了普通值 | provide 一个 ref/reactive，或 `readonly` 包装响应式对象 |
 | keep-alive 缓存后数据不刷新 | `onActivated` 没做重新拉取 | 用 `onActivated` 触发刷新，或用 `:key` 控制缓存粒度 |
 | 大列表滚动卡顿 | 一次渲染全部节点 | 虚拟滚动（vue-virtual-scroller / vueuc） |
+
+## 深水区追问（2026 补充）
+
+**Q：Proxy 代理不到哪些东西？为什么这类对象必须 `markRaw` 或 `shallowRef`？**
+
+| 代理不到的对象 | 症状 | 处理 |
+|:--|:--|:--|
+| 带私有字段的类实例（`#x`） | 方法一调就抛「Cannot read private member」 | `markRaw`，或把方法 `bind` 回原始实例 |
+| `Map` / `Set` / `Date` / `Promise` 等内建对象 | 方法读不到内部槽，报 `incompatible receiver` 或返回空 | `Map`/`Set` Vue 有专门 instrumentation，其余用 `shallowRef` / `markRaw` |
+| 需要 `===` 判等的场景 | `proxy !== raw`，`includes` / `indexOf` 找不到 | 比较前 `toRaw`，或统一只存原始引用 |
+
+根因是 Proxy 只拦截**属性访问**这一层：任何依赖「内部槽」或「this 必须是原始实例」的行为都会失效。所以第三方库实例（ECharts、Three、地图 SDK）一律 `markRaw`——这不是性能优化，是**正确性**要求。
+
+**Q：`const { count } = defineProps()` 为什么曾经丢响应式？Vue 3.5 之后变了吗？**
+
+`props` 是一个响应式代理对象，解构相当于**当场读一次值**存进局部变量，之后 props 更新也不会回写这个变量——这是 JS 解构语义，不是 Vue 的 bug。以前的标准解法是 `toRefs(props)` 或 `toRef(props, 'count')`。Vue 3.5 起，`<script setup>` 里 `defineProps` 的解构会被编译器**改写成 `props.count` 的属性访问**（默认值也编译成 `??` 表达式），所以响应性自动保留。两个限制仍在：只在编译宏场景生效（`this.$props`、运行时 API 声明无效）；解构出的变量**不能重新赋值**，编译器会报错。
+
+**Q：SSR 直出后页面「先闪一下再归位」，hydration mismatch 通常来自哪三类代码？**
+
+① **服务端取不到的值**：`Date.now()`、`Math.random()`、`localStorage`、`navigator.language`、窗口宽度——两次渲染结果不同，客户端 patch 时就得改 DOM。② **条件渲染依赖运行环境**：模板里判断 `typeof window` 是否存在，服务端渲染成 false、客户端首帧 true，结构直接对不上。③ **第三方组件在 setup 顶层就碰 DOM**：地图、编辑器、图表容器在 `onMounted` 之前实例化。修法统一：把环境相关取值挪进 `onMounted` / `onActivated`，或用 `ClientOnly` 组件把整块延后到客户端；`Teleport` 的目标节点必须服务端也存在，否则 hydration 时找不到容器。
+
+**Q：`v-once`、`v-memo`、`shallowRef` 分别省掉什么？代价是什么？**
+
+| 手段 | 省掉的成本 | 代价 |
+|:--|:--|:--|
+| `v-once` | 编译期标记静态，后续更新整棵子树跳过 diff | 里面的插值也永久冻结，只能用于真正不变的块 |
+| `v-memo="[a, b]"` | 依赖数组不变时跳过该节点及其子树的 patch | 依赖漏写就是不更新，得自己判断「影响输出的全部输入」 |
+| `shallowRef` | 跳过深层代理的创建与嵌套 get/set 拦截 | 内部属性 mutate 不触发更新，必须整体替换 `.value` |
+
+三者治的都是「渲染与代理的固定开销」，不是「计算太慢」。真正的计算热点还是得靠 `computed` 缓存加虚拟滚动，别指望用 `v-memo` 救一个大列表的首屏。
 
 ## 自测清单（能答上 8 条算过关）
 

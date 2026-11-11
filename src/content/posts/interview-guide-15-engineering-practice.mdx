@@ -12,6 +12,16 @@ draft: false
 
 ---
 
+## 三层复习路径（浅 → 中 → 深）
+
+| 层级 | 达标标准 | 自测问题 |
+|:--|:--|:--|
+| 浅（说清概念） | 能用自己的话定义术语，方案不混 | ① Monorepo 与 Multirepo 各自的代价是什么？② 微前端的隔离有几层（JS / 样式 / 路由）？③ 组件库为什么同时产出 ESM、CJS、UMD？ |
+| 中（讲机制） | 能画出链路、写出配置、说清每一步在拦什么 | ① pnpm 的三层 node_modules 如何杜绝幽灵依赖？② qiankun 的 HTML Entry、Proxy 沙箱、样式隔离怎么串起来？③ CI 从 push 到灰度上线，每个卡口分别拦什么？ |
+| 深（讲取舍） | 能说出方案边界、失败模式与回滚路径 | ① 增量构建为什么会出现「缓存命中但产物是旧的」？② 微前端号称的样式隔离到底管不管 `body` 和合成事件？③ 静态资源带 hash 发布时 HTML 与 JS 谁先上，回滚按什么顺序？ |
+
+---
+
 ## Monorepo 与代码组织
 
 ### Q1: Monorepo vs Multirepo 怎么选？⭐⭐ 🔥
@@ -756,6 +766,26 @@ dist/
 - 页面停留：visibilitychange + beforeunload
 - 用户轨迹：Session Replay（rrweb 录制 DOM 变化）
 ```
+
+---
+
+## 深水区追问（2026 补充）
+
+**Q：Monorepo 里增量构建「缓存命中了但产物是旧的」，通常是什么原因？**
+
+答：缓存键只认声明的 `inputs`、环境变量和任务定义，**不认你没声明的依赖**。三类典型漏配：① 任务读了根目录的 tsconfig 基线或 `.env`，但 `inputs` 只写了 `src/**`，改配置不影响哈希；② 上游包改了却没用 `dependsOn: ["^build"]` 表达，下游直接吃旧缓存；③ `outputs` 漏了真实产物目录（`.next`、`types` 等），缓存回填时补不全。排查靠 `turbo run build --dry=json` 看每个任务的 hash 与 inputs，再用 `--force` 对比一次。反过来也要防过度声明：`inputs` 写成 `**` 等于把增量构建关掉。
+
+**Q：微前端的样式隔离到什么程度？`body` 样式和 React 合成事件为什么会漏？**
+
+答：分三层看。**选择器级**：qiankun 的实验性样式隔离只是给子应用规则加前缀，能挡类名冲突，挡不住 `body` / `html` / `:root` 这类全局规则，也挡不住 `position: fixed` 逃出容器。**文档级**：真正隔离要 Shadow DOM 或 iframe，但 Shadow DOM 会 retarget 事件（`event.target` 变成宿主元素），依赖具体目标的三方库会失灵，而且 React 16 及以前把事件委托挂在 `document` 上，Shadow DOM 内的事件到不了那里——上 Shadow DOM 就必须 React 17+ 并保证 root 挂在 shadow 内部。**生命周期级**：子应用 `unmount` 不清理定时器、全局监听，切走之后还在跑。所以谈「隔离」必须先说清是隔离样式、隔离运行时、还是隔离部署——三者代价差一个数量级。
+
+**Q：组件库要做破坏性变更，怎么在不发 major 的情况下演进？**
+
+答：三条并行：① **加不删**——新 prop 给默认值，旧 prop 标 `@deprecated` 并在开发环境 `console.warn`，至少留一个版本的迁移窗口；② **双实现期**——新旧行为用开关并存（`legacy` prop 或 feature flag），文档给前后对照，同时提供 codemod 批量改调用点；③ **入口加严等同破坏性变更**——`exports` 字段一加，用户原来 import 深路径立刻报错，这必须按 major 处理，别当「配置优化」混进 minor。判据很硬：**用户代码需要改一行，就是 breaking**。SemVer 的可信度一旦破产，升级就会被无限期拖延，最后只能靠锁版本活着。
+
+**Q：静态资源带 hash 发布，HTML 与 JS 的发布顺序怎么定？回滚为什么常常「回滚了个寂寞」？**
+
+答：原则是**不可变资源先上、入口最后切**：先传带 hash 的 JS / CSS（新文件名，不影响在线页面），再替换 `index.html`，最后刷 CDN 的 HTML 缓存。反过来先切 HTML，用户拿着旧 HTML 去请求已被删掉的旧 chunk，就是 `chunk load failed` 白屏。回滚同理，只回滚 HTML 不够：① CDN 边缘节点缓存 HTML，回滚后部分用户仍拿到新入口；② 已经打开的旧页面在跑，按新清单去取已清理的资源会 404；③ Service Worker 的旧缓存优先级高于网络。所以完整回滚 = HTML 回退 + CDN 刷新 + 上一版资源至少保留一个发布周期，并把 chunk 加载失败单独识别成「提示重载」而不是普通报错。
 
 ---
 
