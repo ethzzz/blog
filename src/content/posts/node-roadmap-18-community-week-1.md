@@ -733,7 +733,7 @@ import { config } from '../../common/config.js';
 export type AccessPayload = { sub: string; roles: string[] };
 
 export function signAccessToken(payload: AccessPayload) {
-  const expiresIn = '15m' as SignOptions['expiresIn'];
+  const expiresIn = '15m' as NonNullable<SignOptions['expiresIn']>;
   return jwt.sign(payload, config.JWT_SECRET, { expiresIn, algorithm: 'HS256' });
 }
 
