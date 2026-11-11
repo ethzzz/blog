@@ -111,29 +111,26 @@ export async function listComments(postId: bigint, limit = 50) {
 
 ### 2. 写 comments.routes.ts
 
+参数解析直接复用 Day 5 写的 `apps/api/src/common/params.ts`，不要再用 `BigInt(req.params.postId ?? '')`。
+
 路径：`apps/api/src/modules/comments/comments.routes.ts`：
 
 ```ts
 import { Router } from 'express';
 import { requireAuth } from '../../common/auth.js';
-import { AppError } from '../../common/errors.js';
 import { asyncHandler } from '../../common/middleware.js';
+import { parseBigIntId } from '../../common/params.js';
 import { createComment, listComments } from './comments.service.js';
 
 export const commentsRouter = Router({ mergeParams: true });
 
-function postId(value: string | undefined) {
-  if (!value || !/^\d+$/.test(value)) throw new AppError('INVALID_POST_ID', 400, 'Invalid post id');
-  return BigInt(value);
-}
-
 commentsRouter.get('/', asyncHandler(async (req, res) => {
-  res.json({ items: await listComments(postId(req.params.postId)) });
+  res.json({ items: await listComments(parseBigIntId(req.params.postId, 'postId')) });
 }));
 
 commentsRouter.post('/', requireAuth, asyncHandler(async (req, res) => {
   res.status(201).json(
-    await createComment(postId(req.params.postId), BigInt(req.user!.sub), req.body),
+    await createComment(parseBigIntId(req.params.postId, 'postId'), BigInt(req.user!.sub), req.body),
   );
 }));
 ```
@@ -227,16 +224,17 @@ export async function unlikePost(postId: bigint, userId: bigint) {
 import { Router } from 'express';
 import { requireAuth } from '../../common/auth.js';
 import { asyncHandler } from '../../common/middleware.js';
+import { parseBigIntId } from '../../common/params.js';
 import { likePost, unlikePost } from './likes.service.js';
 
 export const likesRouter = Router({ mergeParams: true });
 
 likesRouter.post('/', requireAuth, asyncHandler(async (req, res) => {
-  res.json(await likePost(BigInt(req.params.postId ?? ''), BigInt(req.user!.sub)));
+  res.json(await likePost(parseBigIntId(req.params.postId, 'postId'), BigInt(req.user!.sub)));
 }));
 
 likesRouter.delete('/', requireAuth, asyncHandler(async (req, res) => {
-  res.json(await unlikePost(BigInt(req.params.postId ?? ''), BigInt(req.user!.sub)));
+  res.json(await unlikePost(parseBigIntId(req.params.postId, 'postId'), BigInt(req.user!.sub)));
 }));
 ```
 

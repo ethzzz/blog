@@ -1127,6 +1127,22 @@ curl -i -b /tmp/cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/refresh
 
 ### 1. posts 模块
 
+先补一个路由参数解析函数。Express 5 的类型把 `req.params` 的值定义成 `string | string[]`（给通配路由留的），不能直接塞给 `BigInt()`，否则会报 TS2345。统一在边界校验：
+
+`apps/api/src/common/params.ts` 完整文件：
+
+```ts
+import { AppError } from './errors.js';
+
+export function parseBigIntId(value: string | string[] | undefined, field = 'id'): bigint {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw new AppError('INVALID_ID', 400, `Invalid ${field}`);
+  }
+
+  return BigInt(value);
+}
+```
+
 `apps/api/src/modules/posts/posts.service.ts`：
 
 ```ts
@@ -1181,6 +1197,7 @@ export async function getPost(id: bigint, viewerId?: bigint) {
 import { Router } from 'express';
 import { optionalAuth, requireAuth } from '../../common/auth.js';
 import { asyncHandler } from '../../common/middleware.js';
+import { parseBigIntId } from '../../common/params.js';
 import { createPost, getPost, listPublishedPosts } from './posts.service.js';
 
 export const postsRouter = Router();
@@ -1192,7 +1209,7 @@ postsRouter.get('/', asyncHandler(async (_req, res) => {
 }));
 
 postsRouter.get('/:id', optionalAuth, asyncHandler(async (req, res) => {
-  res.json(await getPost(BigInt(req.params.id ?? ''), req.user ? userId(req) : undefined));
+  res.json(await getPost(parseBigIntId(req.params.id), req.user ? userId(req) : undefined));
 }));
 
 postsRouter.post('/', requireAuth, asyncHandler(async (req, res) => {
@@ -1231,17 +1248,18 @@ export async function unfollow(followerId: bigint, followeeId: bigint) {
 import { Router } from 'express';
 import { requireAuth } from '../../common/auth.js';
 import { asyncHandler } from '../../common/middleware.js';
+import { parseBigIntId } from '../../common/params.js';
 import { follow, unfollow } from './users.service.js';
 
 export const usersRouter = Router();
 usersRouter.use(requireAuth);
 
 usersRouter.post('/:id/follow', asyncHandler(async (req, res) => {
-  res.json(await follow(BigInt(req.user!.sub), BigInt(req.params.id ?? '')));
+  res.json(await follow(BigInt(req.user!.sub), parseBigIntId(req.params.id, 'followeeId')));
 }));
 
 usersRouter.delete('/:id/follow', asyncHandler(async (req, res) => {
-  res.json(await unfollow(BigInt(req.user!.sub), BigInt(req.params.id ?? '')));
+  res.json(await unfollow(BigInt(req.user!.sub), parseBigIntId(req.params.id, 'followeeId')));
 }));
 ```
 
