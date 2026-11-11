@@ -107,6 +107,11 @@ export async function apiFetch<T>(
   }
   return res.json() as Promise<T>;
 }
+
+export function getAccessToken() {
+  if (typeof window === 'undefined') return undefined;
+  return sessionStorage.getItem('accessToken') ?? undefined;
+}
 ```
 
 ### 3. 登录/注册 route handler
@@ -130,12 +135,66 @@ export async function POST(request: Request) {
 }
 ```
 
-同样写 `refresh` / `logout` route handler。accessToken 放内存/sessionStorage；refresh 只走 httpOnly Cookie。
+`src/app/api/auth/register/route.ts` 完整文件：
+
+```ts
+export async function POST(request: Request) {
+  const body = await request.json();
+  const upstream = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  const data = await upstream.json();
+  return Response.json(data, { status: upstream.status });
+}
+```
+
+`src/app/api/auth/refresh/route.ts` 完整文件：
+
+```ts
+export async function POST(request: Request) {
+  const upstream = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/auth/refresh`, {
+    method: 'POST',
+    headers: { cookie: request.headers.get('cookie') ?? '' },
+  });
+
+  const data = await upstream.json();
+  const response = Response.json(data, { status: upstream.status });
+  const setCookie = upstream.headers.get('set-cookie');
+  if (setCookie) response.headers.set('set-cookie', setCookie);
+  return response;
+}
+```
+
+`src/app/api/auth/logout/route.ts` 完整文件：
+
+```ts
+export async function POST(request: Request) {
+  const upstream = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/auth/logout`, {
+    method: 'POST',
+    headers: { cookie: request.headers.get('cookie') ?? '' },
+  });
+
+  const response = new Response(null, { status: upstream.status });
+  const setCookie = upstream.headers.get('set-cookie');
+  if (setCookie) response.headers.set('set-cookie', setCookie);
+  return response;
+}
+```
+
+accessToken 放内存/sessionStorage；refresh 只走 httpOnly Cookie。
 
 ### 4. 登录页
 
+`src/app/(auth)/login/page.tsx` 完整文件：
+
 ```tsx
 'use client';
+
+import { useRouter } from 'next/navigation';
+import { useState } from 'react';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -175,7 +234,50 @@ export default function LoginPage() {
 }
 ```
 
-注册页同理，调 `/api/v1/auth/register`，成功后跳登录。
+`src/app/(auth)/register/page.tsx` 完整文件：
+
+```tsx
+'use client';
+
+import { useRouter } from 'next/navigation';
+import { useState } from 'react';
+
+export default function RegisterPage() {
+  const router = useRouter();
+  const [error, setError] = useState('');
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const response = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nickname: form.get('nickname'),
+        email: form.get('email'),
+        password: form.get('password'),
+      }),
+    });
+
+    if (!response.ok) {
+      setError('注册失败，邮箱可能已被使用');
+      return;
+    }
+    router.push('/login');
+  }
+
+  return (
+    <form onSubmit={submit} className="mx-auto max-w-sm space-y-3 py-20">
+      <h1 className="text-2xl font-bold">注册</h1>
+      <input name="nickname" placeholder="昵称" className="w-full rounded border p-2" />
+      <input name="email" type="email" placeholder="邮箱" className="w-full rounded border p-2" />
+      <input name="password" type="password" placeholder="密码" className="w-full rounded border p-2" />
+      {error && <p className="text-sm text-red-500">{error}</p>}
+      <button className="w-full rounded bg-black py-2 text-white">注册</button>
+    </form>
+  );
+}
+```
 
 **验收**：注册 201、登录 200、刷新页面登录态不丢；未登录访问 `/feed` 跳 `/login`。
 
@@ -189,15 +291,25 @@ export default function LoginPage() {
 
 ### 1. feed 首屏
 
-`src/app/(public)/feed/page.tsx`：
+`src/app/(public)/feed/page.tsx` 完整文件：
 
 ```tsx
+import { cookies } from 'next/headers';
+
+type Post = {
+  id: string;
+  content: string;
+  author: { nickname: string };
+};
+
+type FeedResponse = { items: Post[] };
+
 export default async function FeedPage() {
   const response = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/feed?limit=20`, {
     headers: { cookie: (await cookies()).toString() },
     cache: 'no-store',
   });
-  const data = await response.json();
+  const data = (await response.json()) as FeedResponse;
 
   return (
     <main className="mx-auto max-w-2xl py-8">
@@ -206,7 +318,7 @@ export default async function FeedPage() {
         <p className="text-sm text-gray-500">还没有内容，去关注几个人或发第一条帖子。</p>
       ) : (
         <ul className="space-y-4">
-          {data.items.map((post: any) => (
+          {data.items.map((post) => (
             <li key={post.id}>
               <a className="block rounded border p-4" href={`/posts/${post.id}`}>
                 <p className="font-medium">{post.author.nickname}</p>
@@ -223,16 +335,25 @@ export default async function FeedPage() {
 
 ### 2. 帖子详情
 
-`src/app/(public)/posts/[id]/page.tsx`：
+`src/app/(public)/posts/[id]/page.tsx` 完整文件：
 
 ```tsx
+import { notFound } from 'next/navigation';
+
+type Post = {
+  id: string;
+  title: string | null;
+  content: string;
+  author: { nickname: string };
+};
+
 export default async function PostPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const response = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/posts/${id}`, {
     cache: 'no-store',
   });
   if (!response.ok) notFound();
-  const post = await response.json();
+  const post = (await response.json()) as Post;
 
   return (
     <article className="mx-auto max-w-2xl py-8">
@@ -246,10 +367,14 @@ export default async function PostPage({ params }: { params: Promise<{ id: strin
 
 ### 3. 发帖
 
-`src/app/(public)/posts/new/page.tsx`：
+`src/app/(public)/posts/new/page.tsx` 完整文件：
 
 ```tsx
 'use client';
+
+import { useRouter } from 'next/navigation';
+import { useState } from 'react';
+import { apiFetch } from '@/lib/api';
 
 export default function NewPostPage() {
   const router = useRouter();
@@ -284,9 +409,12 @@ export default function NewPostPage() {
 
 ### 4. 登录保护
 
-`src/middleware.ts`：
+`src/middleware.ts` 完整文件：
 
 ```ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
 export function middleware(request: NextRequest) {
   const hasSession = request.cookies.has('refresh_token');
   if (!hasSession && /^\/(feed|posts\/new)/.test(request.nextUrl.pathname)) {

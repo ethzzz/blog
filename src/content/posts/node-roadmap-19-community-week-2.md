@@ -138,10 +138,13 @@ commentsRouter.post('/', requireAuth, asyncHandler(async (req, res) => {
 }));
 ```
 
-`app.ts` 挂载：
+`apps/api/src/app.ts` 只改两处：顶部 import 区加一行，路由区在 `app.use('/api/v1/feed', feedRouter)` 之后加一行。其余代码保持 Day 5 的完整文件不变。
 
 ```ts
+// 插到 apps/api/src/app.ts 顶部的 import 区，按字母序放 feed 路由附近
 import { commentsRouter } from './modules/comments/comments.routes.js';
+
+// 插到 app.use('/api/v1/feed', feedRouter); 之后
 app.use('/api/v1/posts/:postId/comments', commentsRouter);
 ```
 
@@ -237,10 +240,13 @@ likesRouter.delete('/', requireAuth, asyncHandler(async (req, res) => {
 }));
 ```
 
-`app.ts` 挂载：
+`apps/api/src/app.ts` 同样只加两行：import 区和路由区。插入位置与上一天相同：
 
 ```ts
+// 插到 apps/api/src/app.ts 顶部的 import 区
 import { likesRouter } from './modules/likes/likes.routes.js';
+
+// 插到 app.use('/api/v1/posts/:postId/comments', commentsRouter); 之后
 app.use('/api/v1/posts/:postId/like', likesRouter);
 ```
 
@@ -263,7 +269,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3000/api/v1/p
 
 ### 1. 扩展 Prisma
 
-在 `apps/api/prisma/schema.prisma` 增加：
+在 `apps/api/prisma/schema.prisma` **文件末尾**追加（放在 Day 3 的 `Follow` 模型之后，与已有 model 平级）：
 
 ```prisma
 enum NotificationType {
@@ -309,10 +315,22 @@ model Notification {
 }
 ```
 
-User 模型补：
+还要回到 `model User` 内部补一条反向关系。位置：`refreshTokens RefreshToken[]` 这一行之后，和已有的 `posts`、`comments`、`likes` 关系字段放在一起：
 
 ```prisma
-notifications Notification[]
+model User {
+  // ...前面的字段保持不变
+  refreshTokens RefreshToken[]
+  notifications Notification[]
+  roles         UserRole[]
+  posts         Post[]
+  comments      Comment[]
+  likes         Like[]
+  following     Follow[]       @relation("follower")
+  followers     Follow[]       @relation("followee")
+  @@index([createdAt])
+  @@map("users")
+}
 ```
 
 执行：
@@ -504,48 +522,120 @@ notificationWorker.on('failed', (job, error) => {
 });
 ```
 
-`server.ts` 启动：
+`apps/api/src/server.ts` 改完后的完整文件（在 Day 2 版本上启动两个 worker）：
 
 ```ts
+import { config } from './common/config.js';
+import { logger } from './common/logger.js';
 import { startOutboxWorker } from './jobs/outbox.worker.js';
 import './jobs/notification.worker.js';
+import { createApp } from './app.js';
 
+const app = createApp();
 startOutboxWorker();
+
+app.listen(config.PORT, () => {
+  logger.info({ port: config.PORT }, 'API listening');
+});
 ```
 
 ### 5. 业务事务写 Outbox
 
-评论成功分支：
+**评论成功分支**：改 `apps/api/src/modules/comments/comments.service.ts`。在 `createComment` 的事务里，`tx.post.update(...)` 之后、`return created` 之前插入 `enqueueOutbox`。下面是改完的事务块：
 
 ```ts
-await enqueueOutbox(tx, 'comment.created', {
-  commentId: created.id.toString(),
-  postId: postId.toString(),
-  actorId: authorId.toString(),
-  recipientId: post.authorId.toString(),
+// apps/api/src/modules/comments/comments.service.ts
+// 顶部 import 区追加
+import { enqueueOutbox } from '../../common/outbox.js';
+
+// createComment 内部：替换原来的 prisma.$transaction 回调
+const comment = await prisma.$transaction(async (tx) => {
+  const created = await tx.comment.create({
+    data: { postId, authorId, parentId, content: input.content },
+    include: { author: { select: { id: true, nickname: true, avatarUrl: true } } },
+  });
+  await tx.post.update({
+    where: { id: postId },
+    data: { commentCount: { increment: 1 } },
+  });
+  await enqueueOutbox(tx, 'comment.created', {
+    commentId: created.id.toString(),
+    postId: postId.toString(),
+    actorId: authorId.toString(),
+    recipientId: post.authorId.toString(),
+  });
+  return created;
 });
 ```
 
-点赞成功分支：
+**点赞成功分支**：改 `apps/api/src/modules/likes/likes.service.ts` 的 `likePost`。只有真正插入点赞（`created.count === 1`）时才发事件。改完的完整函数：
 
 ```ts
-await enqueueOutbox(tx, 'like.created', {
-  targetType: 'post',
-  targetId: postId.toString(),
-  actorId: userId.toString(),
-  recipientId: post.authorId.toString(),
-});
+// apps/api/src/modules/likes/likes.service.ts
+// 顶部 import 区追加
+import { enqueueOutbox } from '../../common/outbox.js';
+
+export async function likePost(postId: bigint, userId: bigint) {
+  return prisma.$transaction(async (tx) => {
+    const post = await tx.post.findFirst({
+      where: { id: postId, status: 'published' },
+      select: { id: true, authorId: true },
+    });
+    if (!post) throw new AppError('POST_NOT_FOUND', 404, 'Post not found');
+
+    const created = await tx.like.createMany({
+      data: [{ userId, targetType: 'post', targetId: postId }],
+      skipDuplicates: true,
+    });
+
+    if (created.count === 1) {
+      await tx.post.update({
+        where: { id: postId },
+        data: { likeCount: { increment: 1 } },
+      });
+      await enqueueOutbox(tx, 'like.created', {
+        targetType: 'post',
+        targetId: postId.toString(),
+        actorId: userId.toString(),
+        recipientId: post.authorId.toString(),
+      });
+    }
+
+    return { liked: true, changed: created.count === 1, authorId: post.authorId };
+  });
+}
 ```
 
-关注成功分支：
+**关注成功分支**：改 `apps/api/src/modules/users/users.service.ts`。`follow` 原来没有事务，要包进 `prisma.$transaction`，才能让关注关系和 outbox 事件一起提交。改完的完整函数：
 
 ```ts
-await enqueueOutbox(tx, 'follow.created', {
-  followerId: followerId.toString(),
-  followeeId: followeeId.toString(),
-  actorId: followerId.toString(),
-  recipientId: followeeId.toString(),
-});
+// apps/api/src/modules/users/users.service.ts
+// 顶部 import 区追加
+import { enqueueOutbox } from '../../common/outbox.js';
+
+export async function follow(followerId: bigint, followeeId: bigint) {
+  if (followerId === followeeId) throw new AppError('CANNOT_FOLLOW_SELF', 400, 'Cannot follow yourself');
+  const target = await prisma.user.findUnique({ where: { id: followeeId } });
+  if (!target || target.status !== 'active') throw new AppError('USER_NOT_FOUND', 404, 'User not found');
+
+  return prisma.$transaction(async (tx) => {
+    const result = await tx.follow.createMany({
+      data: [{ followerId, followeeId }],
+      skipDuplicates: true,
+    });
+
+    if (result.count === 1) {
+      await enqueueOutbox(tx, 'follow.created', {
+        followerId: followerId.toString(),
+        followeeId: followeeId.toString(),
+        actorId: followerId.toString(),
+        recipientId: followeeId.toString(),
+      });
+    }
+
+    return { created: result.count === 1 };
+  });
+}
 ```
 
 ### 6. 验收
@@ -650,10 +740,13 @@ notificationsRouter.get('/stream', requireAuth, async (req, res) => {
 });
 ```
 
-`app.ts` 挂载：
+`apps/api/src/app.ts` 还是只加两行，插入位置在 `app.use('/api/v1/feed', feedRouter);` 之后：
 
 ```ts
+// 插到 apps/api/src/app.ts 顶部的 import 区
 import { notificationsRouter } from './modules/notifications/notifications.routes.js';
+
+// 插到 app.use('/api/v1/feed', feedRouter); 之后
 app.use('/api/v1/notifications', notificationsRouter);
 ```
 
@@ -724,13 +817,51 @@ export function buildOpenApiDocument() {
 }
 ```
 
-`app.ts`：
+`apps/api/src/app.ts` 到 Day 10 的完整文件（把前面所有路由和 Swagger 放在一起，方便一次核对）：
 
 ```ts
+import cookieParser from 'cookie-parser';
+import cors from 'cors';
+import express from 'express';
+import type { Express } from 'express';
 import swaggerUi from 'swagger-ui-express';
+import { config } from './common/config.js';
+import { errorHandler, notFound, requestId } from './common/middleware.js';
 import { buildOpenApiDocument } from './common/openapi.js';
+import { authRouter } from './modules/auth/auth.routes.js';
+import { commentsRouter } from './modules/comments/comments.routes.js';
+import { feedRouter } from './modules/feed/feed.routes.js';
+import { likesRouter } from './modules/likes/likes.routes.js';
+import { notificationsRouter } from './modules/notifications/notifications.routes.js';
+import { postsRouter } from './modules/posts/posts.routes.js';
+import { usersRouter } from './modules/users/users.routes.js';
 
-app.use('/docs', swaggerUi.serve, swaggerUi.setup(buildOpenApiDocument()));
+export function createApp(): Express {
+  const app = express();
+
+  app.use(requestId);
+  app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
+  app.use(cookieParser());
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  app.use('/api/v1/auth', authRouter);
+  app.use('/api/v1/posts', postsRouter);
+  app.use('/api/v1/posts/:postId/comments', commentsRouter);
+  app.use('/api/v1/posts/:postId/like', likesRouter);
+  app.use('/api/v1/users', usersRouter);
+  app.use('/api/v1/feed', feedRouter);
+  app.use('/api/v1/notifications', notificationsRouter);
+  app.use('/docs', swaggerUi.serve, swaggerUi.setup(buildOpenApiDocument()));
+
+  app.use(notFound);
+  app.use(errorHandler);
+
+  return app;
+}
 ```
 
 ### 2. 测试

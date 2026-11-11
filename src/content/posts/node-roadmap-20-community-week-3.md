@@ -121,7 +121,7 @@ pnpm --filter admin-api exec prisma migrate dev --name init_admin
 
 ### 4. AppModule + PrismaModule
 
-`src/prisma/prisma.module.ts`：
+`apps/admin-api/src/prisma/prisma.module.ts`：
 
 ```ts
 import { Global, Module } from '@nestjs/common';
@@ -135,7 +135,7 @@ import { PrismaClient } from '@prisma/client';
 export class PrismaModule {}
 ```
 
-`src/app.module.ts`：
+`apps/admin-api/src/app.module.ts`：
 
 ```ts
 import { Module } from '@nestjs/common';
@@ -148,7 +148,7 @@ import { PrismaModule } from './prisma/prisma.module';
 export class AppModule {}
 ```
 
-`src/main.ts`：
+`apps/admin-api/src/main.ts`：
 
 ```ts
 import { NestFactory } from '@nestjs/core';
@@ -174,7 +174,7 @@ void bootstrap();
 
 ### 1. 权限装饰器与 Guard
 
-`src/common/decorators/permissions.decorator.ts`：
+`apps/admin-api/src/common/decorators/permissions.decorator.ts`：
 
 ```ts
 import { SetMetadata } from '@nestjs/common';
@@ -183,7 +183,7 @@ export const RequirePermissions = (...permissions: string[]) =>
   SetMetadata(PERMISSIONS_KEY, permissions);
 ```
 
-`src/common/guards/jwt-auth.guard.ts`：
+`apps/admin-api/src/common/guards/jwt-auth.guard.ts`：
 
 ```ts
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
@@ -202,7 +202,7 @@ export class JwtAuthGuard implements CanActivate {
 }
 ```
 
-`src/common/guards/permissions.guard.ts`：
+`apps/admin-api/src/common/guards/permissions.guard.ts`：
 
 ```ts
 import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@nestjs/common';
@@ -232,6 +232,8 @@ export class PermissionsGuard implements CanActivate {
 
 ### 2. Zod Pipe
 
+`apps/admin-api/src/common/pipes/zod.pipe.ts`：
+
 ```ts
 import { Injectable, PipeTransform } from '@nestjs/common';
 import type { ZodType } from 'zod';
@@ -246,6 +248,8 @@ export class ZodPipe implements PipeTransform {
 ```
 
 ### 3. 统一异常与 trace
+
+`apps/admin-api/src/common/filters/all-exceptions.filter.ts`：
 
 ```ts
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException } from '@nestjs/common';
@@ -264,23 +268,33 @@ export class AllExceptionsFilter implements ExceptionFilter {
 }
 ```
 
-`main.ts` 注册：
-
-```ts
-app.useGlobalFilters(new AllExceptionsFilter());
-```
+注册点在 `main.ts`：`app.useGlobalFilters(new AllExceptionsFilter());`，完整文件见下一节。
 
 ### 4. Swagger
 
-```ts
-import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+`apps/admin-api/src/main.ts` 改完后的完整文件（filter 和 Swagger 都挂在这里；Day 11 的版本被这一版替换）：
 
-const config = new DocumentBuilder()
-  .setTitle('Community Admin API')
-  .setVersion('1.0')
-  .addBearerAuth()
-  .build();
-SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, config));
+```ts
+import { NestFactory } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { AppModule } from './app.module';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.setGlobalPrefix('api/v1');
+  app.useGlobalFilters(new AllExceptionsFilter());
+
+  const config = new DocumentBuilder()
+    .setTitle('Community Admin API')
+    .setVersion('1.0')
+    .addBearerAuth()
+    .build();
+  SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, config));
+
+  await app.listen(Number(process.env.ADMIN_PORT ?? 3001));
+}
+void bootstrap();
 ```
 
 **验收**：`/docs` 可打开；无 token 请求 401；普通用户 403。
@@ -295,7 +309,7 @@ SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, config));
 
 ### 1. 内部 API 客户端
 
-`src/common/clients/api-client.ts`：
+`apps/admin-api/src/common/clients/api-client.ts`：
 
 ```ts
 import { Injectable } from '@nestjs/common';
@@ -343,7 +357,13 @@ export class ApiClient {
 
 ### 2. ModerationService
 
+`apps/admin-api/src/modules/moderation/moderation.service.ts`：
+
 ```ts
+import { Injectable } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+import { ApiClient } from '../../common/clients/api-client';
+
 @Injectable()
 export class ModerationService {
   constructor(private readonly prisma: PrismaClient, private readonly api: ApiClient) {}
@@ -368,9 +388,15 @@ export class ModerationService {
 }
 ```
 
-控制器：
+`apps/admin-api/src/modules/moderation/moderation.controller.ts`：
 
 ```ts
+import { Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { RequirePermissions } from '../../common/decorators/permissions.decorator';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../../common/guards/permissions.guard';
+import { ModerationService } from './moderation.service';
+
 @Controller('admin/posts')
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 @RequirePermissions('post:review')
@@ -415,23 +441,52 @@ export class ModerationController {
 pnpm --filter admin-api add @nestjs/microservices amqplib amqp-connection-manager
 ```
 
-`main.ts` 连接 RabbitMQ：
+`apps/admin-api/src/main.ts` 改完后的完整文件（在 Day 12 版本上增加 RabbitMQ 微服务连接）：
 
 ```ts
-app.connectMicroservice({
-  transport: Transport.RMQ,
-  options: {
-    urls: [process.env.RABBITMQ_URL ?? 'amqp://127.0.0.1:5672'],
-    queue: 'admin.events',
-    queueOptions: { durable: true },
-  },
-});
-await app.startAllMicroservices();
+import { NestFactory } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { Transport } from '@nestjs/microservices';
+import { AppModule } from './app.module';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.setGlobalPrefix('api/v1');
+  app.useGlobalFilters(new AllExceptionsFilter());
+
+  app.connectMicroservice({
+    transport: Transport.RMQ,
+    options: {
+      urls: [process.env.RABBITMQ_URL ?? 'amqp://127.0.0.1:5672'],
+      queue: 'admin.events',
+      queueOptions: { durable: true },
+    },
+  });
+  await app.startAllMicroservices();
+
+  const config = new DocumentBuilder()
+    .setTitle('Community Admin API')
+    .setVersion('1.0')
+    .addBearerAuth()
+    .build();
+  SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, config));
+
+  await app.listen(Number(process.env.ADMIN_PORT ?? 3001));
+}
+void bootstrap();
 ```
 
 ### 2. 消费者
 
+`apps/admin-api/src/events/events.controller.ts`：
+
 ```ts
+import { Controller } from '@nestjs/common';
+import { EventPattern } from '@nestjs/microservices';
+import { Prisma, PrismaClient } from '@prisma/client';
+import { DashboardService } from '../modules/dashboard/dashboard.service';
+
 @Controller()
 export class EventsController {
   constructor(
@@ -441,16 +496,18 @@ export class EventsController {
 
   @EventPattern('post.created')
   async onPostCreated(payload: { eventId: string }) {
-    const processed = await this.prisma.processedEvent.findUnique({
-      where: { eventId: payload.eventId },
-    });
-    if (processed) return;
-
-    await this.prisma.processedEvent.create({ data: { eventId: payload.eventId } });
+    try {
+      await this.prisma.processedEvent.create({ data: { eventId: payload.eventId } });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return;
+      throw error;
+    }
     await this.dashboard.invalidate();
   }
 }
 ```
+
+> 幂等靠 `processed_events.event_id` 主键，而不是先查再插；重复投递时 `create` 会抛 P2002，直接忽略。`EventsController` 和 `DashboardService` 都要在 `EventsModule` 的 `controllers`/`providers` 里注册。
 
 公共 API 的 outbox worker 把 `post.created` / `report.created` 发到 RabbitMQ exchange；站内通知仍走 BullMQ。
 
@@ -470,7 +527,7 @@ export class EventsController {
 pnpm --filter admin-api add @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node @opentelemetry/exporter-trace-otlp-http
 ```
 
-`src/otel.ts`：
+`apps/admin-api/src/otel.ts`：
 
 ```ts
 import { NodeSDK } from '@opentelemetry/sdk-node';

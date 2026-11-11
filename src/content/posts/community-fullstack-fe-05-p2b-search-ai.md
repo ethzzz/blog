@@ -39,12 +39,23 @@ draft: false
 
 ### 1. 搜索页
 
+`src/app/(public)/search/page.tsx` 完整文件：
+
 ```tsx
 'use client';
 
+import { useEffect, useState } from 'react';
+import { apiFetch } from '@/lib/api';
+
+type Post = {
+  id: string;
+  title: string | null;
+  content: string;
+};
+
 export default function SearchPage() {
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState<any[]>([]);
+  const [results, setResults] = useState<Post[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -59,7 +70,7 @@ export default function SearchPage() {
       setLoading(true);
       setError('');
       try {
-        const data = await apiFetch(
+        const data = await apiFetch<{ items: Post[] }>(
           `/api/v1/search/posts?q=${encodeURIComponent(query)}`,
           { signal: controller.signal },
         );
@@ -122,11 +133,17 @@ export default function SearchPage() {
 
 ### 1. 对话组件
 
+`src/components/ai-chat.tsx` 完整文件：
+
 ```tsx
 'use client';
 
+import { useRef, useState } from 'react';
+
+type Message = { role: 'user' | 'assistant'; content: string };
+
 export function AiChat() {
-  const [messages, setMessages] = useState<{ role: string; content: string }[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const controllerRef = useRef<AbortController | null>(null);
@@ -211,7 +228,12 @@ export function AiChat() {
 
 ### 2. 开关与降级
 
+`apps/web/.env.local` 完整内容（在 01–03 的基础上加最后一行）：
+
 ```ini
+NEXT_PUBLIC_API_BASE=http://127.0.0.1:3000
+API_BASE_INTERNAL=http://127.0.0.1:3000
+NEXT_PUBLIC_ADMIN_API_BASE=http://127.0.0.1:3002
 NEXT_PUBLIC_AI_ENABLED=false
 ```
 

@@ -55,9 +55,12 @@ infra/k8s/helm/community/
     migrate-job.yaml
 ```
 
-Deployment 里至少要有这些配置：
+`infra/k8s/helm/community/templates/deployment-api.yaml` 里，下面这些字段放在 `spec.template.spec.containers[0]` 下，位置在 `image`、`ports` 之后：
 
 ```yaml
+name: api
+ports:
+  - containerPort: 3000
 readinessProbe:
   httpGet: { path: /ready, port: 3000 }
   initialDelaySeconds: 5
@@ -70,6 +73,8 @@ resources:
   requests: { cpu: 100m, memory: 128Mi }
   limits: { cpu: 500m, memory: 512Mi }
 ```
+
+`/ready` 检查和 `/health` 不要互相替代：前者失败会把 Pod 从 Service 摘掉，后者失败会触发重启。
 
 ### 2. 迁移与 Secret
 
@@ -94,24 +99,43 @@ resources:
 pnpm --filter api add meilisearch
 ```
 
-索引消费者订阅 `post.published`：
+`apps/api/src/jobs/search-indexer.worker.ts`：
 
 ```ts
+import { MeiliSearch } from 'meilisearch';
+
 const client = new MeiliSearch({
   host: process.env.MEILI_HOST ?? 'http://127.0.0.1:7700',
   apiKey: process.env.MEILI_KEY,
 });
 
-await client.index('posts').addDocuments([
-  {
+type PostDocument = {
+  id: string;
+  title: string | null;
+  content: string;
+  authorId: string;
+  createdAt: string;
+};
+
+export async function indexPost(post: {
+  id: bigint;
+  title: string | null;
+  content: string;
+  authorId: bigint;
+  createdAt: Date;
+}) {
+  const document: PostDocument = {
     id: post.id.toString(),
     title: post.title,
     content: post.content,
     authorId: post.authorId.toString(),
     createdAt: post.createdAt.toISOString(),
-  },
-]);
+  };
+  await client.index('posts').addDocuments([document]);
+}
 ```
+
+在 outbox worker 收到 `post.published` 事件后调用 `indexPost(...)`；索引失败只重试索引，不影响帖子发布。
 
 搜索接口：
 
@@ -131,20 +155,37 @@ body: { message: string, postId?: string }
 response: text/event-stream
 ```
 
-最小实现：
+最小实现，`apps/api/src/modules/ai/ai.routes.ts`：
 
 ```ts
-aiRouter.post('/chat', requireAuth, async (req, res) => {
+import { Router } from 'express';
+import { requireAuth } from '../../common/auth.js';
+import { asyncHandler } from '../../common/middleware.js';
+import { chat } from './ai.service.js';
+
+export const aiRouter = Router();
+
+aiRouter.post('/chat', requireAuth, asyncHandler(async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const stream = await llm.chat({ messages: [{ role: 'user', content: req.body.message }] });
+  const stream = await chat(String(req.body.message ?? ''));
   for await (const token of stream) {
     res.write(token);
   }
   res.end();
-});
+}));
+```
+
+在 `apps/api/src/app.ts` 挂载（与其他路由同样的两处修改）：
+
+```ts
+// 插到 apps/api/src/app.ts 顶部的 import 区
+import { aiRouter } from './modules/ai/ai.routes.js';
+
+// 插到 app.use('/api/v1/feed', feedRouter); 之后
+app.use('/api/v1/ai', aiRouter);
 ```
 
 - 检索：用帖子标题/正文做关键词或向量召回。

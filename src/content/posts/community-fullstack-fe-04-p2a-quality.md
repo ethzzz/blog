@@ -42,10 +42,21 @@ draft: false
 
 - 首屏列表/详情用 Server Component。
 - 路由级 `loading.tsx`，避免白屏。
-- 大组件按需加载：
+- 大组件按需加载。`src/components/post-editor.tsx` 完整文件：
 
 ```tsx
-const Editor = dynamic(() => import('@/components/editor'), { ssr: false });
+'use client';
+
+import dynamic from 'next/dynamic';
+
+const Editor = dynamic(() => import('@/components/editor'), {
+  ssr: false,
+  loading: () => <p className="text-sm text-gray-500">编辑器加载中...</p>,
+});
+
+export function PostEditor() {
+  return <Editor />;
+}
 ```
 
 ### 2. 列表与图片
@@ -127,6 +138,8 @@ test('register -> login -> post -> feed', async ({ page }) => {
 **今天目标**：前端容器化，Nginx/K8s Ingress 同源反代，生产环境可访问。
 
 ### 1. Dockerfile
+
+`apps/web/Dockerfile` 完整文件：
 
 ```dockerfile
 FROM node:22-alpine AS build

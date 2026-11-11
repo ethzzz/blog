@@ -72,31 +72,55 @@ CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
 
 ### 2. 全栈 Compose
 
-`infra/docker/docker-compose.yml` 增加：
+`infra/docker/docker-compose.yml` 改完后的完整文件（在 Day 1 只有 mysql/redis 的版本上增加 rabbitmq/api/admin-api/web；不要保留旧的同名 service 块，直接整文件替换）：
 
 ```yaml
 services:
-  mysql: { image: mysql:8.0, ports: ["3306:3306"], environment: { MYSQL_ROOT_PASSWORD: root, MYSQL_DATABASE: community } }
-  redis: { image: redis:7-alpine, ports: ["6379:6379"] }
+  mysql:
+    image: mysql:8.0
+    container_name: community-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: community
+    ports: ["3306:3306"]
+    volumes: ["mysql-data:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: community-redis
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+
   rabbitmq:
     image: rabbitmq:3-management
+    container_name: community-rabbitmq
     ports: ["5672:5672", "15672:15672"]
 
   api:
     build: { context: ../.., dockerfile: apps/api/Dockerfile }
     environment:
+      NODE_ENV: production
       DATABASE_URL: mysql://root:root@mysql:3306/community
       REDIS_URL: redis://redis:6379
       RABBITMQ_URL: amqp://rabbitmq:5672
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      WEB_ORIGIN: http://localhost:3002
     ports: ["3000:3000"]
     depends_on: [mysql, redis, rabbitmq]
 
   admin-api:
     build: { context: ../.., dockerfile: apps/admin-api/Dockerfile }
     environment:
+      NODE_ENV: production
       ADMIN_DATABASE_URL: mysql://root:root@mysql:3306/community_admin
       API_INTERNAL_URL: http://api:3000
       RABBITMQ_URL: amqp://rabbitmq:5672
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
     ports: ["3001:3001"]
     depends_on: [api, rabbitmq]
 
@@ -104,8 +128,13 @@ services:
     build: { context: ../.., dockerfile: apps/web/Dockerfile }
     environment:
       NEXT_PUBLIC_API_BASE: http://localhost:3000
+      API_BASE_INTERNAL: http://api:3000
     ports: ["3002:3000"]
     depends_on: [api, admin-api]
+
+volumes:
+  mysql-data:
+  redis-data:
 ```
 
 `.dockerignore` 必须包含 `node_modules`、`dist`、`.next`、`.env`、`.git`、`tests`。
@@ -122,28 +151,44 @@ services:
 
 ### 1. Nginx
 
+`infra/docker/nginx.conf` 完整文件（`location` 不能单独存在，必须放在 `server` 块里）：
+
 ```nginx
-location /api/ {
-    proxy_pass http://api:3000;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}
+server {
+    listen 80;
+    client_max_body_size 10m;
 
-location /admin-api/ {
-    proxy_pass http://admin-api:3001/;
-    proxy_http_version 1.1;
-}
+    location /api/ {
+        proxy_pass http://api:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
 
-location /api/v1/notifications/stream {
-    proxy_pass http://api:3000;
-    proxy_http_version 1.1;
-    proxy_set_header Connection '';
-    proxy_buffering off;
-    proxy_cache off;
-    gzip off;
-    proxy_read_timeout 3600s;
-    add_header X-Accel-Buffering no;
+    location /admin-api/ {
+        proxy_pass http://admin-api:3001/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # 更长前缀优先匹配，SSE 不会被上面的 /api/ 吃掉
+    location /api/v1/notifications/stream {
+        proxy_pass http://api:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        proxy_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_read_timeout 3600s;
+        add_header X-Accel-Buffering no;
+    }
+
+    location / {
+        proxy_pass http://web:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
 }
 ```
 
@@ -154,6 +199,7 @@ SSE 的 `proxy_buffering off` 和 `X-Accel-Buffering: no` 缺一不可。
 `apps/api/src/common/metrics.ts`：
 
 ```ts
+import type { RequestHandler } from 'express';
 import { Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 
 export const register = new Registry();
@@ -176,12 +222,40 @@ export const metricsMiddleware: RequestHandler = (req, res, next) => {
 };
 ```
 
-`app.use(metricsMiddleware)`；`/metrics` 输出 `await register.metrics()`。
+在 `apps/api/src/app.ts` 里挂载：`app.use(requestId);` 之后加 `app.use(metricsMiddleware);`，并在 `notFound` 之前加 `/metrics` 路由。改动只有这两处：
+
+```ts
+// 插到 apps/api/src/app.ts 顶部的 import 区
+import { metricsMiddleware, register } from './common/metrics.js';
+
+// 插到 app.use(requestId); 之后
+app.use(metricsMiddleware);
+
+// 插到 app.use(notFound); 之前
+app.get('/metrics', async (_req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.send(await register.metrics());
+});
+```
 
 ### 3. 优雅关闭
 
+`apps/api/src/server.ts` 改完后的完整文件（在 Day 8 版本上补优雅关闭；`startOutboxWorker()` 的返回值就是停止函数）：
+
 ```ts
+import { config } from './common/config.js';
+import { logger } from './common/logger.js';
+import { prisma } from './common/db.js';
+import { redis } from './common/redis.js';
+import { notificationWorker } from './jobs/notification.worker.js';
+import { startOutboxWorker } from './jobs/outbox.worker.js';
+import { createApp } from './app.js';
+
+const app = createApp();
+const stopOutbox = startOutboxWorker();
 const server = app.listen(config.PORT);
+
+logger.info({ port: config.PORT }, 'API listening');
 
 async function shutdown(signal: string) {
   logger.info({ signal }, 'shutting down');
@@ -191,7 +265,8 @@ async function shutdown(signal: string) {
   server.close(async () => {
     clearTimeout(force);
     clearTimeout(hardClose);
-    await stopWorkers();
+    await stopOutbox();
+    await notificationWorker.close();
     await prisma.$disconnect();
     await redis.quit();
     process.exit(0);

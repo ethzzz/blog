@@ -400,7 +400,7 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
 
 ### 6. 更新 app.ts 与 server.ts
 
-`app.ts`：
+`apps/api/src/app.ts` 改完后的完整文件：
 
 ```ts
 import express from 'express';
@@ -424,7 +424,7 @@ export function createApp(): Express {
 }
 ```
 
-`server.ts`：
+`apps/api/src/server.ts` 改完后的完整文件：
 
 ```ts
 import { config } from './common/config.js';
@@ -482,10 +482,31 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum UserStatus { active banned deleted }
-enum PostStatus { draft pending published rejected deleted }
-enum CommentStatus { pending published rejected deleted }
-enum LikeTargetType { post comment }
+enum UserStatus {
+  active
+  banned
+  deleted
+}
+
+enum PostStatus {
+  draft
+  pending
+  published
+  rejected
+  deleted
+}
+
+enum CommentStatus {
+  pending
+  published
+  rejected
+  deleted
+}
+
+enum LikeTargetType {
+  post
+  comment
+}
 
 model User {
   id           BigInt     @id @default(autoincrement())
@@ -707,14 +728,55 @@ main()
   .finally(() => prisma.$disconnect());
 ```
 
-`apps/api/package.json` 顶层加：
+`apps/api/package.json` 改完后的完整文件：
 
 ```json
 {
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
+  "name": "api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "dev:once": "tsx src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "argon2": "^0.45.2",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "pino": "^10.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "prisma": "6.19.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   }
 }
+```
+
+`apps/api/prisma.config.ts`（Prisma 6.19.3 的 seed 入口写在这里，不再用 `package.json` 顶层的 `prisma.seed`）：
+
+```ts
+import 'dotenv/config';
+import { defineConfig, env } from 'prisma/config';
+
+export default defineConfig({
+  schema: 'prisma/schema.prisma',
+  migrations: {
+    path: 'prisma/migrations',
+    seed: 'tsx prisma/seed.ts',
+  },
+  engine: 'classic',
+  datasource: {
+    url: env('DATABASE_URL'),
+  },
+});
 ```
 
 ### 5. 迁移与验收
@@ -1007,15 +1069,36 @@ export const optionalAuth: RequestHandler = (req, _res, next) => {
 
 ### 6. app.ts 挂载
 
+`apps/api/src/app.ts` 改完后的完整文件（新增 CORS、Cookie 解析和 auth 路由）：
+
 ```ts
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
+import express from 'express';
+import type { Express } from 'express';
 import { config } from './common/config.js';
+import { errorHandler, notFound, requestId } from './common/middleware.js';
 import { authRouter } from './modules/auth/auth.routes.js';
 
-app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
-app.use(cookieParser());
-app.use('/api/v1/auth', authRouter);
+export function createApp(): Express {
+  const app = express();
+
+  app.use(requestId);
+  app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
+  app.use(cookieParser());
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  app.use('/api/v1/auth', authRouter);
+
+  app.use(notFound);
+  app.use(errorHandler);
+
+  return app;
+}
 ```
 
 ### 7. 验收
@@ -1230,16 +1313,42 @@ feedRouter.get('/', requireAuth, asyncHandler(async (req, res) => {
 }));
 ```
 
-`app.ts` 挂载：
+`apps/api/src/app.ts` 改完后的完整文件（在 Day 4 的基础上挂 posts/users/feed）：
 
 ```ts
+import cookieParser from 'cookie-parser';
+import cors from 'cors';
+import express from 'express';
+import type { Express } from 'express';
+import { config } from './common/config.js';
+import { errorHandler, notFound, requestId } from './common/middleware.js';
+import { authRouter } from './modules/auth/auth.routes.js';
+import { feedRouter } from './modules/feed/feed.routes.js';
 import { postsRouter } from './modules/posts/posts.routes.js';
 import { usersRouter } from './modules/users/users.routes.js';
-import { feedRouter } from './modules/feed/feed.routes.js';
 
-app.use('/api/v1/posts', postsRouter);
-app.use('/api/v1/users', usersRouter);
-app.use('/api/v1/feed', feedRouter);
+export function createApp(): Express {
+  const app = express();
+
+  app.use(requestId);
+  app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
+  app.use(cookieParser());
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  app.use('/api/v1/auth', authRouter);
+  app.use('/api/v1/posts', postsRouter);
+  app.use('/api/v1/users', usersRouter);
+  app.use('/api/v1/feed', feedRouter);
+
+  app.use(notFound);
+  app.use(errorHandler);
+
+  return app;
+}
 ```
 
 ### 4. 验收

@@ -146,6 +146,9 @@ apps/admin-api: @nestjs/core @nestjs/common @nestjs/config @nestjs/swagger
 
 ---
 
+> [!NOTE]
+> 代码示例约定：新文件给完整文件；改已有文件时，代码块会标出文件路径和插入锚点，或直接重贴改完后的完整文件。多天反复改的 `app.ts`、`server.ts`、`schema.prisma` 都会在变更处重新给出全文或明确“追加到文件末尾/某个 model 内”，不需要回头翻前面的步骤。
+
 ## 6. 阶段范围
 
 | 阶段 | 后端范围 | 验收 |
