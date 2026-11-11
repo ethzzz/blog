@@ -15,6 +15,21 @@ draft: false
 
 ---
 
+## 0. 前端文件地图与数据流
+
+先写什么：布局 → 登录态 → 一个页面 → 数据请求 → 交互 → 后台。不要先做一套“万能组件库”。
+
+| 层 | 文件 | 职责 | 以后可能怎么改 |
+|---|---|---|---|
+| 路由 | `app/(public)`、`(auth)`、`(admin)` | 页面分组和布局边界 | 加路由组、权限段、国际化 |
+| 请求 | `lib/api.ts` | API 地址、错误、token | 换 OpenAPI 生成 client |
+| 登录态 | `app/api/auth/*`、`middleware.ts` | 刷新 Cookie、路由保护 | SSO、角色路由、审计 |
+| 首屏 | Server Components | 列表、详情、SEO | 流式渲染、缓存 |
+| 交互 | Client Components + TanStack Query | 点赞、评论、通知 | 乐观更新、离线、多端 |
+| 后台 | `app/(admin)` | 审核、举报、用户 | 表格配置、批量操作、SSO |
+
+**数据流**：Server Component 取首屏数据；Client Component 用 Query 做交互；刷新登录态走 Route Handler；通知走 SSE。权限最终在后端再查一次。
+
 ## 1. 前端系列目录
 
 | 篇 | 主题 | 目标 |

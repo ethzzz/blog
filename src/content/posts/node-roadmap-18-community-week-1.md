@@ -17,6 +17,29 @@ draft: false
 
 我本地是 Node 24 + pnpm 12，下面的命令在 Git Bash 里跑过；PowerShell 不只要改环境变量，`mkdir -p`、`cp`、`curl -i` 这些写法也不一样。建议直接开 Git Bash 跑；只用 PowerShell 的话，下面会标出等价写法。
 
+**这一阶段在练什么**
+
+从空目录切出一个能跑的最小闭环：先定分层，再写功能。每加一个文件，都要能说清它属于哪一层、删掉会怎样。
+
+### 文件地图
+
+| 文件 | 为什么单独存在 | 以后可能怎么改 |
+|---|---|---|
+| `apps/api/package.json` | API 是独立部署单元，依赖和脚本自己管 | 后面加 `admin-api`、`web`，各自独立 |
+| `common/config.ts` | 环境变量集中校验，启动即失败 | 接 secrets manager、多环境配置 |
+| `common/logger.ts` | 日志字段统一、敏感信息脱敏 | 接 OpenTelemetry、采样、日志平台 |
+| `common/errors.ts` | 业务错误有统一结构 | 增加错误码目录、国际化 |
+| `common/middleware.ts` | requestId、错误边界是横切能力 | 拆成 auth、限流、metrics 等独立中间件 |
+| `prisma/schema.prisma` | 领域模型和数据约束的唯一来源 | 迁移、索引、分区、读写分离 |
+| `common/db.ts` | 连接池只初始化一次，方便测试替换 | 加只读副本、连接池指标 |
+| `modules/auth/*` | 认证是一个独立用例，不混进路由 | 加 OAuth、MFA、会话管理 |
+| `modules/posts/*` | 内容是最小垂直切片 | 加审核、搜索、媒体 |
+| `modules/feed/*` | 读模型和写模型分开，查询可以单独优化 | 加缓存、写扩散、只读副本 |
+
+**怎么判断该不该拆**
+
+一个文件只有一个变更理由。路由、业务规则、数据访问分开；以后最先变的是业务规则，不是框架。
+
 ---
 
 ## Day 1：空目录到 `/health`

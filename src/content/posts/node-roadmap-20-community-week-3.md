@@ -13,6 +13,27 @@ draft: false
 
 公共 API 到这里已经够用了。接下来单独加一个 `apps/admin-api`，用 NestJS 做审核、举报、用户管理和审计。NestJS 只负责管理端，公共 API 不动，避免为了用框架而重写。
 
+**这一阶段在练什么**
+
+按边界拆服务，而不是按框架拆。NestJS 的 Module、Guard、Pipe、Interceptor、Filter 都是手段，目的是让管理端的权限、校验、错误和审计有固定位置。
+
+### 文件地图
+
+| 文件 | 为什么单独存在 | 以后可能怎么改 |
+|---|---|---|
+| `app.module.ts` | 管理端的组合根 | 拆更多模块或独立服务 |
+| `common/guards` | 认证和权限是横切边界 | SSO、ABAC、权限缓存 |
+| `common/pipes` | 入参校验统一入口 | 共享 zod 契约 |
+| `common/filters` | 错误响应统一出口 | 错误码目录、告警 |
+| `common/clients/api-client.ts` | 管理端不直接碰核心表 | gRPC、服务网格、内部网关 |
+| `modules/moderation` | 审核是独立业务域 | 工作流、SLA、批量审核 |
+| `modules/reports` | 举报和审计独立演进 | 自动分类、风控 |
+| `events` | 跨服务事件入口 | Kafka、Outbox relay |
+
+**怎么判断**
+
+只有“独立变更、独立扩容、独立故障域”才拆服务。公共 API 不重写，管理端单独拆，是为了边界，不是为了追框架。
+
 ---
 
 ## Day 11：NestJS 脚手架与兼容性 spike

@@ -15,6 +15,26 @@ draft: false
 
 下面用 pnpm，npm/yarn 也能跑，命令自己换一下。
 
+**这一阶段在练什么**
+
+把页面、数据请求和登录态分开。首屏用 Server Component，交互用 Client Component，API 类型集中管理。
+
+### 文件地图
+
+| 文件 | 为什么单独存在 | 以后可能怎么改 |
+|---|---|---|
+| `app/layout.tsx` | 全局布局和 Provider 的边界 | 加主题、国际化、监控 |
+| `lib/api.ts` | API 地址和错误处理只写一次 | 换成 OpenAPI 生成 client |
+| `app/api/auth/*` | 登录态在服务端转发，token 不进前端 | 加 SSO、验证码、审计 |
+| `middleware.ts` | 路由级保护，不等于权限 | 角色路由、灰度入口 |
+| `app/feed/page.tsx` | 首屏数据在服务端取，速度和 SEO 更好 | 加缓存、流式渲染 |
+| `app/posts/[id]/page.tsx` | 详情页是独立路由，方便分享 | 加评论、相关推荐 |
+| `app/posts/new/page.tsx` | 表单交互放 Client Component | 加草稿、图片上传 |
+
+**怎么判断**
+
+首屏数据用 RSC；需要点击、输入、乐观更新的才用 Client Component。权限最终要在服务端再查一次。
+
 ---
 
 ## Day 1：脚手架、API client、登录/注册

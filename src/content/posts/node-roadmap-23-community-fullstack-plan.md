@@ -15,6 +15,21 @@ draft: false
 
 ---
 
+## 0. 后端文件地图与设计顺序
+
+先写什么：config → db → 一个垂直切片（认证或帖子）→ 测试 → 异步 → 管理端。不要先把所有表、所有模块铺满。
+
+| 层 | 文件 | 职责 | 以后可能怎么改 |
+|---|---|---|---|
+| 横切 | `common/config`、`logger`、`errors`、`middleware` | 配置、日志、错误、requestId | 拆中间件、接 OTel、接密钥管理 |
+| 数据 | `prisma/schema.prisma`、`common/db.ts` | 模型、迁移、连接 | 加索引、读写分离、连接池指标 |
+| 业务 | `modules/<domain>/{schemas,service,routes}` | 一个业务域的用例 | 查询复杂后拆 repository、加缓存 |
+| 异步 | `jobs/queue`、`outbox.worker`、`notification.worker` | 异步副作用 | 换 Kafka、加重试/DLQ |
+| 管理 | `apps/admin-api` 的 Nest modules | 审核、举报、审计 | 独立服务、SSO、BFF 聚合 |
+| 运维 | `Dockerfile`、Nginx、Helm | 构建、入口、部署 | K8s、灰度、容量规划 |
+
+**怎么判断模块边界**：一个模块能独立描述“谁在什么条件下做什么”，并且变更时不需要同时改三个以上模块。
+
 ## 1. 后端系列目录
 
 | 篇 | 主题 | 目标 |
