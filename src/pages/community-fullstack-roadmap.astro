@@ -15,9 +15,14 @@ const sortedPosts = allPosts.sort(
 );
 
 const sharedPost = sortedPosts.find((post) => post.data.tags.includes("总览"));
-const backendPosts = sortedPosts.filter((post) => post.data.tags.includes("后端"));
-const frontendPosts = sortedPosts.filter((post) => post.data.tags.includes("前端"));
-const totalPosts = backendPosts.length + frontendPosts.length + (sharedPost ? 1 : 0);
+const backendPosts = sortedPosts.filter((post) =>
+	post.data.tags.includes("后端"),
+);
+const frontendPosts = sortedPosts.filter((post) =>
+	post.data.tags.includes("前端"),
+);
+const totalPosts =
+	backendPosts.length + frontendPosts.length + (sharedPost ? 1 : 0);
 ---
 
 <MainGridLayout title="社区全栈实战">
