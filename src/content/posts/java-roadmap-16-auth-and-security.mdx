@@ -1,0 +1,403 @@
+---
+title: '阶段十六：认证、授权与接口安全'
+published: 2026-11-12T12:00:00+08:00
+description: '从 Session 与 JWT 的取舍到 SecurityFilterChain、RBAC 与数据归属校验，讲清登录之后如何保证「只能看自己的」。'
+tags: [Java, SpringSecurity, JWT, RBAC, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> [阶段十四](/blog/posts/java-roadmap-14-spring-mvc-contract/) 让接口做到「参数可信、错误可读」，但每个登录用户都能读写所有人的任务；[阶段十七](/blog/posts/java-roadmap-17-testing-junit-mockito/) 的测试已按本篇契约写好——40101、40301、`JwtService` 的 `issue` 与 `userId`、`Task.ownerId`。本篇把它们落地。环境 JDK 21、Spring Boot 3.5.x、Spring Security 6.5.x、JJWT 0.12，包名 `com.demo.taskcenter`。
+
+## 一、先跑起来
+
+目标：alice 用自己的令牌读 `GET /api/tasks/9` 得 200，不带令牌得 401，bob 用自己的令牌读同一个 id 得 403。
+
+### 1. 依赖与 owner_id
+
+pom 加 `spring-boot-starter-security` 与 JJWT 三个坐标（api、impl、jackson），版本必须一致。归属列先允许 NULL，回填后再收紧：
+
+```sql
+ALTER TABLE task
+  ADD COLUMN owner_id BIGINT UNSIGNED NULL COMMENT '归属用户' AFTER id,
+  ADD KEY idx_task_owner (owner_id, id);
+
+UPDATE task SET owner_id = 1 WHERE owner_id IS NULL;
+
+ALTER TABLE task MODIFY owner_id BIGINT UNSIGNED NOT NULL;
+```
+
+`idx_task_owner` 服务「我的列表」；阶段十五的 `idx_task_list` 留着，两个入口的查询形状不同。
+
+### 2. 两个错误码
+
+401 是「不知道你是谁」，前端跳登录；403 是「知道你是谁但没这个权限」，前端提示后留在原页。补两个常量：
+
+`UNAUTHENTICATED(40101, HttpStatus.UNAUTHORIZED, "未登录或令牌已失效")` 与 `ACCESS_DENIED(40301, HttpStatus.FORBIDDEN, "没有权限访问该资源")`。
+
+### 3. JwtService：两个方法就是契约
+
+```java title="security/JwtService.java"
+package com.demo.taskcenter.security;
+
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Date;
+import javax.crypto.SecretKey;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+@Service
+public class JwtService {
+
+    private static final Duration TTL = Duration.ofMinutes(30);
+
+    private final SecretKey key;
+
+    public JwtService(@Value("${app.jwt.secret}") String secret) {
+        this.key = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public String issue(long userId, String username) {
+        Instant now = Instant.now();
+        return Jwts.builder()
+                .subject(Long.toString(userId))
+                .claim("username", username)
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plus(TTL)))
+                .signWith(key, Jwts.SIG.HS256)
+                .compact();
+    }
+
+    public long userId(String token) {
+        var claims = Jwts.parser().verifyWith(key).build()
+                .parseSignedClaims(token).getPayload();
+        return Long.parseLong(claims.getSubject());
+    }
+}
+```
+
+`issue` 只放 id 与用户名：角色会变，令牌不会。HS256 要求密钥至少 32 字节，短了抛 `WeakKeyException`；密钥从环境变量注入，不写默认值。
+
+### 4. JwtAuthFilter：只做翻译，不做判断
+
+```java title="security/JwtAuthFilter.java（节选）"
+@Override
+protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                FilterChain chain) throws ServletException, IOException {
+    String header = request.getHeader("Authorization");
+    if (header != null && header.startsWith("Bearer ")) {
+        try {
+            long userId = jwtService.userId(header.substring(7));
+            var auth = new UsernamePasswordAuthenticationToken(
+                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_USER")));
+            SecurityContextHolder.getContext().setAuthentication(auth);
+        } catch (JwtException | IllegalArgumentException e) {
+            SecurityContextHolder.clearContext();
+        }
+    }
+    chain.doFilter(request, response);
+}
+```
+
+类上是 `@Component` 加 `extends OncePerRequestFilter`。解析失败要清空上下文而不能往外抛，否则绕过 `ExceptionTranslationFilter`、异常落到 `/error`，响应体变成 Whitelabel 页面。没令牌时什么也不做，这一层不查库。
+
+### 5. SecurityFilterChain：规则自上而下
+
+```java title="security/SecurityConfig.java（节选）"
+@Bean
+public SecurityFilterChain apiChain(HttpSecurity http) throws Exception {
+    http.csrf(csrf -> csrf.disable())
+            .authorizeHttpRequests(auth -> auth
+                    .requestMatchers("/api/auth/login", "/api/auth/refresh").permitAll()
+                    .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                    .anyRequest().authenticated())
+            .exceptionHandling(e -> e
+                    .authenticationEntryPoint((req, res, ex) -> write(res, ErrorCode.UNAUTHENTICATED))
+                    .accessDeniedHandler((req, res, ex) -> write(res, ErrorCode.ACCESS_DENIED)))
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+    return http.build();
+}
+```
+
+类上还有 `@EnableMethodSecurity` 与返回 `BCryptPasswordEncoder(12)` 的 `@Bean`，`write` 写统一响应体，会话策略设 `STATELESS`。读法：URL 规则（第一条命中即止）、失败出口、插过滤器。`hasRole("ADMIN")` 自动补 `ROLE_`，与手写的 `ROLE_USER` 必须同一套写法。
+
+### 6. 登录
+
+`AuthController` 只做一行转发，判断都在 Service：
+
+```java title="security/AuthService.java（节选）"
+@Transactional(readOnly = true)
+public TokenResp login(LoginReq req) {
+    User user = userMapper.findByUsername(req.username());
+    if (user == null || !passwordEncoder.matches(req.password(), user.getPasswordHash())) {
+        throw new BusinessException(ErrorCode.UNAUTHENTICATED);
+    }
+    return new TokenResp(jwtService.issue(user.getId(), user.getUsername()), "Bearer", 1800L);
+}
+```
+
+用户不存在与密码错合并成同一提示，避免枚举用户名。
+
+### 7. 三条请求
+
+```bash
+ALICE=$(curl -s -X POST http://127.0.0.1:8081/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"s3cret-pass"}' | jq -r .data.accessToken)
+BOB=$(curl -s -X POST http://127.0.0.1:8081/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"bob","password":"s3cret-pass"}' | jq -r .data.accessToken)
+```
+
+```bash
+curl -s -w '\n' http://127.0.0.1:8081/api/tasks/9 -H "Authorization: Bearer $ALICE"
+curl -s -w '\n' http://127.0.0.1:8081/api/tasks/9
+curl -s -w '\n' http://127.0.0.1:8081/api/tasks/9 -H "Authorization: Bearer $BOB"
+```
+
+```http
+1. alice 读自己的任务：HTTP/1.1 200
+{"code":0,"message":"ok","data":{"id":"9","title":"写周报","ownerId":7},"traceId":"8f3a1c62"}
+
+2. 不带 Authorization：HTTP/1.1 401
+{"code":40101,"message":"未登录或令牌已失效","data":null,"traceId":"b41e07d5"}
+
+3. bob 读 alice 的任务：HTTP/1.1 403
+{"code":40301,"message":"没有权限访问该资源","data":null,"traceId":"c95d2a14"}
+```
+
+三条 curl 的差别只有 `Authorization` 头。
+
+## 二、机制：一次请求的身份从哪来
+
+安全链是一串 `Filter`，顺序由 `FilterOrderRegistration` 固定：
+
+| 顺序 | 过滤器 |
+| :-- | :-- |
+| 11 | `JwtAuthFilter`：解析 Bearer 写入 Authentication，本篇唯一新增 |
+| 13 | `AnonymousAuthenticationFilter`：给未认证请求挂匿名身份 |
+| 14 | `ExceptionTranslationFilter`：接住 `AccessDeniedException`，分岔两个出口 |
+| 15 | `AuthorizationFilter`：按规则判断，失败抛异常不写响应 |
+
+**401 与 403 的分界在第 13 与第 14 层。** `AuthorizationFilter` 失败时统一抛 `AccessDeniedException`，翻译过滤器接住后看身份：匿名的说明没登录，交给 entry point 回 401；真实身份的说明登录了但权限不够，交给 accessDeniedHandler 回 403。越权却回 401，几乎总是认证信息中途丢了。
+
+## 三、Session 与 JWT 的取舍
+
+| 维度 | Session | JWT |
+| :-- | :-- | :-- |
+| 状态在哪 | 服务端，客户端只有一个 id | 客户端持有全部声明 |
+| 撤销 | 删 session 立即生效 | 到期前无法单独作废 |
+
+要求「点了下线就立刻踢掉」时，Session 加 Redis 更省事；多端复用、网关后面一串无状态服务时，JWT 更顺。
+
+## 四、SecurityContext 会丢在哪
+
+三个地方：`@Async`、提交给线程池的任务、手动 new 的线程。上下文活在 ThreadLocal 里，请求结束由过滤器清空，但不会跟着任务走，`getContext().getAuthentication()` 在新线程上是 null。修法有两种：用 `DelegatingSecurityContextAsyncTaskExecutor` 包装执行器，让它把上下文一起带过去；或者干脆把 userId 当参数显式传下去。跨进程时包装无效，MQ 消息体里必须带 userId。另一个坑：`@Async` 上的 `@PreAuthorize` 在异步线程里执行，上下文已空，判断必然失败。
+
+## 五、RBAC 四表、归属与两类越权
+
+```sql
+CREATE TABLE app_user (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  username      VARCHAR(64) NOT NULL,
+  password_hash CHAR(60)    NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_user_username (username)
+) DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE role (
+  code VARCHAR(32) NOT NULL,
+  PRIMARY KEY (code)
+) DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE user_role (
+  user_id   BIGINT UNSIGNED NOT NULL,
+  role_code VARCHAR(32) NOT NULL,
+  PRIMARY KEY (user_id, role_code)
+) DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE permission (
+  role_code VARCHAR(32) NOT NULL,
+  code      VARCHAR(64) NOT NULL,
+  PRIMARY KEY (role_code, code)
+) DEFAULT CHARSET = utf8mb4;
+```
+
+四张表回答「你能调这个接口吗」，`task.owner_id` 回答「这条记录是不是你的」。只做 RBAC，任何有 `task:read` 的人都能读 `/api/tasks/9` 与 `/api/tasks/10`，这是水平越权；只做归属，删库、导出全量没有统一开关，这是垂直越权。
+
+```java title="task/TaskService.java（节选）"
+@Transactional(readOnly = true)
+public Task getForUser(long id, long userId) {
+    Task task = mapper.findById(id);
+    if (task == null) {
+        throw new BusinessException(ErrorCode.TASK_NOT_FOUND);
+    }
+    if (!Long.valueOf(userId).equals(task.getOwnerId())) {
+        throw new BusinessException(ErrorCode.ACCESS_DENIED);
+    }
+    return task;
+}
+
+@Transactional(rollbackFor = Exception.class)
+public Task create(TaskSaveReq req, long ownerId) {
+    String title = req.title().trim();
+    if (mapper.countByTitle(title) > 0) {
+        throw new BusinessException(ErrorCode.TASK_TITLE_DUPLICATED);
+    }
+    Task task = new Task();
+    task.setOwnerId(ownerId);
+    task.setTitle(title);
+    task.setDone(false);
+    task.setPriority(req.priority() == null ? 3 : req.priority());
+    task.setDueAt(req.dueAt());
+    task.setRemark(req.meta().remark());
+    task.setEstimateMinutes(req.meta().estimateMinutes());
+    mapper.insert(task);
+    return task;
+}
+```
+
+先判 404 再判 403：顺序反了会把「这个 id 存不存在」泄露给任何登录用户。用 `Long.valueOf(userId).equals(...)` 而不是 `!=`，因为历史行的 `ownerId` 可能为 null，前者安全返回 false 走 403，后者拆箱抛 NPE。分页的 `TaskQuery` 也要带上当前用户，`count` 与 `page` 两条 SQL 都加 `owner_id`，否则 `total` 还是全库数。
+
+```java title="task/TaskController.java（节选）"
+@GetMapping("/{id}")
+public ApiResponse<Task> get(@PathVariable long id, @AuthenticationPrincipal Long userId) {
+    return ApiResponse.ok(service.getForUser(id, userId));
+}
+
+@DeleteMapping("/{id}")
+@PreAuthorize("hasRole('ADMIN')")
+public ApiResponse<Void> delete(@PathVariable long id) {
+    service.deleteForAdmin(id);
+    return ApiResponse.ok(null);
+}
+```
+
+`@PreAuthorize` 靠 AOP 代理生效，同类内部调用不过代理，注解等于没写。URL 规则管「谁能进门」，方法注解管「要什么角色」，归属判断管「这行数据是不是你的」。
+
+## 六、密码、CSRF/CORS 与令牌位置
+
+裸哈希有三个问题：同样的密码得到同样的摘要，撞库时一眼看出谁和谁同密码；没有盐，彩虹表直接反查；SHA-256 太快，GPU 上每秒数十亿次猜测。BCrypt 的设计目标就是慢，成本因子 12 意味着 2 的 12 次方轮迭代，每次 `encode` 都生成新的随机盐，输出固定 60 字符。
+
+CSRF 的前提是浏览器会自动附带凭据。令牌放在 `Authorization` 头，跨站表单带不上这个头，攻击面消失，所以 `csrf.disable()` 合理；但前提是没有同时启用 Cookie 认证，否则 disable 就是真漏洞。CORS 侧要确认 `allowedHeaders` 含 `Authorization`，漏了预检就失败。
+
+## 七、续期、轮换与注销
+
+access 短（15 到 30 分钟）限制泄露窗口，refresh 长（7 到 14 天）负责续命。refresh 必须存库、只存哈希，因为它比 access 值钱。
+
+```sql
+CREATE TABLE refresh_token (
+  token_hash CHAR(64) NOT NULL,
+  user_id    BIGINT UNSIGNED NOT NULL,
+  expires_at DATETIME NOT NULL,
+  revoked_at DATETIME NULL,
+  PRIMARY KEY (token_hash),
+  KEY idx_refresh_user (user_id, expires_at)
+) DEFAULT CHARSET = utf8mb4;
+```
+
+```java title="security/RefreshService.java（节选）"
+@Transactional(rollbackFor = Exception.class)
+public TokenResp refresh(String rawToken) {
+    RefreshToken row = mapper.findByHash(sha256(rawToken));
+    if (row == null || row.getExpiresAt().isBefore(LocalDateTime.now())) {
+        throw new BusinessException(ErrorCode.UNAUTHENTICATED);
+    }
+    if (row.getRevokedAt() != null) {
+        mapper.revokeAllByUser(row.getUserId(), LocalDateTime.now());
+        throw new BusinessException(ErrorCode.UNAUTHENTICATED);
+    }
+    mapper.revoke(row.getTokenHash(), LocalDateTime.now());
+    String next = randomToken();
+    mapper.insert(row.getUserId(), sha256(next), LocalDateTime.now().plusDays(14));
+    return new TokenResp(jwtService.issue(row.getUserId(), row.getUsername()), "Bearer", 1800L);
+}
+```
+
+旧 refresh 再次出现说明它被复制过，这时撤销该用户全部 refresh，让两边都重新登录。存哈希而非明文，库被拖走也不等于令牌泄露。
+
+注销有三条路：
+
+| 方案 | 做法 | 代价 |
+| :-- | :-- | :-- |
+| 黑名单 | Redis 存 jti，TTL 等于剩余有效期 | 每请求一次 Redis 读 |
+| 版本号 | 用户表存 token_version 并写入 claim | 改版本让该用户所有设备下线 |
+| 短 TTL | 只靠过期 | 点了退出，令牌还能用半小时 |
+
+```bash
+curl -s -X POST http://127.0.0.1:8081/api/auth/logout \
+  -H "Authorization: Bearer $ALICE" -H 'Content-Type: application/json' \
+  -d "{\"refreshToken\":\"$REFRESH\"}"
+
+# 注销后再用同一个 refresh 换令牌
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8081/api/auth/refresh \
+  -H 'Content-Type: application/json' -d "{\"refreshToken\":\"$REFRESH\"}"
+```
+
+最后一条必须回 401；回 200 说明 logout 只清了客户端。
+
+## 这条链路在真实项目里的位置
+
+| 环节 | 要回答的问题 | 落点 |
+| :-- | :-- | :-- |
+| 需求 | 未登录被挡住、越权被拒绝 | 401 与 403 进接口文档 |
+| 数据 | 归属存哪、角色怎么挂 | `owner_id`、RBAC 四表、`refresh_token` |
+| 契约 | 失败长什么样 | 40101 与 40301，统一响应体 |
+| 实现 | 判断放在哪一层 | 过滤器还原身份，Service 判归属，注解管角色 |
+| 验证 | 三条 curl 加切片 | 阶段十七的单测、切片、集成 |
+| 上线 | 密钥与观测 | 环境变量注入，401 与 403 进监控 |
+
+改动文件：
+
+| 文件 | 动作 |
+| :-- | :-- |
+| `common/ErrorCode.java` | 改：加 40101 与 40301 |
+| `security/JwtService.java` | 新增：签发与解析 |
+| `security/JwtAuthFilter.java` | 新增：Bearer 翻成身份 |
+| `security/SecurityConfig.java` | 新增：过滤链、两个出口、BCrypt |
+| `security/AuthService.java` | 新增：登录校验与签发 |
+| `security/RefreshService.java` | 新增：轮换、复用检测、注销 |
+| `task/TaskService.java` | 改：`create(req, ownerId)` 与 `getForUser` |
+| `task/TaskController.java` | 改：`@AuthenticationPrincipal` 与注解 |
+| `db/migration/V4__auth_and_owner.sql` | 新增：归属列、索引、RBAC 与 refresh 表 |
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| :-- | :-- | :-- |
+| 连登录接口都 401 | `anyRequest()` 写在 `permitAll` 之前，第一条命中即止 | 具体路径放前面，兜底规则最后 |
+| 401 返回一坨 HTML | 没配 entry point，异常落到 `/error` | 手写 JSON 出口，复用 `ApiResponse` |
+| 越权返回 401 | 解析失败时清了上下文，或抛异常绕过翻译过滤器 | 只在解析失败时清；业务越权交给 handler |
+| `@PreAuthorize` 不生效 | 漏了 `@EnableMethodSecurity`，或同类内部调用 | 加注解；跨类调用或下沉到 Service |
+| 异步任务里 principal 为 null | ThreadLocal 不随任务传播 | 包装执行器，或显式传 userId |
+
+## 验收清单
+
+- [ ] 不带 `Authorization` 请求 `GET /api/tasks/9` 返回 401 与 40101。
+- [ ] alice 的令牌读自己的任务返回 200，`ownerId` 等于她的用户 id。
+- [ ] bob 的令牌读 alice 的任务返回 403 与 40301，而不是 404。
+- [ ] 把 404 与 403 两个分支对调，读别人的任务变成 404。
+- [ ] 普通用户请求 `/api/admin/**` 返回 403，管理员返回 200。
+- [ ] 同一个 refresh 连换两次，第二次返回 401 且全部 refresh 被撤销。
+
+## 练习
+
+1. 把 `JwtAuthFilter` 改成解析失败时直接 `response.sendError(401)`。
+   **自检：** 响应体从统一结构变成容器错误页，`code` 消失；改回清空上下文后 40101 回来。
+
+2. 给 `GET /api/tasks` 增加归属过滤。
+   **自检：** 两个用户各建任务，alice 的列表只有自己的；去掉 `count` 里的条件后 `total` 变大而 `items` 不变。
+
+3. 用 Redis 实现 jti 黑名单，让注销后的 access 立刻失效。
+   **自检：** 注销后旧 access 立刻回 401；清空 Redis 后它又能用，说明黑名单依赖存储。
+
+## 小结
+
+- 401 是「不知道你是谁」，403 是「知道你是谁但不许」，分界在翻译过滤器对匿名身份的判断。
+- `SecurityFilterChain` 的规则第一条命中即止，两个出口必须手写统一响应体。
+- JWT 把状态搬到客户端，代价是不可撤销；要立刻踢人就上短 TTL 加黑名单或版本号。
+- SecurityContext 活在 ThreadLocal 里，异步与线程池都要显式传播。
+- 密码只存 BCrypt，令牌只存哈希；refresh 要轮换并识别复用，注销要作废服务端那条。

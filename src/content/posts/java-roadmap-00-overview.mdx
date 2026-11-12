@@ -1,161 +1,183 @@
 ---
-title: 'Java 学习路线总览：前端工程师的重学笔记'
-published: 2026-09-05T20:00:00+08:00
-description: '一个前端工程师从 0 开始学 Java 的分阶段路线图，每阶段一篇带代码片段与练习的笔记，便于反复回来复习。'
-tags: [Java, 学习路线, 前端]
+title: 'Java 学习路线总览：从语法到能上线的服务'
+published: 2026-11-10T08:00:00+08:00
+description: '面向 JS/TS 工程师的 21 篇 Java 学习路线：用 task-center 串起语法、Spring Boot、MySQL、权限、测试、Redis、部署与任务工单毕业项目。'
+tags: [Java, SpringBoot, 学习路线, 前端, 工程实践]
 category: Java学习路线
 draft: false
 ---
 
-写了几年 JavaScript/TypeScript，最近因为工作要接触后端服务，决定系统地把 Java 学一遍。这个系列不是"Java 从入门到精通"式的教程，而是一份**前端工程师视角**的重学笔记：每个知识点都会尽量对照 JS 里已经熟悉的心智模型，配上可以直接跑的最小代码片段，方便日后回来快速回忆。
-
 > [!NOTE]
-> 阅读顺序建议按下面的阶段编号从头到尾走一遍；已经熟悉的阶段可以直接跳到对应文章当作速查表使用。
+> 这是一位写了多年 JS/TS 的前端工程师重学 Java 的路线，不是注解词典。起点是能写条件和循环，终点是独立交付带权限、测试、日志和回滚步骤的任务工单服务 `task-center`。全线 21 篇：00 是地图，01–12 保留基础编号，13–20 是八个工程阶段，每次前进都要留下可执行的证据。
 
-## 做到什么算过
+## 一、先跑起来
 
-五条，全是能当场验证的行为：
+先证明工具链能工作，再配置 IDE。语言示例统一 **JDK 21**，后端工程统一 **Maven 3.9、Spring Boot 3.5.7、MyBatis Starter 3.0.4**，数据库与缓存使用 MySQL 8.4、Redis 7.4。版本固定便于章节对照，不表示这些版本永远不需要安全更新，真实项目仍需维护受支持的补丁版本。
 
-1. 能读懂一个 Java 项目的分层，并**新增一个完整接口**（Controller → Service → Mapper）。
-2. 能说清 `ArrayList` / `HashMap` 的底层结构与适用场景，而不是只会调 API。
-3. 能写**带事务、带参数校验、带统一错误返回**的业务代码。
-4. 能定位一次线上问题：线程栈、GC 日志、慢 SQL，三样至少会看两样。
-5. 能打包部署（jar + 环境变量 + 反代），并知道怎么回滚。
-
-## 三层结构
-
-| 层 | 解决什么 | 篇目 | 过关标志 |
-|---|---|---|---|
-| **L1 语法与 OOP** | 类型系统、流程控制、类与对象、继承多态、接口 | 01–07 | 能写出结构正确的类，不靠翻译 JS |
-| **L2 语言进阶** | 集合、异常、泛型、Lambda/Stream、多线程 | 08–11 | 集合选型有依据，能解释泛型擦除 |
-| **L3 工程与实战** | 项目向内容分散在各阶段 | 各篇 | 能独立写一个小型服务 |
-
-按起点选读法：
-
-- **A. 完全没写过 Java**：01–11 顺序读，别跳。强类型与 OOP 是地基，跳了后面全是背。
-- **B. 会 JS/TS**：先看下面的"心智模型对照"表，重点 02（类型系统）、05/06（OOP）、08（集合）。
-- **C. 要写后端**：08 → 09 → 10 → 11 → 12，再接 RuoYi 路线补 Shiro、代码生成与完整业务模块。
-- **D. 面试向**：08（集合）、11（多线程），再把 JVM/GC 讲清楚。
-
-> **这个模块的原已知缺口（2026-11 已补）**：阶段十二补上了 Spring Boot + MyBatis 的业务闭环；毕业项目仍建议接 [RuoYi 路线](/blog/ruoyi-roadmap/)（Spring Boot + MyBatis + Shiro 权限串成完整链路），或用阶段十二的 task 服务自己扩一个完整项目。
-
----
-
-## 学习路线图
-
-整个路线拆成 **12 个阶段**，前 4 个阶段是语法基础，中间 4 个是面向对象与常用 API，接着 3 个进入现代 Java 的工程实践，最后一个把语法拼成 Web 业务闭环：
-
-| 阶段 | 主题 | 关键概念 | 预计投入 |
-| :--: | :-- | :-- | :--: |
-| 一 | 环境与第一个程序 | JDK / JRE / JVM、`javac`、`java`、classpath | 半天 |
-| 二 | 变量与数据类型 | 基本类型、包装类、类型转换、`String` 不可变 | 1 天 |
-| 三 | 运算符与流程控制 | `switch` 表达式、增强 for、`break/continue` 标签 | 半天 |
-| 四 | 数组与字符串 | 一维/二维数组、`StringBuilder`、正则 | 1 天 |
-| 五 | 类与对象 | 构造器、`this`、`static`、包与访问修饰符 | 1 天 |
-| 六 | 继承与多态 | `extends`、`super`、重写、向上转型、`Object` | 1 天 |
-| 七 | 接口与抽象类 | `interface`、`abstract`、默认方法、`final` | 1 天 |
-| 八 | 集合框架 | `List` / `Set` / `Map`、`ArrayList` vs `LinkedList`、`HashMap` 原理 | 2 天 |
-| 九 | 异常与泛型 | `try/catch/finally`、`throws`、泛型类/方法/通配符 | 1 天 |
-| 十 | Lambda 与 Stream | 函数式接口、`Stream` 三段式、`Optional` | 1 天 |
-| 十一 | 多线程入门 | `Thread` / `Runnable`、线程池、`synchronized`、`volatile` | 2 天 |
-| 十二 | Spring Boot + MyBatis | IoC/DI、Mapper 映射、`@Transactional`、`@Valid`、统一错误、MockMvc | 2–3 天 |
-
-## 阶段索引
-
-下面是每个阶段对应的文章。链接是站内绝对路径，跟着 base `/blog` 走：
-
-1. [阶段一：JDK、JRE、JVM 与第一个 Java 程序](/blog/posts/java-roadmap-01-env-and-hello/)
-2. [阶段二：变量、数据类型与类型系统](/blog/posts/java-roadmap-02-variables-and-types/)
-3. [阶段三：运算符与流程控制](/blog/posts/java-roadmap-03-operators-and-control-flow/)
-4. [阶段四：数组与字符串](/blog/posts/java-roadmap-04-arrays-and-strings/)
-5. [阶段五：面向对象（一）——类与对象](/blog/posts/java-roadmap-05-oop-class-and-object/)
-6. [阶段六：面向对象（二）——继承与多态](/blog/posts/java-roadmap-06-oop-inheritance-polymorphism/)
-7. [阶段七：接口、抽象类与静态成员](/blog/posts/java-roadmap-07-interface-abstract/)
-8. [阶段八：集合框架 List / Set / Map](/blog/posts/java-roadmap-08-collections/)
-9. [阶段九：异常处理与泛型](/blog/posts/java-roadmap-09-exception-generics/)
-10. [阶段十：Lambda 与 Stream API](/blog/posts/java-roadmap-10-lambda-stream/)
-11. [阶段十一：多线程入门](/blog/posts/java-roadmap-11-thread-basics/)
-12. [阶段十二：Spring Boot + MyBatis——把语法拼成一条业务链路](/blog/posts/java-roadmap-12-springboot-mybatis/)
-
-## 前端工程师的心智模型对照
-
-学 Java 之前，先把 JS 里几个"想当然"的习惯掰一掰：
-
-| 维度 | JavaScript | Java |
-| :-- | :-- | :-- |
-| 类型系统 | 动态类型，运行时才知道 | 静态类型，编译期就检查 |
-| 变量声明 | `let x = 1`（类型自动推断为 `number`） | `int x = 1;`（类型必须显式或用 `var`） |
-| 数字类型 | 只有 `number`（IEEE 754 双精度） | `byte` / `short` / `int` / `long` / `float` / `double` 六种 |
-| 空值 | `null` 与 `undefined` | 只有 `null`；基本类型不能为 `null` |
-| 相等判断 | `==` 会做类型转换，`===` 严格 | `==` 比较值（基本类型）或引用（对象），`.equals()` 才是内容相等 |
-| 字符串 | 不可变，模板字符串 `` `hi ${name}` `` | 不可变，拼接用 `+` 或 `StringBuilder`，格式化用 `String.format` |
-| 数组 | 动态长度、可混合类型 | 固定长度、同一类型；动态用 `ArrayList` |
-| 对象字面量 | `{ name: 'Tom' }` 随手就来 | 必须先有 `class`，再 `new` |
-| 函数 | 一等公民，随处可传 | 必须先属于类；一等公民要靠函数式接口 + Lambda |
-| 模块 | ES Module `import / export` | `package` + `import`，一个 `.java` 文件一个 public 类 |
-| 运行环境 | 浏览器 / Node.js 直接解释 | 编译成字节码，由 JVM 解释或 JIT 执行 |
-| 依赖管理 | npm / pnpm | Maven / Gradle |
-| 空安全 | `?.`、`??` | `Optional<T>`、`Objects.requireNonNull` |
-
-> [!TIP]
-> Java 里最反直觉的两点：
-> 1. `String a = "hi"; String b = "hi"; a == b` 可能为 `true`（字符串常量池），但**永远**用 `.equals()` 比较字符串内容。
-> 2. 对象数组 `new int[3]` 会初始化为 `0`，但 `new String[3]` 里全是 `null`——引用类型默认值是 `null`。
-
-## 环境准备（一次性）
-
-后续每篇文章里的代码都假设你已经完成下面这三件事：
+在终端执行环境检查，Windows 示例默认 Git Bash，IDE 也应选择相同 JDK。
 
 ```bash
-# 1. 装 JDK 21（LTS 版本，Oracle JDK 或 Eclipse Temurin 都行）
 java -version
-# openjdk version "21.0.x" ...
-
-# 2. 装一个 IDE：IntelliJ IDEA Community 免费且开箱即用
-#    VS Code + Extension Pack for Java 也够用
-
-# 3. 装 Maven（后面项目结构那篇会用到）
+javac -version
+jshell --version
 mvn -v
-# Apache Maven 3.9.x
 ```
 
-Windows 用户在系统环境变量里加 `JAVA_HOME` 指向 JDK 安装目录，把 `%JAVA_HOME%\bin` 加进 `PATH`。macOS/Linux 用 `sdkman` 或包管理器安装更省心。
+输出：前三项主版本为 21，最后一项 Maven 为 3.9.x，并显示 Java version 为 21。补丁号与供应商允许不同；如果 `java` 是 21、`mvn` 显示 17，先修正 `JAVA_HOME`，IDE 能运行不能证明命令行打包成功。Windows 的 `JAVA_HOME` 指向 JDK 根目录而不是 `bin`，Path 再加入其 `bin` 子目录，重新打开终端后复查。
 
-## 如何使用这个系列复习
+从 JDK 供应商和 Apache Maven 的官方发行入口选择安装包，不复制来路不明的安装脚本。IDE 可用 IntelliJ IDEA 的免费功能或 VS Code 的 Java 扩展。Java 工程的 Maven 依赖与博客的 npm 依赖无关：在自己的 `task-center` 目录练习，不修改博客依赖。
 
-写这个系列时特意做了两件事，方便日后回来"扫一眼就想起来"：
+用 JDK 自带 REPL 验证任务列表。下面整段是终端命令，单引号 heredoc 防止 shell 提前展开内容。
 
-1. **每篇文章都有"复习卡片"小节**，把关键概念压缩成几行代码或一张表，不用重读正文也能回忆起要点。
-2. **每个新概念都配可运行的最小示例**，代码块都能直接复制到 IDEA 或 [jshell](https://dev.java/learn/jshell/) 里跑起来。
-3. **每篇末尾都有"练习"小节**（3-7 题，不依赖任何第三方库），先自己写一遍再对照正文，比只读代码有效得多。
+```bash
+jshell --feedback concise <<'EOF'
+import java.util.List;
+record Task(String title, boolean done) {}
+var tasks = List.of(new Task("read-java", false), new Task("setup-jdk", true));
+System.out.println(tasks.stream().filter(task -> !task.done()).count());
+/exit
+EOF
+```
 
-推荐的复习节奏：
+输出：除 jshell 提示文字外，包含单独的 `1`。两条任务，一条未完成，这是任务中心最小的一次统计。现在只观察结果，`record`、泛型、Stream 会在后续展开；REPL 中定义类型，不等于已经保存磁盘项目代码。
 
-- **第一次学**：按阶段顺序读，每篇结束在 IDE 里把示例敲一遍。
-- **一周后**：只看每篇的"复习卡片"和代码块标题，回忆不起来的再翻正文。
-- **一个月后**：把整个系列当作速查手册，遇到具体语法问题直接搜文章内的锚点。
+从十二篇开始需要 Docker，届时检查客户端与服务端都能通信。
 
-> [!IMPORTANT]
-> 光读不写等于没学。每篇末尾的练习已经按阶段搭好了台阶，直接照着做即可；如果想再往前一步，可以把它们串成一个小项目：
-> 阶段一到四写命令行小程序（计算器、猜数字），阶段五到七写一个图书管理的 OOP 模型，阶段八到十重构前面的代码用集合和 Stream，阶段十一给图书管理加并发借阅。
+```bash
+docker version
+docker compose version
+```
 
-## 参考资源
+输出：第一条同时出现 Client 与 Server，第二条出现 Compose 版本。只有 Client 不算可运行环境，先启动 Docker Desktop 或自己的 Docker Engine。基础阶段不需要数据库，不必因为 Docker 尚未配好停在第一页。后续数据库只绑定本机回环地址，临时实验账号不能当公网部署账号。
 
-- 官方教程：[https://dev.java/learn/](https://dev.java/learn/)
-- Oracle 官方文档：[https://docs.oracle.com/en/java/javase/21/](https://docs.oracle.com/en/java/javase/21/)
-- 《Java 核心技术·卷 I》（Cay Horstmann）——当作字典查
-- 《Effective Java》（Joshua Bloch）——学到阶段七之后再读
+## 二、机制：为什么先分层学习，而不是背框架
 
-下一篇从最基础的 JDK / JRE / JVM 三兄弟开始，把"Java 代码是怎么跑起来的"讲清楚。
+前端开发者容易把成功返回 JSON 当成一次交付。浏览器得到 200，只说明某次请求走完；没有参数校验，非法 JSON 可以绕过表单入库；没有归属条件，知道别人的任务编号就可能看到别人的内容；没有回滚预案，发布后发现错误也没有安全退路。
 
-## 毕业前自检（整条路线）
+路线按责任递进，不是按热门技术堆积。第一层解决“代码能否表达业务”，第二层解决“数据与并发是否可靠”，第三层解决“别人能否安全地使用、测试和维护服务”。先有语言，再有容器，最后有交付证据，出问题才知道检查哪一层。
 
-- [ ] 能说清 JDK / JRE / JVM 的关系，知道 `javac` 与 `java` 各做什么
-- [ ] 能解释基本类型与包装类的差别，知道自动装箱在循环里的代价
-- [ ] 写过至少 5 个类，用到了继承、接口、抽象类，并能说清何时该用组合
-- [ ] 能说出 `ArrayList` 与 `LinkedList`、`HashMap` 与 `TreeMap` 的选择依据
-- [ ] 能解释泛型擦除，知道为什么不能 `new T[]`
-- [ ] 用 Stream 写过一次"过滤 → 映射 → 分组 → 收集"的完整链
-- [ ] 能写线程安全的代码，知道 `synchronized` 与 `volatile` 的区别
-- [ ] 能读懂一段异常堆栈，定位到自己代码的行号
-- [ ] 能打包成可执行 jar 并用环境变量注入配置
+| 层级 | 篇目 | 核心问题 | 可判定的产物 |
+| :-- | :-- | :-- | :-- |
+| L1 语法与 OOP | 01–07 | 类型、分支、对象边界怎么表达 | 运行命令行练习，解释编译错误与对象调用 |
+| L2 语言进阶 | 08–11 | 集合、异常、函数式与线程怎样协作 | 可重复的筛选统计，保留失败原因，修正共享状态竞争 |
+| L3 工程与交付 | 12–20 | 请求如何可信地入库、授权、测试和上线 | 可验证、可观测、可回滚的工单服务 |
+
+机制不是要求第一天读完整个 Spring 源码，而是每个现象至少追问一次原因。事务没回滚，不是“注解偶尔失灵”，可能是调用没经过代理，或异常类型与传播边界不符合预期；有索引仍然慢，可能是回表、扫描范围过大或排序。知道因果，才能设计实验，不必不断替换配置碰运气。
+
+最小 demo 是局部证据，不是生产承诺。测试只覆盖它的输入与断言，本机一次请求不能证明容量，一次 EXPLAIN 只解释该数据分布与统计信息下的计划。路线不提供脱离机器、数据、负载的 QPS 和 GC 耗时数字，性能结论需要自己记录实验前提与观测。
+
+## 三、按四类起点选择读法
+
+**A：第一次写 Java。** 按 01–11 顺序走，先复制最小 demo，再关闭正文重写。不要跳过类型、引用相等、异常传播，它们影响 Mapper 参数、业务判断、事务结果；遇到注解先问“这是语言语法，还是框架解释的元数据”，避免把所有问题归到 Java 本身。
+
+**B：熟悉 JS/TS，迁移心智模型。** 先看对照表，重点 02、05–10，再做 11 的线程实验。别把 `Map` 当普通对象，也别把 Future 当运行机制完全相同的 Promise。TS 类型声明通常不留在产出的 JS 中，Java 的编译检查与运行时类信息有不同边界；同叫泛型，不意味着运行时行为相同。
+
+**C：会语法，准备写业务。** 用 08–11 练习检查基础，再从 12 连续做到 20。别先复制安全过滤链：先验证没有安全链时的 Controller、参数错误与 404，再加认证比较变化，否则 401、400、500 混在一起，很难确定请求走到了哪一步。
+
+**D：准备面试或接手服务。** 用“讲结论—画调用链—跑反例—说修复边界”复习 08、11、13、15、16、19，再拿 20 讲完整业务。要能说明如何证明权限没有漏，而不只是列框架名。面试材料是实践的归纳，不是另一套只有名词的路线。
+
+入口可以不同，毕业要求不能因此消失。熟悉语法可以通过自检跳过阅读，但不能跳过权限、数据库、测试、部署证据。遇到前置知识时补最小必要部分再回来，不必把每个新名词扩成一条支线。
+
+## 四、21 篇阶段索引与 task-center 演进
+
+旧文件名保持不变，链接包含 `/blog` 前缀。00 计入 21 篇，并不是“21 个工程阶段”。
+
+| 编号 | 文章 | 本步留下的结果 |
+| :--: | :-- | :-- |
+| 00 | [从语法到能上线的服务](/blog/posts/java-roadmap-00-overview/) | 工具链与毕业标准 |
+| 01 | [JDK、JRE、JVM 与第一个程序](/blog/posts/java-roadmap-01-env-and-hello/) | 命令行入口与断点实验 |
+| 02 | [变量、数据类型与类型系统](/blog/posts/java-roadmap-02-variables-and-types/) | 编号、优先级、标题的类型选择 |
+| 03 | [运算符与流程控制](/blog/posts/java-roadmap-03-operators-and-control-flow/) | 处理边界输入的计分器 |
+| 04 | [数组与字符串](/blog/posts/java-roadmap-04-arrays-and-strings/) | 标题清理、遍历与文本处理 |
+| 05 | [面向对象：类与对象](/blog/posts/java-roadmap-05-oop-class-and-object/) | 有边界的任务对象 |
+| 06 | [继承与多态](/blog/posts/java-roadmap-06-oop-inheritance-polymorphism/) | 比较继承与组合，隔离变化点 |
+| 07 | [接口与抽象类](/blog/posts/java-roadmap-07-interface-abstract/) | 用接口定义依赖 |
+| 08 | [集合框架](/blog/posts/java-roadmap-08-collections/) | List 展示、Map 查找、Set 去重 |
+| 09 | [异常处理与泛型](/blog/posts/java-roadmap-09-exception-generics/) | 区分业务失败，保留异常链 |
+| 10 | [Lambda 与 Stream](/blog/posts/java-roadmap-10-lambda-stream/) | 筛选、分组与完成量统计 |
+| 11 | [多线程入门](/blog/posts/java-roadmap-11-thread-basics/) | 并发实验与线程池边界 |
+| 12 | [Spring Boot + MyBatis](/blog/posts/java-roadmap-12-springboot-mybatis/) | `task-center` v1：任务 CRUD |
+| 13 | [Spring 核心：IoC、生命周期与 AOP](/blog/posts/java-roadmap-13-spring-core-ioc-aop/) | 容器、代理、操作日志与事务反例 |
+| 14 | [Spring MVC 与接口契约](/blog/posts/java-roadmap-14-spring-mvc-contract/) | DTO、校验、错误、ID 与时间契约 |
+| 15 | [MySQL 索引、事务与慢 SQL](/blog/posts/java-roadmap-15-mysql-index-transaction/) | 索引、游标与十万行 EXPLAIN 实验 |
+| 16 | [认证、授权与接口安全](/blog/posts/java-roadmap-16-auth-and-security/) | JWT、RBAC、归属与 401/403 |
+| 17 | [JUnit 5、Mockito 与切片测试](/blog/posts/java-roadmap-17-testing-junit-mockito/) | 单测、切片与真实 MySQL 集成测试 |
+| 18 | [Redis 缓存、锁与异步任务](/blog/posts/java-roadmap-18-redis-cache-async/) | 缓存、有限线程池、导出与 Outbox |
+| 19 | [部署、日志与线上排查](/blog/posts/java-roadmap-19-deploy-and-troubleshoot/) | 容器、探活、死锁排查与回滚 |
+| 20 | [毕业项目：任务工单系统](/blog/posts/java-roadmap-20-graduation-workorder/) | 六张业务表、状态机与 25 条验收 |
+
+前十一篇保留图书、支付等已有案例，因为它们能隔离单一概念，不是另一套要维护的产品。每篇说明如何将概念映射回任务中心。独立练习放 `task-center/labs`，十二起建立 Maven 源码目录，避免把临时类型与真实 Controller 混在一起。
+
+主工程包名 `com.demo.taskcenter`，本机端口 8081，任务资源 `/api/tasks`。十二的 `task` 表先保存标题、完成标记、优先级与时间；后续按迁移加入归属、角色、工单状态。后篇 SQL 不能直接用在十二的数据库结构上，然后把未知列误判成框架故障。
+
+十二已经采用构造器注入与基本统一返回，十三解释容器与代理边界，十四完善对外契约。这不是重复宣布同一写法是新功能，而是从“能调用”推进到“知道边界、能验证”。字段改变先明确输入输出，再改实现，最后补回归测试。
+
+## 五、前端工程师的心智模型对照
+
+| 熟悉的概念 | Java 可借用的模型 | 必须保留的差别 |
+| :-- | :-- | :-- |
+| TS 类型注解 | 编译器检查变量、参数、返回值 | 类型正确不等于外部 JSON 合法，仍需校验 |
+| JS number | `int`、`long`、`double` 各有范围 | 长整数需字符串协议，不能丢精度后再补救 |
+| ES Module | package、import 组织名称 | import 不下载依赖，类路径与 Maven 解决可用性 |
+| npm 依赖树 | Maven 坐标与解析 | JDK 是工具链，不是普通业务依赖 |
+| 对象与 interface | 类、record、接口表达结构和行为 | 结构相似不会自动实现 Java 接口 |
+| `===` | 基本值比较，对象常用 equals | 包装缓存和常量池可能掩盖引用比较错误 |
+| provide/inject | Spring 提供依赖 | 生命周期、作用域、代理与并发有额外边界 |
+| Express middleware | Servlet Filter 与 MVC 拦截器 | 层级不同，认证失败可能没到 Controller |
+| Promise、事件循环 | Future、线程池与异步结果 | 多个请求线程可能同时读写同一字段 |
+| 前端路由权限 | RBAC 角色与能力 | 隐藏按钮不是授权，还需校验数据归属 |
+| localStorage | Redis 跨实例共享缓存 | 需处理失效、并发重建、数据库一致性 |
+| 单测与浏览器 E2E | JUnit、切片、集成测试 | mock 通过不证明真实 SQL 成功 |
+| 构建与发布 | Maven、镜像、服务发布 | 连接和后台任务需要探活、优雅停机 |
+
+对照是入口，不是等号。前端组件临时变量通常属于一次渲染，单例 Service 字段却可能被多个请求共享；把 `currentUser` 放进成员变量，就可能串用户数据。身份应来自安全上下文或显式参数，不能存成全局可变状态。
+
+事务也不是前端一次状态更新。数据库事务只约束参与同一资源事务的操作，不会撤销已发出的邮件、HTTP、Redis 写入。十八引入 Outbox，是把“业务已提交”和“通知应送达”之间的问题变成可重试、可观察的状态，不靠一次方法调用假装所有系统都原子完成。
+
+## 六、做到什么算过：五条交付标准
+
+1. **需求到接口可追踪。** 给出“创建任务”需求，能定位 DTO、Controller、Service、Mapper、SQL、测试。合法请求成功，空标题 400，不存在资源返回约定错误，不是全都 200。
+2. **数据行为可解释。** 能选集合，用可重建的十万行数据执行 EXPLAIN，说明索引、扫描范围与回表；用两个数据库会话展示锁等待，不只背隔离级别。
+3. **权限有负向证据。** 能写 SecurityFilterChain，区分未认证 401 与已认证无权 403；A 不能换编号读写 B 的任务，管理员和普通用户能力有边界。
+4. **修改有回归保护。** Service 单测不启动数据库，MVC 切片覆盖契约与安全，Testcontainers 用真实 MySQL 验证 SQL；先观察断言失败，再验证修正后通过，不拿覆盖率代替断言质量。
+5. **上线能观察也能退回。** Docker 启动应用、MySQL、Redis，探活与业务检查各自通过；日志能关联且不泄漏敏感数据；指定上一个镜像完成回滚，说明数据库是否兼容旧程序。
+
+毕业交付对象是服务，不要求同时制作大型后台页面，curl 或已有前端都能消费它。六张表围绕用户、角色、用户角色、工单、审计、通知这些生命周期展开，不为凑复杂度；接口、索引、事务围绕真实查询与状态转换设计。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| :-- | :-- | :-- |
+| IDE 能跑，Maven 编译失败 | SDK 与 JAVA_HOME 不同 | 同时核对三条版本命令 |
+| 后篇代码出现未知列 | 前置迁移未执行 | 先查表结构再查框架 |
+| 错误请求全是 500 | 没区分参数、权限、系统异常 | 分别验证 400/401/403/404 |
+| 隐藏按钮仍能删别人任务 | 只做显示控制或角色检查 | 验证能力和数据归属 |
+| 单测全绿，SQL 上线失败 | mock 没执行真实 SQL | 保留真实 MySQL 集成测试 |
+| 换回旧镜像仍失败 | 表结构不兼容旧程序 | 兼容迁移并演练旧镜像 |
+| 每个技术都开空项目 | 缺共同业务目标 | 回填 task-center 实验结论 |
+
+## 验收清单
+
+- [ ] java、javac、mvn 版本输出显示一致的 JDK 21。
+- [ ] 本页 jshell 命令输出未完成任务数 `1`。
+- [ ] 索引包含 00–20 共 21 条入口，01–12 编号未变。
+- [ ] 选定第一篇，实际执行其“先跑起来”命令。
+- [ ] 区分自己的 labs 与十二篇 Maven 源码目录。
+- [ ] 开始十二前，docker version 同时显示 Server 信息。
+- [ ] 建立五条交付检查记录，不把期望输出当实测。
+- [ ] 从毕业篇返回权限、数据库、测试、部署篇找到对应步骤。
+
+## 练习
+
+1. jshell 增加一条未完成任务再统计。**自检：** 未完成数从 1 变 2，总数从 2 变 3；若仍统计旧列表，能定位变量引用。
+2. 为“完成任务”写需求、数据、契约、实现、验证、上线六行检查。**自检：** 六行都有具体对象，包含“编号不存在”“不是自己的任务”两个失败分支。
+3. 选一个熟悉的前端概念，写出迁移后失效的假设。**自检：** 给出可复现情境，如两个请求同时改单例字段，不仅写“线程不同”。
+4. 写演示顺序卡：启动、登录、创建、越权、测试、回滚。**自检：** 六步对应路线文章，越权步骤明确状态码。
+
+## 小结
+
+| 记住什么 | 本步在 task-center 中留下什么 |
+| :-- | :-- |
+| 语法→语言进阶→工程交付 | 固定工具链、labs 与 Maven 边界 |
+| 正向与负向测试同样重要 | 五条标准，不把预期写成实测 |
+| 学习是解释因果，不是复制注解 | 21 篇地图，从命令行编译开始 |

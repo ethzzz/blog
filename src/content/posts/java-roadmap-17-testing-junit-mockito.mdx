@@ -1,0 +1,1032 @@
+---
+title: '阶段十七：测试——JUnit 5、Mockito 与切片测试'
+published: 2026-11-12T13:00:00+08:00
+description: '从 JUnit 5 生命周期到 Mockito、@WebMvcTest 与 Testcontainers，讲清三层测试各证明什么，以及怎么证明改完没坏。'
+tags: [Java, JUnit5, Mockito, Testcontainers, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> [阶段十六](/blog/posts/java-roadmap-16-auth-and-security/) 给 task-center 接上了 `SecurityFilterChain`、JWT 过滤器、401/403 与 `owner_id`；[阶段十四](/blog/posts/java-roadmap-14-spring-mvc-contract/) 定下了 `ApiResponse`、`ErrorCode` 和校验分组。这一篇不新增业务，只回答一个问题：**怎么证明这些行为改完没坏**。顺序是先写一条会失败的 Service 单测，再补实现让它变绿；然后用 `@WebMvcTest` 一条一条断言 400、401、403；最后用 Testcontainers 起一个真的 MySQL 8.0，把「创建、读回、越权」跑在真实 SQL 上。
+>
+> 环境固定为 JDK 21、Spring Boot 3.5.x、JUnit 5、Maven 3.9，包名 `com.demo.taskcenter`。**如实说明**：写这篇时本机只有 JDK 17 且没有 Docker，文中的测试没有在本机实跑；命令输出里的期望摘要按测试方法数推算，以你机器上的实际输出为准。
+
+## 一、先跑起来
+
+测试这件事最容易走成两个极端：一是「等有空再补」，补的时候接口已经改了八版，测试只能照着现状写，断言的是实现不是需求；二是「先堆覆盖率」，写了一堆调用方法但不断言的测试，绿灯很亮，bug 一个不少。这一节按最小闭环走：先让一条测试红，再让它绿，最后把同一批行为抬到切片和真实数据库上验证。
+
+### 1. 测试依赖只有四类
+
+```xml title="task-center/pom.xml（节选）"
+<properties>
+    <java.version>21</java.version>
+</properties>
+
+<dependencies>
+    <!-- JUnit 5、AssertJ、Mockito、JsonPath、Hamcrest 都在这里 -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- MockMvc 里的 security() 后处理器，以及 401/403 的断言辅助 -->
+    <dependency>
+        <groupId>org.springframework.security</groupId>
+        <artifactId>spring-security-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- @MybatisTest 切片本体 -->
+    <dependency>
+        <groupId>org.mybatis.spring.boot</groupId>
+        <artifactId>mybatis-spring-boot-starter-test</artifactId>
+        <version>3.0.4</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Testcontainers：JUnit 5 扩展 + MySQL 模块，版本由 Boot 的 BOM 管理 -->
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>mysql</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+```
+
+`spring-boot-starter-test` 是聚合包，把 JUnit Jupiter、Mockito、AssertJ、JsonPath、Hamcrest 一起带进来，不必逐个声明版本。需要自己写版本的只有 `mybatis-spring-boot-starter-test`，它不在 Boot 的 BOM 里；Testcontainers 的版本 Boot 3.4 的 BOM 已经管了，所以这里不写。Surefire 由 Boot 父 POM 配置，JDK 21 下直接 `mvn test` 就能跑 JUnit 5，不需要额外的 `junit-platform-launcher`。
+
+### 2. 第一条测试：先让它红
+
+要测的行为来自阶段十六留下的一个重复：归属判断原本写在 Controller 的三个方法里，`get`、`update`、`delete` 各复制了一遍 `task.getOwnerId()` 比较。抽进 `TaskService.getForUser` 之前，先把期望写成测试。写的时候方法还不存在，编译不过——**这不是红，是没写完**。所以先把方法签名补上、只做「存在性检查」，再跑，此时得到的失败才是有效信号。
+
+```java title="task-center/src/test/java/com/demo/taskcenter/task/TaskServiceTest.java"
+package com.demo.taskcenter.task;
+
+import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.demo.taskcenter.common.BusinessException;
+import com.demo.taskcenter.common.ErrorCode;
+import com.demo.taskcenter.task.dto.TaskMeta;
+import com.demo.taskcenter.task.dto.TaskSaveReq;
+import java.time.LocalDateTime;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DuplicateKeyException;
+
+@ExtendWith(MockitoExtension.class)
+@DisplayName("TaskService 的归属与创建规则")
+class TaskServiceTest {
+
+    @Mock
+    private TaskMapper mapper;
+
+    @InjectMocks
+    private TaskService service;
+
+    @Captor
+    private ArgumentCaptor<Task> taskCaptor;
+
+    private static Task task(long id, long ownerId) {
+        Task task = new Task();
+        task.setId(id);
+        task.setOwnerId(ownerId);
+        task.setTitle("写周报");
+        task.setDone(false);
+        task.setPriority(3);
+        return task;
+    }
+
+    private static TaskSaveReq req(String title, Integer priority) {
+        return new TaskSaveReq(title, priority, LocalDateTime.now().plusDays(1),
+                new TaskMeta("备注", 30));
+    }
+
+    @Nested
+    @DisplayName("按归属读取")
+    class GetForUser {
+
+        @Test
+        @DisplayName("任务不存在：40401，而不是 403")
+        void missing() {
+            when(mapper.findById(99L)).thenReturn(null);
+
+            BusinessException ex = assertThrows(BusinessException.class,
+                    () -> service.getForUser(99L, 7L));
+
+            assertAll(
+                    () -> assertEquals(ErrorCode.TASK_NOT_FOUND, ex.getErrorCode()),
+                    () -> assertEquals(404, ex.getErrorCode().getStatus().value())
+            );
+        }
+
+        @Test
+        @DisplayName("别人的任务：40301")
+        void notOwner() {
+            when(mapper.findById(9L)).thenReturn(task(9L, 7L));
+
+            BusinessException ex = assertThrows(BusinessException.class,
+                    () -> service.getForUser(9L, 42L));
+
+            assertEquals(ErrorCode.ACCESS_DENIED, ex.getErrorCode());
+        }
+
+        @Test
+        @DisplayName("自己的任务：原样返回，不产生写操作")
+        void owner() {
+            Task mine = task(9L, 7L);
+            when(mapper.findById(9L)).thenReturn(mine);
+
+            assertSame(mine, service.getForUser(9L, 7L));
+            verify(mapper, never()).update(any(Task.class));
+        }
+    }
+
+    @Nested
+    @DisplayName("创建")
+    class Create {
+
+        @Test
+        @DisplayName("ownerId 落到实体上，优先级缺省为 3")
+        void ownerAndDefaults() {
+            when(mapper.countByTitle("写周报")).thenReturn(0L);
+
+            service.create(req("写周报", null), 7L);
+
+            verify(mapper).insert(taskCaptor.capture());
+            Task saved = taskCaptor.getValue();
+            assertAll(
+                    () -> assertEquals(7L, saved.getOwnerId().longValue()),
+                    () -> assertEquals(3, saved.getPriority().intValue()),
+                    () -> assertEquals(Boolean.FALSE, saved.getDone())
+            );
+        }
+
+        @Test
+        @DisplayName("唯一索引冲突被翻译成 40901，而不是 500")
+        void insertFailure() {
+            when(mapper.countByTitle("写周报")).thenReturn(0L);
+            doThrow(new DuplicateKeyException("uk_task_owner_title"))
+                    .when(mapper).insert(any(Task.class));
+
+            BusinessException ex = assertThrows(BusinessException.class,
+                    () -> service.create(req("写周报", null), 7L));
+
+            assertEquals(ErrorCode.TASK_TITLE_DUPLICATED, ex.getErrorCode());
+        }
+    }
+}
+```
+
+运行单个测试类：
+
+```bash
+cd task-center
+mvn -Dtest='TaskServiceTest*' test
+```
+
+此时的输出（`getForUser` 只做了存在性检查）：
+
+```bash
+[ERROR] TaskServiceTest$GetForUser.notOwner
+  Expected com.demo.taskcenter.common.BusinessException to be thrown, but nothing was thrown.
+[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
+这条失败信息值得逐字读：`Expected ... to be thrown, but nothing was thrown` 说明代码走进了一个本不该走的分支，而且没有任何异常被兜住。它比 `NullPointerException` 有用得多——后者只告诉你某处为空，前者告诉你「你以为的规则根本不存在」。如果第一次跑是编译错误或者 NPE，先别改生产代码，把测试的桩和夹具补齐，直到失败原因只剩断言。
+
+### 3. 补实现，让它绿
+
+只补一个方法：把归属判断抽进 Service。`create` 里的唯一索引翻译是阶段十六留下的，本步用 `insertFailure` 把它锁住，防止以后重构时被顺手删掉。其余代码不动。
+
+```java title="task-center/src/main/java/com/demo/taskcenter/task/TaskService.java（节选：getForUser 为本步新增，create 为阶段十六已有）"
+@Transactional(readOnly = true)
+public Task getForUser(long id, long userId) {
+    Task task = mapper.findById(id);
+    if (task == null) {
+        throw new BusinessException(ErrorCode.TASK_NOT_FOUND);
+    }
+    if (!Long.valueOf(userId).equals(task.getOwnerId())) {
+        throw new BusinessException(ErrorCode.ACCESS_DENIED);
+    }
+    return task;
+}
+
+@Transactional(rollbackFor = Exception.class)
+public Task create(TaskSaveReq req, long ownerId) {
+    String title = req.title().trim();
+    if (mapper.countByTitle(title) > 0) {
+        throw new BusinessException(ErrorCode.TASK_TITLE_DUPLICATED);
+    }
+    Task task = new Task();
+    task.setOwnerId(ownerId);
+    task.setTitle(title);
+    task.setDone(false);
+    task.setPriority(req.priority() == null ? 3 : req.priority());
+    task.setDueAt(req.dueAt());
+    task.setRemark(req.meta().remark());
+    task.setEstimateMinutes(req.meta().estimateMinutes());
+    try {
+        mapper.insert(task);
+    } catch (DuplicateKeyException e) {
+        throw new BusinessException(ErrorCode.TASK_TITLE_DUPLICATED);
+    }
+    return task;
+}
+```
+
+节选只保留方法，import 与字段沿用现有文件。这几行里有三个细节值得说清楚：
+
+- **先判 404 再判 403**。任务不存在就返回 404，存在但不属于你才返回 403。顺序反了会把「这个 id 存不存在」泄露给任何登录用户。
+- **用 `Long.valueOf(userId).equals(...)` 而不是 `!=`**。前者在 `ownerId` 为 `null` 时安全地返回 false（走 403），后者会拆箱抛 NPE；阶段十六加列时历史行没有归属，这个分支真的会出现。
+- **`countByTitle` 只是快路径**。两个请求同时提交都会看到 0，真正的兜底是 `(owner_id, title)` 唯一索引；捕获 `DuplicateKeyException` 再翻译成 40901，才能在并发下也给出同一个错误码。
+
+重跑同一个命令：
+
+```bash
+cd task-center
+mvn -Dtest='TaskServiceTest*' test
+```
+
+```bash
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+这 5 条测试都是普通 `@Test`，参数化留到第三节；`@Nested` 已经让输出变成「按归属读取 > 别人的任务：40301」这种可读路径，红灯时不用翻行号。
+
+### 4. 切片：400、401、403 一次说完
+
+单测证明了 Service 的分支，但证明不了三件事：请求体校验有没有生效、没带令牌是不是 401、业务异常有没有被 advice 翻译成 403。这三件都在 MVC 层，用 `@WebMvcTest` 只起 Web 那一层，不连数据库、不扫描 `@Service`。阶段十六在 `ErrorCode` 里补了 `UNAUTHENTICATED(40101, 401)` 与 `ACCESS_DENIED(40301, 403)`，entry point 和 accessDeniedHandler 都写统一响应体——切片要断言的就是这两个码。
+
+```java title="task-center/src/test/java/com/demo/taskcenter/task/TaskControllerTest.java"
+package com.demo.taskcenter.task;
+
+import static org.hamcrest.Matchers.containsString;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+import com.demo.taskcenter.common.BusinessException;
+import com.demo.taskcenter.common.ErrorCode;
+import com.demo.taskcenter.security.JwtService;
+import com.demo.taskcenter.security.SecurityConfig;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.MockMvc;
+
+@WebMvcTest(TaskController.class)
+@Import(SecurityConfig.class)
+@DisplayName("TaskController 的契约切片")
+class TaskControllerTest {
+
+    @Autowired
+    private MockMvc mvc;
+
+    @MockitoBean
+    private TaskService service;
+
+    @MockitoBean
+    private JwtService jwtService;
+
+    @Test
+    @DisplayName("空标题：400 + 40000，且不调用 Service")
+    void blankTitle() throws Exception {
+        when(jwtService.userId("ok-token")).thenReturn(7L);
+
+        mvc.perform(post("/api/tasks")
+                        .header("Authorization", "Bearer ok-token")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"title": "  ", "priority": 2,
+                                 "dueAt": "2099-01-01T10:00:00",
+                                 "meta": {"remark": "r", "estimateMinutes": 30}}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(40000))
+                .andExpect(jsonPath("$.message").value(containsString("title")));
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @DisplayName("无令牌：401 + 40101，不是 403")
+    void noToken() throws Exception {
+        mvc.perform(get("/api/tasks/9"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value(40101));
+    }
+
+    @Test
+    @DisplayName("别人的任务：403 + 40301")
+    void notOwner() throws Exception {
+        when(jwtService.userId("ok-token")).thenReturn(7L);
+        when(service.getForUser(9L, 7L))
+                .thenThrow(new BusinessException(ErrorCode.ACCESS_DENIED));
+
+        mvc.perform(get("/api/tasks/9")
+                        .header("Authorization", "Bearer ok-token"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value(40301));
+    }
+}
+```
+
+这个文件里有三个容易被忽略的点：
+
+- `@Import(SecurityConfig.class)` 不能省。组件扫描在切片里被过滤掉了，`@Configuration` 类不会自动进来；不导入就会落到 Boot 的默认安全链上，所有请求都要求认证，400 那条会先变成 401。这个坑在真实项目里非常常见，报错却只是一句「期望 400 实际 401」。
+- `JwtService` 用 `@MockitoBean` 打桩，`JwtAuthFilter` 本身是 `Filter`，会被切片收进来并真的执行。也就是说，401 这条测的是整条过滤器链，而不是某个 Controller 方法的注解。
+- 每条测试自己打桩。不要把 `when(jwtService.userId("ok-token"))` 放进 `@BeforeEach`，因为 401 那条根本不会调用它，Mockito 的严格桩会抛 `UnnecessaryStubbingException`。
+
+```bash
+cd task-center
+mvn -Dtest=TaskControllerTest test
+```
+
+```bash
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+切片跑完只花启动一个 Web 上下文的时间，不连库、不起 Tomcat。它证明的是**契约**：状态码、业务码、错误消息里的字段名、过滤器链的放行顺序。它不证明 SQL 能不能执行、事务会不会回滚，这两件事只能交给下一条。
+
+### 5. 集成：真的 MySQL 8.0
+
+集成测试要跑三件事：Flyway 能不能在干净库上建表、MyBatis 的 SQL 在 MySQL 方言下能不能执行、Jackson 的时间格式有没有按 `JacksonConfig` 输出。前提是阶段十六的 `JwtService` 提供 `issue(long userId, String username)` 与 `userId(String token)` 两个方法。
+
+```java title="task-center/src/test/java/com/demo/taskcenter/task/TaskApiIntegrationTest.java"
+package com.demo.taskcenter.task;
+
+import static org.hamcrest.Matchers.matchesPattern;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+import com.demo.taskcenter.security.JwtService;
+import com.demo.taskcenter.task.dto.TaskMeta;
+import com.demo.taskcenter.task.dto.TaskSaveReq;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.util.UUID;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.MediaType;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.web.servlet.MockMvc;
+import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+@SpringBootTest
+@AutoConfigureMockMvc
+@Testcontainers
+@DisplayName("真实 MySQL 下的任务链路")
+class TaskApiIntegrationTest {
+
+    @Container
+    static final MySQLContainer<?> MYSQL = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))
+            .withDatabaseName("demo")
+            .withUsername("demo")
+            .withPassword("demo")
+            .withCommand("--character-set-server=utf8mb4",
+                    "--collation-server=utf8mb4_0900_ai_ci");
+
+    @DynamicPropertySource
+    static void datasource(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
+        registry.add("spring.datasource.username", MYSQL::getUsername);
+        registry.add("spring.datasource.password", MYSQL::getPassword);
+    }
+
+    @Autowired
+    private MockMvc mvc;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    private JwtService jwtService;
+
+    @Test
+    @DisplayName("创建后按归属读回；换个用户读是 403")
+    void createReadBackAndForbidden() throws Exception {
+        long owner = 7L;
+        String title = "集成-" + UUID.randomUUID().toString().substring(0, 8);
+        String token = jwtService.issue(owner, "alice");
+
+        String created = mvc.perform(post("/api/tasks")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body(title)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.title").value(title))
+                .andExpect(jsonPath("$.data.ownerId").value(7))
+                .andExpect(jsonPath("$.data.dueAt")
+                        .value(matchesPattern("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}")))
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+
+        long id = objectMapper.readTree(created).path("data").path("id").asLong();
+
+        mvc.perform(get("/api/tasks/" + id)
+                        .header("Authorization", "Bearer " + jwtService.issue(42L, "bob")))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value(40301));
+
+        mvc.perform(get("/api/tasks/" + id)
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.id").value(String.valueOf(id)));
+    }
+
+    @Test
+    @DisplayName("同名任务：40901，且库里只留一行")
+    void duplicateTitle() throws Exception {
+        long owner = 7L;
+        String title = "重复-" + UUID.randomUUID().toString().substring(0, 8);
+        String token = jwtService.issue(owner, "alice");
+
+        mvc.perform(post("/api/tasks")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body(title)))
+                .andExpect(status().isCreated());
+
+        mvc.perform(post("/api/tasks")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body(title)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value(40901));
+
+        mvc.perform(get("/api/tasks").param("keyword", title)
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.total").value(1));
+    }
+
+    private String body(String title) throws Exception {
+        return objectMapper.writeValueAsString(new TaskSaveReq(
+                title, 2, LocalDateTime.now().plusDays(1), new TaskMeta("集成测试", 30)));
+    }
+}
+```
+
+运行前先确认 Docker 可用，再跑这一个类：
+
+```bash
+docker info --format '{{.ServerVersion}}'
+cd task-center
+mvn -Dtest=TaskApiIntegrationTest test
+```
+
+```bash
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+这里没有 `@Transactional`。因为测试断言的是「提交之后别人能读到」和「冲突之后库里只有一行」，如果套上测试事务，一切都在未提交的隔离世界里，断言全绿但证明不了任何持久化行为。数据隔离靠的是标题里的随机后缀，而不是回滚，第八节会专门算这笔账。
+
+全量跑 `mvn test`，下面只摘出这三个类的摘要：
+
+```bash
+cd task-center
+mvn test
+```
+
+```bash
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+三行分别来自 `TaskServiceTest`、`TaskControllerTest`、`TaskApiIntegrationTest`。整包里还有第三节的 `TaskQueryTest` 与第六节的 `TaskMapperTest`，再加项目原有测试，所以汇总总数不会等于 10；这三个主链路类合计 10 条。没有 Docker 的机器上，把 `@Testcontainers` 改成 `@Testcontainers(disabledWithoutDocker = true)`，集成类会跳过而不是红一片——跳过要在报告里说明，不能当作通过。
+
+## 二、机制
+
+JUnit 5 本身不认识 Spring。让 `@SpringBootTest` 生效的是 `SpringExtension`：它实现 `BeforeAllCallback`、`TestInstancePostProcessor`、`BeforeEachCallback` 等扩展点，把 JUnit 的生命周期转交给 `TestContextManager`。`TestContextManager` 再按顺序通知一组监听器：
+
+| 监听器 | 做什么 | 失败时的典型症状 |
+| :-- | :-- | :-- |
+| `ServletTestExecutionListener` | 为 `@WebAppConfiguration` 准备 MockServletContext | MockMvc 拿不到上下文 |
+| `DependencyInjectionTestExecutionListener` | 给测试实例注入 `@Autowired` 字段 | 字段为 null |
+| `DirtiesContextTestExecutionListener` | 处理 `@DirtiesContext`，关闭或重建上下文 | 下个类启动变慢 |
+| `TransactionalTestExecutionListener` | 开测试事务，方法后回滚 | 数据莫名其妙留库 |
+| `SqlScriptsTestExecutionListener` | 执行 `@Sql` 脚本 | 脚本找不到、顺序不对 |
+
+**上下文是缓存的。** `TestContext` 把已启动的 `ApplicationContext` 放进一个静态缓存，key 由「合并后的配置」决定：`classes`、`locations`、激活的 profile、`@TestPropertySource`、以及所有 `ContextCustomizer`。`@MockitoBean` 会生成一个 customizer，所以「同一个 `@SpringBootTest`，但 mock 的 bean 不同」其实是两个上下文。这也解释了为什么切片测试快：不是它偷偷优化了启动，而是它加载的 bean 定义本来就少，而且同一套切片配置能在多个测试类之间复用。
+
+**切片是对组件扫描做减法，不是对功能做模拟。** `@WebMvcTest` 带着 `@TypeExcludeFilters(WebMvcTypeExcludeFilter.class)`，只放行 `@Controller`、`@ControllerAdvice`、`@JsonComponent`、`Converter`、`Filter`、`WebMvcConfigurer`、`HandlerMethodArgumentResolver` 这些类型；`@Service`、`@Repository`、普通 `@Component` 一律不扫。`@MybatisTest` 用的是 `MybatisTypeExcludeFilter`，放行 Mapper 和 DataSource 相关配置，把 Web 层挡在外面。两者都通过 `@ImportAutoConfiguration` 只引入自己需要的那批自动配置。
+
+**`@SpringBootTest` 默认是 `webEnvironment = MOCK`**：不启 Tomcat，只准备一个 `WebApplicationContext`，`MockMvc` 直接调用 DispatcherServlet，请求和测试在同一个线程里。改成 `RANDOM_PORT` 才会真的起内嵌容器，请求由 Tomcat 的工作线程处理——这一个参数的变化，会直接决定测试事务还能不能覆盖请求，第八节会用到这个结论。
+
+**`MockMvc` 不是「假装发请求」。** 它走完整的 Filter 链、参数解析、校验、Controller、返回值转换和异常解析，唯一省掉的是网络和 Servlet 容器。所以切片能证明 401/403 的顺序，但不能证明 Tomcat 的连接数、超时和序列化后的字节数。
+
+## 三、JUnit 5：生命周期、嵌套与参数化
+
+JUnit 5 默认每个测试方法都新建一个测试实例（`PER_METHOD`），所以实例字段天然隔离，`@BeforeEach` 里初始化的东西不会漏到下一条。`@BeforeAll` 必须是静态方法（除非类上标了 `@TestInstance(PER_CLASS)`），适合放容器、服务器这类昂贵资源。
+
+```java title="task-center/src/test/java/com/demo/taskcenter/task/dto/TaskQueryTest.java"
+package com.demo.taskcenter.task.dto;
+
+import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import java.util.stream.Stream;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+@DisplayName("TaskQuery 的缺省值与偏移量")
+class TaskQueryTest {
+
+    private TaskQuery query;
+
+    @BeforeEach
+    void setUp() {
+        query = new TaskQuery(null, null, null, null, null);
+    }
+
+    @AfterEach
+    void tearDown() {
+        query = null;
+    }
+
+    @Test
+    @DisplayName("五个参数都为 null 时给出 page=1、size=20、sort=id")
+    void defaults() {
+        assertEquals(1, query.page().intValue());
+        assertEquals(20, query.size().intValue());
+        assertEquals("id", query.sort());
+    }
+
+    @ParameterizedTest(name = "page={0}, size={1} -> offset={2}")
+    @CsvSource({"1, 20, 0", "2, 20, 20", "5, 10, 40"})
+    void offset(int page, int size, int expected) {
+        assertEquals(expected, new TaskQuery(page, size, null, null, null).offset());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"id", "priority", "createdAt"})
+    void allowedSort(String sort) {
+        assertEquals(sort, new TaskQuery(1, 20, null, null, sort).sort());
+    }
+
+    @ParameterizedTest
+    @MethodSource("oddSorts")
+    @DisplayName("DTO 不做白名单校验：非法排序原样保留，400 由框架给")
+    void keepsUnknownSort(String sort) {
+        assertEquals(sort, new TaskQuery(1, 20, null, null, sort).sort());
+    }
+
+    static Stream<String> oddSorts() {
+        return Stream.of("created_at", "priority desc", "id; DROP TABLE task");
+    }
+
+    @Nested
+    @DisplayName("显式值不被覆盖")
+    class Explicit {
+
+        @Test
+        void keepsGivenValues() {
+            TaskQuery q = new TaskQuery(3, 50, true, "周报", "priority");
+            assertAll(
+                    () -> assertEquals(3, q.page()),
+                    () -> assertEquals(50, q.size()),
+                    () -> assertEquals(100, q.offset())
+            );
+        }
+    }
+}
+```
+
+四种参数化来源各有适用面：
+
+| 注解 | 适合 | 注意 |
+| :-- | :-- | :-- |
+| `@ValueSource` | 一组同类型字面量 | 只支持基本类型、`String`、`Class`；不能传 `null` |
+| `@CsvSource` | 多参数、需要可读的表格 | 含逗号的字符串要加单引号；空串写 `''` |
+| `@MethodSource` | 动态生成、复杂对象 | 方法默认必须是 `static`，返回 `Stream`、`Iterable` 或数组 |
+| `@EnumSource` | 枚举全覆盖 | 可用 `names` 或 `mode` 排除个别值 |
+
+`@Nested` 的价值在失败报告里最明显：外层 `@BeforeEach` 先执行，内层 `@BeforeEach` 后执行，`@AfterEach` 反过来；输出会显示成 `TaskService 的归属与创建规则 > 按归属读取 > 别人的任务：40301`，一眼知道坏在哪个行为组，而不是在几十个平铺的方法名里找。
+
+两条纪律：**不要依赖方法执行顺序**，JUnit 默认的顺序是确定但不承诺的（基于方法名哈希），有共享状态就说明夹具设计错了；**不要在测试里写 `Thread.sleep`**，那是在用时间掩盖竞态，应该用 `Awaitility` 之类的轮询，或者干脆把异步边界抽出去单测。
+
+## 四、断言与覆盖率：绿灯证明什么
+
+断言只有三种写法值得记：
+
+- `assertEquals(expected, actual)`：值比较，注意包装类型和基本类型的重载，`assertEquals(3, someInteger)` 在 `int` 与 `Integer` 混用时会撞上重载歧义，写成 `someInteger.intValue()` 最稳。
+- `assertThrows(ExceptionType.class, executable)`：返回捕获到的异常，可以继续断言 `code`、`status`、`message`，但**断言业务码，不要断言整段文案**——文案会改，业务码是契约。
+- `assertAll(...)`：把所有断言都跑完再汇总失败。校验多个字段时尤其重要，否则第一条失败就遮住了后面三条，改一轮只能看到一个错。
+
+**红绿节奏的核心是「先看断言失败」。** 写完测试立刻跑，确认失败原因就是你要证明的那条规则；不失败说明测试没测到东西。实现变绿之后还有一步常被跳过：**故意把实现改坏，看测试会不会红**。把 `getForUser` 里的归属判断删掉，`notOwner` 必须失败；把 404 与 403 的顺序对调，`missing` 必须失败。这一步在覆盖率工具里看不出来，却是唯一能证明断言有效的手段。
+
+覆盖率数字本身很容易骗人：
+
+| 指标 | 能说明 | 不能说明 |
+| :-- | :-- | :-- |
+| 行覆盖 | 这行代码被执行过 | 执行结果对不对；断言存不存在 |
+| 分支覆盖 | `if` 的两边都走过 | 走对之后有没有检查副作用 |
+| 变异覆盖 | 改坏代码后测试会不会红 | 需求本身对不对 |
+
+一个只有 `service.create(req, 7L);` 而没有断言的测试，行覆盖可以很高，变异 score 接近零：把 `setOwnerId` 删掉、把优先级默认值从 3 改成 5，它照样绿。所以真正要盯的是**断言密度**（每个行为至少一条能失败的断言）和**负向用例**（不存在、越权、重复、非法参数各至少一条），而不是那个百分比。
+
+想在 CI 里量化「断言有没有用」，可以接 PIT（变异测试）。它按变异算子改字节码（把 `>` 改成 `>=`、删掉一次方法调用、把返回值换成 `null`），再跑测试，活下来的变异就是断言的漏洞：
+
+```xml title="task-center/pom.xml（节选：变异测试插件）"
+<plugin>
+    <groupId>org.pitest</groupId>
+    <artifactId>pitest-maven</artifactId>
+    <version>1.17.2</version>
+    <configuration>
+        <targetClasses>
+            <param>com.demo.taskcenter.task.*</param>
+        </targetClasses>
+        <targetTests>
+            <param>com.demo.taskcenter.task.*Test</param>
+        </targetTests>
+        <mutationThreshold>60</mutationThreshold>
+        <outputFormats>
+            <param>HTML</param>
+        </outputFormats>
+    </configuration>
+    <dependencies>
+        <dependency>
+            <groupId>org.pitest</groupId>
+            <artifactId>pitest-junit5-plugin</artifactId>
+            <version>1.2.1</version>
+        </dependency>
+    </dependencies>
+</plugin>
+```
+
+`mutationThreshold` 是「变异被杀死的最低比例」，设成多少取决于这个包有多核心；`task` 包承载权限判断，门槛可以比工具类高。不要把它当覆盖率刷，它跑得比单测慢一个量级，放夜间流水线更合适。
+
+## 五、Mockito：mock 协作对象，不 mock 值对象
+
+Mockito 的四个工具对应四种问题：
+
+- `@Mock` + `@InjectMocks`：造一个被测对象，把依赖换成假的。`@InjectMocks` 优先走构造器注入，找不到才用字段反射；如果两个依赖同类型，它会按字段名猜，猜错了就手动 `new TaskService(mapper)`，比调注解快。
+- `when(...).thenReturn(...)`：规定协作对象的返回值。只 stub 当前测试用得到的调用，Mockito 的严格模式会把多余 stub 当成错误。
+- `doThrow(...).when(mock).method(...)`：给方法注入异常。`void` 方法只能用这个顺序，`when(mock.voidMethod())` 编译不过；比如让 `mapper.insert` 抛唯一键冲突时也用它。
+- `verify` + `ArgumentCaptor`：检查「有没有调用」和「调用时传了什么」。返回值简单的场景直接 `verify(mapper).insert(any())` 就够；需要逐字段检查落库对象时才上 Captor。
+
+上面的用法在 `TaskServiceTest` 里已经出现过；再补一条对「更新」的检查，重点是 Captor——返回值只有一个对象时，`verify` 只能证明「调用过」，Captor 才能证明「传进去的东西是对的」：
+
+```java title="task-center/src/test/java/com/demo/taskcenter/task/TaskServiceTest.java（追加的测试方法，与上文同一个类）"
+@Test
+@DisplayName("更新时归属不变、优先级保留，落库对象可逐字段检查")
+void updateKeepsOwnerAndPriority() {
+    Task existing = new Task();
+    existing.setId(9L);
+    existing.setOwnerId(7L);
+    existing.setTitle("旧标题");
+    existing.setDone(false);
+    existing.setPriority(4);
+    when(mapper.findById(9L)).thenReturn(existing);
+
+    service.update(9L, req("新标题", null), 7L);
+
+    ArgumentCaptor<Task> captor = ArgumentCaptor.forClass(Task.class);
+    verify(mapper).update(captor.capture());
+    Task saved = captor.getValue();
+    assertAll(
+            () -> assertEquals("新标题", saved.getTitle()),
+            () -> assertEquals(4, saved.getPriority().intValue()),
+            () -> assertEquals(7L, saved.getOwnerId().longValue())
+    );
+}
+```
+
+一条禁令：**不要 mock 值对象**。`Task`、`TaskSaveReq`、`TaskMeta`、`String`、`List` 都是值，直接 `new` 一个、传进去、断言字段。mock 值对象只会让测试变得难读：`when(task.getTitle()).thenReturn("x")` 之后，你连自己写的是「任务标题是 x」还是「getId 时返回 x」都分不清，而且一旦 `Task` 从 POJO 改成 record，整片测试跟着重写。
+
+同样不建议的还有：mock 被测类自己（那是在测 mock）、mock `List`/`Map`（用真的，空实现没有成本）、为了绕过静态方法去上 `mockStatic`（先问问这段代码为什么需要静态）。真正需要 mock 的只有「跨进程、跨网络、跨数据库」的协作对象：Mapper、Redis 客户端、HTTP 客户端、消息队列。
+
+## 六、切片怎么裁剪上下文
+
+测试金字塔不是按数量摊派，而是按「越往下越便宜、越往上越可信」分工：单元测试最多，负责逻辑分支；切片居中，负责契约与序列化；集成测试最少，只留给真实 SQL、事务和安全链。比例是结果不是目标——Service 里 if 多，单测自然多；只有一条 SQL，集成测试一条就够。真正的错误是反过来：用大量单测假装覆盖了数据库，或者用一条 E2E 试图证明所有分支。
+
+三个层次解决三个问题，别用错工具：
+
+| 注解 | 加载什么 | 证明什么 | 代价 |
+| :-- | :-- | :-- | :-- |
+| `@WebMvcTest` | MVC、Jackson、Filter、Security 链、Advice；不含 Service/Repository | 参数校验、状态码、业务码、JSON 序列化 | 低：一个 Web 上下文，不连库 |
+| `@MybatisTest` | MyBatis、DataSource、事务管理器；不含 Web | 真实 SQL、索引约束、类型映射 | 中：要数据库，默认回滚 |
+| `@SpringBootTest` | 全部自动配置与全部 Bean | 端到端装配、事务、安全、序列化 | 高：完整上下文，慢在启动 |
+
+`@MybatisTest` 默认会尝试把 DataSource 换成内嵌库，用真实 MySQL 时必须显式关掉替换，并让 Flyway 在这个切片里也跑起来：
+
+```java title="task-center/src/test/java/com/demo/taskcenter/task/TaskMapperTest.java"
+package com.demo.taskcenter.task;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.mybatis.spring.boot.test.autoconfigure.MybatisTest;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.ImportAutoConfiguration;
+import org.springframework.boot.autoconfigure.flyway.FlywayAutoConfiguration;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+@MybatisTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@ImportAutoConfiguration(FlywayAutoConfiguration.class)
+@Testcontainers
+@DisplayName("TaskMapper 的真实 SQL 约束")
+class TaskMapperTest {
+
+    @Container
+    static final MySQLContainer<?> MYSQL = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))
+            .withDatabaseName("demo")
+            .withUsername("demo")
+            .withPassword("demo");
+
+    @DynamicPropertySource
+    static void datasource(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
+        registry.add("spring.datasource.username", MYSQL::getUsername);
+        registry.add("spring.datasource.password", MYSQL::getPassword);
+    }
+
+    @Autowired
+    private TaskMapper mapper;
+
+    @Test
+    @DisplayName("(owner_id, title) 唯一索引由数据库兜底")
+    void uniqueIndex() {
+        Task first = new Task();
+        first.setOwnerId(7L);
+        first.setTitle("唯一-" + System.nanoTime());
+        first.setDone(false);
+        first.setPriority(3);
+        mapper.insert(first);
+
+        Task second = new Task();
+        second.setOwnerId(7L);
+        second.setTitle(first.getTitle());
+        second.setDone(false);
+        second.setPriority(3);
+
+        assertThrows(DuplicateKeyException.class, () -> mapper.insert(second));
+        assertEquals(1, mapper.countByTitle(first.getTitle()));
+    }
+}
+```
+
+这个类默认带 `@Transactional`，测试结束回滚，容器里的数据不会累积。`@ImportAutoConfiguration(FlywayAutoConfiguration.class)` 是因为 MyBatis 切片不会自动加载 Flyway，不加的话表根本不存在，你会得到一句「Table 'task' doesn't exist」，误以为是 SQL 写错了。
+
+`@SpringBootTest` 的成本要提前算：它加载全部自动配置，任何一个 `@MockitoBean`、`@TestPropertySource` 都会产生新的上下文缓存条目；一个项目里出现七八种组合，Surefire 就得启动七八个上下文。降低成本的顺序是：能切片的切片，能共用配置的共用一个 `@TestConfiguration`，最后才考虑 `@DirtiesContext`——它的语义是「这个类弄脏了上下文，关掉」，代价是下一个类重新启动。
+
+## 七、Testcontainers：为什么比 H2 可信
+
+H2 的 MySQL 兼容模式是个善意的谎言。它能让 `LIMIT`、`CONCAT` 跑起来，但下面这些地方会给出和 MySQL 不同的答案：
+
+| 维度 | H2 的表现 | MySQL 8.0 的表现 |
+| :-- | :-- | :-- |
+| 方言与函数 | MySQL 模式覆盖部分语法，`JSON_TABLE`、窗口函数、排序规则仍不一致 | 生产 SQL 直接用到 |
+| 排序规则 | 没有 `utf8mb4_0900_ai_ci`，大小写与重音规则不同 | `WHERE title = 'ABC'` 会命中 `abc` |
+| 事务与锁 | 默认 READ COMMITTED，没有间隙锁 | 默认 REPEATABLE READ，有间隙锁与 next-key lock |
+| 索引与执行计划 | 索引结构与优化器不同，执行计划不能互相参照 | `EXPLAIN` 的 `key`、`rows` 才是你排查的依据 |
+| 类型精度 | `DATETIME` 精度、`DECIMAL` 舍入可能不同 | 列定义决定截断与舍入 |
+
+所以「H2 上全绿、MySQL 上 500」几乎是一类固定故障：唯一索引与排序规则在 H2 里是另一套、`utf8mb4` 下的长度超限、`ON DUPLICATE KEY` 的语义有差异、`FOR UPDATE` 锁住的区间不同。Testcontainers 的代价是每条流水线要拉镜像、起容器，换来的是**你测的就是你要部署的那个数据库**。
+
+用法上有几个约定：
+
+- 容器声明为 `static final`，配 `@Container`。`@Testcontainers` 的扩展在 `@BeforeAll` 阶段启动它，Spring 的 `@DynamicPropertySource` 在上下文刷新前读取它，顺序才对。写成实例字段会导致每个测试方法重启一次容器。
+- 镜像 tag 要钉住主版本（`mysql:8.0`），别用 `latest`。镜像悄悄升级会改变排序规则和默认参数，测试红的时候你找不到原因。
+- `@DynamicPropertySource` 必须是 `static`，参数是 `DynamicPropertyRegistry`。它注册的是 `Supplier`，容器启动后取值，所以能拿到随机映射的端口。
+- 一个 JVM 一个容器通常够用。`@Testcontainers` 默认每个测试类一个容器（静态字段随类生命周期），要跨类复用得打开 `testcontainers.reuse.enable=true`，并接受「复用的容器里残留着上一次的数据」这个前提。
+- Boot 3.1 起可以用 `@ServiceConnection` 代替三行 `registry.add`，它按容器类型自动映射 URL、用户名、密码；`@DynamicPropertySource` 仍然要会，因为 Oracle、多数据源、需要额外参数的场景它覆盖不到。
+
+Testcontainers 也不是生产。容器里的 MySQL 大部分参数是默认值，数据量是几行，网络是本地回环，隔离级别没人改过。它能证明「这条 SQL 在这个版本、这个 schema 下能跑、约束生效」，不能证明「十万行时还是这个执行计划」——那是[阶段十五](/blog/posts/java-roadmap-15-mysql-index-transaction/)用 `EXPLAIN` 干的事。
+
+## 八、事务回滚与数据隔离
+
+`@Transactional` 标在测试类上时，`TransactionalTestExecutionListener` 在 `@BeforeEach` 之前开启事务，在 `@AfterEach` 之后回滚。Service 上默认的 `@Transactional` 传播行为是 `REQUIRED`，会加入这个测试事务，所以「插入后断言、结束自动清空」成立。这条机制很舒服，但有四个缺口：
+
+**缺口一：服务自己开的新事务不在回滚范围。** `REQUIRES_NEW`、`@Async`、消息监听、定时任务、`TransactionTemplate` 显式设了 `PROPAGATION_REQUIRES_NEW` 的调用，都会拿新连接、独立提交。测试事务回滚时管不到它：
+
+```java title="task-center/src/test/java/com/demo/taskcenter/task/TransactionTrapTest.java（反例）"
+package com.demo.taskcenter.task;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import java.util.UUID;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+
+@SpringBootTest
+@Transactional
+class TransactionTrapTest {
+
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    @Test
+    @DisplayName("反例：新事务提交后，测试回滚带不走这行数据")
+    void requiresNewEscapesTestRollback() {
+        TransactionTemplate requiresNew = new TransactionTemplate(transactionManager);
+        requiresNew.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        requiresNew.executeWithoutResult(status -> jdbc.update(
+                "INSERT INTO task(owner_id, title, done, priority) VALUES (?, ?, 0, 3)",
+                7L, "跨事务-" + UUID.randomUUID()));
+
+        Integer inside = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM task WHERE title LIKE '跨事务-%'", Integer.class);
+        assertEquals(1, inside.intValue());
+    }
+}
+```
+
+这段代码只贴测试方法本体，容器三件套（`@Testcontainers`、静态 `MySQLContainer`、`@DynamicPropertySource`）与 `TaskApiIntegrationTest` 相同，否则它会连到本机开发库。它只用来观察一次行为，不要放进 CI。
+
+这条测试第一次会绿，数据却留在库里；第二次再跑，断言里的 1 就变成 2，测试红。它本身就是一个反面教材：**测试事务只保护加入它的事务，不保护独立提交的写。** 生产代码里出现这种结构（比如「主流程失败但审计日志必须留下」），测试就要显式断言「新事务的数据存在」，并在独立事务里清理，而不是指望回滚。
+
+**缺口二：提交时机被推迟。** 测试事务里，`flush` 可能发生在查询前或回滚前，唯一索引冲突、非空约束、字段截断的异常不一定在你以为的那一行抛出。上文的 `insertFailure` 是单测，用 `doThrow` 直接模拟；集成测试里要验证约束，应该像 `TaskMapperTest` 那样让插入真的执行，或者用 `TestTransaction.end()` 手动结束测试事务再断言。
+
+**缺口三：容器线程不加入测试事务。** `@SpringBootTest(webEnvironment = RANDOM_PORT)` 时，HTTP 请求由 Tomcat 线程处理，测试线程的事务和它无关。此时 `@Transactional` 不但不回滚请求写入的数据，还会让你误以为隔离了。
+
+**缺口四：自调用让事务根本没开。** 阶段十三讲过，同类方法内部调用不走代理；测试里外层有事务，看起来一切正常，生产上没有，于是「测试通过、线上没回滚」。这类问题只能靠集成测试覆盖真实入口，或者用 `TransactionTemplate` 把边界写显式。
+
+需要保留数据排查时，用 `@Commit`（等价于 `@Rollback(false)`）：
+
+```java title="TaskServiceTest.java（临时排查用；需补 import org.springframework.test.annotation.Commit）"
+@Test
+@Commit
+@DisplayName("临时排查用：数据留在库里，提交前删掉这个注解")
+void keepDataForInspection() {
+    service.create(req("排查-临时", 2), 7L);
+}
+```
+
+`TestTransaction` 提供了更细的控制：`TestTransaction.flagForCommit()` 标记当前测试事务提交，`TestTransaction.end()` 立即结束，`TestTransaction.start()` 再开一个。它适合「先提交，再用另一个事务读，确认隔离级别」这种实验，不适合日常用例。
+
+`@Rollback(true)` 是默认行为，显式写它只有一个用途：覆盖类级别的 `@Commit`。团队里更常见的是反过来——某个类临时加了 `@Commit` 排查问题，忘了删，之后所有测试的数据都留库，CI 上看着全绿，库却越跑越脏。所以 `@Commit` 的生命周期应该以「一次本地调试」为单位，提交前删掉。
+
+既然回滚不可靠，数据隔离就要另想办法：
+
+- **每条测试造自己的数据**，标题带 `UUID` 后缀或 `System.nanoTime()`，不要假设表里只有自己插的行。
+- **不要断言自增 id 的具体值**，容器复用、其他测试插入都会让序列变化；用返回的 id 继续请求。
+- **`@Sql` 清理要看清事务模式**。默认它在测试事务里执行，删掉的数据会跟着回滚；要清掉之前提交的残留，得用 `ISOLATED` 模式，让脚本在独立事务里提交。
+
+```sql title="task-center/src/test/resources/sql/clean-test-task.sql"
+DELETE FROM task
+WHERE title LIKE '集成-%'
+   OR title LIKE '重复-%'
+   OR title LIKE '跨事务-%';
+```
+
+```java title="TaskApiIntegrationTest.java（类上的注解，容器复用时追加；需补 Sql 与 SqlConfig 的 import）"
+@Sql(scripts = "/sql/clean-test-task.sql",
+        executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD,
+        config = @SqlConfig(transactionMode = SqlConfig.TransactionMode.ISOLATED))
+```
+
+`ISOLATED` 的代价是这条 DELETE 真的落库，所以脚本必须按前缀精确匹配，不能 `DELETE FROM task`——共享容器上还有别的测试类在跑。并行执行时更要注意：JUnit 5 的并行默认关闭，打开后同一个容器上的测试会互相看到对方的数据，除非每条测试的过滤条件完全独立。
+
+## 这条链路在真实项目里的位置
+
+测试不是「开发完补一下」，它嵌在每一次改动的中间。把这一篇放回一次迭代：
+
+| 环节 | 本步要回答的问题 | 落点 |
+| :-- | :-- | :-- |
+| 需求 | 「用户只能看自己的任务；未登录必须被挡住」 | 401/403 两条验收，写进接口文档 |
+| 数据 | 归属存在哪、唯一性靠什么保证 | `task.owner_id`、`(owner_id, title)` 唯一索引 |
+| 契约 | 未登录与越权分别返回什么 | `ErrorCode` 的 40101/40301，统一响应体 |
+| 实现 | 归属判断放在哪一层 | `TaskService.getForUser`，Controller 只取 `@AuthenticationPrincipal` |
+| 验证 | 三层测试各证明一段 | 三个主链路类：单测 5 条、切片 3 条、集成 2 条 |
+| 上线 | 改完怎么确认没坏 | `mvn test` 作为合并门禁，集成测试进 CI |
+
+本步在 task-center 新增的测试文件：
+
+| 文件 | 类型 | 证明什么 |
+| :-- | :-- | :-- |
+| `src/test/java/com/demo/taskcenter/task/TaskServiceTest.java` | Mockito 单测 | 404 与 403 的分支、ownerId 落库、优先级缺省、唯一键翻译 |
+| `src/test/java/com/demo/taskcenter/task/TaskControllerTest.java` | `@WebMvcTest` 切片 | 400/401/403、业务码、错误字段名、过滤器链 |
+| `src/test/java/com/demo/taskcenter/task/TaskApiIntegrationTest.java` | `@SpringBootTest` + Testcontainers | 真实 SQL、Flyway、Jackson 时间格式、提交后可见性 |
+| `src/test/java/com/demo/taskcenter/task/TaskMapperTest.java` | `@MybatisTest` + Testcontainers | 唯一索引由数据库兜底、默认回滚 |
+| `src/test/java/com/demo/taskcenter/task/dto/TaskQueryTest.java` | 参数化单测 | 缺省值、offset 计算、白名单外的值透传 |
+| `src/test/resources/sql/clean-test-task.sql` | 测试资源 | 独立事务清理按前缀命中的残留 |
+
+**这一步不做什么也要写清楚。** 不追覆盖率数字，不引入 Selenium/Playwright 做浏览器 E2E，不为了测试改生产接口的形状，不把 `@Transactional` 当成数据隔离的万能药。下一步 [Redis 缓存、锁与异步任务](/blog/posts/java-roadmap-18-redis-cache-async/) 会给 `TaskService` 加缓存和异步导出，那时候「缓存没命中」「异步任务没跑完」都要靠今天这套夹具来断言；[阶段十九](/blog/posts/java-roadmap-19-deploy-and-troubleshoot/) 的探活与排查，也以 `mvn test` 全绿为发布前提。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| :-- | :-- | :-- |
+| 切片里所有请求都 401 | `@WebMvcTest` 不扫 `@Configuration`，落到了默认安全链 | `@Import(SecurityConfig.class)`，并把过滤器依赖用 `@MockitoBean` 补上 |
+| `@MockBean` 被标记废弃 | Boot 3.4 起由 `@MockitoBean` 取代，旧注解不再演进 | 换 `org.springframework.test.context.bean.override.mockito.MockitoBean` |
+| `UnnecessaryStubbingException` | 严格模式 + `@BeforeEach` 里统一打桩，部分测试没用到 | 桩放进具体测试方法，或确实需要时用 `lenient()` |
+| `InvalidUseOfMatchersException` | 同一个调用里混用裸值和 `any()` | 要么全裸值，要么全 matcher，裸值也包成 `eq(...)` |
+| 单测全绿，上线 SQL 报错 | mock 的 Mapper 不执行 SQL，方言/约束完全没验证 | 保留 `@MybatisTest` 或 Testcontainers 集成测试 |
+| 集成测试里唯一索引冲突测不出来 | 测试事务未提交，异常在回滚阶段才出现或被吞 | 去掉测试事务，或 `TestTransaction.end()` 后断言 |
+| 测试数据越跑越多 | 服务用 `REQUIRES_NEW` 独立提交，回滚管不到 | 用唯一后缀 + `ISOLATED` 模式脚本清理，测试里显式断言 |
+| 无 Docker 机器上集成测试全红 | 容器起不来被当成断言失败 | `@Testcontainers(disabledWithoutDocker = true)`，并在报告里标跳过 |
+| H2 通过、MySQL 失败 | 方言、排序规则、隔离级别、索引行为不同 | 集成测试直接用同版本 MySQL 容器 |
+| 第二个测试类启动特别慢 | `@MockitoBean`/属性组合不同，上下文缓存失效 | 收敛配置组合；`@DirtiesContext` 只留给真的弄脏上下文的类 |
+| 断言整段错误文案，改个字段顺序就红 | 校验消息的拼接顺序不是契约 | 断言 `code` 与关键字段名，不断言整句 |
+| 单独跑绿、全量跑红 | 测试之间靠数据或执行顺序耦合 | 每条测试自造数据，禁止依赖前一条的写入 |
+
+## 验收清单
+
+- [ ] `mvn test` 通过，三个主链路类合计 10 条（5 条单测、3 条切片、2 条集成），`TaskQueryTest` 与 `TaskMapperTest` 也全绿，没有被静默跳过的用例。
+- [ ] 把 `getForUser` 里的归属判断删掉，`TaskServiceTest.notOwner` 变红；恢复后变绿。
+- [ ] 把 `getForUser` 里 404 与 403 两个分支对调，`TaskServiceTest.missing` 变红（收到 403 而不是 404），说明「不泄露资源是否存在」被锁住。
+- [ ] 去掉 `@Import(SecurityConfig.class)`，`TaskControllerTest.blankTitle` 从 400 变成 401，能解释原因。
+- [ ] 集成测试断言了 `dueAt` 的字符串格式是 `yyyy-MM-dd'T'HH:mm:ss`，改 `JacksonConfig` 的格式会让它红。
+- [ ] 在容器里手动执行 `SHOW INDEX FROM task`，能看到 `(owner_id, title)` 的唯一索引，且 `TaskMapperTest` 对它做了负向验证。
+- [ ] 连跑两次 `mvn test`，第二次按本次随机标题查 `keyword` 仍然只返回 1 条，说明随机后缀有效、数据没有跨次串。
+- [ ] 没有 Docker 的机器上集成测试是 skipped 而不是 failure，且你能说清「跳过不等于通过」。
+
+## 练习
+
+1. 给 `page` 接口补两条切片测试：`size=101` 返回 400，`sort=created_at` 返回 400。
+   **自检：** 两条都断言 `code=40000` 且 `message` 含字段名；把 `TaskQuery` 上的 `@Max(100)` 改成 `@Max(200)`，第一条必须红；把 `@Pattern` 的正则放宽，第二条必须红。
+
+2. 用 `@ParameterizedTest` + `@MethodSource` 遍历 `ErrorCode`，断言「业务码前三位等于 HTTP 状态码」这条约定（例如 40401 对应 404）。
+   **自检：** 故意把 `ACCESS_DENIED` 的状态改成 400，测试失败并指出是哪个枚举；把约定写进断言消息，失败时能直接看到违反的枚举名。
+
+3. 把 `TaskApiIntegrationTest` 改成 `webEnvironment = RANDOM_PORT` + `TestRestTemplate`，并在测试方法上加 `@Transactional`。
+   **自检：** 请求仍然成功，但测试结束后数据留在库里；在日志里确认请求线程与测试线程不是同一个，并用这个现象解释「为什么容器线程不加入测试事务」。
+
+4. 给 `TaskServiceTest` 增加一条「两个不同 owner 可以使用同一个标题」的用例，先写测试再改实现。
+   **自检：** 测试起初因为 `countByTitle` 是全局计数而失败（40901）；把 Service 的预检查改成按 owner 计数后变绿，唯一索引本来就是 `(owner_id, title)`；再补一条 Mapper 用例，两个 owner 插入同名任务都不抛异常。
+
+5. 用 `@Sql` 的 `ISOLATED` 模式清理 `跨事务-` 前缀的数据，并让 `TransactionTrapTest` 在结束时不留行。
+   **自检：** 连续跑三次 `mvn test`，`SELECT COUNT(*) FROM task WHERE title LIKE '跨事务-%'` 始终为 0；把 `ISOLATED` 去掉后计数开始累加，说明清理脚本也被回滚了。
+
+## 小结
+
+- 三层测试各证明一段：单测证明逻辑分支，切片证明契约与序列化，集成证明真实 SQL 与事务；任何一层都替代不了另一层。
+- JUnit 5 默认每个方法一个新实例，`@BeforeEach` 准备、`@AfterEach` 收尾；`@Nested` 让失败报告按行为分组，参数化把同一规则的多个输入压成一张表。
+- 断言要能失败才算断言：先看它红，再让它绿，最后改坏实现确认它还会红；`assertAll` 一次报全，`assertThrows` 断言业务码而不是文案。
+- Mockito 只 mock 跨进程的协作对象，值对象直接 new；严格桩会把「多余的 when」当错误，这是好事。
+- 切片靠组件扫描做减法，`@WebMvcTest` 不扫 `@Configuration`，安全链要显式导入；`@MybatisTest` 用真实库时要关掉 DataSource 替换并补上 Flyway。
+- Testcontainers 的可信度来自「同版本、同方言、同约束」，H2 的兼容模式证明不了索引、排序规则和事务行为；容器也不是生产。
+- 测试事务只覆盖加入它的事务，`REQUIRES_NEW`、`@Async`、容器线程都能逃出去；隔离靠唯一数据与独立清理，不靠回滚。
+- 覆盖率是探照灯不是成绩单，变异测试和负向用例才能说明断言有没有咬住行为；本步在 task-center 留下 5 个测试类，主链路的 10 条作为后续缓存与部署改动的回归底线。

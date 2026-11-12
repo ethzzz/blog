@@ -1,0 +1,461 @@
+---
+title: '阶段十九：部署、日志与线上排查'
+published: 2026-11-12T15:00:00+08:00
+description: '从 Maven 生命周期到多阶段 Dockerfile、compose 与 Nginx，讲清一个 jar 如何变成能探活、能排障、能回滚的线上服务。'
+tags: [Java, Docker, 部署, 日志, 排查, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> 阶段十八让缓存和异步导出跑起来了，但它们只活在一个 `mvn spring-boot:run` 的终端里。这一篇把同一个 jar 推进容器：本机打包、多阶段 Dockerfile 做镜像、compose 拉起 MySQL/Redis/应用/Nginx，再回答三个上线才会问的问题——**怎么知道它活着、出事看什么、发坏了怎么退**。
+>
+> 本机没有 Docker 和 JDK 21，必须起容器才能得到的输出标成「预期输出」并写清判据；容器限额与 JVM 参数是示例值，不是实测结论。
+
+## 一、先跑起来
+
+Maven 生命周期是 `validate`、`compile`、`test`、`package`、`verify`、`install`、`deploy` 一条链，`mvn package` 执行到 `package`，`test` 不跳过。该阶段产出普通 jar，`repackage` 再换成可执行 jar，原名留成 `.jar.original`。
+
+```xml title="task-center/pom.xml"
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<plugin>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-maven-plugin</artifactId>
+</plugin>
+```
+
+可执行 jar 里 `BOOT-INF/classes` 放应用类、`BOOT-INF/lib` 放依赖，`java -jar` 读的是 manifest 里的 `Start-Class`。
+
+```bash
+cd task-center
+mvn -B clean package
+ls -lh target/*.jar
+```
+
+输出：可执行 jar 与 `.jar.original` 并存。`-DskipTests` 省掉的不是时间而是证据：测试照常编译、并不执行，运行期错误看不见，所以 CI 必须先跑 `mvn verify`。
+
+```dockerfile title="task-center/Dockerfile"
+FROM maven:3.9-eclipse-temurin-21 AS builder
+WORKDIR /build
+COPY pom.xml .
+RUN mvn -B -q dependency:go-offline
+COPY src ./src
+RUN mvn -B -q -DskipTests package
+
+FROM eclipse-temurin:21-jre
+RUN apt-get update && apt-get install -y --no-install-recommends curl tzdata \
+ && rm -rf /var/lib/apt/lists/*
+ENV TZ=Asia/Shanghai
+RUN groupadd --system app && useradd --system --gid app --home /app app
+WORKDIR /app
+COPY --from=builder /build/target/task-center-0.0.1-SNAPSHOT.jar app.jar
+RUN mkdir -p /app/data/exports && chown -R app:app /app
+USER app
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-XX:+ExitOnOutOfMemoryError", \
+            "-Duser.timezone=Asia/Shanghai", "-jar", "/app/app.jar"]
+```
+
+先 pom 后 src 让依赖层可复用，`USER app` 让它非 root 运行，堆上限用比例而不是 `-Xmx`。镜像能启动也不等于能干活，它还要连库、要一份不打进镜像的配置：
+
+```yaml title="task-center/compose.yml"
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      MYSQL_DATABASE: taskcenter
+      MYSQL_USER: taskcenter
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?}
+    volumes: ["mysql-data:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?}"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      retries: 10
+
+  app:
+    image: task-center:${APP_TAG:-0.1.0}
+    build: .
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/taskcenter
+      SPRING_DATASOURCE_USERNAME: taskcenter
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:?}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    ports: ["8081:8081"]
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/actuator/health/readiness"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+    volumes: ["export-data:/app/data/exports"]
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  export-data:
+```
+
+`${VAR:?}` 是「没有就报错退出」，比默认值安全；`$$` 是 compose 的转义，单个 `$` 在解析时就被替换。
+
+```bash
+docker build -t task-center:0.1.0 .
+docker compose up -d && docker compose ps
+curl -s http://127.0.0.1:8081/actuator/health
+TOKEN=$(curl -s -X POST http://127.0.0.1:8081/api/auth/login \
+  -H 'Content-Type: application/json' -d '{"username":"alice","password":"Lab@12345"}' \
+  | jq -r '.data.accessToken')
+curl -s http://127.0.0.1:8081/api/tasks -H "Authorization: Bearer $TOKEN"
+```
+
+预期输出：mysql、redis、app 都是 `healthy`，nginx 是 `running`；健康检查返回 `{"status":"UP","groups":["liveness","readiness"]}`；最后一条是业务 JSON。
+
+## 二、机制
+
+### 1. 镜像分层：缓存的是层，不是命令
+
+层按内容摘要寻址：`COPY` 看文件内容，`RUN` 看命令加父层。所以「先拷 pom」不是风格——`pom.xml` 不变，离线层一直命中；`COPY src` 一变，之后所有层重建。多阶段只把 `COPY --from` 点名的文件带进最终镜像。
+
+### 2. 容器内存与 JVM：两个 OOM 长得不一样
+
+cgroup 限额是硬上限。JDK 10 起 `UseContainerSupport` 让 JVM 读限额，`MaxRAMPercentage=75` 即「限额的 75% 给堆」：`--memory=512m` 下堆约 384m，其余留给 Metaspace、线程栈和 DirectByteBuffer（示例值）。Java 层 OOM 抛 `OutOfMemoryError`；容器层 OOM 是 RSS 超限被内核杀，退出码 137、日志空白。
+
+### 3. 探活：liveness 与 readiness 回答的不是同一个问题
+
+| 端点 | 回答的问题 | 失败后编排器做什么 | 该包含什么 |
+| :-- | :-- | :-- | :-- |
+| `/actuator/health/liveness` | 进程还能不能自己恢复 | 重启容器 | 只包含 JVM 自身 |
+| `/actuator/health/readiness` | 现在能不能接流量 | 摘掉流量，不重启 | 数据库、Redis、迁移完成 |
+
+把数据库放进 liveness 是最常见的放大器：库抖一下，所有实例同时失败、同时重启。**liveness 只答「进程死没死」，readiness 才答「能不能接流量」**，后者还负责优雅下线：SIGTERM 后置 `REFUSING_TRAFFIC`、摘流量、再处理在途请求。
+
+## 三、配置与密钥
+
+优先级从高到低：命令行参数、`SPRING_APPLICATION_JSON`、环境变量、`application-{profile}.yml`、`application.yml`。**越靠近运行时优先级越高**，同一份镜像才能跑出不同行为。`SPRING_PROFILES_ACTIVE` 决定加载哪个文件，它不写进镜像。
+
+密钥靠三件事：`.gitignore` 掉 `.env`，仓库只留键名齐全的 `.env.example`；compose 用 `${VAR:?}` 强制存在；配置不写默认值——`${JWT_SECRET:dev-secret}` 让线上也能用开发密钥启动。更严格的做法是用 `SPRING_CONFIG_IMPORT` 挂文件。
+
+```yaml title="task-center/src/main/resources/application-prod.yml"
+spring:
+  datasource:
+    # 环境变量本来就会覆盖同名属性；显式写 ${...} 是为了缺了就启动失败
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST}
+      password: ${SPRING_DATA_REDIS_PASSWORD}
+      timeout: 300ms
+  flyway:
+    clean-disabled: true
+server:
+  port: 8081
+  forward-headers-strategy: framework
+  shutdown: graceful
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,loggers,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+      group:
+        readiness:
+          include: readinessState,db,redis
+```
+
+## 四、启动顺序不等于就绪
+
+`depends_on` 短语法只保证容器启动，不保证进程能干活。MySQL 要先初始化数据目录再监听 3306，这中间 Hikari 已经在连，连不上 Boot 就退出，`restart` 再拉起来——「重启几次才起来」最难被当成问题。
+
+`condition: service_healthy` 只解决启动那一刻。健康检查在容器里执行，镜像里必须有那条命令（所以装了 `curl`），地址写 `127.0.0.1` 而不是 `localhost`（可能先解析到 IPv6）。运行中 MySQL 挂了 app 不重启，这是对的：库恢复后连接池换掉失效连接。数据库、Redis、导出文件都放命名卷，`compose down -v` 会连卷删掉。
+
+## 五、Nginx：转发头、缓冲与超时
+
+Nginx 在前面做 TLS 终止、统一入口与限流，代价是客户端 IP、协议、原始 Host 必须显式转发。它作为第四个服务加进同一条 compose，把 `nginx.conf` 挂到 `conf.d`，`depends_on` 用 app 的 healthy。
+
+```nginx title="task-center/nginx.conf"
+upstream taskcenter {
+    server app:8081;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+
+    location /api/ {
+        proxy_pass http://taskcenter;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+
+    # SSE：关缓冲、关压缩，读超时要大于心跳间隔
+    location ~ ^/api/exports/[0-9]+/events$ {
+        proxy_pass http://taskcenter;
+        proxy_buffering off;
+        gzip off;
+        proxy_read_timeout 120s;
+        add_header X-Accel-Buffering no always;
+    }
+
+    location /actuator/ {
+        return 404;
+    }
+}
+```
+
+**结尾斜杠是头号坑。** 写 `proxy_pass http://taskcenter;` 时 URI 原样转给上游；带结尾斜杠会替换掉 `location /api/` 前缀，`/api/tasks` 到上游变成 `/tasks`，接口整片 404。
+
+**转发头决定应用里的事实**：`$proxy_add_x_forwarded_for` 是追加而不是覆盖，多级代理才不会丢真实 IP；`X-Forwarded-Proto` 决定 Spring 生成绝对 URL 用哪个协议。
+
+**SSE 是唯一会被「优化」搞坏的东西。** `proxy_buffering` 默认开着，上游写出的几十字节事件先攒在缓冲区，攒够或上游关闭才下发：普通 JSON 无所谓，SSE 就是「转圈半天，最后一次性刷出」。所以要关缓冲、加 `X-Accel-Buffering: no`、关 gzip。
+
+**超时是两次读之间的间隔，不是总时长**：心跳 15 秒，120 秒上限足够。导出这类长请求给单独 location，别调全局 `proxy_read_timeout`。
+
+**`/actuator/` 整段 404** 是入口侧隔离，不替代授权：`SecurityFilterChain` 里 `/actuator/health/**` 放行，其余要求 `ADMIN`。
+
+## 六、日志：traceId、结构化与脱敏
+
+排查的起点不是「哪行报错」，而是「把一次请求串起来」。
+
+```java title="task-center/src/main/java/com/demo/taskcenter/observability/TraceIdFilter.java"
+package com.demo.taskcenter.observability;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.util.UUID;
+import org.slf4j.MDC;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class TraceIdFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain chain) throws ServletException, IOException {
+        String traceId = request.getHeader("X-Request-Id");
+        if (traceId == null || traceId.isBlank() || traceId.length() > 64) {
+            traceId = UUID.randomUUID().toString().replace("-", "");
+        }
+        MDC.put("traceId", traceId);
+        response.setHeader("X-Request-Id", traceId);
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            MDC.remove("traceId");
+        }
+    }
+}
+```
+
+三个决定：**复用入站头**，上游已有 `X-Request-Id` 就沿用；**长度上限 64**，入站头会写进每一行日志，超长能撑爆文件；**在 `finally` 里清**，Tomcat 线程复用，不清就把 traceId 带给下一个请求。`@Order` 让它在 Security 之前跑，认证失败的 401 也有 traceId。MDC 是 ThreadLocal，`@Async` 切线程后就空了，要用 `TaskDecorator` 复制上下文。
+
+结构化日志要「一行一条、字段固定」。Boot 3.4 起有内建 `logging.structured.format.console=ecs`，但它只作用于默认 appender；自己写 `logback-spring.xml` 就得自己接 encoder。
+
+```xml title="task-center/src/main/resources/logback-spring.xml"
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <springProfile name="prod">
+      <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+    </springProfile>
+    <springProfile name="!prod">
+      <encoder>
+        <pattern>%d{HH:mm:ss.SSS} %-5level [%X{traceId:-}] [%thread] %logger{36} - %msg%n</pattern>
+      </encoder>
+    </springProfile>
+  </appender>
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>
+```
+
+两个取舍：dev 用文本、prod 用 JSON，`%X{traceId:-}` 的 `:-` 表示缺值输出空，不加会打出 `traceId_IS_UNDEFINED`；脱敏正则只兜底——`%replace` 只认 `password=xxx`，JSON 里的 `"password": "xxx"` 不在射程内，真正的防线是「不打请求体」。
+
+级别可以在线改：`GET /actuator/loggers/com.demo.taskcenter.export` 看 `effectiveLevel`，`POST` 同路径带 `{"configuredLevel":"DEBUG"}`，传 `null` 恢复。它只影响当前实例、重启即失效，DEBUG 排完必须改回去。
+
+## 七、排查三件套：jstack、jmap、Arthas
+
+CPU 高看谁在跑，内存涨看谁在占，不返回看谁在等。死锁是第三类里最典型的一种。
+
+```java title="task-center/src/main/java/com/demo/taskcenter/lab/DeadlockLabController.java"
+package com.demo.taskcenter.lab;
+
+import org.springframework.context.annotation.Profile;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@Profile("lab")
+@RequestMapping("/lab")
+public class DeadlockLabController {
+
+    private final Object left = new Object();
+    private final Object right = new Object();
+
+    @GetMapping("/deadlock")
+    public String deadlock(@RequestParam String side) throws InterruptedException {
+        if ("left".equals(side)) {
+            synchronized (left) {
+                Thread.sleep(200L);
+                synchronized (right) {
+                    return "left done";
+                }
+            }
+        }
+        synchronized (right) {
+            Thread.sleep(200L);
+            synchronized (left) {
+                return "right done";
+            }
+        }
+    }
+}
+```
+
+两个并发请求分别带 `side=left` 与 `side=right`，两个 Tomcat 线程各拿一把锁再等对方，谁都不超时、不抛异常，请求就这么挂住。`jstack` 直接给结论：`Found one Java-level deadlock`，再用 `waiting to lock monitor` 与 `which is held by` 指出互相等待的两条线程。读法只有一条：**沿 `waiting to lock` 找到持有者，再看持有者在等谁，绕回自己就是死锁**。它不烧 CPU，症状是「接口不返回、CPU 不高、线程占满」，最容易被误判成慢查询。
+
+```bash
+PID=$(jps -l | awk '/task-center/ {print $1}')
+jstack -l "$PID" > /tmp/stack.txt
+jmap -histo:live "$PID" | head -15
+```
+
+`jmap -histo:live` 会先做一次 Full GC，只统计存活对象——既是价值（排除垃圾）也是代价（STW）。`java.lang.Thread` 实例数增长是线程池泄漏，`byte[]` 和大 Map 排前面多半是缓存无界。
+
+```bash
+docker cp arthas-boot.jar task-center:/tmp/
+docker exec -it task-center sh -c 'cd /tmp && java -jar arthas-boot.jar 1'
+# 进入交互界面之后
+thread -b
+thread -n 3
+trace com.demo.taskcenter.task.TaskService update '#cost > 200'
+sc -d com.demo.taskcenter.task.TaskService
+stop
+```
+
+`thread -b` 找阻塞别人的线程，`thread -n 3` 看最忙的三个，`trace` 只打印超过 200 毫秒的调用并给出耗时分布，比加日志再发版快得多。`sc -d` 确认加载的是哪个 jar 里的类——「改了没生效」有一半是加载了旧 class。两个边界：JRE 镜像里没有 `jstack`/`jmap`/`jcmd`，要么把 Arthas 的 jar 拷进去，要么临时换成 JDK 镜像；`trace` 会织入切面，排完记得 `stop`。
+
+## 八、发布与回滚
+
+tag 不用 `latest`（回滚时无法指定），用 `task-center:1.4.0` 加 `sha-短提交号` 双标签，compose 里写 `image: task-center:${APP_TAG}`。
+
+迁移是单向的：Flyway 执行过的版本记在 `flyway_schema_history`，回滚代码不会撤销它。判断标准只有一句：**这次发布之后，N 与 N-1 两版代码必须能在同一份 schema 上跑通**。所以加可空列、加索引先改表；重命名、删列必须先发代码停止使用，等一版全量后再改表。
+
+```sql
+-- V5：只加可空列，旧版代码 SELECT 不到它也不受影响
+ALTER TABLE task
+  ADD COLUMN assignee_id BIGINT UNSIGNED NULL AFTER owner_id,
+  ADD KEY idx_task_assignee (assignee_id);
+-- 收紧约束不随这次发布：等 1.4.x 全量、数据回填完，再作为 V6 提交
+```
+
+回滚就是把 `APP_TAG` 改回上一版，再验三件事：readiness、一条业务请求、错误日志行数。
+
+```bash
+grep APP_TAG .env
+APP_TAG=1.4.0 docker compose up -d app
+curl -fsS http://127.0.0.1:8081/actuator/health/readiness
+docker compose logs --since 5m app | grep -c ' ERROR '
+```
+
+最常见的回滚失败是镜像不在了：`docker image prune -a` 会删掉所有不在运行的镜像，清理时按 tag 精确删，保留最近两三个版本。
+
+## 这条链路在真实项目里的位置
+
+| 阶段 | 本步的新问题 | 落点 |
+| :-- | :-- | :-- |
+| 需求 | 能不能在别人的机器上跑，出事能不能看 | 可部署、可探活、可排障 |
+| 数据 | 配置与密钥从哪来，容器数据放哪 | `.env` 与环境变量；三个命名卷 |
+| 契约 | 探活与排查端点算不算对外接口 | readiness/liveness 开放，其余只给管理员 |
+| 实现 | 镜像、编排、代理、日志 | Dockerfile、compose.yml、nginx.conf、logback-spring.xml、application-prod.yml |
+| 验证 | 怎么证明跑的就是这一版 | tag、`Start-Class`、readiness、一条业务 curl |
+| 上线 | 发坏了怎么退 | tag 回退、迁移向前兼容、回滚后三条验证 |
+
+本步新增或改动的文件：
+
+| 文件 | 动作 | 为什么 |
+| :-- | :-- | :-- |
+| `Dockerfile` | 新增 | 两阶段、先 pom 后源码、非 root、内存比例 |
+| `compose.yml` | 新增 | 三个服务、healthcheck、三个命名卷 |
+| `nginx.conf` | 新增 | 反向代理、转发头、SSE 关缓冲、拦 `/actuator/` |
+| `logback-spring.xml` | 新增 | dev 文本 / prod JSON、traceId、脱敏兜底 |
+| `application-prod.yml` | 新增 | 只放不敏感的默认值，密钥全部来自环境变量 |
+| `TraceIdFilter.java` | 新增 | 复用入站头、MDC、响应头、长度上限 |
+| `AsyncConfig.java` | 改 | 加 `TaskDecorator`，把 MDC 传进导出线程 |
+
+下一步是 [毕业项目：任务工单系统](/blog/posts/java-roadmap-20-graduation-workorder/)：六张表、一个状态机和 25 条验收，每条都要在容器里跑过一次。
+
+## 常见坑
+
+| 现象 | 根因 | 处理 |
+| :-- | :-- | :-- |
+| 每次构建都重新下载依赖 | `COPY . .` 在 `RUN mvn` 之前，改一行整层失效 | 先 `COPY pom.xml` 跑离线目标，再 `COPY src` |
+| 容器起来几秒后被杀，退出码 137 | 总 RSS 超过 cgroup 限额，被内核 OOM killer 杀掉 | 看 `docker inspect` 的 `OOMKilled`，重算堆比例 |
+| app 反复重启几次才成功 | 短语法 `depends_on` 只等启动，MySQL 还不能接受连接 | 改 `condition: service_healthy` |
+| 服务是好的却一直 unhealthy | 探测写了 `localhost`，解析到 IPv6 | 改 `127.0.0.1`，确认镜像里有 `curl` |
+| 接口在 Nginx 后面整片 404 | `proxy_pass` 带结尾斜杠，替换掉了 location 前缀 | 去掉结尾斜杠，或按预期重写路径 |
+| SSE 一直不更新，最后一次性刷出 | `proxy_buffering` 默认开启 | 关缓冲、加 `X-Accel-Buffering: no`、关 gzip |
+| traceId 时有时无 | 异步线程没复制 MDC，或 `finally` 里没清 | `TaskDecorator` 复制上下文，`MDC.remove` 放 `finally` |
+
+## 验收清单
+
+- [ ] `mvn -B clean package` 产出可执行 jar 与 `.jar.original`；`docker compose ps` 里 mysql、redis、app 均为 `healthy`。
+- [ ] `curl /actuator/health` 返回 `{"status":"UP","groups":["liveness","readiness"]}`；停掉 MySQL 后 readiness 转 `DOWN`、liveness 仍 `UP`。
+- [ ] 带 token 请求 `/api/tasks` 返回 200，响应头有 `X-Request-Id`，该请求每行日志带同一个 `traceId`。
+- [ ] `POST /actuator/loggers/...` 后能看到该包 DEBUG 输出，置回 `null` 后恢复；`export-1` 线程的日志同样带 `traceId`。
+- [ ] 并发两次 `/lab/deadlock` 后请求挂住，`jstack` 输出出现 `Found one Java-level deadlock`。
+- [ ] 用上一版 tag 回滚后 readiness 为 `UP`、业务接口 200，错误日志行数与发布前相当。
+
+## 练习
+
+1. **把限额降到堆不够用。** 保持 `MaxRAMPercentage=75`，把 `--memory` 降到 256m 再跑一次导出。**自检：** 先出现 `OutOfMemoryError` 或退出码 137，`docker inspect` 里 `OOMKilled` 为 true；比例降到 60 后同一个导出能过，这两次说明「堆够」和「内存够」不是一回事。
+2. **制造启动顺序故障。** 删掉 app 的 `condition`，只留短语法。**自检：** app 启动即退出，`docker compose ps` 中处于 `restarting`；改回 `service_healthy` 后一次成功。
+3. **给 SSE 做 A/B。** 加一个 `GET /api/exports/{id}/events`，先去掉 `proxy_buffering off` 观察，再加回来。**自检：** 前者 `curl -N` 长时间没有输出、最后一次性收到；后者逐行到达，间隔约等于心跳周期。再把 `V5` 的顺序颠倒一次：先发布读 `assignee_id` 的代码，**自检**是旧 schema 下接口 500、日志里列不存在。
+
+## 小结
+
+- `mvn package` 执行到 `package`，`repackage` 换成可执行 jar；`-DskipTests` 省掉的是证据。
+- 配置越靠近运行时优先级越高；密钥靠 `.env` 隔离、`${VAR:?}` 强制、拒绝默认值。
+- 镜像的收益来自层缓存与「builder 不跟到 runtime」；非 root、内存比例、时区在同一个文件里做完。
+- `condition: service_healthy` 只保证启动那一刻；运行中的依赖故障靠 readiness 与连接池自愈。
+- Nginx 三个高频错误：`proxy_pass` 的结尾斜杠、漏转发头、SSE 没关缓冲。
+- traceId 要穿过过滤器、异步线程与响应头；脱敏靠「不打」，不靠正则。
+- jstack 看谁在等，jmap 看谁在占，Arthas 看运行时的真实调用；JRE 镜像里要自己带。
+- 发布只认 tag；迁移必须让 N 与 N-1 都能跑。

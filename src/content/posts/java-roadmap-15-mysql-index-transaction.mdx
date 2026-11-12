@@ -1,0 +1,732 @@
+---
+title: '阶段十五：MySQL 索引、事务与慢 SQL'
+published: 2026-11-12T11:00:00+08:00
+description: '从 B+ 树、回表与最左前缀讲到 MVCC、间隙锁和深分页，用十万行数据的两条 EXPLAIN 解释「加了索引为什么还是慢」。'
+tags: [Java, MySQL, 索引, 事务, 慢SQL, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> 阶段十二的列表接口是 `LIMIT ? OFFSET ?`，那时候表里只有几十行，怎么写都快。这一篇把同一张 `task` 表灌到十万行，用两条 SQL 的 EXPLAIN 回答一个具体问题：**为什么加了索引还是慢**。
+>
+> 全程只用一个 Docker 起的 MySQL 容器，不碰 `task-center` 的业务库。读完要能做到两件事：看 EXPLAIN 说清「扫了多少、回表几次、排没排序」；用两个会话复现锁等待和死锁，而不是背隔离级别名词。所有 EXPLAIN 结果都是某一次执行的样子，`type`、`key`、`rows` 会随数据分布、统计信息和版本变化，本文只承诺**趋势**与**判断方法**。
+
+## 一、先跑起来
+
+先解决环境。学索引必须能自由 `ALTER TABLE`、能随手灌十万行、能开两个会话互相阻塞。直接改阶段十二的业务库有三个问题：造数污染本地数据、加错索引忘了回收、锁实验可能卡住正在跑的服务。所以单独起一个容器，映射到 3307，和本机 3306 隔开。
+
+```yaml
+# docker-compose.mysql.yml
+services:
+  mysql-lab:
+    image: mysql:8.0
+    container_name: mysql-lab
+    environment:
+      MYSQL_ROOT_PASSWORD: lab123456
+      MYSQL_DATABASE: taskcenter
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --innodb-buffer-pool-size=256M
+      - --slow-query-log=1
+      - --long-query-time=0.2
+      - --innodb-lock-wait-timeout=50
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-lab-data:/var/lib/mysql
+volumes:
+  mysql-lab-data:
+```
+
+`--slow-query-log=1` 和 `--long-query-time=0.2` 是为了让慢 SQL 自己冒出来：阈值压低到 0.2 秒，实验里的全表扫描就会落进日志，不用手工比对。`innodb-lock-wait-timeout` 默认 50 秒，实验时会显得像卡死，后面单独调小。
+
+```bash
+docker compose -f docker-compose.mysql.yml up -d
+docker compose -f docker-compose.mysql.yml exec mysql-lab \
+  mysql -uroot -plab123456 -e "SELECT VERSION(), @@innodb_page_size, @@transaction_isolation;"
+```
+
+输出：表头之后只有一行数据，依次是 `8.0.x`、`16384`（页大小 16 KiB）、`REPEATABLE-READ`。这三项决定了后面所有结论的前提——换成 5.7 没有递归 CTE，换成 MyISAM 没有事务，页大小改了树高会变。`-p` 和密码之间不能有空格，否则 `mysql` 会把后面的词当成库名。
+
+进入交互式客户端，后面所有 SQL 都在这里执行：
+
+```bash
+docker compose -f docker-compose.mysql.yml exec mysql-lab \
+  mysql -uroot -plab123456 taskcenter
+```
+
+输出：提示符变成 `mysql>`，`taskcenter` 库已由 `MYSQL_DATABASE` 建好。开第二个会话再执行同一条命令即可，锁实验需要两个终端。
+
+建表。列和阶段十二保持一致，只把类型写严谨（`BIGINT UNSIGNED`、显式字符集），并**故意先不建任何二级索引**：
+
+```sql
+DROP TABLE IF EXISTS task;
+
+CREATE TABLE task (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  title       VARCHAR(120)    NOT NULL,
+  done        TINYINT         NOT NULL DEFAULT 0,
+  priority    INT             NOT NULL DEFAULT 3,
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4
+  COLLATE = utf8mb4_0900_ai_ci;
+
+SHOW INDEX FROM task;
+```
+
+输出：`SHOW INDEX` 只有一行，`Key_name = PRIMARY`。现在这张表除了主键什么都没有，下面第一条 EXPLAIN 就是它的「裸奔」状态。
+
+造十万行。用递归 CTE 一条 `INSERT ... SELECT` 搞定，比循环 10 万次 `INSERT` 快得多（后者是 10 万次独立事务、10 万次日志落盘）：
+
+```sql
+SET SESSION cte_max_recursion_depth = 100001;
+
+INSERT INTO task (id, title, done, priority, created_at)
+WITH RECURSIVE seq (n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 100000
+)
+SELECT n,
+       CONCAT('task-', LPAD(n, 6, '0')),
+       IF(n % 3 = 0, 1, 0),
+       1 + (n % 5),
+       DATE_ADD('2026-01-01 00:00:00', INTERVAL n MINUTE)
+FROM seq;
+```
+
+输出：`Query OK, 100000 rows affected`，耗时随机器差异很大，不做数字承诺。两个前提必须满足：**MySQL 8.0.1 及以上**才有递归 CTE 和 `INSERT ... WITH`；`cte_max_recursion_depth` 默认只有 1000，不调大就会在 1000 行时报 `Recursion limit exceeded`。`SET SESSION` 只影响当前连接，重连后要重设。5.7 只能写存储过程循环，或者用 `seq_1_to_10` 这类数字表交叉连接。
+
+数据分布是刻意设计的：`done = 0` 占三分之二，`priority` 只有 1 到 5 五个值，`title` 里带六位序号。这样后面「选择性差导致优化器放弃索引」才有东西可看。
+
+```sql
+ANALYZE TABLE task;
+
+SELECT COUNT(*) AS total,
+       SUM(done = 0) AS undone,
+       MIN(created_at) AS first_at,
+       MAX(created_at) AS last_at
+FROM task;
+```
+
+输出：`total = 100000`、`undone = 66667`、时间范围跨 2026-01-01 之后约 69 天。`ANALYZE TABLE` 会重算索引统计信息，刚灌完数据时它可能还没跟上来，这一步不能省。
+
+### 第一条 SQL：列表首屏
+
+业务查询是「未完成任务，按优先级升序、同优先级按 id 升序，取前 20 条」。先看没有索引时它怎么执行：
+
+```sql
+EXPLAIN
+SELECT id, title, done, priority
+FROM task
+WHERE done = 0
+ORDER BY priority, id
+LIMIT 20;
+```
+
+输出示例：`type = ALL`、`key = NULL`、`rows` 约 10 万、`Extra = Using where; Using filesort`。翻译成人话：把十万行全部读出来，逐行判断 `done = 0`，把命中的六万多行放进排序缓冲排一遍，最后只要前 20 行。`LIMIT 20` 没有省下任何扫描——排序之前它不知道哪 20 行在最前面。
+
+现在加索引。顺序很关键：**等值条件在前，排序列在后**。`(done, priority)` 让「`done` 相等的那一段」内部按 `priority` 有序，`priority` 相同的再按主键有序——第三列不用写，InnoDB 会自动把主键追加到每个二级索引末尾：
+
+```sql
+ALTER TABLE task
+  ADD KEY idx_task_list (done, priority),
+  ADD KEY idx_task_created (created_at);
+
+ANALYZE TABLE task;
+
+EXPLAIN
+SELECT id, title, done, priority
+FROM task
+WHERE done = 0
+ORDER BY priority, id
+LIMIT 20;
+```
+
+输出示例：`type = ref`、`key = idx_task_list`、`key_len = 1`、`rows` 约 6.6 万、`Extra` 里**不再有 Using filesort**。`key_len = 1` 是因为 `WHERE` 里只有 `done` 一个条件（1 字节），`priority` 没有等值条件，它参与的是排序而不是定位；没有排序是因为索引里「`done` 相同的那一段」本身就按 `priority`、`id` 有序，MySQL 顺着叶子链表往后读 20 条就够。`rows` 约 6.6 万只是「这个索引区间里有多少行」的估算，不等于真的读了 6.6 万行——读了 20 行就停了。
+
+> 索引在 `ALTER TABLE` 时是 Online DDL（`ALGORITHM=INPLACE, LOCK=NONE`），十万行瞬间完成，业务读写不中断。但这不是「生产上也可以随手加」的理由：表大到几十 GB 时，加索引要重建整个二级索引，占用大量 IO 和磁盘，需要用 gh-ost / pt-online-schema-change 分片搬迁，并挑低峰执行。
+
+### 第二条 SQL：深页
+
+同一个接口翻到第 1500 页，`OFFSET 30000`。这条是本文的主角——它**已经走了索引**，但还是慢：
+
+```sql
+EXPLAIN
+SELECT id, title, priority
+FROM task
+WHERE done = 0
+ORDER BY priority, id
+LIMIT 20 OFFSET 30000;
+```
+
+输出示例：`type = ref`、`key = idx_task_list`、`key_len = 1`、`rows` 约 6.6 万、`Extra` 为空。看起来一切正常，`Extra` 里连 `Using filesort` 都没有。
+
+问题就在这里：**EXPLAIN 不告诉你 OFFSET 的代价**。`rows` 估算的是「这个访问方式要考察多少行」，而 `OFFSET 30000` 的真实开销是：沿索引往后走 30020 个索引项，每拿到一个主键就回聚簇索引取整行（因为 `title` 不在索引里），把前 30000 行丢掉，只返回最后 20 行。索引让「定位」变快了，但没有让「丢弃」变便宜。
+
+改法一，延迟关联：先在索引里只取主键，把 3 万次回表甩掉，最后只对 20 个主键回表。
+
+```sql
+EXPLAIN
+SELECT t.id, t.title, t.priority
+FROM (
+  SELECT id
+  FROM task
+  WHERE done = 0
+  ORDER BY priority, id
+  LIMIT 20 OFFSET 30000
+) AS page
+JOIN task AS t ON t.id = page.id
+ORDER BY t.priority, t.id;
+```
+
+输出示例：两行。第一行是派生表 `page`，`type = index`（或 `range`）、`key = idx_task_list`、`Extra = Using index`——只读索引不回表；第二行 `t` 的 `type = eq_ref`、`key = PRIMARY`、`rows = 1`，说明它被回表 20 次。总代价从「3 万次回表」降到「扫描 3 万个索引项 + 20 次回表」，扫描量没变，但要读的页少了两个数量级。
+
+改法二，游标（keyset）分页：不再用「第几页」定位，而是用「上一页最后一行的排序键」定位。首页不传游标，之后每页都从上一页的断点往后接。
+
+```sql
+-- 首页
+SELECT id, title, priority
+FROM task
+WHERE done = 0
+ORDER BY priority, id
+LIMIT 20;
+
+-- 后续页：假设上一页最后一行是 priority = 3, id = 30042
+SELECT id, title, priority
+FROM task
+WHERE done = 0
+  AND (priority > 3 OR (priority = 3 AND id > 30042))
+ORDER BY priority, id
+LIMIT 20;
+```
+
+输出：第二条的 `type` 应为 `range`（不同版本也可能显示 `ref` 加索引条件下推），`key` 仍是 `idx_task_list`，`rows` 是「这一小段区间」而不是 6.6 万。不管翻到第几页，它都只读 20 行左右，代价恒定。
+
+两种改法的取舍必须写进契约，不能只在代码里悄悄换：
+
+| 维度 | 延迟关联 | 游标分页 |
+| :-- | :-- | :-- |
+| 能跳到第 N 页 | 能 | 不能，只能上一页/下一页 |
+| 深页代价 | 随 offset 线性增长（但只扫索引） | 恒定 |
+| 并发插入时 | 翻页会错位、重复 | 稳定，不会因为前面插入而整体后移 |
+| 总数与总页数 | 另跑 `COUNT(*)` | 通常只给「还有更多」 |
+| 改动面 | Mapper 一条 SQL | 契约、Mapper、前端翻页组件 |
+
+真正上线时常见组合是：**后台管理要跳页，用延迟关联 + 限制最大页数；信息流要无限滚动，用游标**。给后台也上纯游标，运营会立刻问「我怎么回到第 30 页」。
+
+## 二、机制
+
+上面两个实验的结论先摆在这：索引能省掉「扫描」和「排序」，但省不掉「按 offset 丢弃」；而要不要走索引，是优化器按成本算出来的，不是语法决定的。下面把这几个结论拆到底层。
+
+### 1. B+ 树：为什么不是 B 树，也不是哈希
+
+InnoDB 和磁盘打交道的单位是**页**，默认 16 KiB。一次随机读就是一个页（页内还有若干次连续读，但寻道和旋转只付一次）。所以「快」的定义很具体：**把树高降到 2 到 3 层，让一次等值查询只碰两三个页，其中根页几乎常驻内存**。
+
+B+ 树做到的正是这件事：非叶子节点只存「键 + 子页号」，不存数据行，因此一页能装下极多条目录项，扇出（fan-out）极大。
+
+```text
+页大小 16 KiB = 16384 B
+非叶子条目 ≈ 8 B 主键 + 6 B 页号 = 14 B   → 每页约 1170 个孩子
+叶子行     ≈ 1 KiB 一行（取决于列宽）      → 每页约 16 行
+
+树高 2 层（根 + 叶子）：1170 × 16        ≈ 1.9 万行
+树高 3 层（根 + 内节点 + 叶子）：1170 × 1170 × 16 ≈ 2190 万行
+```
+
+这是估算，不是承诺：行长 300 字节时一页能放 50 行，三层就能撑六千万行；主键换成 36 字节的 UUID，非叶子一页只放 390 条，扇出掉到三分之一，同样数据量可能要多一层。**主键越短、越有序，索引越矮、页分裂越少**——这是「别拿 UUID 当 InnoDB 主键」的真正原因，不是为了省 8 个字节。
+
+为什么不是 B 树：B 树的非叶子节点也存数据行，一页能放的目录项大幅减少，扇出变小、树变高；而且范围扫描要在树上中序来回跳。B+ 树把所有数据行都放在叶子层，叶子之间用双向链表串起来，`WHERE priority BETWEEN 2 AND 4` 变成「定位到 2，然后顺着链表往后读」，是顺序 IO，还能用上预读。
+
+为什么不是哈希：哈希索引等值查找是 O(1)，但完全不支持范围、排序和最左前缀。`WHERE priority BETWEEN 2 AND 4 ORDER BY priority` 在哈希上只能全表扫完再排序。InnoDB 里有个「自适应哈希索引」，那是 InnoDB 自己在 buffer pool 上观察热路径后偷偷建的内存结构，你不能声明它，也不能靠它兜底；真要显式哈希索引，得用 MEMORY 引擎，而 MEMORY 引擎重启即丢、不支持事务。
+
+### 2. 聚簇索引、二级索引与回表
+
+InnoDB 的表本身就是一棵 B+ 树，叫**聚簇索引**，键是主键，叶子节点存完整行。所以「按主键查」只有一次树查找；也所以「主键」不是普通索引，它就是数据的物理组织方式。
+
+二级索引是另一棵独立的 B+ 树，叶子只存两部分：**索引列的值 + 主键值**。注意后半句——主键是白送的，你写 `KEY idx_task_list (done, priority)`，实际结构是 `(done, priority, id)`。
+
+于是 `WHERE done = 0 AND priority = 3` 有两条路：
+
+1. 在 `idx_task_list` 里找到 `(0, 3)` 这一段，拿到一堆主键；
+2. 拿每个主键回聚簇索引查整行——这就是**回表**。
+
+一次回表 = 一次额外的 B+ 树查找。查 20 行就是 20 次，查 3 万行就是 3 万次随机 IO。深分页为什么慢，到这里就闭环了：慢的不是索引，是回表的次数。
+
+**覆盖索引**是唯一的免票通道：查询需要的列全在二级索引里，就不用回表。`EXPLAIN` 的 `Extra` 会写 `Using index`，这就是「索引覆盖」的证据：
+
+```sql
+EXPLAIN
+SELECT id, done, priority FROM task
+WHERE done = 0 AND priority = 3;
+
+EXPLAIN
+SELECT id, title, done, priority FROM task
+WHERE done = 0 AND priority = 3;
+```
+
+输出示例：两条的 `type`、`key`、`key_len` 完全一样（都是 `ref` / `idx_task_list` / 5），差别只在 `Extra`：第一条有 `Using index`，第二条没有。因为第一条要的三列都在索引里（`id` 是追加的主键），第二条要 `title`，必须回表。
+
+推论很实用：`SELECT *` 会把覆盖索引变成回表，哪怕你只用到其中三列。列表接口应该写明确需要的列，而不是 `SELECT *` 图省事——阶段十二的 Mapper 就是 `SELECT *`，阶段十四改契约时也没动它，这一篇要顺手改掉。
+
+### 3. 联合索引：最左前缀与六类失效写法
+
+联合索引不是「几个单列索引拼一起」，它是**按列序排序的一个整体**：先按第一列排，第一列相同再按第二列，以此类推。所以它能被使用的前提是「从最左列开始、连续地用上」。
+
+```sql
+EXPLAIN SELECT id FROM task WHERE done = 0;
+EXPLAIN SELECT id FROM task WHERE done = 0 AND priority = 3;
+EXPLAIN SELECT id FROM task WHERE priority = 3;
+EXPLAIN SELECT id FROM task WHERE done = 0 AND id > 50000;
+EXPLAIN SELECT id FROM task WHERE done = 0 AND priority >= 3 AND id >= 100;
+```
+
+输出示例（逐条）：
+
+1. `key = idx_task_list`、`key_len = 1`、`Extra = Using index`——只用了 `done`，因为投影只有 `id`，索引覆盖。
+2. `key_len = 5`——两列都用上。
+3. `key = NULL`、`type = ALL`——`priority` 是第二列，第一列没给值，索引完全用不上。这就是「最左前缀」。
+4. `key_len = 1`、`Extra` 里可能看到 `Using index condition`（投影被索引覆盖时也可能只显示 `Using index`）——`done` 之后直接跳到 `id`，中间的 `priority` 断了，`id > 50000` 只能当过滤条件（索引条件下推，ICP），不能缩小扫描区间。
+5. `key_len = 5`——`priority` 上是范围（`>=`），范围之后的 `id` **不能再用来定位**，只能 ICP 过滤。
+
+第 5 条就是「范围查询后面的列为什么用不上索引」的全部答案：索引的有序性只保证「在 `done` 相同、`priority` 相同的那一段里，`id` 才有序」。一旦 `priority` 是范围，区间里混着不同 `priority` 的行，`id` 的顺序被打散了，B+ 树没法用 `id` 去收缩区间。
+
+`key_len` 是最好用的验证工具：它告诉你「优化器到底用了索引的前多少字节」。`VARCHAR(120)` 在 utf8mb4 下最大 482 字节（120 × 4 + 2 长度字节），所以看到 `key_len = 482` 就知道整列都用上了；看到 `key_len = 5` 就知道只用了前面两个整型列。
+
+那列的先后顺序怎么定？四条经验，按优先级：
+
+1. **等值条件在前，范围条件在后**——反过来范围列会把后面的等值列废掉。
+2. **排序列紧跟等值列**——`WHERE done = ? ORDER BY priority, id` 要的就是 `(done, priority)`。
+3. **区分度高的列不一定排最前**——`done` 只有两个值、区分度极低，但它是等值条件，必须放最前；把「区分度高」当成唯一标准是常见误解。
+4. **尽量让一个索引服务多条 SQL**——`(done, priority)` 同时能服务「只按 done 查」和「done + priority + 排序」，这就是最左前缀的红利。
+
+顺带一个容易翻车的细节：`ORDER BY priority ASC, id DESC` 这种**混合方向**排序，索引默认全是 ASC，扫出来的顺序对不上，优化器只能 filesort。MySQL 8.0 支持在索引里声明方向（`KEY idx (priority ASC, id DESC)`），5.7 会解析但忽略它。要么把排序统一成同向，要么老实用 8.0 并声明方向。
+
+最左前缀只回答「列的先后」，实际排查时遇到的却是另外六种写法。「失效」这个词要打个折：严格说不是索引坏了，而是优化器**判断走索引不划算**，或者语法让索引的有序性不成立。判断标准永远是 EXPLAIN 里的 `key` 和 `rows`，不是口诀。
+
+**第一类，列上做函数或运算。** `WHERE DATE(created_at) = '2026-03-01'` 里，索引存的是 `created_at` 的值，不是 `DATE(created_at)` 的值，有序性对函数结果不成立。
+
+```sql
+-- 反例：列被函数包住
+EXPLAIN SELECT id, title FROM task
+WHERE DATE(created_at) = '2026-03-01';
+
+-- 正例：改成半开区间，让列裸露在比较符左边
+EXPLAIN SELECT id, title FROM task
+WHERE created_at >= '2026-03-01 00:00:00'
+  AND created_at <  '2026-03-02 00:00:00';
+```
+
+输出对比：反例的 `key = NULL`、`type = ALL`；正例 `type = range`、`key = idx_task_created`，`rows` 只有一天的量。边界上还有一层：MySQL 8.0.13 起支持函数索引（`KEY ((DATE(created_at)))`）和生成列，所以「列上做函数必然失效」在 8.0 里不再绝对——但函数索引要单独占空间、只能加速那一个表达式，能用区间改写的场景仍然优先改写。
+
+**第二类，隐式类型转换。** 规则不对称，必须记清楚：字符串列和数字比较时，MySQL 把**字符串列**转成数字，索引失效；数字列和字符串比较时，把常量转成数字，索引照常可用。
+
+```sql
+-- 先给 title 建索引，才能看出「转换」到底破坏了什么
+ALTER TABLE task ADD KEY idx_task_title (title);
+ANALYZE TABLE task;
+
+EXPLAIN SELECT id, title FROM task WHERE title = 12345;
+EXPLAIN SELECT id, title FROM task WHERE id = '12345';
+```
+
+输出示例：第一条 `key = NULL`、`type = ALL`——`idx_task_title` 明明在，但 `title` 是 `VARCHAR`，整列被转成数字再比，索引的排序作废；第二条 `type = const`、`key = PRIMARY`——`id` 是数字列，`'12345'` 被转成 12345，索引正常。同一个接口里 `WHERE id = ?` 和 `WHERE title = ?` 传错了类型，结果完全相反。
+
+**第三类，前导模糊。** `LIKE 'task-0001%'` 是范围查询，能用索引；`LIKE '%0001'` 和 `LIKE '%0001%'` 不行，因为不知道前缀，B+ 树无从定位。
+
+```sql
+EXPLAIN SELECT id FROM task WHERE title LIKE 'task-0001%';
+EXPLAIN SELECT id FROM task WHERE title LIKE '%000123';
+```
+
+输出示例：第一条 `type = range`、`key = idx_task_title`、`key_len = 482`（正好是 `VARCHAR(120)` 在 utf8mb4 下的上限）、`rows` 只有一两百，因为 `task-0001` 这个前缀能定位到一个连续区间；第二条即使建了 `idx_task_title` 也是 `type = ALL`、`key = NULL`——不知道前缀，B+ 树无从定位，只能整棵扫。要真正做「标题里含关键字」的搜索，正确方向是全文索引（`FULLTEXT`，中文需要分词插件）或外置 ES，不是给 `title` 硬加个普通索引然后期待奇迹。
+
+**第四类，OR 混用非索引列。** `WHERE done = 0 OR title LIKE '%0007'` 的语义是「两个条件有一个成立就返回」，优化器必须能对**两边都**用索引才敢走索引合并；一边是全表条件，整体就退化成全表扫描。
+
+```sql
+-- 反例
+EXPLAIN SELECT id, title FROM task
+WHERE done = 0 OR title LIKE '%0007';
+
+-- 正例：拆成两段，各自走各自的路
+EXPLAIN
+SELECT id, title FROM task WHERE done = 0
+UNION ALL
+SELECT id, title FROM task WHERE title LIKE '%0007' AND done <> 0;
+```
+
+输出示例：反例 `type = ALL`；正例的第一段走索引，第二段仍全表扫，但扫的是「已经排除掉 done = 0 的部分」，而且两段互不重叠，不会产生重复行。注意 `UNION ALL` 而不是 `UNION`——后者要额外去重排序。
+
+**第五类，`!=` 和 `NOT IN`。** 这两个不能一概说「失效」。在 B+ 树上，`<>` 仍然是等值取反后的一组区间，所以 `EXPLAIN` 里完全可能看到 `range`；麻烦在于这些区间往往覆盖了表里绝大多数行，优化器算完成本会直接选全表扫描，因为「走索引 + 大量回表」比「顺序扫全表」更贵。同一列、同一个索引，只把比较符换个形状，结论就可能不同：
+
+```sql
+-- created_at 上有 idx_task_created
+EXPLAIN SELECT id, title FROM task
+WHERE created_at <> '2026-01-01 00:00:00';
+
+EXPLAIN SELECT id, title FROM task
+WHERE created_at > '2026-03-01 00:00:00';
+```
+
+输出示例：第一条大概率 `type = ALL`，因为它排除的只是一行，剩下的行几乎等于全表；第二条是 `type = range`、`key = idx_task_created`，因为 3 月之后只占约六分之一。如果你机器上第一条也走了 `range`，那更有说服力——**这不是语法问题，是成本问题**，判断依据永远是 `rows` 与 `filtered`，不是口诀。
+
+`NOT IN` 还要多一个坑：子查询结果里只要有 `NULL`，整个 `NOT IN` 恒为 `UNKNOWN`，一行都查不出来。这不是性能问题，是正确性问题。
+
+**第六类，字符集或排序规则不一致。** 两列字符集不同（`utf8mb3` 对 `utf8mb4`），比较前 MySQL 要先把窄的一方提升成宽的一方，索引的排序随之作废。
+
+```sql
+CREATE TABLE task_archive (
+  id    BIGINT UNSIGNED NOT NULL,
+  title VARCHAR(120)    NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_archive_title (title)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb3;
+
+INSERT INTO task_archive (id, title)
+SELECT id, title FROM task WHERE id <= 1000;
+
+EXPLAIN
+SELECT t.id, a.title
+FROM task AS t
+JOIN task_archive AS a ON a.title = t.title
+WHERE t.id = 1;
+```
+
+输出示例：`t` 走 `PRIMARY`，`a` 是 `type = ALL`，`key = NULL`——`a.title` 被提升为 utf8mb4 后再比较，`idx_archive_title` 用不上。线上最常见的成因是历史表建库时用了 `utf8`（即 utf8mb3），新表用了 `utf8mb4`，然后某个 JOIN 悄悄全表扫。`utf8mb3` 在 8.0 已经废弃，建表时会提示 warning。
+
+六类里，函数运算、隐式类型转换、前导模糊和字符集不一致这四类会**直接让索引不可用**；OR 与 `!=` / `NOT IN` 更多是成本判断，优化器可能用、可能不用。养成习惯：改完 SQL 一定要跑一次 EXPLAIN，别按口诀改。
+
+### 4. EXPLAIN：把一条慢 SQL 读成执行路径
+
+`EXPLAIN` 输出十几列，实际用到六个。读的顺序也有讲究，不是从左往右扫。
+
+| 列 | 在回答什么 | 怎么用 |
+| :-- | :-- | :-- |
+| `type` | 访问方式 | 从好到坏：`system`、`const`、`eq_ref`、`ref`、`range`、`index`、`ALL`；看到 `ALL` 就要解释为什么 |
+| `key` | 实际用了哪个索引 | 为 `NULL` 说明没走索引；跟你预期的索引不一致，先查最左前缀和类型 |
+| `key_len` | 用了索引的前多少字节 | 验证「几列用上了」；和列的字节宽度对得上才算真用上 |
+| `rows` | 估算要考察多少行 | 乘以 `filtered` 才是估算的结果行数；不精确，但量级能用 |
+| `filtered` | 考察的行里有多少比例能通过条件 | 10% 配 10 万行 = 1 万行过滤，很常见；100% 且 `rows` 很大就要警惕 |
+| `Extra` | 额外动作 | `Using index` 覆盖、`Using where` 服务层过滤、`Using filesort` 额外排序、`Using temporary` 临时表、`Using index condition` 索引下推 |
+
+一条慢 SQL 的读法，固定成五步：
+
+1. **看 `type`**：是不是 `ALL` 或 `index`（全索引扫描）。是，就先问「有没有可用索引、为什么没用」。
+2. **看 `key` 和 `key_len`**：预期用的索引用上没有、用到第几列。深分页那条 `key` 是对的，所以问题不在索引，在 offset。
+3. **看 `rows × filtered`**：估算要碰多少行。十万行的表出现 `rows` 十万，基本就是全表。
+4. **看 `Extra`**：出现 `Using filesort` 说明排序没被索引满足；出现 `Using temporary` 说明有分组或 `UNION` 落了临时表，数据量大时会写磁盘。
+5. **看真实值**：MySQL 8.0.18 起有 `EXPLAIN ANALYZE`，它**会真的执行** SQL 并给出实际耗时与实际行数，用来验证估算偏差。生产上只能在只读库或 `SELECT` 上用，别对 `UPDATE` 随便加。
+
+估算和实际差得远，通常是统计信息过期，`ANALYZE TABLE` 能救一部分；如果表刚经历大批量增删，直方图也可能失真，8.0 可以建直方图（`ANALYZE TABLE ... UPDATE HISTOGRAM ON col`）改善等值条件的估算。这些都不改变一个事实：**`rows` 是估算，`LIMIT` 的 offset 成本不在任何一列里**。
+
+深分页的两种改法在第一节已经跑过，这里只补一句边界：延迟关联的派生表里**只能查索引覆盖的列**，一旦你在子查询里写了 `SELECT *`，回表又回来了，等于白改。游标分页的边界是**排序键必须唯一确定**——`(priority, id)` 唯一，因为 `id` 唯一；只拿 `priority` 当游标，同优先级的行会被跳过或重复。
+
+### 5. 事务与 MVCC：可重复读是怎么做到的
+
+ACID 四个词，真正要看的是实现：
+
+| 字母 | 含义 | InnoDB 靠什么 |
+| :-- | :-- | :-- |
+| A 原子性 | 要么全做，要么全不做 | undo log：回滚就是把改动反向执行一遍 |
+| C 一致性 | 约束与业务规则不被破坏 | 由 A、I、D 和应用共同保证，不是某个机制 |
+| I 隔离性 | 并发事务互不干扰 | 锁 + MVCC |
+| D 持久性 | 提交后不丢 | redo log：先写日志再刷数据页，崩溃后重放 |
+
+隔离级别四个，MySQL 默认是 `REPEATABLE READ`（RR），和 Oracle、PostgreSQL 默认的 `READ COMMITTED`（RC）不一样。这个默认值直接决定了「同一条 SELECT 在同一个事务里读两次，结果是否相同」。
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 | 快照读的实现 |
+| :-- | :-- | :-- | :-- | :-- |
+| READ UNCOMMITTED | 可能 | 可能 | 可能 | 直接读最新版本 |
+| READ COMMITTED | 不会 | 可能 | 可能 | 每条语句新建 ReadView |
+| REPEATABLE READ | 不会 | 不会 | 快照读不会，当前读靠间隙锁 | 事务内第一次快照读时建 ReadView |
+| SERIALIZABLE | 不会 | 不会 | 不会 | 读也加锁，并发最差 |
+
+RR 解决不可重复读靠的是 **MVCC**，不靠锁。三样东西：
+
+1. **隐藏列**。每行有两个 InnoDB 自己加的列：`DB_TRX_ID`（最后改动这行的事务 id）、`DB_ROLL_PTR`（指向 undo log 里这个版本的上一版）。
+2. **undo log 版本链**。每次更新都把旧值写进 undo log，`DB_ROLL_PTR` 把版本串成链：最新版 → 上一版 → 更早的版本。
+3. **ReadView**。事务第一次快照读时，把「此刻还有哪些事务没提交」抄一份下来：活跃事务 id 列表、最小活跃 id、下一个待分配 id、自己的 id。
+
+可见性判断就是拿版本链上每个版本的 `DB_TRX_ID` 去和 ReadView 比：
+
+```text
+设版本的 trx_id 为 T，ReadView 记录 up_limit（最小活跃 id）、
+low_limit（下一个待分配 id）、m_ids（活跃事务集合）、creator（自己）
+
+T == creator            → 可见（自己改的，当然看得见）
+T 小于 up_limit         → 可见（ReadView 建立之前就已提交）
+T 大于等于 low_limit    → 不可见（ReadView 建立之后才开始的事务）
+T 在 m_ids 里           → 不可见（还没提交）
+其余                    → 可见（已提交）
+```
+
+不可见就顺着 `DB_ROLL_PTR` 往更早的版本走，直到找到一个可见的。这就是「读旧数据」的全部机制——不复制表、不建快照文件，只是沿着一条链表往回走。
+
+RC 和 RR 的唯一差别是**什么时候建 ReadView**：RC 每条语句建一次，所以同一事务里第二次 SELECT 能看到别人新提交的数据（不可重复读）；RR 只在第一次快照读时建一次，之后一直用它，所以整事务看到的是同一份快照。
+
+两个会话验证一下。会话 A：
+
+```sql
+-- 会话 A
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT id, priority FROM task WHERE id = 1;
+```
+
+输出：记下这次的 `priority`（假设是 2）。这一步同时建立了 ReadView。
+
+会话 B 改完并提交：
+
+```sql
+-- 会话 B（另一个终端）
+START TRANSACTION;
+UPDATE task SET priority = 5 WHERE id = 1;
+COMMIT;
+```
+
+输出：`Query OK, 1 row affected`。B 已经提交，数据是真的变了。
+
+会话 A 再读：
+
+```sql
+-- 会话 A，仍在同一个事务里
+SELECT id, priority FROM task WHERE id = 1;              -- 还是 2
+SELECT id, priority FROM task WHERE id = 1 FOR UPDATE;   -- 变成 5
+COMMIT;
+```
+
+输出：第一条仍是 2，因为 A 的 ReadView 在第一次 SELECT 的时候就定下来了，B 的事务 id 落在这个快照的可见范围之外（`trx_id` 不小于 `low_limit`），版本链上的 5 不可见；第二条是 5，因为 `FOR UPDATE` 是**当前读**，它不看 ReadView，直接读最新版本并加锁。
+
+这就是**快照读与当前读**的分界：普通 `SELECT` 是快照读（MVCC）；`SELECT ... FOR UPDATE`、`SELECT ... LOCK IN SHARE MODE`、`UPDATE`、`DELETE`、`INSERT` 都是当前读（加锁 + 读最新）。而且当前读**不会**让 A 的快照更新——之后 A 再执行普通 SELECT，看到的还是 2。同一事务里两个读看到不同版本，这是 RR 的真实行为，也是「RR 到底有没有解决幻读」争论的来源：快照读靠 MVCC 看不见幻影，当前读靠间隙锁挡住幻影，但两者混用时，你会看到「查不到、却能改到、改完又查不到」。
+
+### 6. 锁：行锁、间隙锁与 next-key lock
+
+先纠正一个说法：InnoDB 的「行锁」**加在索引项上**，不是加在行上。这一句能解释后面所有现象。
+
+- **记录锁（record lock）**：锁住某一条索引记录。
+- **间隙锁（gap lock）**：锁住两条索引记录之间的空隙，作用只有一个——阻止别人往里插。
+- **next-key lock**：记录锁 + 它前面的间隙，是 RR 下范围扫描的默认加锁单位。
+
+加锁范围由**访问路径**决定，不是由 `WHERE` 里的条件决定：
+
+```sql
+-- 会话 A：范围加锁，锁住 id 大于 100000 的所有间隙
+SET SESSION innodb_lock_wait_timeout = 5;
+START TRANSACTION;
+SELECT id FROM task WHERE id > 100000 FOR UPDATE;
+```
+
+```sql
+-- 会话 B：插入被挡在间隙上
+INSERT INTO task (id, title, done, priority)
+VALUES (100001, 'gap-test', 0, 3);
+```
+
+输出：B 会等到 `innodb_lock_wait_timeout` 超时，报 `ERROR 1205 (HY000): Lock wait timeout exceeded`。`id > 100000` 在那张表里一行都没有，但 A 仍然锁住了 `100000` 之后的整个间隙（包括 supremum 伪记录），所以 B 插不进去。回滚 A（`ROLLBACK;`）之后 B 立刻成功。
+
+最危险的一类是**更新条件没有索引**。先把前面为演示建的 `title` 索引删掉，回到「条件列裸奔」的状态：
+
+```sql
+ALTER TABLE task DROP INDEX idx_task_title;
+
+-- 会话 A：title 上没有索引
+START TRANSACTION;
+UPDATE task SET priority = 2 WHERE title = 'task-000500';
+```
+
+```sql
+-- 会话 B：完全不相干的一行，也会被挡
+START TRANSACTION;
+UPDATE task SET priority = 3 WHERE title = 'task-000900';
+```
+
+输出：B 被阻塞。因为 A 只能全表扫描，**扫过的每一行都被加上锁**（RR 下还会锁间隙），十万行的表就是十万个锁，效果接近表锁。这类 SQL 在线上就是「改一行，全站写入排队」。修复方法不是调小超时，是给 `title` 建合适的索引——顺带一提，`title` 上是精确等值，建普通索引即可，不需要前缀索引。（实验结束后用 `ROLLBACK;` 把 A 的事务结束掉，别让锁一直挂着。）
+
+范围更新锁更多的原因也在这里：`UPDATE task SET done = 1 WHERE priority = 3 AND done = 0` 走 `idx_task_list`，它会锁住这个索引区间里**所有**记录和间隙，而不只是「最终被改的那几行」，因为没走完之前它不知道哪些行满足条件。所以**范围更新的加锁范围 ≈ 索引区间的宽度**，条件写得越宽，锁得越多。
+
+死锁是两个事务各持有一把锁、又都在等对方的锁。复现只需要交换顺序：
+
+```sql
+-- 会话 A
+START TRANSACTION;
+UPDATE task SET priority = 2 WHERE id = 1;
+UPDATE task SET priority = 2 WHERE id = 2;
+```
+
+```sql
+-- 会话 B（在 A 的第一条之后、第二条之前执行）
+START TRANSACTION;
+UPDATE task SET priority = 2 WHERE id = 2;
+UPDATE task SET priority = 2 WHERE id = 1;
+```
+
+输出：其中一个会话立刻收到 `ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction`。InnoDB 有死锁检测，会主动回滚「代价较小」的那一个，不会真的死等。查看现场：
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+输出：`LATEST DETECTED DEADLOCK` 段落里有两条事务分别持有什么锁、在等什么锁、最后执行的 SQL。这是排查死锁唯一有价值的证据，比看应用日志强得多。生产上还可以打开 `innodb_print_all_deadlocks=ON`，把所有死锁写进错误日志。
+
+规避死锁的四条，按有效性排序：
+
+1. **固定加锁顺序**。批量更新前先按主键排序，保证所有事务以同样顺序碰行。这一条能消掉绝大多数业务死锁。
+2. **缩小事务**。事务里只放数据库操作，别放 HTTP 调用、别睡眠、别等用户输入。锁的持有时间越短，撞上的概率越低。
+3. **让 WHERE 走索引**。加锁范围从「全表」缩到「几行」，冲突面自然小。
+4. **把 1213 和 1205 当可重试错误**。它们不代表业务失败，重试一次通常就过了——但重试必须发生在新事务里：
+
+```java
+@Service
+public class TaskWriteService {
+
+    private final TaskMapper mapper;
+
+    public TaskWriteService(TaskMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    /**
+     * 死锁（1213）与锁等待超时（1205）是可重试的临时错误。
+     * 注意：重试要包在事务外层，事务已被标记 rollback-only 时重试没有意义。
+     */
+    public void movePriority(long id, int priority, int maxAttempts) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                mapper.movePriority(id, priority);   // 内部是独立事务
+                return;
+            } catch (DeadlockLoserDataAccessException | CannotAcquireLockException e) {
+                if (attempt >= maxAttempts) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(20L * attempt);      // 线性退避，别原地狂重试
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
+}
+```
+
+`DeadlockLoserDataAccessException` 和 `CannotAcquireLockException` 是 Spring 把 MySQL 的 1213 / 1205 翻译成的异常类型，不用自己解析错误码。但如果你用的是 `@Transactional` 方法内部捕获，事务已经被标记为只能回滚，重试会直接抛 `UnexpectedRollbackException`——所以重试循环必须在事务边界之外，这也是上面注释里强调的那句。
+
+## 这条链路在真实项目里的位置
+
+前面所有实验都在一个独立容器里做，现在把它落回 `task-center`。这一篇在链路上的位置很具体：**接口形状不变，改的是数据层的物理结构和分页策略**。
+
+| 环节 | 本步要回答的问题 | 落点 |
+| :-- | :-- | :-- |
+| 需求 | 列表要翻到很后面仍然快，运营要能跳页 | 明确「深页」是需求，不是偶发 |
+| 数据 | 十万行、done 分布 2:1、priority 只有 5 个值 | 决定索引列序与是否需要游标 |
+| 契约 | 分页参数从 page/size 变成 cursor 还是保留 page | `GET /api/tasks` 的入参与响应 |
+| 实现 | 联合索引 + 游标或延迟关联 | 迁移脚本 + Mapper + Service |
+| 验证 | 首页与深页的 EXPLAIN 都要 `key` 正确、无 filesort | 手工 EXPLAIN + 集成测试（17 篇补齐） |
+| 上线 | 先加索引再发代码，索引可回滚 | Online DDL 窗口 + 慢查询日志观察 |
+
+具体改动三个文件：
+
+```sql
+-- task-center/src/main/resources/db/migration/V3__task_page_index.sql
+ALTER TABLE task
+  ADD KEY idx_task_list (done, priority),
+  ADD KEY idx_task_created (created_at);
+
+-- 先加索引是向后兼容的：旧代码继续用 LIMIT/OFFSET，只是变快；
+-- 新代码上线后再删旧 SQL，顺序反了就会出现「新代码跑在旧索引上」的窗口
+```
+
+`(done, priority)` 而不是 `(priority, done)`：`done` 是等值条件且总会出现，`priority` 要参与范围或排序，把等值列放最左才符合最左前缀。`created_at` 单独一个索引，服务「按时间筛」的新需求——不要试图用 `(done, priority, created_at)` 一个索引包打天下，`priority` 一旦是范围，`created_at` 就用不上了。
+
+这里必须对着阶段十四的 Mapper 说清楚一个现实：`page` 的 `ORDER BY` 是动态拼列名，后面跟 `DESC, id DESC`。**索引只能服务固定列序**，所以不可能给每个可选排序都配一个索引——这一篇只给最常用的两个（`priority`、`created_at`）建。「按截止时间排」「按预计工时排」这类低频排序照样会 filesort，要么接受（数据量不大时无感），要么把可排序字段收敛到两三个，让 Service 的白名单和索引一一对应。
+
+同理，`keyword LIKE CONCAT('%', ?, '%')` 这条条件索引救不了，它会强制全表扫描。所以带关键词的列表请求必然是慢查询高发区：要么限制「关键词 + 深页」的组合，要么把搜索挪到全文索引或 ES。索引不是万能的，它只解决「有明确列序」的那部分问题。
+
+Mapper 换成游标，`TaskMapper.xml` 里用动态 SQL 拼游标条件（阶段十二的注解写法放不下 `if` 标签，复杂 SQL 本来就该上 XML）：
+
+```xml
+<!-- task-center/src/main/resources/mapper/TaskMapper.xml -->
+<select id="pageByCursor" resultType="com.demo.taskcenter.task.Task">
+  SELECT id, title, done, priority, created_at
+  FROM task
+  WHERE done = #{done}
+  <if test="afterId != null">
+    AND (priority > #{afterPriority}
+         OR (priority = #{afterPriority} AND id > #{afterId}))
+  </if>
+  ORDER BY priority, id
+  LIMIT #{limit}
+</select>
+```
+
+`TaskController` 接受 `afterPriority` / `afterId` / `size`，`size` 仍然要夹紧（阶段十二写的 `Math.min(Math.max(size, 1), 100)` 继续保留），响应体从「数组」变成「带游标的对象」：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      { "id": 30042, "title": "task-030042", "done": 0, "priority": 3 }
+    ],
+    "next": { "afterPriority": 3, "afterId": 30042 },
+    "hasMore": true
+  }
+}
+```
+
+`next` 为空表示没有下一页。**不要**把 `next` 算成「第几页」再返回，前端一旦拿它去拼 `page=`，就等于把游标又退回了 offset。
+
+保留跳页能力的话，`TaskService` 里同时留两条路：`page`（延迟关联，限制 `page × size` 不超过一个上限，比如 5000）和 `cursor`（默认路径）。上限不是技术限制，是产品限制——超过上限就让用户改用筛选条件缩小范围，比让数据库扫十万行体面。
+
+## 常见坑
+
+| 现象 | 根因 | 处理 |
+| :-- | :-- | :-- |
+| 加了索引还是 `Using filesort` | 排序列不在索引里，或排序方向与索引不一致 | 建「等值列 + 排序列」联合索引；混合方向在 8.0 显式声明 `DESC` |
+| 索引建了但 `type = ALL` | 最左前缀不满足、隐式类型转换、或选择性太差被优化器放弃 | 先看 `key_len`，再对比 `rows`；不按口诀改 |
+| 分页越翻越慢 | `OFFSET` 是「读出来再丢掉」，每行都要回表 | 延迟关联（只取主键）或游标分页 |
+| 改游标后不能跳页 | 游标只能顺序前进 | 后台保留 offset 并限制最大页数，前端无限滚动用游标 |
+| 一条 UPDATE 卡住全站写入 | 条件列没索引，扫过的行全被锁 | 给条件列建索引，缩小事务范围 |
+| 死锁偶发、重试就好 | 两事务加锁顺序相反 | 批量前按主键排序；捕获 1213 在新事务里退避重试 |
+| `LIKE '%关键字%'` 慢 | 前导模糊无法用 B+ 树定位 | 全文索引或 ES，别硬加普通索引 |
+| 两表 JOIN 有一侧全表扫 | 字符集或排序规则不一致导致隐式转换 | 统一 `utf8mb4` 与同一 collation，改列而不是改 SQL |
+| 事务里调外部接口后超时 | 锁和连接被长时间持有 | 外部调用移出事务，或改事件/消息 |
+| `NOT IN` 一行都查不出 | 子查询结果含 `NULL`，比较结果为 `UNKNOWN` | 改 `NOT EXISTS`，或子查询里过滤 `NULL` |
+
+## 验收清单
+
+- [ ] 容器起来后 `SELECT VERSION(), @@innodb_page_size` 返回 8.0.x 与 16384，且 `@@transaction_isolation` 是 `REPEATABLE-READ`。
+- [ ] `SELECT COUNT(*) FROM task` 为 100000，`SUM(done = 0)` 为 66667，说明造数脚本真的跑完了。
+- [ ] 建索引前，列表首屏 EXPLAIN 是 `type = ALL` 且 `Extra` 含 `Using filesort`；建索引后是 `type = ref`、`key = idx_task_list`、`key_len = 1`，且不再有 `Using filesort`。
+- [ ] 深页那条 SQL 在索引生效后 `key` 也是 `idx_task_list`，但你能说清「慢在 3 万次回表」而不是「没走索引」；延迟关联的派生表 `Extra` 含 `Using index`。
+- [ ] 能逐条解释五个最左前缀实验的 `key_len` 为什么是 1、5、没有、1、5，特别是「范围后面的列不能定位」那一条。
+- [ ] 两个会话复现了「快照读读到旧值、`FOR UPDATE` 读到新值、之后快照读又回到旧值」。
+- [ ] `WHERE id > 100000 FOR UPDATE` 能挡住插入并报 1205；交换顺序更新的两个会话能报 1213，且 `SHOW ENGINE INNODB STATUS` 里能看到那段死锁记录。
+- [ ] 能指出 `task-center` 里这一篇要改的三个文件，并说明为什么「先加索引、再发代码」。
+
+## 练习
+
+1. **给排序换方向。** 把列表查询改成 `ORDER BY priority DESC, id DESC`。自检：仍走 `idx_task_list` 且没有 `Using filesort`（因为整体方向反转时 InnoDB 可以反向扫索引）；再改成 `ORDER BY priority DESC, id ASC`，如果没有显式声明 `DESC` 列，`Extra` 应该出现 `Using filesort`，并解释为什么「整体反转可以、混向不行」。
+2. **把覆盖索引用起来。** 让列表接口只返回 `id`、`done`、`priority` 三列。自检：`Extra` 出现 `Using index`；再加回 `title` 后消失。然后用一条 `EXPLAIN` 验证 `SELECT *`：`Extra` 里一定没有 `Using index`。
+3. **量化延迟关联。** 用 `EXPLAIN ANALYZE`（8.0.18 及以上）分别跑「原始 offset 版」和「延迟关联版」，记录 `actual rows`。自检：原始版的 actual rows 与 offset 同量级，延迟关联版的派生表行数是 30020 而外层是 20；两者返回的 20 行必须完全一致。
+4. **制造一次死锁并修掉。** 用两个会话按相反顺序更新 id 1 和 2，确认报 1213；然后把更新改成先按 id 升序批量执行，自检：不再报错，`SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK` 时间戳不再更新。
+5. **验证字符集那条。** 把 `task_archive` 改成 `utf8mb4` 后重跑那条 JOIN 的 EXPLAIN。自检：`a` 的 `type` 从 `ALL` 变成 `ref` 或 `eq_ref`，`key` 变成 `idx_archive_title`；改回 `utf8mb3` 又变回 `ALL`。
+
+## 小结
+
+- 一次随机读 = 一个页，B+ 树的价值是把树高压到 2 到 3 层；主键越短越有序，扇出越大。
+- 二级索引叶子存「索引列 + 主键」，回表就是拿主键再查一次聚簇索引；覆盖索引是唯一免票通道。
+- 联合索引按列序排序，最左前缀不可跳；范围列之后的列只能靠 ICP 过滤，不能缩小扫描区间。
+- 函数、隐式类型转换、前导模糊、字符集不一致会直接废掉索引；`OR` 与 `!=` 是成本问题，判断依据永远是 EXPLAIN 的 `key`、`key_len`、`rows`。
+- 深分页慢在 offset 的「读出来再丢掉」和逐行回表，改法是延迟关联或游标。
+- RR 靠 undo log 版本链 + 一次 ReadView 实现可重复读；快照读与当前读看到不同版本是设计使然。
+- 锁加在索引上：条件没索引就是全表加锁，范围更新锁住整个索引区间，死锁靠固定加锁顺序和可重试错误兜底。
+- 本步在 `task-center` 留下的是：`V3__task_page_index.sql` 里的联合索引、`TaskMapper.xml` 的游标查询、`TaskController` 的游标契约。下一步 [认证、授权与接口安全](/blog/posts/java-roadmap-16-auth-and-security/) 会给 `task` 加归属列，届时索引要跟着变成「归属在前」的联合索引——列序会随查询形状变，这点要有心理准备。

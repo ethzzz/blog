@@ -1,0 +1,1315 @@
+---
+title: '阶段十三：Spring 核心——IoC、Bean 生命周期与 AOP'
+published: 2026-11-12T09:00:00+08:00
+description: '从 Bean 生命周期、三级缓存到 AOP 代理，讲清 Spring 接管对象后事务为什么失效，并给出可复现的修复示例。'
+tags: [Java, Spring, IoC, AOP, 事务, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> 阶段十二让 Spring 接管了对象的创建：Controller 不再 new Service，`@Transactional` 也能用了。但有两件事没讲清：容器到底怎么造对象，以及同一个注解为什么换个调用位置就失效。
+>
+> 这一篇用「完成任务」一条链路补上。先用手写 JDK 代理复现自调用失效，只用 JDK、不装 Spring 也能跑；再把 `OperationLog` 与切面落进 `task-center`；最后解释三级缓存、代理选择和传播行为。
+>
+> 前置是阶段十二：`task-center` 能启动，端口 8081，包名 `com.demo.taskcenter`，表里有任务数据。Spring 相关代码需要 JDK 21、Maven 3.9 和 12 里的 MySQL。写作环境只有 JDK 17，Spring 段没有实际启动，命令与预期输出按 Spring Boot 3.x 的公开行为书写，验收以你本机为准。
+
+## 一、先跑起来
+
+事务失效最气人的地方是安静：不报错、不告警，接口返回 200，数据却没回滚。根因通常不在数据库，而在「这次方法调用有没有经过代理」。lab 把这条边界放大到肉眼可见——一个 `InvocationHandler` 加一份「撤销清单」，不依赖 Spring，也不依赖数据库。
+
+### 1. 建实验目录
+
+```bash
+mkdir -p task-center/labs/13-proxy/src/com/demo/taskcenter/lab13
+cd task-center/labs/13-proxy
+```
+
+输出：无文本。后续命令都在这个目录执行；`labs` 与 12 的 Maven 源码目录彼此独立，不会被打进正式应用。
+
+### 2. 用撤销清单模拟事务
+
+真事务靠数据库的 undo 日志；这里换一个等价物：每次写操作登记一个「反向动作」，提交时丢弃，回滚时倒序执行。
+
+完整文件：
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/MiniTx.java"
+package com.demo.taskcenter.lab13;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+
+public final class MiniTx {
+
+    /** 标记「这个方法要独立事务」，对应 Spring 的 propagation = REQUIRES_NEW。 */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.METHOD)
+    public @interface RequiresNew {
+    }
+
+    /** 一次事务的句柄，代理在方法返回或抛异常时调用 commit / rollback。 */
+    public interface Tx {
+        void commit();
+
+        void rollback();
+    }
+
+    private static final ThreadLocal<Deque<List<Runnable>>> JOURNALS =
+            ThreadLocal.withInitial(ArrayDeque::new);
+    private static final ThreadLocal<Integer> DEPTH = ThreadLocal.withInitial(() -> 0);
+    private static final ThreadLocal<Boolean> ROLLBACK_ONLY = ThreadLocal.withInitial(() -> false);
+
+    private MiniTx() {
+    }
+
+    public static Tx begin(String label, boolean independent) {
+        boolean owner = DEPTH.get() == 0 || independent;
+        if (owner) {
+            JOURNALS.get().push(new ArrayList<>());
+        }
+        DEPTH.set(DEPTH.get() + 1);
+        System.out.println("  TX begin    " + label
+                + " independent=" + independent + " depth=" + DEPTH.get());
+        return new Tx() {
+            @Override
+            public void commit() {
+                finish(true, label, owner);
+            }
+
+            @Override
+            public void rollback() {
+                finish(false, label, owner);
+            }
+        };
+    }
+
+    /** 登记一条写操作的撤销动作；没有活动事务时直接拒绝，让「没进事务」立刻暴露。 */
+    public static void onRollback(Runnable undo) {
+        Deque<List<Runnable>> journals = JOURNALS.get();
+        if (journals.isEmpty()) {
+            throw new IllegalStateException("no active transaction");
+        }
+        journals.peek().add(undo);
+    }
+
+    private static void finish(boolean commit, String label, boolean owner) {
+        DEPTH.set(DEPTH.get() - 1);
+        if (!owner) {
+            if (!commit) {
+                ROLLBACK_ONLY.set(true);
+            }
+            System.out.println("  TX " + (commit ? "join    " : "rollback ") + label
+                    + " 并入外层事务 depth=" + DEPTH.get());
+            return;
+        }
+        List<Runnable> undo = JOURNALS.get().pop();
+        boolean doRollback = !commit || ROLLBACK_ONLY.get();
+        ROLLBACK_ONLY.set(false);
+        if (doRollback) {
+            for (int i = undo.size() - 1; i >= 0; i--) {
+                undo.get(i).run();
+            }
+        }
+        System.out.println("  TX " + (doRollback ? "rollback " : "commit  ") + label
+                + (doRollback ? " 回滚，执行撤销 " : " 提交，丢弃撤销 ")
+                + undo.size() + " 条 depth=" + DEPTH.get());
+    }
+}
+```
+
+三条设计决定值得停一下：
+
+- `owner = DEPTH == 0 || independent`：只有最外层事务或 `REQUIRES_NEW` 持有撤销清单，其余方法只是「加入」外层，和 Spring 的 REQUIRED 语义一致。
+- `onRollback` 在没有活动事务时直接抛异常。真实 Spring 里，没有事务的写操作会各自自动提交，不会报错；这里故意让它炸，是为了让「方法没进事务」立刻暴露，而不是等到线上对账。
+- `ROLLBACK_ONLY`：内层加入外层后失败，会把外层标记成只能回滚，对应 Spring 的 rollback-only 标记和 `UnexpectedRollbackException`。
+
+### 3. 两张假表
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/FakeDb.java"
+package com.demo.taskcenter.lab13;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/** 两行数据足够观察事务：task 的完成状态，和一张只追加的操作日志表。 */
+public final class FakeDb {
+
+    private static final Map<Long, Boolean> TASK_DONE = new LinkedHashMap<>();
+    private static final List<String> OPERATION_LOG = new ArrayList<>();
+
+    static {
+        TASK_DONE.put(1L, false);
+        TASK_DONE.put(2L, false);
+    }
+
+    private FakeDb() {
+    }
+
+    public static boolean isDone(long id) {
+        return TASK_DONE.getOrDefault(id, false);
+    }
+
+    public static void markDone(long id) {
+        boolean previous = TASK_DONE.getOrDefault(id, false);
+        TASK_DONE.put(id, true);
+        MiniTx.onRollback(() -> TASK_DONE.put(id, previous));
+    }
+
+    public static void appendLog(String row) {
+        OPERATION_LOG.add(row);
+    }
+
+    public static void removeLastLog() {
+        if (!OPERATION_LOG.isEmpty()) {
+            OPERATION_LOG.remove(OPERATION_LOG.size() - 1);
+        }
+    }
+
+    public static List<String> logs() {
+        return List.copyOf(OPERATION_LOG);
+    }
+
+    public static void reset() {
+        TASK_DONE.replaceAll((id, done) -> false);
+        OPERATION_LOG.clear();
+    }
+}
+```
+
+`markDone` 和 `appendLog` 都会登记撤销动作。真正的回滚由数据库完成，这里只是一次次把旧值 `put` 回去；连「撤销也必须按相反顺序执行」这一点都保留了。
+
+### 4. 两个接口、两个实现
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/TaskService.java"
+package com.demo.taskcenter.lab13;
+
+public interface TaskService {
+    void complete(long id);
+}
+```
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/LogService.java"
+package com.demo.taskcenter.lab13;
+
+public interface LogService {
+    void write(String action, long id);
+}
+```
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/LogServiceImpl.java"
+package com.demo.taskcenter.lab13;
+
+public class LogServiceImpl implements LogService {
+
+    @Override
+    @MiniTx.RequiresNew
+    public void write(String action, long id) {
+        FakeDb.appendLog(action + "#" + id);
+        MiniTx.onRollback(FakeDb::removeLastLog);
+        System.out.println("  log      append " + action + "#" + id);
+    }
+}
+```
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/TaskServiceImpl.java"
+package com.demo.taskcenter.lab13;
+
+public class TaskServiceImpl implements TaskService {
+
+    private final LogService log;
+    private final boolean selfCall;
+
+    public TaskServiceImpl(LogService log, boolean selfCall) {
+        this.log = log;
+        this.selfCall = selfCall;
+    }
+
+    @Override
+    public void complete(long id) {
+        FakeDb.markDone(id);
+        if (selfCall) {
+            // 等价于 this.audit(id)：绕开代理，既没有独立事务，也没有任何事务
+            new LogServiceImpl().write("COMPLETE", id);
+        } else {
+            // 走注入的代理：方法上的 @RequiresNew 才会被读取
+            log.write("COMPLETE", id);
+        }
+        throw new IllegalStateException("后续步骤失败，模拟业务异常");
+    }
+}
+```
+
+`@MiniTx.RequiresNew` 标在实现方法上，不是接口方法上。Spring 解析事务属性时也是先找目标类的具体方法，找不到再回退到接口方法，所以「注解写在实现类、调用方拿接口」是最稳妥的写法，和 12 的风格一致。
+
+`TaskServiceImpl` 用 `selfCall` 开关切换两种调用：`new LogServiceImpl().write(...)` 等价于业务代码里的 `this.audit(...)`；`log.write(...)` 走注入进来的代理。
+
+### 5. 代理：唯一读注解的地方
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/TxProxy.java"
+package com.demo.taskcenter.lab13;
+
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+
+/** 对应 Spring 的 TransactionInterceptor：入口开事务，出口提交或回滚。 */
+public final class TxProxy implements InvocationHandler {
+
+    private final Object target;
+
+    private TxProxy(Object target) {
+        this.target = target;
+    }
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 注解写在实现类的方法上，接口方法上没有；Spring 也是先找最具体的实现方法
+        Method specific = target.getClass().getMethod(method.getName(), method.getParameterTypes());
+        boolean independent = specific.isAnnotationPresent(MiniTx.RequiresNew.class);
+        MiniTx.Tx tx = MiniTx.begin(
+                target.getClass().getSimpleName() + "." + method.getName(), independent);
+        try {
+            Object result = method.invoke(target, args);
+            tx.commit();
+            return result;
+        } catch (InvocationTargetException e) {
+            tx.rollback();
+            throw e.getCause();
+        } catch (Throwable e) {
+            tx.rollback();
+            throw e;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> T wrap(T target, Class<T> iface) {
+        return (T) Proxy.newProxyInstance(
+                iface.getClassLoader(),
+                new Class<?>[]{iface},
+                new TxProxy(target));
+    }
+}
+```
+
+`invoke` 是唯一读 `@RequiresNew` 的地方。没经过它的调用，注解就是一段装饰性文字。两个容易忽略的细节：`target.getClass().getMethod(...)` 找的是实现方法；`InvocationTargetException` 必须解包，否则调用方收到的是反射包装异常，业务里所有 `catch (BusinessException)` 都会失效。
+
+### 6. 跑两个场景
+
+```java title="task-center/labs/13-proxy/src/com/demo/taskcenter/lab13/Demo.java"
+package com.demo.taskcenter.lab13;
+
+public final class Demo {
+
+    public static void main(String[] args) {
+        runSelfCall();
+        FakeDb.reset();
+        runInjectedProxy();
+    }
+
+    private static void runSelfCall() {
+        System.out.println("== 场景 A：同类里 new 一个实现类（等价 this.audit） ==");
+        TaskService taskService = TxProxy.wrap(
+                new TaskServiceImpl(new LogServiceImpl(), true), TaskService.class);
+        System.out.println("代理类名: " + taskService.getClass().getName());
+        try {
+            taskService.complete(1);
+        } catch (IllegalStateException e) {
+            System.out.println("调用方收到: " + e.getMessage());
+        }
+        System.out.println("task1.done=" + FakeDb.isDone(1) + " 操作日志=" + FakeDb.logs());
+    }
+
+    private static void runInjectedProxy() {
+        System.out.println("== 场景 B：日志服务注入代理，方法标记独立事务 ==");
+        LogService logService = TxProxy.wrap(new LogServiceImpl(), LogService.class);
+        TaskService taskService = TxProxy.wrap(
+                new TaskServiceImpl(logService, false), TaskService.class);
+        System.out.println("代理类名: " + taskService.getClass().getName());
+        try {
+            taskService.complete(1);
+        } catch (IllegalStateException e) {
+            System.out.println("调用方收到: " + e.getMessage());
+        }
+        System.out.println("task1.done=" + FakeDb.isDone(1) + " 操作日志=" + FakeDb.logs());
+    }
+}
+```
+
+```bash
+javac --release 21 -encoding UTF-8 -d out $(find src -name "*.java")
+java -cp out com.demo.taskcenter.lab13.Demo
+```
+
+输出：
+
+```text
+== 场景 A：同类里 new 一个实现类（等价 this.audit） ==
+代理类名: jdk.proxy1.$Proxy0
+  TX begin    TaskServiceImpl.complete independent=false depth=1
+  log      append COMPLETE#1
+  TX rollback TaskServiceImpl.complete 回滚，执行撤销 2 条 depth=0
+调用方收到: 后续步骤失败，模拟业务异常
+task1.done=false 操作日志=[]
+== 场景 B：日志服务注入代理，方法标记独立事务 ==
+代理类名: jdk.proxy1.$Proxy0
+  TX begin    TaskServiceImpl.complete independent=false depth=1
+  TX begin    LogServiceImpl.write independent=true depth=2
+  log      append COMPLETE#1
+  TX commit  LogServiceImpl.write 提交，丢弃撤销 1 条 depth=1
+  TX rollback TaskServiceImpl.complete 回滚，执行撤销 1 条 depth=0
+调用方收到: 后续步骤失败，模拟业务异常
+task1.done=false 操作日志=[COMPLETE#1]
+```
+
+两处差异就是全部答案：
+
+- 场景 A 的日志为空。`complete` 自己 new 了 `LogServiceImpl`，`write` 在 `this` 上执行，代理没参与，`@RequiresNew` 没人读，日志写在外层事务里，跟着一起回滚。
+- 场景 B 的日志留下了。`LogServiceImpl` 先被代理包住再注入，`write` 的独立事务立即提交，外层回滚只撤销任务状态。
+
+代理类名 `jdk.proxy1.$Proxy0` 由 JDK 生成，编号与包名由 JVM 分配（JDK 16 起代理类放在动态模块的包里），不要拿它做断言。
+
+### 7. 落回 task-center：OperationLog 与切面
+
+lab 证明了「调用必须经过代理」。真实项目里这件事由容器完成：给 `TaskService` 注入 `OperationLogService`，Spring 注入的其实是代理。下面按 12 的工程增量写，工程结构见 [Spring Boot + MyBatis](/blog/posts/java-roadmap-12-springboot-mybatis/)。
+
+先建表：
+
+```sql
+CREATE TABLE operation_log (
+  id         BIGINT       PRIMARY KEY AUTO_INCREMENT,
+  action     VARCHAR(64)  NOT NULL,
+  task_id    BIGINT       NOT NULL,
+  detail     VARCHAR(255) NOT NULL,
+  created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_task_action (task_id, action)
+);
+```
+
+```java title="task-center/src/main/java/com/demo/taskcenter/log/OperationLog.java"
+package com.demo.taskcenter.log;
+
+import java.time.LocalDateTime;
+
+public class OperationLog {
+
+    private Long id;
+    private String action;
+    private Long taskId;
+    private String detail;
+    private LocalDateTime createdAt;
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getAction() {
+        return action;
+    }
+
+    public void setAction(String action) {
+        this.action = action;
+    }
+
+    public Long getTaskId() {
+        return taskId;
+    }
+
+    public void setTaskId(Long taskId) {
+        this.taskId = taskId;
+    }
+
+    public String getDetail() {
+        return detail;
+    }
+
+    public void setDetail(String detail) {
+        this.detail = detail;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(LocalDateTime createdAt) {
+        this.createdAt = createdAt;
+    }
+}
+```
+
+```java title="task-center/src/main/java/com/demo/taskcenter/log/OperationLogMapper.java"
+package com.demo.taskcenter.log;
+
+import java.util.List;
+import org.apache.ibatis.annotations.Insert;
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Options;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+
+@Mapper
+public interface OperationLogMapper {
+
+    @Insert("""
+            INSERT INTO operation_log(action, task_id, detail)
+            VALUES(#{action}, #{taskId}, #{detail})
+            """)
+    @Options(useGeneratedKeys = true, keyProperty = "id")
+    int insert(OperationLog log);
+
+    @Select("""
+            SELECT id, action, task_id, detail, created_at
+            FROM operation_log
+            WHERE task_id = #{taskId}
+            ORDER BY id ASC
+            """)
+    List<OperationLog> findByTaskId(@Param("taskId") long taskId);
+}
+```
+
+```java title="task-center/src/main/java/com/demo/taskcenter/log/OperationLogService.java"
+package com.demo.taskcenter.log;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OperationLogService {
+
+    private final OperationLogMapper mapper;
+
+    public OperationLogService(OperationLogMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    /** 独立事务：外层回滚不影响这条日志。代价是占用第二条连接。 */
+    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
+    public void record(String action, long taskId, String detail) {
+        OperationLog log = new OperationLog();
+        log.setAction(action);
+        log.setTaskId(taskId);
+        log.setDetail(detail);
+        mapper.insert(log);
+    }
+}
+```
+
+```java title="task-center/src/main/java/com/demo/taskcenter/log/OperationLogging.java"
+package com.demo.taskcenter.log;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface OperationLogging {
+    String action();
+}
+```
+
+```java title="task-center/src/main/java/com/demo/taskcenter/log/OperationLogAspect.java"
+package com.demo.taskcenter.log;
+
+import org.aspectj.lang.JoinPoint;
+import org.aspectj.lang.annotation.AfterReturning;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+
+@Aspect
+@Component
+@Order(Ordered.LOWEST_PRECEDENCE - 10)
+public class OperationLogAspect {
+
+    private final OperationLogService logService;
+
+    public OperationLogAspect(OperationLogService logService) {
+        this.logService = logService;
+    }
+
+    @AfterReturning(pointcut = "@annotation(logging)", argNames = "joinPoint,logging")
+    public void afterReturning(JoinPoint joinPoint, OperationLogging logging) {
+        Object[] args = joinPoint.getArgs();
+        if (args.length == 0 || !(args[0] instanceof Long taskId)) {
+            return;
+        }
+        logService.record(logging.action(), taskId, "ok");
+    }
+}
+```
+
+切面的 order 是 `LOWEST_PRECEDENCE - 10`，比事务拦截器更靠外。`@EnableTransactionManagement` 的 `order` 默认就是 `Ordered.LOWEST_PRECEDENCE`，所以成功那条日志写在业务事务提交之后；失败时业务已经回滚，日志由 `REQUIRES_NEW` 独立提交。顺序写死，不依赖 Bean 的注册先后。
+
+```java title="task-center/src/main/java/com/demo/taskcenter/task/TaskService.java"
+package com.demo.taskcenter.task;
+
+import com.demo.taskcenter.common.BusinessException;
+import com.demo.taskcenter.log.OperationLogService;
+import com.demo.taskcenter.log.OperationLogging;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class TaskService {
+
+    private final TaskMapper mapper;
+    private final OperationLogService operationLogService;
+
+    public TaskService(TaskMapper mapper, OperationLogService operationLogService) {
+        this.mapper = mapper;
+        this.operationLogService = operationLogService;
+    }
+
+    @OperationLogging(action = "TASK_COMPLETE")
+    @Transactional(rollbackFor = Exception.class)
+    public void complete(long id) {
+        Task task = mapper.findById(id);
+        if (task == null) {
+            throw new BusinessException(404, "任务不存在");
+        }
+        if (Boolean.TRUE.equals(task.getDone())) {
+            // 独立事务：下面这行 409 会让外层回滚，但这条日志必须留下
+            operationLogService.record("TASK_COMPLETE_SKIP", id, "已经完成，拒绝重复操作");
+            throw new BusinessException(409, "任务已经完成");
+        }
+        task.setDone(true);
+        mapper.update(task);
+    }
+}
+```
+
+在 `complete` 这条路径上，与 12 相比只有两处变化：构造器多了 `OperationLogService` 依赖，方法里出现了一次跨 Bean 调用。12 提醒过「同类内部调用不走代理」，这里把它变成具体改法：审计逻辑必须拆到独立 Bean，不能留在同一个类里。
+
+Controller 只加一个方法（片段，加在 12 的 `TaskController` 里）：
+
+```java
+@PostMapping("/{id}/complete")
+public ApiResponse<Void> complete(@PathVariable long id) {
+    service.complete(id);
+    return ApiResponse.ok(null);
+}
+```
+
+`pom.xml` 补一个依赖，`@Aspect` 需要 aspectjweaver：
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-aop</artifactId>
+</dependency>
+```
+
+启动后验证两次：
+
+```bash
+# 第一次：成功，返回 code 0
+curl -s -X POST http://localhost:8081/api/tasks/1/complete
+# 第二次：重复完成，返回 code 409
+curl -s -X POST http://localhost:8081/api/tasks/1/complete
+```
+
+输出：第一条返回的 `code` 是 0、`message` 是 `ok`、`data` 是 null；第二条返回的 `code` 是 409、`message` 是「任务已经完成」。12 的 `GlobalExceptionHandler` 会按 `BusinessException.code` 设置 HTTP 状态。
+
+```sql
+SELECT id, action, task_id, detail, created_at
+FROM operation_log
+WHERE task_id = 1
+ORDER BY id DESC
+LIMIT 5;
+```
+
+输出：两行。`TASK_COMPLETE_SKIP` 的 `detail` 是「已经完成，拒绝重复操作」，`TASK_COMPLETE` 的是 `ok`；时间列取当前时间，不做固定值验收。注意第二次请求里业务事务整体回滚（任务状态没有二次变化），但跳过日志仍然落库——这就是 `REQUIRES_NEW` 的可观测结果。
+
+## 二、机制
+
+跑通之后回头补原理。这一节只回答三个问题：容器手上拿的是什么、循环依赖靠什么救、事务从哪进从哪出。
+
+### 1. BeanDefinition：容器拿到的不是对象，是配方
+
+**结论**：Spring 启动时先读出一堆 `BeanDefinition`，再按需把它们变成对象。`Bean` 是配方执行后的成品，`new` 出来的对象只是一块内存。
+
+组件扫描、`@Bean` 方法、XML 最终都会注册成 `BeanDefinition`。它记录的不是实例，而是「怎么造、造几个、造完叫什么、什么时候销毁」：
+
+| 字段 | 作用 |
+| :-- | :-- |
+| `beanClassName` | 要实例化的类（工厂方法场景可能为空） |
+| `scope` | singleton / prototype 等作用域 |
+| `lazyInit` | 是否延迟到第一次 getBean |
+| `dependsOn` | 必须先初始化的其他 Bean |
+| `primary` | 同类型多个候选时优先选它 |
+| `factoryBeanName` / `factoryMethodName` | 由哪个 Bean 的哪个方法生产 |
+| `constructorArgumentValues` / `propertyValues` | 构造参数与属性值 |
+| `initMethodName` / `destroyMethodName` | 自定义初始化与销毁方法 |
+
+读一个定义只需要几行（`ctx` 是 `AnnotationConfigApplicationContext`）：
+
+```java
+BeanDefinition bd = ctx.getBeanFactory().getBeanDefinition("taskService");
+System.out.println(bd.getBeanClassName());    // com.demo.taskcenter.task.TaskService
+System.out.println(bd.getScope());            // singleton
+System.out.println(bd.getFactoryMethodName()); // null，普通组件不是工厂方法产的
+```
+
+`@Bean` 方法注册的定义不同：那里最关键的是 `factoryMethodName`，实例由配置类调用该方法产生。
+
+和 `new` 的差别可以列成一张表：
+
+| 维度 | `new TaskService(...)` | 容器里的 Bean |
+| :-- | :-- | :-- |
+| 身份 | 一个引用，没有名字 | 有 beanName，可被 `getBean` 查找 |
+| 依赖 | 调用方自己凑齐 | 容器解析构造器并注入 |
+| 数量 | 想 new 几次就几次 | 单例默认全容器一个 |
+| 生命周期 | 没有回调 | Aware、初始化、销毁、BPP |
+| 增强 | 无 | 可被代理、被切面拦截 |
+| 替换 | 改代码 | 换实现、`@Primary`、`@Conditional` |
+
+还有一层容易忽略：单例池（`singletonObjects`）缓存的是成品，`BeanDefinition` 只是图纸。改图纸不会改已经造好的单例；动态注册的定义也要等下一次创建才生效。
+
+前端类比：`BeanDefinition` 像打包器里的模块记录（id、工厂函数、依赖），Bean 像求值后的模块导出；但 Java 多了作用域、生命周期回调，以及「导出可以被代理替换」。
+
+### 2. BeanFactory 与 ApplicationContext
+
+**结论**：`BeanFactory` 是最小容器，只负责「根据定义造对象、管单例」；`ApplicationContext` 在它之上补齐了企业应用需要的基础设施。业务代码里永远用后者。
+
+`ApplicationContext` 继承 `ListableBeanFactory` 与 `HierarchicalBeanFactory`，并额外实现了一批接口：
+
+| 能力 | 接口 | 解决什么 |
+| :-- | :-- | :-- |
+| 资源加载 | `ResourceLoader` | 从 classpath、文件、URL 读资源 |
+| 国际化 | `MessageSource` | 按 Locale 取文案 |
+| 事件 | `ApplicationEventPublisher` | 发布/监听应用事件 |
+| 环境与配置 | `Environment` | profile、属性源 |
+| 自动装配后处理器 | `refresh()` 里的注册步骤 | 自动发现 `BeanPostProcessor`、`BeanFactoryPostProcessor` |
+| 生命周期 | `Lifecycle` / `SmartLifecycle` | 容器的 start / stop |
+
+两个行为差异最实用：
+
+1. **预实例化**。`ApplicationContext` 启动时会把所有非 lazy 单例造完；`BeanFactory` 默认等到第一次 `getBean`。所以「启动成功」在 ApplicationContext 里意味着依赖图已经走通，在裸 BeanFactory 里不成立。
+2. **后处理器自动生效**。`AnnotationConfigApplicationContext` 会注册 `AutowiredAnnotationBeanPostProcessor`、`CommonAnnotationBeanPostProcessor`，`@Autowired`、`@PostConstruct` 才有意义；裸 `DefaultListableBeanFactory` 需要手动 `addBeanPostProcessor`，否则注解全是摆设。
+
+什么时候用 `BeanFactory`：写框架、写工具、内存极敏感、只需要按名字取对象。Spring 内部大量使用 `DefaultListableBeanFactory`；业务应用没有理由绕开 `ApplicationContext`。
+
+也不要把它当服务定位器：在业务类里到处 `ctx.getBean(...)`，等于把依赖关系藏进字符串，测试和重构都会失控。`getBean` 适合入口层和框架代码，不适合 Service 内部。
+
+### 3. 三级缓存与循环依赖
+
+**结论**：Spring 能救「属性注入形成的循环依赖」，靠的是提前暴露一个引用；它救不了「构造器注入形成的循环依赖」，因为构造器阶段连对象都还没有。
+
+创建单例的主线（简化到本篇需要的粒度）：
+
+1. `getSingleton(beanName)` 先查一级缓存，命中直接返回。
+2. 没命中就 `createBeanInstance`：调构造器或工厂方法，得到原始对象。
+3. 把 `ObjectFactory` 放进三级缓存 `singletonFactories`，这个工厂能在被调用时返回「早期引用」。
+4. `populateBean` 属性填充，注入依赖。如果依赖的 Bean 又回头要当前 Bean，就会走到第 3 步放的工厂。
+5. `initializeBean`：Aware、BeanPostProcessor 前置、初始化方法、后置处理（AOP 代理通常在这里生成）。
+6. 放入一级缓存 `singletonObjects`，清掉二级、三级里的临时记录。
+
+三级缓存各存什么：
+
+| 缓存 | 存什么 | 写入时机 | 读取时机 |
+| :-- | :-- | :-- | :-- |
+| `singletonObjects` | 完整可用的单例 | 初始化完成后 | 每次 `getBean` 先查 |
+| `earlySingletonObjects` | 提前暴露的引用，可能是代理 | 循环依赖触发、从三级取出后 | 同一 Bean 再次被依赖时 |
+| `singletonFactories` | `ObjectFactory`，能产出早期引用 | 实例化之后、属性填充之前 | 检测到循环依赖时调用 |
+
+**为什么需要第三级**：如果只有二级，就必须在属性填充前把「最终引用」定下来。但最终引用要不要是代理，取决于 `BeanPostProcessor`，而 BPP 要等初始化阶段才跑。提前定，等于让所有 Bean 在创建早期就被代理，正常顺序被打乱；不提前定，循环依赖又拿不到引用。第三级把「要不要提前生成代理」推迟到真的有人来要的时候：工厂被调用时才执行 `getEarlyBeanReference`，必要时提前创建代理并放进二级缓存，保证后续注入拿到同一个代理。
+
+这也是 AOP 与循环依赖的交汇点：一个被切面增强的 Bean 参与循环依赖时，早期引用就可能是代理，而不是原始对象。
+
+**构造器循环依赖为什么救不了**：三级缓存在 `createBeanInstance` 之后才写入。构造器注入要求「先有对方才能 new 自己」，两个 Bean 都卡在第一步，谁都没进缓存，容器只能抛 `BeanCurrentlyInCreationException`。Spring Boot 2.6 起默认 `spring.main.allow-circular-references=false`，这类结构直接在启动时报错，而不是悄悄放行。
+
+```java
+@Service
+public class TaskService {
+    private final TaskAuditService audit;
+
+    public TaskService(TaskAuditService audit) {
+        this.audit = audit;
+    }
+}
+
+@Service
+public class TaskAuditService {
+    private final TaskService taskService;
+
+    public TaskAuditService(TaskService taskService) {
+        this.taskService = taskService;
+    }
+}
+```
+
+输出（启动失败，关键行）：
+
+```text
+The dependencies of some of the beans in the application context form a cycle
+┌─────┐
+|  taskService
+↑     ↓
+|  taskAuditService
+└─────┘
+```
+
+正确修法是重构：审计服务不应该反向依赖业务服务。确实需要回调时，用 `@Lazy` 在一侧注入代理延迟解析，或者改成事件；把构造器改回字段注入只是把问题藏起来，下一篇做接口契约时还会撞上。
+
+### 4. JDK 动态代理与 CGLIB
+
+**结论**：有接口不一定走 JDK 代理——Spring Boot 3 默认用 CGLIB；决定代理方式的是配置，不是「有没有接口」。
+
+| 维度 | JDK 动态代理 | CGLIB |
+| :-- | :-- | :-- |
+| 前提 | 目标实现至少一个接口 | 目标类可被继承 |
+| 生成方式 | `Proxy.newProxyInstance` | 生成子类字节码 |
+| 能代理的方法 | 接口里声明的方法 | 可覆写的实例方法 |
+| 不能代理 | 接口外的方法 | final 类、final 方法、private 方法、静态方法 |
+| 调用方要求 | 按接口类型注入 | 按类类型注入 |
+
+Spring 自己的默认值分两层，别混：
+
+| 场景 | 默认 `proxyTargetClass` | 结果 |
+| :-- | :-- | :-- |
+| Spring Boot 3 自动配置 | true | 默认 CGLIB，即使有接口 |
+| 裸 Spring 的 `@EnableAspectJAutoProxy` | false | 有接口走 JDK，无接口才 CGLIB |
+
+Boot 的 `AopAutoConfiguration` 在 `spring.aop.proxy-target-class` 缺省时按 true 装配，所以「Boot 3 项目里代理类名带 CGLIB」是正常现象；想强制 JDK 代理，显式写 `spring.aop.proxy-target-class=false`（没有接口的 Bean 仍会回退 CGLIB）。这一项同时影响事务代理，因为事务也是 AOP。
+
+判断一个 Bean 到底被怎么代理，不要猜类名：
+
+```java
+Object bean = ctx.getBean("taskService");
+System.out.println(bean.getClass().getName());         // ...TaskService$$SpringCGLIB$$0
+System.out.println(AopUtils.isAopProxy(bean));         // true
+System.out.println(AopUtils.isCglibProxy(bean));       // true
+System.out.println(AopUtils.isJdkDynamicProxy(bean));  // false
+```
+
+`AopUtils` 在 `org.springframework.aop.support` 包。类名只能当线索：Spring Framework 6 的 CGLIB 代理形如 `...$$SpringCGLIB$$0`，5.x 是 `...$$EnhancerBySpringCGLIB$$...`，不要写进断言。
+
+**final 方法为什么不行**：CGLIB 生成的是子类，`final` 方法不能被覆写，拦截器没有插入点。注解照写、编译照过、运行时不生效——这是最危险的一类失效。`private` 方法同理，子类看不见；`static` 方法属于类而不属于实例，代理无从插手。
+
+顺带纠正一个流传很广的说法：「CGLIB 会调用两次构造器」。这个说法来自「目标实例一次 + 代理子类实例一次」；Spring 用 Objenesis 创建代理实例、跳过父类构造器的副作用，所以业务对象的构造器通常只执行一次。拿构造器调用次数判断代理方式并不可靠。
+
+### 5. 事务拦截器如何工作
+
+**结论**：`@Transactional` 不是数据库魔法，它只是一个方法拦截器：进入方法前开事务、绑定连接，退出时按规则提交或回滚。
+
+```text
+调用方
+  └─ 代理对象（CGLIB 子类或 JDK 代理）
+       └─ TransactionInterceptor.invoke
+            ├─ 解析 @Transactional（方法级优先于类级）
+            ├─ getTransaction：取连接、关闭自动提交、绑定到当前线程
+            ├─ 执行目标方法（业务代码）
+            └─ commit / rollback，然后释放连接
+```
+
+关键点：
+
+- 事务属性来自 `@Transactional`，解析器是 `SpringTransactionAnnotationParser`；方法上的注解覆盖类上的。
+- 连接由 `PlatformTransactionManager` 获取，`DataSourceTransactionManager` 会把它绑定到 `TransactionSynchronizationManager` 的 ThreadLocal 上。同一个线程里再调用事务方法，才能「加入」同一事务。
+- 默认回滚规则是 `RuntimeException` 与 `Error`；受检异常默认提交。规则由 `RollbackRuleAttribute` 判定，不是「有异常就回滚」。
+- `propagation` 决定「加入还是新建」，`readOnly`、`isolation`、`timeout` 也在同一个属性对象里。
+
+下面五类失效都出在这条链上：没经过代理（自调用）、代理看不到方法（private/final/static）、异常没到拦截器（被 catch）、拦截器判断不该回滚（异常类型）、不在同一线程（异步）。下一节逐条复现。
+
+## 三、构造器注入为什么优于字段注入
+
+**结论**：构造器注入让依赖成为对象的一部分，字段注入只是给对象打了个补丁。
+
+| 维度 | 构造器注入 | 字段注入 |
+| :-- | :-- | :-- |
+| 不可变 | 字段可 `final` | 反射赋值，不能 `final` |
+| 可测 | 直接 `new`，不用容器 | 必须起容器或反射注入 |
+| 缺依赖 | 编译期就报错 | 运行期才 NPE |
+| 循环依赖 | 启动即失败，逼你重构 | 可能被悄悄注入，问题延后 |
+| 依赖数量 | 一多就刺眼，提醒拆分 | 加一行不痛不痒 |
+
+「启动即暴露循环依赖」是构造器注入最被低估的价值：它把设计问题提前到启动阶段，而不是等到某个凌晨的请求。
+
+```java
+class TaskServiceTest {
+
+    @Test
+    void complete_should_fail_when_task_missing() {
+        TaskMapper mapper = mock(TaskMapper.class);
+        OperationLogService logs = mock(OperationLogService.class);
+        TaskService service = new TaskService(mapper, logs);   // 不需要 Spring
+        assertThrows(BusinessException.class, () -> service.complete(99));
+    }
+}
+```
+
+字段注入还有一个隐蔽的时序坑：
+
+```java
+@Service
+public class BadService {
+
+    @Autowired
+    private TaskMapper mapper;
+
+    public BadService() {
+        mapper.findById(1);   // NPE：构造器执行时字段还没被注入
+    }
+}
+```
+
+构造器注入下这段代码根本编译不过，问题在写的时候就暴露了。只有一个构造器时 `@Autowired` 可以不写；有多个构造器时，必须标一个让容器知道用哪个。
+
+## 四、Bean 生命周期
+
+**结论**：一个单例从「图纸」到「可用」再到「销毁」，中间有一串固定回调；代理在初始化后置阶段才出现，所以初始化方法里调本类事务方法不会生效。
+
+| 阶段 | 发生什么 | 谁触发 |
+| :-- | :-- | :-- |
+| 1 实例化 | 调构造器或工厂方法 | 容器 |
+| 2 属性填充 | 按定义注入依赖 | 容器 |
+| 3 Aware | `BeanNameAware`、`BeanFactoryAware`、`ApplicationContextAware` 等 | 容器 |
+| 4 BPP 前置 | `postProcessBeforeInitialization`，`@PostConstruct` 在这一步执行 | `BeanPostProcessor` |
+| 5 初始化 | `InitializingBean.afterPropertiesSet`，再执行 `init-method` | 容器 |
+| 6 BPP 后置 | `postProcessAfterInitialization`，AOP 代理通常在这里包上 | `BeanPostProcessor` |
+| 7 使用 | 注入到调用方，方法被代理拦截 | 应用 |
+| 8 销毁 | `@PreDestroy`、`DisposableBean.destroy`、`destroy-method` | 容器关闭时 |
+
+注意第 4 步：`@PostConstruct` 由 `CommonAnnotationBeanPostProcessor` 在执行前置处理时调用，所以它和 BPP 前置不是并列的两步。
+
+```java title="task-center/src/test/java/com/demo/taskcenter/lab13/lifecycle/LifecycleDemo.java"
+package com.demo.taskcenter.lab13.lifecycle;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.time.Clock;
+import org.springframework.beans.factory.BeanNameAware;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class LifecycleDemo {
+
+    static class CacheWarmer implements BeanNameAware, InitializingBean, DisposableBean {
+
+        CacheWarmer() {
+            System.out.println("1 实例化");
+        }
+
+        @Autowired
+        void setClock(Clock clock) {
+            System.out.println("2 属性填充：注入 " + clock.getClass().getSimpleName());
+        }
+
+        @Override
+        public void setBeanName(String name) {
+            System.out.println("3 BeanNameAware: " + name);
+        }
+
+        @PostConstruct
+        void postConstruct() {
+            System.out.println("4 @PostConstruct");
+        }
+
+        @Override
+        public void afterPropertiesSet() {
+            System.out.println("5 afterPropertiesSet");
+        }
+
+        void customInit() {
+            System.out.println("6 init-method");
+        }
+
+        @PreDestroy
+        void preDestroy() {
+            System.out.println("8 @PreDestroy");
+        }
+
+        @Override
+        public void destroy() {
+            System.out.println("9 DisposableBean.destroy");
+        }
+
+        void customDestroy() {
+            System.out.println("10 destroy-method");
+        }
+    }
+
+    @Bean
+    Clock clock() {
+        return Clock.systemUTC();
+    }
+
+    @Bean(initMethod = "customInit", destroyMethod = "customDestroy")
+    CacheWarmer cacheWarmer() {
+        return new CacheWarmer();
+    }
+
+    public static void main(String[] args) {
+        try (AnnotationConfigApplicationContext ctx =
+                     new AnnotationConfigApplicationContext(LifecycleDemo.class)) {
+            System.out.println("7 使用：" + ctx.getBean(CacheWarmer.class).getClass().getSimpleName());
+        }
+        System.out.println("11 容器已关闭");
+    }
+}
+```
+
+这个文件放进 `task-center/src/test/java/com/demo/taskcenter/lab13/lifecycle/`，在 IDE 里直接运行 `main` 即可：Maven 的测试 classpath 已经包含 `spring-context` 与 `jakarta.annotation-api`，不需要额外配置。它故意只依赖容器，不起 Web、不连数据库。
+
+输出：
+
+```text
+1 实例化
+2 属性填充：注入 SystemClock
+3 BeanNameAware: cacheWarmer
+4 @PostConstruct
+5 afterPropertiesSet
+6 init-method
+7 使用：CacheWarmer
+8 @PreDestroy
+9 DisposableBean.destroy
+10 destroy-method
+11 容器已关闭
+```
+
+真实项目里不会单独拼这个 classpath，直接用 `task-center` 的 Maven 依赖跑；上面的写法只是说明这个文件不依赖 Web 和数据库。`jakarta.annotation` 是 Spring Boot 3 的包名，2.x 还是 `javax.annotation`，复制旧代码时最容易在这里报错。
+
+两个边界：
+
+- `@PostConstruct` 执行时代理还没生成。在初始化方法里调用本类的 `@Transactional` 方法，事务不会生效——它同样绕过了代理。
+- 销毁回调只对容器管理的单例可靠。`prototype` 交给调用方，容器不负责销毁；`@PreDestroy` 也不会执行。
+
+## 五、五个 @Transactional 失效场景
+
+把「代理 + 拦截器」这条链拆开，失效场景就是固定的几类。每类都给最小复现和修法。
+
+### 1. 同类自调用
+
+```java
+@Service
+public class WrongTaskService {
+
+    private final TaskMapper mapper;
+    private final OperationLogMapper logMapper;
+
+    public WrongTaskService(TaskMapper mapper, OperationLogMapper logMapper) {
+        this.mapper = mapper;
+        this.logMapper = logMapper;
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void complete(long id) {
+        Task task = mapper.findById(id);
+        task.setDone(true);
+        mapper.update(task);
+        this.audit(id);          // this 是原始对象，不是代理
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
+    public void audit(long id) {
+        OperationLog log = new OperationLog();
+        log.setAction("TASK_COMPLETE");
+        log.setTaskId(id);
+        log.setDetail("ok");
+        logMapper.insert(log);
+    }
+}
+```
+
+现象：`audit` 的独立事务完全没有发生，日志跟着外层一起回滚。根因：`this` 指向被代理的目标对象，调用不经过拦截器。
+
+修法：把 `audit` 移到 `OperationLogService`，用构造器注入，调用变成 `operationLogService.record(...)`。次选是 `AopContext.currentProxy()`，但它要求在 `@EnableAspectJAutoProxy(exposeProxy = true)` 下运行，等于把代理细节写进业务代码，只适合过渡。自注入（`ObjectProvider` 拿自己）也能绕过去，但通常说明职责该拆了。
+
+### 2. private、static、final 方法
+
+```java
+@Transactional(rollbackFor = Exception.class)
+private void syncCache() {
+    cacheMapper.refresh();
+}
+
+@Transactional(rollbackFor = Exception.class)
+public static void resetAll() {
+    // 静态方法不归容器管
+}
+```
+
+现象：注解写了，事务没开，也没有任何警告。根因：事务默认只对 `public` 方法生效，`private` 和包级方法直接被跳过；静态方法无法被代理；`final` 方法在 CGLIB 下无法覆写。
+
+修法：改成 `public` 并从**其他 Bean** 调用；静态方法拆成普通 Bean 的方法；`final` 去掉，或改成实现接口走 JDK 代理。最稳的检查方式是写一个测试，断言代理类型与事务是否真的开启，而不是靠肉眼。
+
+### 3. 异常类型不在 rollbackFor 范围
+
+```java
+@Transactional
+public void importFile(Path path) throws IOException {
+    List<String> lines = Files.readAllLines(path);
+    for (int i = 0; i < lines.size(); i++) {
+        String title = lines.get(i).trim();
+        if (title.isEmpty()) {
+            throw new IOException("第 " + (i + 1) + " 行是空行");  // 受检异常：默认提交
+        }
+        Task task = new Task();
+        task.setTitle(title);
+        task.setDone(false);
+        task.setPriority(3);
+        taskMapper.insert(task);
+    }
+}
+```
+
+现象：抛了异常，前面的插入却留在了库里。根因：默认只回滚 `RuntimeException` 和 `Error`，受检异常被视为「可恢复」，提交。
+
+修法：`@Transactional(rollbackFor = Exception.class)`。同时把业务失败统一成运行时异常（12 的 `BusinessException` 就是），避免调用方被迫写 `throws`。如果确实要用受检异常表达失败，显式写 `rollbackFor`，不要靠记忆。
+
+### 4. 异常被 try/catch 吞掉
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void complete(long id) {
+    try {
+        Task task = mapper.findById(id);
+        task.setDone(true);
+        mapper.update(task);
+        riskService.check(id);        // 抛 RuntimeException
+    } catch (RuntimeException e) {
+        log.warn("检查失败，先忽略", e);   // 没有继续抛
+    }
+}
+```
+
+现象：拦截器看到方法正常返回，提交。根因：回滚判断发生在拦截器里，异常没传出去，它无从知道失败。
+
+修法：要么重新抛出，要么显式标记：
+
+```java
+TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+```
+
+第二种只适合「必须吞掉异常但仍要回滚」的少数场景，比如批量任务里记录失败条数。吞异常前先想清楚：调用方是否需要一个失败信号。
+
+### 5. 多线程与异步
+
+把异步审计拆成一个独立 Bean 后，问题从「事务」变成了「跨线程边界」：
+
+```java
+@Service
+public class TaskService {
+
+    private final TaskMapper mapper;
+    private final AuditAsyncService auditAsync;
+
+    public TaskService(TaskMapper mapper, AuditAsyncService auditAsync) {
+        this.mapper = mapper;
+        this.auditAsync = auditAsync;
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void complete(long id) {
+        Task task = mapper.findById(id);
+        task.setDone(true);
+        mapper.update(task);
+        auditAsync.audit(id);   // 另一个 Bean：@Async 生效，但不在同一事务
+    }
+}
+
+@Service
+public class AuditAsyncService {
+
+    private final OperationLogMapper logMapper;
+
+    public AuditAsyncService(OperationLogMapper logMapper) {
+        this.logMapper = logMapper;
+    }
+
+    @Async
+    public void audit(long id) {
+        OperationLog log = new OperationLog();
+        log.setAction("TASK_COMPLETE");
+        log.setTaskId(id);
+        log.setDetail("async ok");
+        logMapper.insert(log);
+    }
+}
+```
+
+现象：主事务回滚了，异步线程写的日志却在。根因：事务上下文绑定在线程上，新线程没有那条连接，也不参与外层提交/回滚。这里 `auditAsync` 确实跑在新线程，事务却留在原线程；如果写成 `this.audit(id)`，连异步都不会发生（`@Async` 同样依赖代理），两层问题叠在一起。
+
+修法：不要跨线程共享事务。要么把异步动作放到提交之后（`TransactionSynchronization.afterCommit`、`@TransactionalEventListener(phase = AFTER_COMMIT)`），要么用 Outbox 表在同一个事务里落一条待发记录，再由后台任务异步处理。跨线程只能保证「最终一致」，拿不到「同一事务」。
+
+## 六、传播行为：日志必须落库
+
+**结论**：`REQUIRED` 是加入，`REQUIRES_NEW` 是另起炉灶，`NESTED` 是在当前事务里打保存点。
+
+| 传播 | 是否复用外层事务 | 外层回滚时 | 内层回滚时 | 连接 |
+| :-- | :-- | :-- | :-- | :-- |
+| `REQUIRED`（默认） | 有就加入 | 内层一起回滚 | 整个事务标记 rollback-only | 同一条 |
+| `REQUIRES_NEW` | 否，挂起外层 | 内层已提交，保留 | 只回滚内层 | 第二条 |
+| `NESTED` | 是，用保存点 | 全部回滚 | 只回滚到保存点 | 同一条 |
+
+第一节的 `TaskService.complete` 就是「日志必须落库」的例子：任务已完成的重复操作要留痕，业务用 409 结束，日志不能跟着消失。实现只有一行注解：
+
+```java
+@Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
+public void record(String action, long taskId, String detail) {
+    OperationLog log = new OperationLog();
+    log.setAction(action);
+    log.setTaskId(taskId);
+    log.setDetail(detail);
+    mapper.insert(log);   // 独立连接、独立提交
+}
+```
+
+代价要说清：`REQUIRES_NEW` 会从连接池再借一条连接。外层事务还没结束时，一个请求同时占两条连接；如果连接池只有 5 条，并发稍高就会互相等待。日志量大时优先考虑异步落库，而不是在每个业务方法里嵌套独立事务。
+
+`NESTED` 适合「批量里单条失败不拖累其他条」：
+
+```java
+@Service
+public class TaskImportItemService {
+
+    private final TaskMapper mapper;
+
+    public TaskImportItemService(TaskMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    @Transactional(propagation = Propagation.NESTED, rollbackFor = Exception.class)
+    public void importOne(TaskCreateReq row) {
+        Task task = new Task();
+        task.setTitle(row.title());
+        task.setPriority(row.priority());
+        task.setDone(false);
+        mapper.insert(task);
+    }
+}
+```
+
+调用方逐条调用并捕获异常，只回滚单条：
+
+```java
+@Service
+public class TaskImportService {
+
+    private final TaskImportItemService itemService;
+
+    public TaskImportService(TaskImportItemService itemService) {
+        this.itemService = itemService;
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public int importAll(List<TaskCreateReq> rows) {
+        int ok = 0;
+        for (TaskCreateReq row : rows) {
+            try {
+                itemService.importOne(row);   // 另一个 Bean，才会走代理
+                ok++;
+            } catch (DataIntegrityViolationException e) {
+                // 只回滚到保存点，外层继续
+            }
+        }
+        return ok;
+    }
+}
+```
+
+`NESTED` 依赖保存点，需要 JDBC 事务管理器（`DataSourceTransactionManager`）和数据库支持；JTA 事务不支持嵌套。另外它仍然要求跨 Bean 调用——把 `importOne` 写回 `TaskImportService` 内部，保存点也不会创建。
+
+## 七、这条链路在真实项目里的位置
+
+一个「操作留痕」需求是怎么从一句话走到线上的：
+
+| 环节 | 这一步落什么 | 对应 task-center 的文件 |
+| :-- | :-- | :-- |
+| 需求 | 完成任务要留痕：谁、对哪条任务、结果如何 | 无代码，验收标准先写清 |
+| 数据 | 新建 `operation_log`，按 `task_id` 查询 | `operation_log` 建表语句 |
+| 契约 | 新增完成端点，成功 0、重复 409 | `TaskController` 新增方法，契约在 14 完善 |
+| 实现 | 日志服务独立事务，切面统一记成功 | `OperationLog.java`、`OperationLogService.java`、`OperationLogAspect.java` |
+| 集成 | `TaskService` 构造器多一个依赖，删除 `this.` 调用 | `task/TaskService.java` |
+| 验证 | curl 两次看状态码，再查日志表 | 上面的 curl 与 SQL |
+| 上线 | 观察日志表增长、慢查询、切面异常 | 索引 `idx_task_action`、日志归档策略 |
+
+本步的文件清单：
+
+```text
+task-center/src/main/java/com/demo/taskcenter/
+├── log/
+│   ├── OperationLog.java            实体，与表一一对应
+│   ├── OperationLogMapper.java      INSERT / SELECT
+│   ├── OperationLogService.java     REQUIRES_NEW 的写入入口
+│   ├── OperationLogging.java        注解，声明 action
+│   └── OperationLogAspect.java      @AfterReturning 统一记录
+└── task/
+    ├── TaskService.java             构造器多一个依赖，删除 this 调用
+    └── TaskController.java          新增完成端点（14 统一契约）
+```
+
+这条链路和下一篇的分工：13 解决「对象怎么被创建、被谁代理、事务边界在哪」，14 解决「对外接口的字段、错误码、时间与 ID 格式」。所以本步的端点可以先长这样，14 会把它整理成契约文档并补校验。继续读 [Spring MVC 与接口契约](/blog/posts/java-roadmap-14-spring-mvc-contract/)。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| :-- | :-- | :-- |
+| 异常抛了，数据还在 | 同类 `this.` 调用没走代理 | 拆到另一个 Bean，或注入自身代理 |
+| `@Transactional` 写在 private 方法上，毫无反应 | 事务默认只处理 public 方法 | 改 public，从外部 Bean 调用 |
+| final 方法上的事务/切面不生效 | CGLIB 子类无法覆写 final 方法 | 去掉 final，或实现接口走 JDK 代理 |
+| 受检异常后数据未回滚 | 默认只回滚运行时异常 | `rollbackFor = Exception.class` |
+| catch 后不再抛，事务提交 | 拦截器没看到异常 | 重新抛出或 `setRollbackOnly` |
+| 异步线程写的记录留了下来 | 事务绑定线程，新线程不参与 | afterCommit 事件或 Outbox |
+| 日志表跟着业务回滚 | 日志方法用默认 `REQUIRED` | 日志写入改 `REQUIRES_NEW` |
+| 启动报 `BeanCurrentlyInCreationException` | 构造器注入形成环 | 重构职责，或用 `@Lazy` |
+| `@PostConstruct` 里调本类事务方法无效 | 代理在初始化后置阶段才生成 | 改用 `ApplicationReadyEvent` |
+| 连接池偶发耗尽 | `REQUIRES_NEW` 嵌套占用两条连接 | 缩小事务范围，日志改异步 |
+| 切面写库失败导致接口 500，业务其实已提交 | 成功日志在事务外写入 | 切面内捕获并降级为文件日志 |
+| 以为没走 CGLIB 就是事务没生效 | Boot 3 默认 CGLIB，裸 Spring 默认 JDK | 用 `AopUtils` 判断代理类型 |
+
+## 验收清单
+
+- [ ] 能说出三级缓存各存什么，以及为什么代理对象需要第三级缓存。
+- [ ] 构造器注入形成循环依赖时，启动失败并报 `BeanCurrentlyInCreationException`。
+- [ ] lab 场景 A 输出 `操作日志=[]`，场景 B 输出 `操作日志=[COMPLETE#1]`。
+- [ ] 能解释 `jdk.proxy1.$Proxy0` 这类名字由 JVM 分配，不写进断言。
+- [ ] 在 Boot 3 项目里用 `AopUtils.isCglibProxy` 确认过代理类型。
+- [ ] 五个失效场景各能写一个最小复现，并说出对应修法。
+- [ ] 重复完成同一任务返回 409，且 `operation_log` 里有 `TASK_COMPLETE_SKIP`。
+- [ ] 生命周期示例输出顺序与第四节一致，关闭容器后能看到销毁回调。
+
+## 练习
+
+1. **把自调用修成自注入。** 在 lab 里给 `TaskServiceImpl` 注入 `TaskService` 自身（用 `Supplier` 模拟 `ObjectProvider`），让 `complete` 通过它调用 `audit`。自检：场景 A 的日志变成保留，且代理只创建一次，不出现无限递归。
+2. **用 `@Lazy` 打破构造器环。** 在 `TaskAuditService` 的构造参数上加 `@Lazy`，重启应用。自检：启动成功；打印注入对象类名，能看到 CGLIB 代理；去掉 `@Lazy` 后恢复启动失败。
+3. **验证 rollbackFor。** 给 `complete` 加一个抛 `IOException` 的分支，先不写 `rollbackFor`，再写上。自检：第一次任务状态已改，第二次回滚；两次的异常都返回给调用方。
+4. **对比三种传播。** 用同一段「写任务 + 写日志 + 抛异常」的代码，分别把日志方法设成 `REQUIRED`、`REQUIRES_NEW`、`NESTED`，查表。自检：结果分别是日志无、日志有、日志无（外层回滚连保存点一起撤销）；同时观察连接池活跃连接数。
+5. **写一个统计切面。** 用 `@Around` 统计 `TaskService` 每个 public 方法的执行时间并打印，不写库。自检：只对代理调用生效，自调用不打印；输出顺序在事务提交之后。
+
+## 小结
+
+- BeanDefinition 是配方，Bean 是成品；容器管理的是「名字 + 作用域 + 生命周期 + 代理」，`new` 出来的对象什么都没有。
+- 业务用 `ApplicationContext`；`BeanFactory` 是它的最小内核，适合框架和工具。
+- 构造器注入换来不可变、可测、启动即暴露循环依赖。
+- 三级缓存解决属性注入的环；构造器注入的环无解，只能重构或 `@Lazy`。
+- Boot 3 默认 CGLIB，final 方法无法被增强；代理类型用 `AopUtils` 判断。
+- 事务是拦截器：自调用、非 public、异常类型、吞异常、跨线程，五类失效都出在这条链上。
+- 日志要落库用 `REQUIRES_NEW`，代价是第二条连接；批量单条失败用 `NESTED` 保存点。
+
+| 三级缓存 | 一句话 |
+| :-- | :-- |
+| `singletonObjects` | 成品，优先命中 |
+| `earlySingletonObjects` | 半成品，可能是代理 |
+| `singletonFactories` | 生产半成品的工厂，推迟代理决策 |

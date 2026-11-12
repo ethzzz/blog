@@ -115,10 +115,10 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 			{
 				title: "Java 入门",
 				abbr: "Java",
-				desc: "Java 基础语法、面向对象、集合与线程",
+				desc: "从语法、集合、并发到 Spring Boot、MySQL、Redis 与部署，含任务工单毕业项目",
 				url: "/java-roadmap/",
 				category: "Java学习路线",
-				chips: ["OOP", "集合", "线程"],
+				chips: ["Spring Boot", "MySQL", "Redis", "部署"],
 			},
 			{
 				title: "Go 从零到能写服务",

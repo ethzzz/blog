@@ -1,0 +1,582 @@
+---
+title: '毕业项目：任务工单系统'
+published: 2026-11-12T16:00:00+08:00
+description: '把前面十九篇的能力收成一个可交付的任务工单系统：六张表、状态机、权限、审计、通知、测试与容器化，附 25 条验收。'
+tags: [Java, 毕业项目, SpringBoot, 工单系统, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> 收官篇。`task-center` 从一个 Task 的增删改查长成一套工单流转：六张表、五个状态、三种角色、审计与通知。前置是 [十二](/blog/posts/java-roadmap-12-springboot-mybatis/) 的分层与事务、[十四](/blog/posts/java-roadmap-14-spring-mvc-contract/) 的响应外壳、[十六](/blog/posts/java-roadmap-16-auth-and-security/) 的 JWT 与 RBAC、[十七](/blog/posts/java-roadmap-17-testing-junit-mockito/) 的三层测试、[十八](/blog/posts/java-roadmap-18-redis-cache-async/) 的线程池、[十九](/blog/posts/java-roadmap-19-deploy-and-troubleshoot/) 的容器与探活，地图在 [00](/blog/posts/java-roadmap-00-overview/)。
+> 环境 JDK 21、Spring Boot 3.5.x、Maven 3.9、MySQL 8.0、Redis 7.2，包名 `com.demo.taskcenter`，端口 8081。
+> 写这篇的机器没有 Docker、JDK 21 与 MySQL，命令和测试按契约写好但没在本机跑过；25 条验收因此都写成可判定的结果。
+
+## 一、先跑起来
+
+目标：alice 建单、bob 受理、carol 读不到、bob 重复受理拿 409。
+
+```bash
+docker run -d --name wo-mysql -p 3306:3306 -e MYSQL_DATABASE=taskcenter \
+  -e MYSQL_USER=demo -e MYSQL_PASSWORD=demo -e MYSQL_ROOT_PASSWORD=root mysql:8.0
+docker run -d --name wo-redis -p 6379:6379 redis:7.2
+export DB_PASSWORD=demo JWT_SECRET=$(openssl rand -base64 48)
+cd task-center && mvn -q spring-boot:run
+```
+
+Flyway 建表与角色，dev 配置的 `DemoDataInitializer` 再建 alice、bob、carol、admin 四个账号，密码都是 `s3cret-pass`，角色依次是 REPORTER、AGENT、AGENT、ADMIN。散列由 `BCryptPasswordEncoder(12)` 现算，仓库里不存散列字面量。
+
+```bash
+BASE=http://127.0.0.1:8081
+tok() { curl -s -X POST $BASE/api/auth/login -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$1\",\"password\":\"s3cret-pass\"}" | jq -r .data.accessToken; }
+ALICE=$(tok alice); BOB=$(tok bob); CAROL=$(tok carol); H='Content-Type: application/json'
+
+curl -s -X POST $BASE/api/work-orders -H "Authorization: Bearer $ALICE" -H "$H" \
+  -d '{"title":"三楼打印机卡纸","description":"A3 纸盒进纸即卡","priority":2}' | jq -c .data
+# {"id":"1001","status":"PENDING","reporterId":"1","assigneeId":null,"version":0,...}
+
+curl -s -X POST $BASE/api/work-orders/1001/transitions -H "Authorization: Bearer $BOB" \
+  -H "$H" -d '{"action":"ACCEPT"}' | jq -c .data
+# {"id":"1001","status":"IN_PROGRESS","assigneeId":"2","version":1,...}
+
+curl -s -o /dev/null -w '%{http_code}\n' $BASE/api/work-orders/1001 -H "Authorization: Bearer $CAROL"
+# 403：carol 既不是提交人，也不是处理人
+
+curl -s -X POST $BASE/api/work-orders/1001/transitions -H "Authorization: Bearer $BOB" \
+  -H "$H" -d '{"action":"ACCEPT"}' | jq -c '{code,message}'
+# {"code":40911,"message":"当前状态不允许该操作"}
+```
+
+403 说的是「这个人不该碰这张单」，409 说的是「这张单现在不能这么做」；不带令牌时两条都先变 401，那是验收第 4 条。
+
+## 二、机制：两条正交的轴
+
+难点不是增删改查，而是同一行数据被三种身份在五个状态上反复操作。判定拆成两条正交的轴：状态机管「现在能不能做」，授权管「这个人能不能做」。两条都过才写库，顺序固定，换顺序会泄露信息。
+
+| 步骤 | 判定 | 失败码 | 为什么排在这里 |
+| :-- | :-- | :-- | :-- |
+| 1 | 工单是否存在 | 40402 | 不把存在性告诉无关的人 |
+| 2 | 可见性与角色 | 40301 至 40303 | 越权者不该知道单子走到哪一步 |
+| 3 | 状态机是否允许 | 40911 | 此时已确认有权操作 |
+| 4 | 版本是否仍是读到的那版 | 40912 | 状态没变、数据变了 |
+
+一次流转写三样：工单一行、审计一行、一个事件。前两个同事务；事件在提交后消费，通知失败不该拖垮流转。
+
+两人同时受理时，先查再改会让第二条 UPDATE 覆盖第一条。把判定下沉进 WHERE，行锁保证只有一条影响行数为 1——这是唯一可信的胜负信号，内存里的 if 不是。
+
+## 三、六张表
+
+身份三张（`app_user`、`role`、`user_role`），业务三张（`work_order`、`audit_log`、`notification`）。阶段十六的 `permission` 表被收进代码枚举，少一张要运维配置的表。
+
+```sql
+-- db/migration/V1__schema.sql；六张表统一 InnoDB 与 utf8mb4
+CREATE TABLE app_user (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  username VARCHAR(64) NOT NULL,
+  password_hash CHAR(60) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_user_username (username)
+);
+CREATE TABLE role (
+  code VARCHAR(32) NOT NULL,
+  PRIMARY KEY (code)
+);
+CREATE TABLE user_role (
+  user_id BIGINT UNSIGNED NOT NULL,
+  role_code VARCHAR(32) NOT NULL,
+  PRIMARY KEY (user_id, role_code),
+  KEY idx_user_role_role (role_code, user_id)
+);
+CREATE TABLE work_order (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  title VARCHAR(120) NOT NULL,
+  description TEXT NOT NULL,
+  priority TINYINT NOT NULL DEFAULT 3,
+  status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+  reporter_id BIGINT UNSIGNED NOT NULL,
+  assignee_id BIGINT UNSIGNED NULL,
+  version INT NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  closed_at DATETIME NULL,
+  PRIMARY KEY (id),
+  KEY idx_wo_reporter (reporter_id, status, id),
+  KEY idx_wo_assignee (assignee_id, status, id),
+  KEY idx_wo_status (status, updated_at, id)
+);
+CREATE TABLE audit_log (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  actor_id BIGINT UNSIGNED NOT NULL,
+  action VARCHAR(32) NOT NULL,
+  target_id BIGINT UNSIGNED NOT NULL,
+  from_status VARCHAR(16) NULL,
+  to_status VARCHAR(16) NULL,
+  summary VARCHAR(500) NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_audit_target (target_id, id)
+);
+CREATE TABLE notification (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  type VARCHAR(32) NOT NULL,
+  body VARCHAR(500) NOT NULL,
+  ref_id BIGINT UNSIGNED NOT NULL,
+  read_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_notify_user (user_id, read_at, id)
+);
+```
+
+取舍：`status` 存字符串，五个值不值得维护翻译表；`version` 管并发、`updated_at` 管游标；联合索引按「过滤列、状态列、排序列」拼；审计只存 from/to 与摘要，不复制 `description`。V2 用 `INSERT IGNORE` 写入三个角色。
+
+## 四、状态机
+
+| 动作 | 起点到终点 | 谁 | 拒绝码 |
+| :-- | :-- | :-- | :-- |
+| ACCEPT | PENDING 到 IN_PROGRESS | AGENT 自领，ADMIN 可指定 | 40303 / 40302 / 40911 |
+| SUBMIT | IN_PROGRESS 到 WAITING_CONFIRM | 当前 assignee 或 ADMIN | 40302 / 40911 |
+| CONFIRM | WAITING_CONFIRM 到 DONE | reporter 或 ADMIN | 40301 / 40911 |
+| REJECT | WAITING_CONFIRM 到 IN_PROGRESS | reporter 或 ADMIN | 40301 / 40911 |
+| CANCEL | PENDING 到 CANCELLED | reporter 或 ADMIN | 40301 / 40911 |
+| CANCEL | IN_PROGRESS 到 CANCELLED | 仅 ADMIN | 40303 / 40911 |
+
+DONE 与 CANCELLED 是终态；REJECT 是唯一回退边，只把责任推回处理人。管理员能代替某一方执行动作，但不能绕过状态机，所以没有「直接改状态」的接口。
+
+```java
+public enum WorkOrderStatus {
+    PENDING, IN_PROGRESS, WAITING_CONFIRM, DONE, CANCELLED;
+
+    public enum Action { ACCEPT, SUBMIT, CONFIRM, REJECT, CANCEL }
+
+    public static WorkOrderStatus next(WorkOrderStatus from, Action action) {
+        return switch (from) {
+            case PENDING -> switch (action) {
+                case ACCEPT -> IN_PROGRESS;
+                case CANCEL -> CANCELLED;
+                default -> illegal();
+            };
+            case IN_PROGRESS -> switch (action) {
+                case SUBMIT -> WAITING_CONFIRM;
+                case CANCEL -> CANCELLED;
+                default -> illegal();
+            };
+            case WAITING_CONFIRM -> switch (action) {
+                case CONFIRM -> DONE;
+                case REJECT -> IN_PROGRESS;
+                default -> illegal();
+            };
+            case DONE, CANCELLED -> illegal();
+        };
+    }
+
+    private static WorkOrderStatus illegal() {
+        throw new BusinessException(ErrorCode.INVALID_TRANSITION);
+    }
+}
+```
+
+迁移写成穷举的 switch，而不是散落的 if：加动作必须改分支，漏掉就编译不过；非法边只有一个出口，异常直接绑定 40911。
+
+```sql
+UPDATE work_order
+SET status = #{to},
+    assignee_id = IF(#{to} = 'IN_PROGRESS', COALESCE(assignee_id, #{actorId}), assignee_id),
+    version = version + 1,
+    closed_at = CASE WHEN #{to} IN ('DONE', 'CANCELLED') THEN NOW() ELSE closed_at END
+WHERE id = #{id} AND status = #{from} AND version = #{version};
+```
+
+一条 UPDATE 同时守状态与版本；`assignee_id` 只在进入 IN_PROGRESS 时才落值，取消不会把提交人写成处理人；`closed_at` 由目标状态决定。
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public TransitionResult transition(long id, Action action, long userId, String comment) {
+    WorkOrder wo = mapper.findById(id);
+    if (wo == null) throw new BusinessException(ErrorCode.WORK_ORDER_NOT_FOUND);
+    Actor actor = actors.load(userId);
+    policy.checkVisible(wo, actor);
+    policy.checkActor(wo, action, actor);
+    WorkOrderStatus from = wo.getStatus();
+    WorkOrderStatus to = WorkOrderStatus.next(from, action);
+
+    if (mapper.move(id, from, to, wo.getVersion(), userId, comment) == 0) {
+        WorkOrder fresh = mapper.findById(id);
+        throw new BusinessException(fresh != null && !fresh.getStatus().equals(from)
+                ? ErrorCode.INVALID_TRANSITION : ErrorCode.VERSION_CONFLICT);
+    }
+    audit.transition(userId, id, from, to, comment);
+    events.publishEvent(new WorkOrderChanged(id, action, from, to, userId));
+    return new TransitionResult(mapper.viewById(id), from, to, comment);
+}
+```
+
+`changed` 为 0 时回查一次：状态变了是 40911（别人先动了），状态没变是 40912（其他字段被改）。审计与事件都排在成功之后，否则失败的请求也会留痕。
+
+## 五、接口契约
+
+| 方法 | 路径 | 身份 | 成功码 |
+| :-- | :-- | :-- | :-- |
+| POST | `/api/auth/login` | 公开 | 200 + 令牌 |
+| POST | `/api/work-orders` | REPORTER 或 ADMIN | 201 |
+| GET | `/api/work-orders/:id` | 可见者 | 200 |
+| PATCH | `/api/work-orders/:id` | reporter，且状态为 PENDING | 200 |
+| DELETE | `/api/work-orders/:id` | 仅 ADMIN，软删 | 200 |
+| GET | `/api/work-orders` | 按 scope 过滤 | 200 |
+| POST | `/api/work-orders/:id/transitions` | 按动作判定 | 200 |
+| GET | `/api/work-orders/:id/audit` | 可见者 | 200 |
+| GET | `/api/notifications` | 本人 | 200 |
+| POST | `/api/notifications/:id/read` | 本人 | 200 |
+
+响应外壳沿用阶段十四的 `code`、`message`、`data`、`traceId`。新增八个码，规则仍是「HTTP 状态乘一百加两位序号」：
+
+```java
+public enum ErrorCode {
+
+    OK(0, HttpStatus.OK, "ok"),
+    INVALID_PARAM(40000, HttpStatus.BAD_REQUEST, "参数不合法"),
+    UNAUTHENTICATED(40101, HttpStatus.UNAUTHORIZED, "未登录或令牌已失效"),
+    ACCESS_DENIED(40301, HttpStatus.FORBIDDEN, "没有权限访问该资源"),
+    NOT_ASSIGNEE(40302, HttpStatus.FORBIDDEN, "该工单不在你名下"),
+    ROLE_REQUIRED(40303, HttpStatus.FORBIDDEN, "当前角色不能执行该操作"),
+    WORK_ORDER_NOT_FOUND(40402, HttpStatus.NOT_FOUND, "工单不存在"),
+    INVALID_TRANSITION(40911, HttpStatus.CONFLICT, "当前状态不允许该操作"),
+    VERSION_CONFLICT(40912, HttpStatus.CONFLICT, "工单已被他人修改，请刷新后重试"),
+    INTERNAL_ERROR(50000, HttpStatus.INTERNAL_SERVER_ERROR, "服务器开小差了，请稍后再试");
+
+    private final int code;
+    private final HttpStatus status;
+    private final String message;
+
+    ErrorCode(int code, HttpStatus status, String message) {
+        this.code = code;
+        this.status = status;
+        this.message = message;
+    }
+
+    public int getCode() { return code; }
+    public HttpStatus getStatus() { return status; }
+    public String getMessage() { return message; }
+}
+```
+
+三个 403 分别表示「单子跟你无关」「归别人了」「角色不够」，前端对应回列表、提示刷新、隐藏按钮；两个 409 是「刷新看状态」与「重试一次」。
+
+Controller 只做收参、调用、定状态码，`POST` 返回 201；`@PreAuthorize` 只管能不能进门，归属判断仍在 Service。`PATCH` 必须带 `version`，不匹配返回 40912；`DELETE` 是软删，把状态改成 CANCELLED 并写审计，不物理删行。`scope` 与 `status` 用枚举接收，让 Jackson 拒绝未知值——先收 `String` 再 `valueOf` 会变 500。
+
+## 六、权限与分页查询
+
+可见性三行规则：提交人看自己、处理人看名下、管理员看全部，读与流转共用 `checkVisible`。比较用 `Long.valueOf(...).equals`，`assignee_id` 为 NULL 时拆箱会 NPE。
+
+ACCEPT 先判归属再判状态，所以 carol 对已被接的单得 40302 而不是 40911。待接单池只回摘要，不含 `description`。
+
+```sql
+-- A. 我的工单：游标是上一页末条的 (updated_at, id)
+SELECT id, title, status, priority, assignee_id, version, updated_at
+FROM work_order
+WHERE reporter_id = #{uid} AND (updated_at, id) < (#{cursorTime}, #{cursorId})
+ORDER BY updated_at DESC, id DESC LIMIT #{size};
+
+-- B. 管理端：延迟关联，先只在覆盖索引上取 id
+SELECT w.id, w.title, w.status, w.reporter_id, w.assignee_id
+FROM (SELECT id FROM work_order WHERE status = #{status} ORDER BY id DESC
+      LIMIT #{size} OFFSET #{offset}) AS t
+JOIN work_order AS w ON w.id = t.id ORDER BY w.id DESC;
+```
+
+带状态过滤时游标退化成 `id`，走 `idx_wo_reporter` 的第三列。延迟关联把扫描限制在索引上，只对最终 `size` 行回表；`total` 只在第一页算，`size` 上限 50。
+
+## 七、审计与通知
+
+审计回答谁、何时、对哪张单、从 A 到 B；建单一行（`from_status` 为空），流转一行。黑名单是密码散列、令牌、`description` 全文，`summary` 只放动作、枚举值与评论长度。
+
+```sql
+INSERT INTO audit_log (actor_id, action, target_id, from_status, to_status, summary)
+VALUES (#{actorId}, #{action}, #{targetId}, #{from}, #{to}, #{summary});
+```
+
+不用 AOP 的原因：切面默认在事务切面之外，`proceed()` 返回时事务已提交，审计会独立落库，业务回滚也删不掉。所以显式写在 Service 里，也就是第四节那行 `audit.transition(...)`。
+
+通知走事件：`@TransactionalEventListener` 的 `AFTER_COMMIT` 加 `@Async`。线程池核心 2、最大 4、队列 200、`CallerRunsPolicy`、停机等待 20 秒；允许丢就换 `AbortPolicy` 并打点。`TaskDecorator` 带上 traceId；`actorId` 放进事件，因为 SecurityContext 不跟线程走。
+
+```java
+@Component
+public class WorkOrderNotifier {
+
+    private final WorkOrderMapper orders;
+    private final NotificationMapper notifications;
+
+    @Async("notificationExecutor")
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onChanged(WorkOrderChanged event) {
+        WorkOrder wo = orders.findById(event.orderId());
+        Long to = switch (event.action()) {
+            case ACCEPT, SUBMIT -> wo.getReporterId();
+            case CONFIRM, REJECT -> wo.getAssigneeId();
+            case CANCEL -> event.actorId() == wo.getReporterId()
+                    ? wo.getAssigneeId() : wo.getReporterId();
+        };
+        if (to == null || to == event.actorId()) return;
+        notifications.insert(to, "WORK_ORDER_" + event.to(),
+                "工单 #" + wo.getId() + " 进入 " + event.to(), wo.getId());
+    }
+}
+```
+
+已读用一条条件更新：`UPDATE notification SET read_at = NOW() WHERE id = ? AND user_id = ? AND read_at IS NULL`。影响行数为 0 说明已读或不是你的，都回 404 不区分——区分了就能拿它探测别人的通知 id。
+
+## 八、三层测试
+
+单测证状态机与版本冲突，切片证错误码与过滤器链，集成证 SQL、事务与异步通知。
+
+```java
+@ExtendWith(MockitoExtension.class)
+class WorkOrderServiceTest {
+
+    @Mock WorkOrderMapper mapper;
+    @Mock WorkOrderPolicy policy;
+    @Mock AuditRecorder audit;
+    @Mock ActorService actors;
+    @Mock ApplicationEventPublisher events;
+    WorkOrderService service;
+
+    @BeforeEach
+    void setUp() { service = new WorkOrderService(mapper, policy, audit, actors, events); }
+
+    @Test
+    void staleVersionIsConflictAndWritesNoAudit() {
+        assertThrows(BusinessException.class, () -> WorkOrderStatus.next(DONE, CONFIRM));
+        when(actors.load(2L)).thenReturn(Actor.agent(2L));
+        when(mapper.findById(9L)).thenReturn(order(PENDING, 0)).thenReturn(order(PENDING, 1));
+        when(mapper.move(9L, PENDING, IN_PROGRESS, 0, 2L, null)).thenReturn(0);
+        var e = assertThrows(BusinessException.class,
+                () -> service.transition(9L, ACCEPT, 2L, null));
+        assertEquals(ErrorCode.VERSION_CONFLICT, e.getErrorCode());
+        verifyNoInteractions(audit, events);
+    }
+}
+```
+
+切片的坑在注解：`@WebMvcTest` 不扫配置，`SecurityConfig` 必须 `@Import`，漏了会落到默认安全链，400 变 401。三条断言对应 40101、40301、40911。
+
+集成跑真 MySQL：`CASE WHEN ... IN (...)`、行构造器比较、`ON UPDATE` 都是方言。无 Docker 时显示 `skipped`，CI 上必须真跑。
+
+```java
+@SpringBootTest
+@Testcontainers(disabledWithoutDocker = true)
+class WorkOrderFlowIT {
+
+    @Container @ServiceConnection
+    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0");
+
+    @Autowired WorkOrderService service;
+    @Autowired JdbcTemplate jdbc;
+
+    @Test
+    void fullFlowWritesAuditAndNotifications() {
+        long id = service.create(new CreateReq("集成-卡纸", "A3 进纸即卡", 2), 1L);
+        service.transition(id, ACCEPT, 2L, null);
+        service.transition(id, SUBMIT, 2L, null);
+        service.transition(id, CONFIRM, 1L, null);
+        assertEquals(4, jdbc.queryForObject(
+                "SELECT COUNT(*) FROM audit_log WHERE target_id = ?", Integer.class, id));
+        await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals(2,
+                jdbc.queryForObject("SELECT COUNT(*) FROM notification WHERE ref_id = ?",
+                        Integer.class, id)));
+    }
+}
+```
+
+## 九、容器化与回滚
+
+多阶段构建把 Maven 留在 builder，运行时只带 JRE；镜像按 sha 打标签，回滚才有东西可回。readiness 含 db 与 redis，liveness 只看进程。readiness 组要显式声明：`management.endpoint.health.group.readiness.include=readinessState,db,redis`，否则第 3 条验收拿不到这两个组件。
+
+```dockerfile
+FROM maven:3.9-eclipse-temurin-21 AS builder
+WORKDIR /build
+COPY . .
+RUN mvn -q -B -DskipTests package && cp target/task-center-*.jar /build/app.jar
+
+FROM eclipse-temurin:21-jre-alpine
+RUN adduser -S -u 10001 app
+COPY --from=builder /build/app.jar /app/app.jar
+USER 10001
+EXPOSE 8081
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+HEALTHCHECK CMD wget -qO- http://127.0.0.1:8081/actuator/health/readiness || exit 1
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]
+```
+
+```yaml
+name: task-center
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: taskcenter
+      MYSQL_USER: demo
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-p${DB_ROOT_PASSWORD}"]
+      interval: 10s
+      retries: 12
+  redis:
+    image: redis:7.2
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+  app:
+    image: ${APP_IMAGE:-task-center:local}
+    build: .
+    ports: ["8081:8081"]
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/taskcenter
+      SPRING_DATA_REDIS_HOST: redis
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+```
+
+```bash
+TAG=$(git rev-parse --short HEAD)
+docker build -t task-center:$TAG .
+APP_IMAGE=task-center:$TAG docker compose up -d --no-deps app
+
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/actuator/health/readiness)
+if [ "$code" != "200" ]; then
+  PREV=$(docker images --format '{{.Repository}}:{{.Tag}}' task-center | grep -v "$TAG" | head -1)
+  APP_IMAGE=$PREV docker compose up -d --no-deps app
+  echo "已回滚到 $PREV"
+fi
+```
+
+回滚只回应用：Flyway 不做 down，旧镜像遇到新版本会拒绝启动，所以迁移要向后兼容——先加列、双写、再删列。真退库只能恢复快照，快照会丢窗口内的新数据。
+
+## 这条链路在真实项目里的位置
+
+| 环节 | 要回答的问题 | 落点 |
+| :-- | :-- | :-- |
+| 需求 | 三种角色各看到什么、什么动作不可逆 | 五状态、六条边、三条可见性规则 |
+| 数据 | 状态与归属存哪、并发怎么挡 | `status`、`version`、三组联合索引 |
+| 契约 | 失败长什么样、越权与冲突怎么分 | 40101 至 40303、40402、40911、40912 |
+| 实现 | 判定顺序、事务边界、副作用放哪 | `WorkOrderPolicy`、`transition`、`WorkOrderNotifier` |
+| 验证 | 怎么证明没漏权限、没丢审计 | 七条负向用例、切片断言码、集成断言行数 |
+| 上线 | 挂了怎么摘流量、发错了怎么退 | readiness、sha 标签、兼容式迁移 |
+
+对应文件：`security/` 沿用阶段十六，`workorder/` 下新增 `WorkOrderStatus`、`WorkOrderPolicy`、`WorkOrderService`、`WorkOrderController`、`WorkOrderNotifier`、`AuditRecorder`，迁移是 `V1__schema.sql` 与 `V2__seed_roles.sql`。**不做什么**：不做附件、SLA 计时、多租户、SSO，每一项都会把状态机与表结构再拉宽一圈。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| :-- | :-- | :-- |
+| 状态变了、审计没写 | 审计在 AOP 或异步里，落在事务外 | Service 内同事务显式写 |
+| 两人同时受理，后者覆盖前者 | 先 SELECT 再 UPDATE | 条件 UPDATE 加 `version`，看影响行数 |
+| 通知比工单先到 | 提交前就发通知 | 事件加 `AFTER_COMMIT` |
+| 处理人看不到待接单 | 归属条件写死 `assignee_id` | 单开只有摘要字段的池查询 |
+| 深翻页越翻越慢 | 大 OFFSET 扫过大量行再回表 | 延迟关联或 id 游标 |
+| 回滚后应用起不来 | 新迁移不兼容旧代码 | 先加列、双写、再删列 |
+| 越权返回 401 | 解析失败清了上下文，或业务抛认证异常 | 归属与角色一律抛 40301 至 40303 |
+
+## 25 条验收
+
+`$BASE` 与三个令牌沿用第一节。
+
+**启动与健康**
+
+1. `docker compose ps` 三个服务都是 `healthy`。
+2. `curl -s $BASE/actuator/health | jq -r .status` 输出 `UP`。
+3. readiness 的 `components` 含 `db` 与 `redis`。
+
+**认证与权限**
+
+4. 不带 `Authorization` 读单返回 401 与 40101。
+5. carol 读 alice 的单返回 403 与 40301。
+6. alice 对 PENDING 单执行 ACCEPT 返回 403 与 40303。
+7. `scope=pool` 返回 200，条目里没有 `description`。
+8. admin 用 `scope=all` 看到至少两个不同 `reporterId`。
+
+**工单状态机**
+
+9. bob 受理后 `status` 为 `IN_PROGRESS`、`version` 加 1。
+10. bob 再受理返回 409 与 40911。
+11. bob 执行 SUBMIT 后 `status` 为 `WAITING_CONFIRM`。
+12. alice 执行 CONFIRM 后 `status` 为 `DONE` 且 `closedAt` 非空。
+13. 对 DONE 单执行 CANCEL 返回 409 与 40911。
+14. alice 取消自己的 PENDING 单得 200；取消 IN_PROGRESS 单得 403 与 40303。
+
+**查询与分页**
+
+15. `EXPLAIN` 第 A 条 SQL，`key` 为 `idx_wo_reporter`，`Extra` 不含 `Using filesort`。
+16. `size=51` 返回 400 与 40000。
+17. 连续两页 id 无交集，第二页首条 `updatedAt` 不高于第一页末条。
+
+**审计与通知**
+
+18. 完成一单后 `audit_log` 里该单为 4 行。
+19. 审计 `summary` 里搜不到 `description` 原文。
+20. 通知列表的未读数与 `items` 长度一致。
+21. 标记已读后 `readAt` 非空、未读数减 1；重复调用仍 200。
+
+**测试**
+
+22. `mvn -Dtest=WorkOrderServiceTest test` 全绿，无 `UnnecessaryStubbing`。
+23. `mvn -Dtest=WorkOrderControllerTest test` 覆盖 40101、40301、40911 三个码。
+24. `mvn verify` 时集成测试真跑；无 Docker 时显示 `skipped`。
+
+**部署与回滚**
+
+25. 镜像 tag 等于当前 git sha；回退 tag 后 readiness 回 200，`flyway_schema_history` 最大版本号不变。
+
+```bash
+#!/usr/bin/env bash
+set -uo pipefail
+BASE=${BASE:-http://127.0.0.1:8081}; B=$(mktemp); FAIL=0
+tok() { curl -s -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$1\",\"password\":\"s3cret-pass\"}" | jq -r .data.accessToken; }
+A=$(tok alice); BOB=$(tok bob); CAROL=$(tok carol)
+req() { local m=$1 p=$2 t=$3 d=${4:-}; local a=(-s -o "$B" -w '%{http_code}' -X "$m" "$BASE$p")
+  [ -n "$t" ] && a+=(-H "Authorization: Bearer $t")
+  [ -n "$d" ] && a+=(-H 'Content-Type: application/json' -d "$d"); curl "${a[@]}"; }
+chk() { local ac; ac=$(jq -r '.code // -1' "$B")
+  if [ "$4" = "$2" ] && [ "$ac" = "$3" ]; then echo "PASS $1"
+  else echo "FAIL $1 want $2/$3 got $4/$ac"; FAIL=$((FAIL+1)); fi; }
+
+chk "无令牌读单" 401 40101 "$(req GET /api/work-orders/1 "" "")"
+chk "alice 建单" 201 0 "$(req POST /api/work-orders "$A" '{"title":"验收-卡纸","description":"A3 进纸即卡","priority":2}')"
+ID=$(jq -r .data.id "$B")
+chk "carol 越权读" 403 40301 "$(req GET "/api/work-orders/$ID" "$CAROL" "")"
+chk "bob 受理" 200 0 "$(req POST "/api/work-orders/$ID/transitions" "$BOB" '{"action":"ACCEPT"}')"
+chk "重复受理" 409 40911 "$(req POST "/api/work-orders/$ID/transitions" "$BOB" '{"action":"ACCEPT"}')"
+chk "bob 提交" 200 0 "$(req POST "/api/work-orders/$ID/transitions" "$BOB" '{"action":"SUBMIT"}')"
+chk "alice 确认" 200 0 "$(req POST "/api/work-orders/$ID/transitions" "$A" '{"action":"CONFIRM"}')"
+chk "审计查询" 200 0 "$(req GET "/api/work-orders/$ID/audit" "$A" "")"
+req GET '/api/notifications?unread=true' "$A" "" >/dev/null
+chk "通知已读" 200 0 "$(req POST "/api/notifications/$(jq -r '.data.items[0].id' "$B")/read" "$A" "")"
+echo "审计条数: $(jq '.data | length' "$B") 失败项: $FAIL"; rm -f "$B"; [ "$FAIL" -eq 0 ]
+```
+
+第一行故意不用 `set -e`：断言失败要计数而不是中途退出；最后一行把结果交给 `FAIL`，可以直接进 CI。
+
+## 练习
+
+1. 加 `REOPEN`：DONE 的单在 7 天内可由提交人重开为 PENDING，并写审计。
+   **自检：** 第 8 天调用返回 409 与 40911；重开后 `assignee_id` 为 NULL，审计 from 为 DONE、to 为 PENDING。
+2. 把「我的工单」改成游标分页，同时保留 `page` 参数一个版本周期。
+   **自检：** 传 `page` 时响应带 `Deprecation` 头；只传 `cursor` 时 `EXPLAIN` 不再出现 `Using filesort`。
+3. 允许管理员在 ACCEPT 时指定 `assigneeId`。
+   **自检：** 普通 AGENT 传了也指派给自己；admin 指定 carol 后，bob 再 SUBMIT 得 40302。
+4. 让审计查询也只能看与自己有关的单，并改成游标分页。
+   **自检：** carol 查 alice 单的审计得 403 与 40301；两页 id 无交集。
+
+## 小结
+
+- 复杂度在「谁在什么状态能做什么」，拆成状态机与授权两条正交的轴，判定顺序是存在、权限、状态、版本。
+- 判定要落进 SQL 的 WHERE，影响行数是唯一可信的并发胜负信号。
+- 审计与业务同事务，通知在提交后异步，两者失败语义完全不同。
+- 四个错误码各管一段：401 身份、403 权限、404 存在、409 状态与版本。
+- 测试分三层，集成跑真 MySQL；部署按 sha 打标签，回滚只回应用，迁移必须向后兼容。

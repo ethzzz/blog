@@ -1,223 +1,477 @@
 ---
 title: 'Java 阶段一：JDK、JRE、JVM 与第一个程序'
 published: 2026-09-02T09:00:00+08:00
-description: '先把 Java 是怎么跑起来的搞清楚：JDK / JRE / JVM 三兄弟、字节码、classpath，然后写下第一个 Hello World。'
-tags: [Java, JDK, JVM, 入门]
+description: '从前端视角用 JDK 21 跑通 Hello World、求和与断点调试，讲清字节码、类加载、classpath、jshell 和 Maven/Gradle 的职责。'
+tags: [Java, JDK, JVM, 入门, 学习路线]
 category: Java学习路线
 draft: false
 ---
 
-学任何语言之前，先弄明白"我敲的代码到底是怎么变成屏幕上运行的程序的"。JavaScript 是浏览器/V8 直接解释执行，Java 多了一步"编译成字节码"。这个阶段就把这一步彻底讲清楚。
+> [!NOTE]
+> 本篇把「代码为什么能跑」变成可验证的命令链路：前置只需会使用终端和 JS/TS 变量，读完能用 JDK 21 编译、运行、定位类路径错误，并在 IDE 中逐步观察求和。所有示例只用标准库，位于 `task-center/labs/01-env`，独立于后续 Maven 应用源码，不需要付费软件或预览特性。
 
-## JDK、JRE、JVM 到底谁装谁
+## 一、先跑起来
 
-三个缩写经常被混用，其实是三层包含关系：
+写前端时，我习惯先让页面出现一个按钮，再回头看打包过程。学 Java 也一样：先拿到确定的输出，再拆解 JDK、类和入口方法。本篇不让脚手架替我们完成所有步骤，因为以后遇到「IDE 能跑，终端不能跑」时，手工编译这条短链路就是排查基准。
 
-```text
-┌────────────────────────────── JDK ──────────────────────────────┐
-│  javac 编译器   jdb 调试器   jshell   jar 打包   ...开发工具     │
-│                                                                 │
-│  ┌─────────────────────────── JRE ───────────────────────────┐  │
-│  │  Java 标准库（java.lang、java.util、java.io ...）         │  │
-│  │                                                            │  │
-│  │  ┌────────────────────── JVM ─────────────────────────┐    │  │
-│  │  │  类加载器 → 字节码解释器 / JIT 编译器 → 操作系统    │    │  │
-│  │  └────────────────────────────────────────────────────┘    │  │
-│  └────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+### 1. 确认环境与实验目录
+
+本系列固定使用 **JDK 21 的正式特性**，不加 `--enable-preview`。先执行版本命令：
+
+```bash
+java -version
+javac -version
+jar --version
+jshell --version
 ```
 
-- **JVM**（Java Virtual Machine）：真正执行字节码的虚拟机，屏蔽操作系统差异。"一次编写，到处运行"就靠它。
-- **JRE**（Java Runtime Environment）= JVM + Java 标准库。**只想运行 Java 程序**装它就够了。
-- **JDK**（Java Development Kit）= JRE + 编译器 `javac` + 各种开发工具。**要写 Java 代码必须装 JDK**。
+输出：四项均应为 `21` 或 `21.0.x`，供应商、补丁号和构建信息可以不同。`java -version` 通常写到标准错误流，看到版本文本不代表执行失败。
 
-> [!TIP]
-> JDK 21 之后，Oracle 已经把 JRE 从发行包里拆掉了，日常开发直接装 JDK 即可，不用再纠结选哪个。这个系列用的都是 JDK 21（LTS）。
+如果只有 `java` 可用，可能仅安装了运行时，也可能 `PATH` 未指向完整 JDK，先按第三节检查。下面的命令使用 Bash，Windows 可以在 Git Bash 中执行。文件保存为 UTF-8；选一个学习项目的父目录，如果已有 `task-center` 就复用，不再套一层同名目录。
 
-## Java 程序的运行流程
-
-一个 `.java` 文件从源代码到运行结果，中间经过两步：
-
-```text
-HelloWorld.java  ──[javac 编译]──▶  HelloWorld.class  ──[java 运行]──▶  JVM 执行字节码
-    源代码                              字节码                             运行结果
+```bash
+mkdir -p task-center/labs/01-env/src/com/demo/taskcenter/lab01
+mkdir -p task-center/labs/01-env/out
+cd task-center/labs/01-env
 ```
 
-对比一下熟悉的前端流程：
+输出：成功时没有控制台文本。**本文后续命令的工作目录均为 `task-center/labs/01-env`**，不重复切换目录。
 
-| 阶段 | Java | 前端类比 |
-| :-- | :-- | :-- |
-| 编写 | `HelloWorld.java` | `index.ts` |
-| 编译 | `javac` 生成 `.class` 字节码 | `tsc` 生成 `.js` |
-| 打包 | `jar` 命令打包成 `.jar` | `vite build` 打包成 `dist/` |
-| 运行 | JVM 解释或 JIT 编译字节码 | 浏览器/Node 解释或 JIT 执行 JS |
+这里的 `src` 只是实验源码根，不是后续 Web 服务的 `task-center/src/main/java`。所有包名以 `com.demo.taskcenter` 为根，本篇增加 `lab01` 子包。不要把实验源码加入 Maven 主应用的 sourceDirectory，也不要把主应用启动类复制到这里。
 
-区别在于：Java 的字节码是**平台无关**的中间形式，同一个 `.class` 文件在 Windows、Linux、macOS 上都能跑；JS 的产物则是给浏览器/V8 直接吃的文本。
+### 2. 完整文件、编译与执行
 
-## 第一个程序：Hello World
+新建完整文件 `task-center/labs/01-env/src/com/demo/taskcenter/lab01/HelloWorld.java`：
 
-新建 `HelloWorld.java`，注意文件名必须和 public 类名**完全一致**（大小写敏感）：
+```java title="task-center/labs/01-env/src/com/demo/taskcenter/lab01/HelloWorld.java"
+package com.demo.taskcenter.lab01;
 
-```java title="HelloWorld.java"
 public class HelloWorld {
     public static void main(String[] args) {
-        System.out.println("Hello, World!");
+        String name = args.length == 0 ? "World" : args[0];
+        System.out.println("Hello, " + name + "!");
     }
 }
 ```
 
-编译 + 运行：
+输出：无参数运行时打印 `Hello, World!`，传入 `task-center` 时打印 `Hello, task-center!`；保存源码不会自动执行。`String` 和 `System` 属于自动导入的 `java.lang`，不需要额外 import。
 
 ```bash
-javac HelloWorld.java     # 生成 HelloWorld.class
-java HelloWorld           # 运行，注意不带 .class 后缀
-# 输出：Hello, World!
+javac --release 21 -encoding UTF-8 -d out src/com/demo/taskcenter/lab01/HelloWorld.java
+java -cp out com.demo.taskcenter.lab01.HelloWorld
+java -cp out com.demo.taskcenter.lab01.HelloWorld task-center
 ```
 
-从 JDK 11 开始还支持**单文件直接运行**，省去手动编译：
+输出：编译成功通常没有文本；两次运行依次打印 `Hello, World!` 和 `Hello, task-center!`。磁盘生成 `out/com/demo/taskcenter/lab01/HelloWorld.class`。
+
+`--release 21` 把语言规则、目标 class 版本和可用标准 API 对齐到 Java 21；它不是让旧 JDK 支持新语法的开关。用 JDK 17 执行会报告不支持 release 21，应切换到已安装的 JDK 21，不能删除约束后把 Java 17 的运行结果当成基线验证。
+
+这一步给 `task-center` 新增的是 **独立环境探针**：同一源码与参数，在终端和 IDE 中应得到一致输出。没有 HTTP、数据库或 Spring Bean，当前也不需要它们。
+
+## 二、机制：源码到字节码，再到类加载
+
+### 1. 编译和运行不是同一个步骤
+
+Java 常规链路是「先编译，后运行」，但不要把 JS 说成只有逐行解释。现代浏览器与 Node 的引擎同样会解析代码、生成内部表示，并可能 JIT 编译。真正有用的区别是：Java 的 `.class` 是稳定可保存、可分发的中间产物；`tsc` 通常输出 JavaScript 文本，多数 TS 类型信息被擦除。
+
+| 阶段 | Java | 前端里的近似位置 | 类比边界 |
+| --- | --- | --- | --- |
+| 编写 | `.java` 与静态类型 | `.ts` | Java 类型不只是编辑器提示 |
+| 编译 | `javac` 生成 `.class` | `tsc` 生成 `.js` | 字节码不能交给浏览器执行 |
+| 组织产物 | `jar` 归档 class 与资源 | 组织 `dist` | 普通 JAR 不自动合并所有依赖 |
+| 运行 | JVM 加载并执行字节码 | Node/V8 执行 JS | JVM 不负责下载项目依赖 |
+| 热点优化 | 常见 JVM 解释执行并 JIT | V8 也有运行时优化 | 不能凭语言名称预测性能 |
+
+`javac` 读取文本、解析语法、检查类型和符号，再写出 class 文件。随后执行 `java` 启动另一个进程，它使用编译产物，不会因源码刚保存就自动重新编译。遇到「我明明改了，结果却没变」，先问有没有生成新 class，而不是立刻清理 IDE 缓存。
+
+运行链路可以拆成五步；具体符号的解析时机允许由 JVM 实现选择，并非所有类都必须在启动瞬间完成每一步。
+
+1. 启动器读取参数并创建 JVM，按全限定类名查找入口类。
+2. 类加载器读取 class 字节，建立运行时类表示；类名不是任意文件路径的别名。
+3. 链接包括验证、准备、解析：验证字节码约束，为类变量准备空间，将符号引用关联到运行时目标；解析可能延迟。
+4. 在首次主动使用等规定条件下初始化类，执行静态字段初始化与静态初始化块；相关父类通常先初始化。
+5. 调用标准 `main`，执行其中的指令。常见 JVM 可能解释执行并把热点代码编译为机器码，JIT 并不是 Hello World 必须先完成的步骤。
+
+编译期检查不能替代运行期验证，因为 JVM 也可能接收其他语言编译器或外部工具生成的字节码。类加载、验证、动态链接都有成本，所以「新进程里只算一次加法」与「同一进程里重复计算」不是同一个性能问题，本篇不编造启动耗时。
+
+### 2. 看实际字节码与类来源
+
+JDK 自带 `javap`，不必安装反编译插件：
 
 ```bash
-java HelloWorld.java      # 编译 + 运行一步到位，适合写小脚本
+javap -classpath out -c com.demo.taskcenter.lab01.HelloWorld
+javap -classpath out -verbose com.demo.taskcenter.lab01.HelloWorld
+java -Xlog:class+load=info -cp out com.demo.taskcenter.lab01.HelloWorld
 ```
 
-## 逐行拆解代码
+输出：第一条显示构造方法和 `main` 的字节码，能看到对 `println` 的调用；第二条包含 `major version: 65`，即 Java 21 的 class 主版本；第三条在问候之外输出类加载记录，其中包含本篇 Hello 的来源。时间、常量池编号和标准库加载顺序不作为固定输出验收。
 
-上面这 5 行看着简单，其实每一处都有说法：
+标准库由启动类加载器、平台类加载器等提供，应用 classpath 由应用类加载器处理。常见父级委派机制让核心类先交给上层寻找，但不能把它说成所有自定义加载器都不可改变的固定实现。本篇不自定义加载器，只用日志证明当前加载的是哪份产物。
 
-```java
-public class HelloWorld {
-```
+### 3. 加载与初始化也要区分
 
-- `public`：访问修饰符，表示所有类都能访问它。一个 `.java` 文件里**最多只能有一个 public 类**，且文件名必须等于这个类名。
-- `class`：定义一个类。Java 是纯面向对象语言，所有代码都必须写在类里。
-- `HelloWorld`：类名，**大驼峰**命名（PascalCase）。
+新增完整文件 `task-center/labs/01-env/src/com/demo/taskcenter/lab01/ClassLoadingProbe.java`，通过可见输出观察第一次主动使用：
 
-```java
+```java title="task-center/labs/01-env/src/com/demo/taskcenter/lab01/ClassLoadingProbe.java"
+package com.demo.taskcenter.lab01;
+
+public class ClassLoadingProbe {
+    static class Rules {
+        static int bonus = initialize();
+
+        private static int initialize() {
+            System.out.println("Rules initialized");
+            return 5;
+        }
+    }
+
     public static void main(String[] args) {
+        System.out.println("main starts");
+        System.out.println("bonus=" + Rules.bonus);
+        System.out.println("bonus again=" + Rules.bonus);
+    }
+}
 ```
 
-- `public static`：静态方法，属于类本身而不是类的实例，JVM 启动时直接调用，不需要 `new`。
-- `void`：返回类型是"无"。JS 里函数不写 `return` 就是返回 `undefined`，Java 必须显式声明。
-- `main`：方法名，**JVM 启动时约定的入口方法**，名字必须是 `main`。
-- `String[] args`：命令行参数数组。执行 `java HelloWorld a b c` 时，`args` 就是 `["a", "b", "c"]`。
-
-```java
-        System.out.println("Hello, World!");
-```
-
-- `System` 是 `java.lang` 包里的类，`out` 是它的静态字段（一个 `PrintStream` 对象），`println` 是这个对象的方法。
-- 等价于 JS 的 `console.log`，但 `println` 会自动加换行，`print` 不会。
-- Java 里字符串用**双引号**，单引号只表示 `char` 字符。这一点跟 JS 反着来，刚开始容易写错。
-
-## 常见编译错误对照
-
-| 报错 | 原因 | JS 里的类比 |
-| :-- | :-- | :-- |
-| `class, interface, enum, or record expected` | 类外写了代码 | 顶层没有正确闭合花括号 |
-| `';' expected` | 语句末尾漏了分号 | JS 有 ASI 自动补，Java 没有 |
-| `cannot find symbol` | 变量/方法/类没导入或拼错 | `ReferenceError` |
-| `class HelloWorld is public, should be declared in a file named HelloWorld.java` | 文件名和 public 类名不一致 | —— |
-| `main method not found` | `main` 签名写错（比如少了 `static`） | —— |
-
-> [!WARNING]
-> Java **每一条语句都必须以分号 `;` 结尾**，没有 JS 那种自动分号插入（ASI）。写完一行就加分号是最省事的习惯。
-
-## classpath：JVM 去哪儿找 class 文件
-
-`java HelloWorld` 命令默认从**当前目录**找 `HelloWorld.class`。如果 class 文件在别的目录，需要 `-cp`（或 `-classpath`）指定：
+输出：运行后依次为 `main starts`、`Rules initialized`、`bonus=5`、`bonus again=5`。
 
 ```bash
-# 假设编译产物在 ./out 目录
-javac -d out HelloWorld.java    # -d 指定输出目录
-java -cp out HelloWorld         # -cp 指定 classpath
+javac --release 21 -encoding UTF-8 -d out src/com/demo/taskcenter/lab01/ClassLoadingProbe.java
+java -cp out com.demo.taskcenter.lab01.ClassLoadingProbe
 ```
 
-后续用 Maven/Gradle 时，classpath 由构建工具自动管理，写业务代码时基本不用手动碰。但看到 `ClassNotFoundException` 时，第一反应就是"classpath 里没这个类"。
+输出：得到上述四行，初始化提示只出现一次；再次执行整个 `java` 命令是新进程，仍会重新出现一次。
 
-## 第一个稍微像样的程序
+原因不是输出被缓存，而是同一加载器定义的类在正常初始化成功后，不会每次读取字段都重新初始化。这里的 `bonus` 不是编译期常量，读取会触发初始化；改成可编译期内联的 `static final int` 常量，现象可能不同。由此也别把「类加载」「对象构造」「框架创建 Bean」混成一个动作。
 
-写一个命令行计算器，读入两个数字并输出和。这里用到 `Scanner` 读控制台输入：
+## 三、JDK、JRE、JVM：能力包含不等于安装包套娃
 
-```java title="Sum.java"
-import java.util.Scanner;   // 引入其他包的类要 import
+**日常开发安装完整 JDK 21，不另找固定的 JRE 安装包。** JVM 是执行字节码的虚拟机规范及其实现；运行环境还需要标准库、原生支持库和其他资源。JDK 在运行能力之外，提供 `javac`、`jar`、`javadoc`、`jdb`、`javap` 和 `jshell` 等开发工具。
+
+「JDK 包含 JRE，JRE 包含 JVM」可以当能力分层记忆，却不能推断现代发行包必有一个 `jre` 子目录。Java 9 引入模块化运行时镜像，JDK 目录结构随之改变；**Oracle 从 JDK 11 起不再提供独立 JRE 和 Server JRE 下载**，不是到 JDK 21 才发生。其他发行方仍可能提供自己的运行时包，所以也不能说整个 Java 生态已经没有 JRE。
+
+只运行程序需要匹配的运行环境，不一定需要编译器；环境可以来自完整 JDK、发行方的运行时包，或用 `jlink` 制作的定制镜像。定制镜像受操作系统、CPU 架构与所选模块约束，本篇不制作它。学习时使用完整 JDK 最省心，因为运行、编译、诊断工具都齐全。
+
+| 名称 | 解决的问题 | 本篇可见证据 |
+| --- | --- | --- |
+| JVM | 如何加载并执行字节码 | `java -version` 中的 VM 信息 |
+| 运行环境/JRE 概念 | 执行时有哪些库和资源可用 | Hello 能调用标准库 |
+| JDK | 如何开发、检查、归档程序 | `javac`、`javap`、`jar`、`jshell` 可用 |
+| OpenJDK | Java 平台的开源实现项目 | 多家厂商基于它构建发行版 |
+| 发行版 | 安装、更新、支持和许可由谁提供 | 版本输出中的供应商信息 |
+
+免费学习可以选择 Eclipse Temurin 等 OpenJDK 发行版；商业支持是否收费是另一件事，仍应核对具体许可证。LTS 是发行方的长期支持安排，不代表所有厂商的更新时间和服务条款完全一致。
+
+### 对齐终端与 IDE 的 JDK
+
+`JAVA_HOME` 指向 **JDK 根目录**，不是 `bin`；`PATH` 包含相应的 `bin` 目录。Windows 系统环境变量界面通常配置 `%JAVA_HOME%\bin`，Git Bash 的变量引用却是 `$JAVA_HOME`，不能混用两种 shell 语法。无需删除其他项目使用的旧 JDK，只需确认当前项目实际选择的是哪一个。
+
+```bash
+command -v java
+command -v javac
+java -XshowSettings:properties -version
+```
+
+输出：前两条显示当前解析到的可执行文件路径；第三条显示属性与版本，重点核对 `java.home`、`java.version` 和 `os.arch`，路径由本机安装位置决定。
+
+`JAVA_HOME` 正确不保证终端 `java` 正确，因为 shell 通常先按 `PATH` 查找；IDE 的 Project SDK 又可能是第三个位置。若路径经过命令转发器或符号链接，应继续用 `java.home` 和版本交叉验证。
+
+「一次编写，到处运行」也有边界：class 面向 JVM，但目标 JVM 必须支持相应 class 版本，依赖、API、本地库也必须可用。Java 21 的默认产物不能直接交给 Java 17；即使字节码兼容，源码写死的 Windows 盘符也不会自动适配 Linux。
+
+## 四、入口方法与输入边界：把 Hello 扩成求和
+
+### 1. 逐行拆开入口约定
+
+`public class HelloWorld` 声明公开顶层类。常规 `javac` 文件组织中，一个 `.java` 最多有一个公开顶层类，文件名与其名称必须一致，包含大小写。同一文件还可有非公开顶层类型和嵌套类型，因此不保证只生成一个 class；第二节就会额外生成 `ClassLoadingProbe$Rules.class`。
+
+本系列采用标准入口 `public static void main(String[] args)`：`public` 允许启动器访问，`static` 表示不用先创建实例，`void` 表示不返回结果值。`args` 只包含放在类名后面的字符串参数，不包含可执行文件路径和类名，与 Node 的 `process.argv` 默认前两项不同。`main` 中 `return;` 是结束方法，不是给调用者返回 JS 的 `undefined`。
+
+Java 有基本类型，不是没有基本类型的「纯面向对象语言」。本篇用显式类和入口组织程序，不采用 JDK 21 的预览入口形式。声明、赋值、方法调用、`return` 等语句通常需要分号，类体、方法体及 `if` 块末尾却不因此额外加分号；Java 没有 JS 的 ASI，但也不是每行都加分号。
+
+`System.out` 是标准输出流，`println` 换行、`print` 不换行，`printf` 用于格式化。字符串用双引号，单引号只表示一个 `char`，不能像 JS 一样包住整段字符串。`+` 遇到字符串会连接，所以先计算数值，再拼接结果。
+
+### 2. 交互求和与 Scanner
+
+保留最直观的控制台练习，补上非法输入与求和溢出边界。新增完整文件 `task-center/labs/01-env/src/com/demo/taskcenter/lab01/Sum.java`：
+
+```java title="task-center/labs/01-env/src/com/demo/taskcenter/lab01/Sum.java"
+package com.demo.taskcenter.lab01;
+
+import java.util.Scanner;
 
 public class Sum {
     public static void main(String[] args) {
-        Scanner scanner = new Scanner(System.in);
-
-        System.out.print("请输入第一个整数：");
-        int a = scanner.nextInt();
-
-        System.out.print("请输入第二个整数：");
-        int b = scanner.nextInt();
-
-        System.out.println("a + b = " + (a + b));
-
-        scanner.close();
+        try (Scanner scanner = new Scanner(System.in)) {
+            System.out.println("请输入第一个整数：");
+            if (!scanner.hasNextInt()) {
+                System.out.println("输入错误：需要 int 范围内的整数");
+                return;
+            }
+            int a = scanner.nextInt();
+            System.out.println("请输入第二个整数：");
+            if (!scanner.hasNextInt()) {
+                System.out.println("输入错误：需要 int 范围内的整数");
+                return;
+            }
+            int b = scanner.nextInt();
+            long sum = (long) a + b;
+            System.out.println("a + b = " + sum);
+        }
     }
 }
 ```
 
-跑起来：
+输出：输入 `3` 与 `5`，程序先后提示输入两个整数，最后打印 `a + b = 8`；首个输入为 `x` 时打印输入错误并结束。
 
 ```bash
-javac Sum.java
-java Sum
-# 请输入第一个整数：3
-# 请输入第二个整数：5
-# a + b = 8
+javac --release 21 -encoding UTF-8 -g -d out src/com/demo/taskcenter/lab01/Sum.java
+java -cp out com.demo.taskcenter.lab01.Sum
 ```
 
-几个新知识点：
+输出：等待终端输入，再得到上述结果；第二个数字到达前没有总和是正常等待，不是程序卡死。
 
-- `import java.util.Scanner;` 类似 JS 的 `import { Scanner } from 'java.util'`，只是 Java 没有相对路径的概念，都是包的全限定名。
-- `new Scanner(System.in)` 创建对象，Java 里除了基本类型都要用 `new`。
-- `"a + b = " + (a + b)`：`+` 遇到字符串会做拼接，所以要用括号保证先算加法。**注意优先级**，写成 `"a + b = " + a + b` 会变成 `"a + b = 35"`（拼接）。
+`import java.util.Scanner;` 是编译期类型名称导入，不是 JS 模块那样的加载执行语句，也不会在线安装依赖。创建扫描器用构造调用，但不能推广为所有引用都要通过 `new` 获得：字符串字面量、工厂方法、方法返回值同样能提供引用。
+
+`hasNextInt()` 检查下一个 token，`nextInt()` 消费它；检查可能等待用户输入，读取发生在当前主线程，不是浏览器事件循环里的异步回调。先把一个操作数转为 `long` 再相加，避免两个合法 `int` 的和先溢出；只把接收变量改成 `long` 太晚。
+
+`try` 圆括号中的资源在退出时自动关闭，包括提前 `return`。关闭这个 Scanner 也会关闭它包装的 `System.in`；本例是独立 CLI，可以如此处理，但共享输入流的组件不能随意决定所有权。以后混用 `nextInt()` 与 `nextLine()` 时，还要处理留在输入中的行分隔符。
+
+### 3. 参数式求和便于重复验证
+
+浏览器请求有 schema，命令行参数也应有契约。新增完整文件 `task-center/labs/01-env/src/com/demo/taskcenter/lab01/ArgsSum.java`，要求恰好两个 `int`：
+
+```java title="task-center/labs/01-env/src/com/demo/taskcenter/lab01/ArgsSum.java"
+package com.demo.taskcenter.lab01;
+
+public class ArgsSum {
+    public static void main(String[] args) {
+        if (args.length != 2) {
+            System.out.println("用法：ArgsSum 整数 整数");
+            return;
+        }
+        try {
+            int a = Integer.parseInt(args[0]);
+            int b = Integer.parseInt(args[1]);
+            long sum = (long) a + b;
+            System.out.println("a + b = " + sum);
+        } catch (NumberFormatException e) {
+            System.out.println("输入错误：需要两个 int 范围内的整数");
+        }
+    }
+}
+```
+
+输出：参数 `3 5` 得到 `a + b = 8`；数量错误显示用法，无法解析或超过 `int` 范围显示输入错误。
+
+```bash
+javac --release 21 -encoding UTF-8 -g -d out src/com/demo/taskcenter/lab01/ArgsSum.java
+java -cp out com.demo.taskcenter.lab01.ArgsSum 3 5
+java -cp out com.demo.taskcenter.lab01.ArgsSum 3
+java -cp out com.demo.taskcenter.lab01.ArgsSum 3 x
+java -cp out com.demo.taskcenter.lab01.ArgsSum 2147483647 1
+```
+
+输出：依次为 `a + b = 8`、`用法：ArgsSum 整数 整数`、`输入错误：需要两个 int 范围内的整数`、`a + b = 2147483648`。
+
+JS 的 `parseInt("3x")` 可以解析前缀，`Integer.parseInt("3x")` 却会拒绝。本例把错误变成可读文本，但没有调用 `System.exit`，非法输入仍正常返回；未来在 CI 中需要区分参数错误时，应另行定义非零退出码，不能只凭提示文本推断进程状态。
+
+## 五、classpath：填包树的根，不是最深目录
+
+**启动参数写全限定类名，classpath 写包含包树的根。** `com.demo.taskcenter.lab01.HelloWorld` 对应相对路径 `com/demo/taskcenter/lab01/HelloWorld.class`，接到 `out` 后面才是实际文件。
+
+`-d out` 指定编译输出根，`javac` 按包声明创建下面的目录；`-cp out` 告诉启动器从该根找应用类。未指定 classpath 且没有 `CLASSPATH` 环境变量时通常使用当前目录；显式 `-cp` 覆盖环境变量，也不会自动附带其他你以为应当存在的路径。本系列每次明确写出，避免依赖全局环境。
+
+下面故意先执行两条错误命令，不修改源码：
+
+```bash
+java -cp out/com/demo/taskcenter/lab01 com.demo.taskcenter.lab01.HelloWorld
+java -cp out com.demo.taskcenter.lab01.HelloWorld.class
+java -cp out com.demo.taskcenter.lab01.HelloWorld
+```
+
+输出：前两条失败，常见提示含 `Could not find or load main class`；第三条为 `Hello, World!`。第一条根目录过深，第二条把扩展名当成类名的一部分。
+
+这是类名查找，不是执行操作系统路径，不能直接类比 `node dist/index.js`。默认包例子常掩盖这个区别：文件刚好在当前目录，读者便以为 Java 一直按文件名启动。本篇从一开始就使用真实包名，是为了让错误尽早暴露。
+
+### Windows 的多个路径用分号
+
+Windows Java 的 classpath 分隔符是分号，Linux/macOS 是冒号。Git Bash 只是 shell，不会把 Windows Java 的约定变成 Linux 约定；含分号参数必须加引号，防止 shell 把它当命令分隔符。以下两组命令按平台择一执行：
+
+```bash
+# Windows Git Bash，调用 Windows JDK
+mkdir -p lib
+java -cp "out;lib/*" com.demo.taskcenter.lab01.HelloWorld
+```
+
+输出：`Hello, World!`；`lib` 为空不影响只使用标准库的程序。
+
+```bash
+# Linux/macOS
+mkdir -p lib
+java -cp "out:lib/*" com.demo.taskcenter.lab01.HelloWorld
+```
+
+输出：在对应系统上为 `Hello, World!`，不要在 Windows Java 上混用两种分隔符。
+
+这个通配形式引入目录中的 JAR，不递归扫描所有子目录和 class。编译所需依赖与运行所需依赖都要配置；编译成功不代表每个类型在运行时一定可见。`ClassNotFoundException` 常见于动态按名称查类失败，`NoClassDefFoundError` 也可能来自依赖缺失或此前类初始化失败，必须读完整原因链，不能一律归为路径拼错。
+
+### 用 jar 保存可运行产物
+
+仍使用刚才编译好的 Hello：
+
+```bash
+jar --create --file hello.jar --main-class com.demo.taskcenter.lab01.HelloWorld -C out com/demo/taskcenter/lab01/HelloWorld.class
+jar --list --file hello.jar
+java -jar hello.jar task-center
+```
+
+输出：创建通常无文本；列表包含 `META-INF/MANIFEST.MF` 和 Hello 的 class 路径；最后为 `Hello, task-center!`。
+
+`--main-class` 在 manifest 中写入入口信息。普通 JAR 不自动下载或嵌入项目依赖；`java -jar` 的用户类路径由 JAR 及其 manifest 约定管理，不能认为再放一个 `-cp` 就能像普通类启动那样追加依赖。后续 Spring Boot 可执行 JAR 还有自己的启动器与依赖布局，不是所有 JAR 都天然具备。
+
+## 六、单文件运行与 jshell：缩短反馈，不隐藏规则
+
+### 1. 源码启动仍然会编译
+
+从 JDK 11 起支持单文件源码模式，JDK 21 可以直接运行本篇自洽的 Hello：
+
+```bash
+java --source 21 src/com/demo/taskcenter/lab01/HelloWorld.java task-center
+```
+
+输出：`Hello, task-center!`。这次编译不把 class 写到源码旁边，也不会清空第一节已经生成的 `out`。
+
+这里给的是 `.java` 路径而不是类名，启动器先在内存中编译，再运行入口，带本篇的包声明也可以使用。它适合单文件小实验，不是 Maven 多文件项目的替代品；不要把更高版本新增的多源码启动行为当成 JDK 21 的能力。
+
+### 2. 用 jshell 验证一个小问题
+
+jshell 类似浏览器 Console 或 Node REPL，允许直接输入声明与表达式。它是专门的工具，不代表普通 Java 文件可以随意在类外写语句。下面是交给 jshell 的完整会话输入，不创建其他脚本文件：
+
+```bash
+jshell --feedback concise <<'EOF'
+int a = 3;
+int b = 5;
+System.out.println("sum=" + (a + b));
+System.out.println("concat=" + a + b);
+System.out.println(7 / 2);
+System.out.println(7.0 / 2);
+/exit
+EOF
+```
+
+输出：在工具提示之外能看到 `sum=8`、`concat=35`、`3`、`3.5`；提示符和变量回显不要求逐字符相同。
+
+先连接字符串会使后续的 `+` 继续连接，整数除法则先按操作数类型计算。以后即使把结果赋给浮点变量，也不能找回已经丢掉的小数；[阶段三](/blog/posts/java-roadmap-03-operators-and-control-flow/)会继续实验这两条规则。
+
+jshell 也能使用已经编译的类，仍然依赖正确的 classpath：
+
+```bash
+jshell --class-path out --feedback concise <<'EOF'
+import com.demo.taskcenter.lab01.HelloWorld;
+HelloWorld.main(new String[]{"jshell"});
+/list
+/exit
+EOF
+```
+
+输出：`Hello, jshell!`，随后 `/list` 列出本会话输入的片段。
+
+交互时还可用 `/vars` 查看变量、`/methods` 查看方法、`/reset` 清空会话。REPL 可能依赖上一次残留的状态，导致同一行放到新会话中失败；有价值的实验最终应整理成完整文件，并在新进程中核对，而不是停留在「我的 Console 能跑」。
+
+## 七、IDE 断点：逐步复现一次变量变化
+
+**先让终端结果确定，再让 IDE 执行同一份源码。** 可以使用 IntelliJ IDEA 的免费 Java 能力，或 VS Code 的 Java 扩展。下面采用 IDEA 常见动作名称，快捷键受系统和 keymap 影响，不要求购买插件。
+
+1. 打开 `task-center/labs/01-env` 作为独立实验项目。Project SDK 与 language level 都设为 21，不启用预览；把 `src` 标为 Sources Root，而不是把最深的 `lab01` 标为根。
+2. 打开第四节完整的 ArgsSum，确认包名与目录对应，没有编译错误。用 `main` 左侧图标创建 Application 运行配置。
+3. 核对 Main class 是 `com.demo.taskcenter.lab01.ArgsSum`，Program arguments 填 `3 5`，不是 VM options；运行 JDK 选 21，Working directory 为本实验目录。
+4. 在 `long sum = (long) a + b;` 左侧设置行断点，执行 **Debug** 而非 Run，在线程列表选中执行入口的 `main` 线程。
+5. 暂停时当前行通常尚未执行。Variables 中应看到两个字符串参数、`a=3`、`b=5`；`sum` 可能尚不在可见作用域，不能期待已等于 8。
+6. 用 **Step Over** 执行求和行，停在 `println` 前，此时 `sum=8`。用 Evaluate Expression 求 `a + b` 得到 8，再求 `"a + b = " + a + b` 得到字符串 `a + b = 35`。
+7. 用 **Resume** 完成执行，控制台为 `a + b = 8`。把参数改成 `3 x` 再 Debug，求和断点不会命中，因为解析先失败；在 catch 内的打印行增加断点即可看到错误路径。
+
+这组操作能重复验证，而不只是建议「打个断点看看」。断点未命中可能说明分支没走到、输入解析失败、启动了另一个类，或使用了另一份产物；先确定执行路径，再检查断点配置。
+
+Step Over 通常不进入当前行调用的方法；Step Into 进入可调试的方法；Step Out 运行到当前方法返回。观察自有逻辑时先用 Step Over，避免一上来进入整数解析或打印流内部。Evaluate 也能执行带副作用的方法，并非纯显示器，所以本例只做求值。
+
+调试外部 `javac` 产物时，`-g` 保留包括局部变量在内的调试信息；IDE 自己编译通常会附带这些信息。IDE 的输出目录和终端 `out` 不一定相同，源码改动后重新编译，并核对运行配置，比反复重启 IDE 更有依据。
+
+## 八、Maven 与 Gradle：管理工程，不替代 JVM
+
+**本篇不引入构建文件，不要求安装构建工具。** 手工链路已足够运行实验；此处只建立与 npm 的对应关系，避免把 `pom.xml` 当成 JVM 的配置文件。
+
+| 关注点 | npm/pnpm | Maven 3.9 | Gradle |
+| --- | --- | --- | --- |
+| 项目描述 | `package.json` | `pom.xml` | `build.gradle` 或 `build.gradle.kts` |
+| 依赖身份 | 包名与版本 | groupId、artifactId、version | 常用相同的 Maven 坐标 |
+| 常见源码根 | 项目约定的 `src` | `src/main/java`、`src/test/java` | Java 插件默认采用相同布局 |
+| 编译产物 | 常见 `dist` | 常见 `target/classes` | 常见 `build/classes/java/main` |
+| 执行组织 | scripts | 生命周期阶段与插件目标 | 插件提供任务和依赖图 |
+| 工具版本固定 | packageManager 等约定 | Maven Wrapper | Gradle Wrapper |
+| Java 选择 | 类似 Node 版本管理的问题 | 当前 JDK 或 toolchains | Java toolchain 与运行 Gradle 的 JVM |
+
+Maven 按生命周期组织验证、编译、测试、打包；Gradle 按任务依赖图执行，不是 Maven 命令换个名字。二者都解析依赖、管理编译与测试路径，通过插件调用具体工具，最终程序还是由 JVM 执行。只有特定插件额外提供启动能力时，才会有一个构建命令直接运行服务的体验。
+
+如果本机**已经安装**相应工具，可以检查版本；没有就不执行，不影响本文核心实验，也不要在没有构建文件的 `01-env` 中尝试构建。
+
+```bash
+mvn -v
+```
+
+输出：已安装时显示 `Apache Maven 3.9.x`、Java version 和 Java home，重点核对它使用的 Java 是否为 21。
+
+```bash
+gradle --version
+```
+
+输出：已安装时显示 Gradle 版本与 JVM 信息。Gradle 8.5 起支持用 Java 21 运行 Gradle；将来项目有 Wrapper，应以仓库固定且兼容 JDK 21 的版本为准。
+
+Wrapper 不代表所有东西已经离线可用：首次执行可能获取构建工具，解析依赖也可能访问仓库，类似 npm 安装阶段。本篇所有核心 demo 都无需它们，不会触发外部依赖下载。
+
+后续 Maven 应用的源码进入 `task-center/src/main/java/com/demo/taskcenter`。默认 Maven 不编译这里的 `labs`，不要改 sourceDirectory 来强行混入；要复习实验，就进入它的目录执行独立命令。这种隔离让主线逐渐增加业务能力，而不是把早期所有 `main` 都塞进正式应用。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| --- | --- | --- |
+| `java` 有版本，`javac` 不存在 | 只有运行时或 PATH 未包含开发工具 | 检查完整 JDK 21 安装位置与 PATH |
+| `release version 21 not supported` | 实际运行的是旧编译器 | 核对 javac 路径与版本，不删除约束掩盖问题 |
+| `UnsupportedClassVersionError` | 运行时比目标 class 版本旧 | 对齐编译和运行 JDK，核对 IDE 配置 |
+| `';' expected` | 声明或表达式语句缺分号 | 修正所指语句，不给控制块无差别补分号 |
+| `cannot find symbol` | 名称拼错、作用域错误或类型不可用 | 先看报错符号，再查 import 与编译路径 |
+| 公开类应声明在同名文件中 | 文件名和公开类不一致 | 统一大小写，检查磁盘文件名 |
+| `Main method not found` | 标准入口签名写错或启动类不对 | 核对完整签名与运行配置 |
+| 找不到主类 | classpath 根过深或类名误加扩展名 | 按根目录加包路径核对 class 文件 |
+| Windows 多路径失败 | 分隔符错误或分号没有加引号 | 使用带引号的 `"out;lib/*"` |
+| 修改源码后输出不变 | 运行旧产物或另一输出目录 | 重新编译，查看类加载来源 |
+| 求和打印 `35` | 字符串连接先发生 | 先计算数值，或给加法加括号 |
+| 断点处没有 `sum` | 赋值未执行或缺调试信息 | Step Over 后查看，外部编译加 `-g` |
+
+## 验收清单
+
+- [ ] 四项工具版本均为 21 系列，不只展示 IDE 中的 SDK 名称。
+- [ ] Hello 编译成功并输出两种问候，能找到对应包目录下的 class 文件。
+- [ ] `javap -verbose` 显示 `major version: 65`，加载日志中能找到 Hello 的来源。
+- [ ] ClassLoadingProbe 的初始化提示恰好一次，位于两次 bonus 输出之前。
+- [ ] 两条错误 classpath 命令失败，正确命令成功，不通过删除包声明绕过问题。
+- [ ] ArgsSum 的四组参数输出与正文一致，交互 Sum 输入 `x` 时给出可读提示。
+- [ ] IDE 中看到求和前 `a=3`、`b=5`，Step Over 后 `sum=8`，`3 x` 命中错误路径。
+- [ ] 源码模式、jshell 调用与 JAR 启动均输出对应问候，实验没有进入主应用源码目录。
 
 ## 练习
 
-1. 不查资料，说出 `java`、`javac`、`jar` 分别属于 JDK / JRE / JVM 的哪一层，然后各执行一次版本命令验证（`jar` 用 `jar --version`）。
-2. 用单文件源码模式（`java Hello.java`）和先编译再运行（`javac Hello.java` + `java Hello`）各跑一遍，对比目录里 `.class` 文件的有无，并解释单文件模式为什么不在当前目录留下字节码。
-3. 故意制造三个编译错误，记下报错首行：文件名与 `public class` 不一致、语句末尾漏分号、`main` 写成 `public static void main()`。
-4. 把类编译到独立目录：`javac -d out Hello.java`，再分别执行 `java -cp out Hello` 和 `java out/Hello`，解释后者为什么找不到类。
-5. 写一个接收两个命令行参数并输出和的小程序；分别传入 `3 5`、只传 `3`、传 `3 x`，让后两种情况给出可读提示而不是直接抛异常。
+1. **证明编译与执行分离。** 在 Hello 打印文本中加入 `v2`，先运行已有 class，再重新编译后运行。自检：第一次是旧问候，第二次才有 `v2`；源码模式直接看到保存后的新文本。
+2. **定位入口契约。** 在 Hello 中临时把 `main(String[] args)` 改成 `main()`，并把 `name` 初始化改为常量 `"World"`，避免方法体仍引用参数。自检：编译通过，类模式启动却报告找不到入口；恢复原代码后成功。
+3. **区分失败阶段。** 分两次实验：让文件名与公开类名不一致；恢复后把 classpath 改为最深包目录。自检：前者编译失败，后者运行失败；每次实验结束恢复，不同时制造两个问题。
+4. **扩展参数契约。** 在 ArgsSum 中支持三个整数，用 `long` 做总和。自检：`3 5 7` 为 15，两个参数显示新用法，`3 5 x` 显示错误，三个 `2147483647` 相加为 `6442450941`。
+5. **先预测再调试。** 在 ArgsSum 中传入 `2147483647 1`，先保留转型，再临时移除加法前的 `long` 转型。自检：前者是 `2147483648`，后者是 `-2147483648`；恢复正确代码，解释为什么接收变量为 `long` 仍不能补救先发生的溢出。
 
-## 复习卡片
+## 小结
 
-一分钟回想整个阶段的关键点：
-
-```java
-// 1. 一个 .java 文件 = 一个 public 类，文件名 = 类名
-public class HelloWorld {
-    // 2. main 方法是入口，签名固定
-    public static void main(String[] args) {
-        // 3. 输出：println 带换行，print 不带
-        System.out.println("Hello");
-        // 4. 每条语句必须以分号结尾
-    }
-}
-```
-
-```bash
-# 5. 编译 + 运行
-javac HelloWorld.java    # 生成 .class
-java HelloWorld          # 运行（不带 .class）
-
-# 6. 单文件直接运行（JDK 11+）
-java HelloWorld.java
-
-# 7. classpath 指定
-javac -d out HelloWorld.java
-java -cp out HelloWorld
-```
-
-**记忆要点**：
-
-- JDK ⊃ JRE ⊃ JVM
-- `.java` → `javac` → `.class`（字节码）→ `java` → JVM 执行
-- `main` 方法签名必须一字不差：`public static void main(String[] args)`
-- 文件名 = public 类名
-- 字符串用双引号，字符用单引号
-- 语句末尾必须有分号
-
-下一个阶段进入变量和数据类型，看看 Java 的静态类型系统和 JS 的动态类型到底差在哪儿。
+- 开发安装完整 JDK 21；JRE 是运行环境概念，现代发行包不能套用旧版嵌套目录图。
+- `javac` 生成字节码，`java` 启动 JVM 并执行；保存源码不等于更新 class。
+- classpath 填包树根；Windows 多项用分号，Linux/macOS 用冒号。
+- 标准入口为 `public static void main(String[] args)`；jshell 和源码模式只缩短反馈。
+- 本篇给 `task-center/labs/01-env` 新增 Hello、初始化探针、交互求和与参数求和，未改变后续 Maven 应用。
+- 工具速查：`javac` 编译 / `java` 运行 / `javap` 检查 / `jar` 归档 / `jshell` 实验 / IDE 断点观察。
+- 下一步进入[变量与数据类型](/blog/posts/java-roadmap-02-variables-and-types/)，继续追问类型转换与溢出规则。
