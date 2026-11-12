@@ -116,7 +116,7 @@ Node.js 事件驱动模型：
 |:--|:--|:--|
 | 语法 | `require` / `module.exports` | `import` / `export` |
 | 加载时机 | 运行时（同步） | 编译时（静态分析） |
-| 值 | 拷贝（值传递） | 引用（实时绑定） |
+| 值 | 导出值快照（基本类型拷值，对象拷引用） | 活绑定（实时读取） |
 | this | 当前模块 | undefined |
 | 顶层 await | ❌ | ✅ |
 | Tree Shaking | ❌（动态无法分析） | ✅（静态结构） |
@@ -156,6 +156,61 @@ setTimeout(() => count = 100, 1000);
 import { count } from './counter.mjs';
 setTimeout(() => console.log(count), 2000);  // 100（实时读取）
 ```
+
+#### 追问：如果导出的是对象，还成立吗？
+
+**成立，但「拷贝」的含义变了。** CJS 拷贝的是 `require` 那一刻的**导出值**：基本类型拷的是值，对象拷的是**引用**。所以对象属性被修改时，CJS 这一侧也能看到；只有「把变量重新赋值」才会分叉。
+
+```javascript
+// ① 改属性：CJS 也能看到（同一引用）
+// counter.cjs
+const state = { count: 0 };
+setTimeout(() => { state.count = 100; }, 1000);
+module.exports = { state };
+
+// main.cjs
+const { state } = require('./counter.cjs');
+setTimeout(() => console.log(state.count), 2000);  // 100
+```
+
+```javascript
+// ② 重新赋值：CJS 看不到（导出的是旧引用）
+// counter.cjs
+let state = { count: 0 };
+setTimeout(() => { state = { count: 100 }; }, 1000);
+module.exports = { state };
+
+// main.cjs
+const { state } = require('./counter.cjs');
+setTimeout(() => console.log(state.count), 2000);  // 0
+```
+
+两个额外的坑：
+
+- **解构本身就是一次拷贝**。`const { state } = require(...)` 之后，就算模块里执行 `module.exports.state = 新对象`，已解构的 `state` 也不会更新；要拿最新值就保留 `const mod = require(...)` 再读 `mod.state`。
+- **`exports = { ... }` 无效**。它只是给局部别名重新赋值，不会改 `module.exports`；必须写 `module.exports = ...` 或 `module.exports.x = ...`。
+
+```javascript
+// ③ ESM：属性修改和变量重赋值都能看到
+// counter.mjs
+export let state = { count: 0 };
+setTimeout(() => { state.count = 100; }, 1000);
+setTimeout(() => { state = { count: 200 }; }, 2000);
+
+// main.mjs
+import * as mod from './counter.mjs';
+setTimeout(() => console.log(mod.state.count), 3000);  // 200
+// mod.state = { count: 300 };  // TypeError：命名空间对象只读
+```
+
+| 变更方式 | CJS | ESM |
+|:--|:--|:--|
+| 修改导出对象的属性 | 可见（同一引用） | 可见 |
+| 重新赋值导出变量 | 不可见（旧引用快照） | 可见（活绑定） |
+| 整体替换 `module.exports` | 新的 `require` 可见，旧持有者不可见 | 不适用 |
+| 解构或赋给新变量 | 当时值的拷贝，不跟随 | 当时值的拷贝，不跟随（import 绑定本身仍是活的） |
+
+面试一句话：**CJS 是「导出值快照」，对象只是快照了引用；ESM 是「活绑定」。** 所以别把 CJS 的拷贝理解成深拷贝——属性变了它也看得见。
 
 ### Q4: Node.js 中如何混用 CJS 和 ESM？⭐⭐⭐
 
@@ -1326,7 +1381,7 @@ A：502 通常不是"退出太慢"，而是"流量还没摘干净进程就没了
 > 1. **Node.js 特点**：单线程 + 非阻塞 I/O + 事件驱动，适合 I/O 密集
 > 2. **架构**：V8（执行 JS）+ libuv（异步 I/O）+ C++ Bindings
 > 3. **高并发原理**：事件循环 + libuv 线程池，主线程不阻塞
-> 4. **CJS vs ESM**：运行时同步拷贝 vs 编译时静态引用；ESM 支持顶层 await 和 Tree Shaking
+> 4. **CJS vs ESM**：CJS 是「导出值快照」（对象快照的是引用），ESM 是编译期静态结构 + 运行时活绑定；ESM 支持顶层 await 和 Tree Shaking
 > 5. **循环依赖**：Node 返回不完整 exports，需重构避免
 > 6. **事件循环六阶段**：timers → pending → poll → check → close；nextTick > Promise > setTimeout
 > 7. **Buffer**：二进制容器，堆外内存，alloc/from/concat/slice
