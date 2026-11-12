@@ -60,6 +60,7 @@ export async function createComment(
 
   let parentId: bigint | undefined;
   if (input.parentId) {
+    // 回复只能指向同一帖子下的已发布评论，避免跨帖串楼
     parentId = BigInt(input.parentId);
     const parent = await prisma.comment.findFirst({
       where: { id: parentId, postId, status: 'published' },
@@ -68,6 +69,7 @@ export async function createComment(
     if (!parent) throw new AppError('PARENT_COMMENT_NOT_FOUND', 404, 'Parent comment not found');
   }
 
+  // 评论和计数必须同事务：任何一步失败一起回滚
   const comment = await prisma.$transaction(async (tx) => {
     const created = await tx.comment.create({
       data: { postId, authorId, parentId, content: input.content },
@@ -182,12 +184,14 @@ export async function likePost(postId: bigint, userId: bigint) {
     });
     if (!post) throw new AppError('POST_NOT_FOUND', 404, 'Post not found');
 
+    // 唯一约束 + skipDuplicates = 幂等：重复点赞不会插第二行
     const created = await tx.like.createMany({
       data: [{ userId, targetType: 'post', targetId: postId }],
       skipDuplicates: true,
     });
 
     if (created.count === 1) {
+      // 只有真正插入成功才改计数，重复请求不会把计数加爆
       await tx.post.update({
         where: { id: postId },
         data: { likeCount: { increment: 1 } },
@@ -204,6 +208,7 @@ export async function unlikePost(postId: bigint, userId: bigint) {
       where: { id: postId, status: 'published' },
       select: { id: true },
     });
+    // 取消点赞也必须校验 published：待审核/已拒绝的帖子不允许操作
     if (!post) throw new AppError('POST_NOT_FOUND', 404, 'Post not found');
 
     const deleted = await tx.like.deleteMany({
@@ -211,6 +216,7 @@ export async function unlikePost(postId: bigint, userId: bigint) {
     });
 
     if (deleted.count === 1) {
+      // 只有真正删掉点赞才减计数；取消不存在的点赞不会把计数减成负数
       await tx.post.updateMany({
         where: { id: postId, likeCount: { gt: 0 } },
         data: { likeCount: { decrement: 1 } },
@@ -385,6 +391,7 @@ export const notificationQueue = new Queue('notifications', {
 ```ts
 import type { Prisma } from '@prisma/client';
 
+// 必须传事务客户端：业务写入和事件写入要么一起成功，要么一起回滚
 export async function enqueueOutbox(
   tx: Prisma.TransactionClient,
   type: string,
@@ -420,6 +427,7 @@ async function tick() {
         where: { id: event.id, status: 'pending' },
         data: { status: 'processing' },
       });
+      // 条件更新抢占事件：多实例同时跑也只有一个 worker 能处理
       if (claimed.count === 0) continue;
 
       try {
@@ -488,6 +496,7 @@ export const notificationWorker = new Worker(
     const recipientId = payload.recipientId ?? payload.followeeId;
     if (!actorId || !recipientId || actorId === recipientId) return;
 
+    // eventId 唯一：重复投递只会命中 update，不会产生第二条通知
     const notification = await prisma.notification.upsert({
       where: { eventId: job.id },
       update: {},
@@ -589,12 +598,14 @@ export async function likePost(postId: bigint, userId: bigint) {
     });
     if (!post) throw new AppError('POST_NOT_FOUND', 404, 'Post not found');
 
+    // 唯一约束 + skipDuplicates = 幂等：重复点赞不会插第二行
     const created = await tx.like.createMany({
       data: [{ userId, targetType: 'post', targetId: postId }],
       skipDuplicates: true,
     });
 
     if (created.count === 1) {
+      // 只有真正插入成功才改计数，重复请求不会把计数加爆
       await tx.post.update({
         where: { id: postId },
         data: { likeCount: { increment: 1 } },
@@ -722,6 +733,7 @@ notificationsRouter.get('/stream', requireAuth, async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  // 关掉 Nginx 缓冲，否则事件会被攒到连接结束才发出去
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
@@ -733,10 +745,12 @@ notificationsRouter.get('/stream', requireAuth, async (req, res) => {
     if (!closed) res.write(`event: notification\ndata: ${message}\n\n`);
   });
 
+  // 心跳防止代理把长时间没有数据的 SSE 连接断掉
   const heartbeat = setInterval(() => {
     if (!closed) res.write(': ping\n\n');
   }, 15000);
 
+  // 客户端断开必须清理订阅，否则 Redis 连接会泄漏
   req.on('close', () => {
     closed = true;
     clearInterval(heartbeat);
@@ -797,6 +811,7 @@ pnpm --filter api add -D @types/swagger-ui-express
 import { OpenAPIRegistry, OpenApiGeneratorV3 } from '@asteasolutions/zod-to-openapi';
 import { z } from 'zod';
 
+// 契约只注册一次，Swagger 和前端生成的 client 共用同一份定义
 export const registry = new OpenAPIRegistry();
 
 registry.registerPath({
@@ -902,6 +917,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
 import { prisma } from '../src/common/db.js';
 
+// 直接拿 createApp 测，不用真的监听端口
 const app = createApp();
 
 describe('likes', () => {
@@ -954,6 +970,7 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 用 service 容器起依赖，CI 不依赖外部 MySQL/Redis
     services:
       mysql:
         image: mysql:8.0

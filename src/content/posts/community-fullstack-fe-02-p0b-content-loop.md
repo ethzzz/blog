@@ -53,6 +53,7 @@ import { useState } from 'react';
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [client] = useState(() => new QueryClient({
+    // staleTime 减少重复请求；retry 1 避免依赖故障时雪崩
     defaultOptions: { queries: { staleTime: 30_000, retry: 1 } },
   }));
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
@@ -77,6 +78,7 @@ type Comment = {
 
 export function CommentList({ postId }: { postId: string }) {
   const { data, isLoading, error } = useQuery({
+    // queryKey 带 postId，切换帖子不会串数据
     queryKey: ['comments', postId],
     queryFn: () => apiFetch<{ items: Comment[] }>(`/api/v1/posts/${postId}/comments?limit=50`),
   });
@@ -123,6 +125,7 @@ export function CommentForm({ postId }: { postId: string }) {
     }, getAccessToken());
 
     setContent('');
+    // 评论和计数都以服务端为准：成功后失效缓存，不手工改本地数字
     await queryClient.invalidateQueries({ queryKey: ['comments', postId] });
     await queryClient.invalidateQueries({ queryKey: ['post', postId] });
   }
@@ -163,6 +166,7 @@ export function LikeButton({ postId, initialLiked, initialCount }: Props) {
   const [error, setError] = useState('');
 
   async function toggle() {
+    // 先乐观更新，接口失败再回滚；后端幂等保证连点不会加爆
     const next = !liked;
     setLiked(next);
     setCount((value) => value + (next ? 1 : -1));
@@ -221,6 +225,7 @@ export function FollowButton({
   const [pending, setPending] = useState(false);
 
   async function toggle() {
+    // 先乐观更新，失败回滚，避免界面和服务端状态不一致
     const next = !following;
     setFollowing(next);
     setPending(true);
@@ -265,6 +270,7 @@ export function useNotifications(enabled: boolean) {
   useEffect(() => {
     if (!enabled) return;
 
+    // EventSource 不能带 Authorization，用 httpOnly Cookie 鉴权
     const source = new EventSource('/api/v1/notifications/stream', {
       withCredentials: true,
     });
@@ -273,6 +279,7 @@ export function useNotifications(enabled: boolean) {
       const notification = JSON.parse((event as MessageEvent).data) as Notification;
       queryClient.setQueryData<{ items: Notification[] }>(['notifications'], (old) => {
         const items = old?.items ?? [];
+        // 按 id 去重，断线重连不会重复插入
         if (items.some((item) => item.id === notification.id)) return old;
         return { items: [notification, ...items] };
       });
@@ -359,6 +366,7 @@ type FeedPage = {
 
 export function FeedList() {
   const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
+    // 游标只透传，不自己拼时间；useInfiniteQuery 负责累积每一页
     queryKey: ['feed'],
     initialPageParam: null as string | null,
     queryFn: ({ pageParam }) =>

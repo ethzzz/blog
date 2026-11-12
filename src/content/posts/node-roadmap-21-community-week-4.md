@@ -54,6 +54,7 @@ FROM node:22-alpine AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# 先生成 Prisma Client；构建阶段不需要连数据库
 RUN pnpm --filter api exec prisma generate && pnpm --filter api build
 
 FROM node:22-alpine AS runtime
@@ -64,6 +65,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/apps/api/dist ./dist
 COPY --from=build /app/apps/api/prisma ./prisma
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
+# 非 root 运行，降低容器被攻破后的影响
 USER node
 CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]
 ```
@@ -102,6 +104,7 @@ services:
     ports: ["5672:5672", "15672:15672"]
 
   api:
+    # 服务名就是容器网络里的 DNS：api、mysql、redis
     build: { context: ../.., dockerfile: apps/api/Dockerfile }
     environment:
       NODE_ENV: production
@@ -172,7 +175,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
-    # 更长前缀优先匹配，SSE 不会被上面的 /api/ 吃掉
+    # 更长前缀优先匹配；SSE 必须关闭缓冲，否则事件会被 Nginx 攒着
     location /api/v1/notifications/stream {
         proxy_pass http://api:3000;
         proxy_http_version 1.1;
@@ -208,6 +211,7 @@ collectDefaultMetrics({ register });
 export const httpDuration = new Histogram({
   name: 'http_request_duration_seconds',
   help: 'HTTP request duration',
+  // route 用路由模板而不是原始 URL，避免标签基数爆炸
   labelNames: ['method', 'route', 'status'],
   buckets: [0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5],
   registers: [register],
@@ -258,6 +262,7 @@ const server = app.listen(config.PORT);
 logger.info({ port: config.PORT }, 'API listening');
 
 async function shutdown(signal: string) {
+  // 先停止接收新连接，再等旧请求和 worker 收尾
   logger.info({ signal }, 'shutting down');
   const force = setTimeout(() => process.exit(1), 10_000);
   const hardClose = setTimeout(() => server.closeAllConnections(), 5_000);

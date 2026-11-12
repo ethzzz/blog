@@ -127,6 +127,7 @@ pnpm --filter admin-api exec prisma migrate dev --name init_admin
 import { Global, Module } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 
+// Prisma 只初始化一次，全局注入，避免每个模块各建连接池
 @Global()
 @Module({
   providers: [{ provide: PrismaClient, useFactory: () => new PrismaClient() }],
@@ -156,6 +157,7 @@ import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  // 管理端也走 /api/v1，但端口和部署单元独立
   app.setGlobalPrefix('api/v1');
   await app.listen(Number(process.env.ADMIN_PORT ?? 3001));
 }
@@ -189,6 +191,7 @@ export const RequirePermissions = (...permissions: string[]) =>
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
 import jwt from 'jsonwebtoken';
 
+// Guard 只做认证，不写业务；权限判断交给 PermissionsGuard
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   canActivate(context: ExecutionContext) {
@@ -219,6 +222,7 @@ export class PermissionsGuard implements CanActivate {
       context.getClass(),
     ]) ?? [];
     const user = context.switchToHttp().getRequest().user;
+    // 权限来自 token；短 TTL 让撤权在重新登录后尽快生效
     const granted = user?.permissions ?? [];
     if (!required.every((permission) => granted.includes(permission))) {
       throw new ForbiddenException('Permission denied');
@@ -238,6 +242,7 @@ export class PermissionsGuard implements CanActivate {
 import { Injectable, PipeTransform } from '@nestjs/common';
 import type { ZodType } from 'zod';
 
+// 入参在边界解析，service 里拿到的是已校验类型
 @Injectable()
 export class ZodPipe implements PipeTransform {
   constructor(private readonly schema: ZodType) {}
@@ -254,6 +259,7 @@ export class ZodPipe implements PipeTransform {
 ```ts
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException } from '@nestjs/common';
 
+// 所有异常统一成 JSON，前端不用猜每个接口的错误格式
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
   catch(error: unknown, host: ArgumentsHost) {
@@ -282,6 +288,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  // 管理端也走 /api/v1，但端口和部署单元独立
   app.setGlobalPrefix('api/v1');
   app.useGlobalFilters(new AllExceptionsFilter());
 
@@ -314,6 +321,7 @@ void bootstrap();
 ```ts
 import { Injectable } from '@nestjs/common';
 
+// 管理端不直接连核心库，只通过内部 API 操作数据
 @Injectable()
 export class ApiClient {
   private readonly base = process.env.API_INTERNAL_URL ?? 'http://127.0.0.1:3000';
@@ -373,6 +381,7 @@ export class ModerationService {
   }
 
   async approve(postId: string, operatorId: bigint) {
+    // 先改状态再写审计；跨服务无法同事务，审计失败要能追溯
     await this.api.setPostStatus(postId, 'published');
     await this.prisma.moderationRecord.create({
       data: { targetType: 'post', targetId: BigInt(postId), action: 'approve', operatorId },
@@ -452,9 +461,11 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  // 管理端也走 /api/v1，但端口和部署单元独立
   app.setGlobalPrefix('api/v1');
   app.useGlobalFilters(new AllExceptionsFilter());
 
+  // 队列持久化，消费者重启后消息还在
   app.connectMicroservice({
     transport: Transport.RMQ,
     options: {
@@ -497,6 +508,7 @@ export class EventsController {
   @EventPattern('post.created')
   async onPostCreated(payload: { eventId: string }) {
     try {
+      // processed_events 主键做幂等，重复投递直接忽略
       await this.prisma.processedEvent.create({ data: { eventId: payload.eventId } });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return;
@@ -542,6 +554,7 @@ const sdk = new NodeSDK({
   instrumentations: [getNodeAutoInstrumentations()],
 });
 
+// 必须在 main.ts 第一行 import，自动埋点才能覆盖后续加载的模块
 sdk.start();
 ```
 

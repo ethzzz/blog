@@ -49,6 +49,7 @@ draft: false
 
 import dynamic from 'next/dynamic';
 
+// 编辑器只在客户端加载，减小首屏 bundle
 const Editor = dynamic(() => import('@/components/editor'), {
   ssr: false,
   loading: () => <p className="text-sm text-gray-500">编辑器加载中...</p>,
@@ -103,6 +104,7 @@ pnpm --filter web exec playwright install
 ```ts
 import { test, expect } from '@playwright/test';
 
+// 只覆盖主链路；细节交给组件测试，避免 E2E 变成慢而脆的全量回归
 test('register -> login -> post -> feed', async ({ page }) => {
   await page.goto('/register');
   await page.getByLabel('邮箱').fill('e2e@test.com');
@@ -151,6 +153,7 @@ RUN pnpm install --frozen-lockfile && pnpm --filter web build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+# 只复制运行产物和 public，镜像里不带源码
 COPY --from=build /app/apps/web/.next ./.next
 COPY --from=build /app/apps/web/public ./public
 COPY --from=build /app/apps/web/package.json ./package.json

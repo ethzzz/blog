@@ -153,6 +153,7 @@ import type { Express } from 'express';
 
 export function createApp(): Express {
   const app = express();
+  // 限制请求体大小，避免超大 JSON 打满内存
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/health', (_req, res) => {
@@ -171,6 +172,7 @@ import { createApp } from './app.js';
 const port = Number(process.env.PORT ?? 3000);
 const app = createApp();
 
+// createApp 与 listen 分开，测试可以直接拿 app 发请求，不用真的占端口
 app.listen(port, () => {
   console.log(`API listening on http://127.0.0.1:${port}`);
 });
@@ -192,6 +194,7 @@ services:
       MYSQL_DATABASE: community
     ports: ["3306:3306"]
     volumes: ["mysql-data:/var/lib/mysql"]
+    # 健康检查让依赖服务等到 MySQL 真正可连接，而不是容器一启动就迁移
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
       interval: 10s
@@ -277,6 +280,7 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 });
 
+// 启动即失败：坏配置不要拖到第一个请求才暴露
 const parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {
   console.error('Invalid environment variables:', parsed.error.issues);
@@ -298,6 +302,7 @@ import { config } from './config.js';
 export const logger = pino({
   level: config.LOG_LEVEL,
   timestamp: pino.stdTimeFunctions.isoTime,
+  // 日志脱敏：token、Cookie、密码不能原样进日志平台
   redact: {
     paths: ['req.headers.authorization', 'req.headers.cookie', 'password', '*.password', 'token', '*.token'],
     censor: '[REDACTED]',
@@ -344,6 +349,7 @@ const REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
 
 export const requestId: RequestHandler = (req, res, next) => {
   const incoming = req.header('x-request-id');
+  // 只复用格式合法的上游 id，避免日志注入和超长 header
   const id = incoming && REQUEST_ID.test(incoming) ? incoming : randomUUID();
   res.locals.requestId = id;
   res.setHeader('x-request-id', id);
@@ -352,6 +358,7 @@ export const requestId: RequestHandler = (req, res, next) => {
 
 type AsyncRoute = (req: Request, res: Response, next: NextFunction) => Promise<unknown>;
 
+// 把 async 路由里的 rejected Promise 统一交给 Express 错误中间件
 export function asyncHandler(handler: AsyncRoute): RequestHandler {
   return (req, res, next) => {
     Promise.resolve()
@@ -364,6 +371,7 @@ export const notFound: RequestHandler = (req, _res, next) => {
   next(new AppError('NOT_FOUND', 404, `Route not found: ${req.method} ${req.originalUrl}`));
 };
 
+// 所有错误统一成 JSON；requestId 用来把响应和日志串起来
 export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   const requestId = String(res.locals.requestId ?? '');
 
@@ -410,6 +418,7 @@ import { errorHandler, notFound, requestId } from './common/middleware.js';
 export function createApp(): Express {
   const app = express();
 
+  // 中间件顺序不能乱：requestId -> CORS/Cookie -> 解析 -> 路由 -> 404 -> 错误处理
   app.use(requestId);
   app.use(express.json({ limit: '1mb' }));
 
@@ -584,14 +593,17 @@ model Post {
   title        String?    @db.VarChar(200)
   content      String     @db.Text
   status       PostStatus @default(pending)
+  // 计数是反范式字段：读多写少，必须和评论/点赞在同一事务里维护
   likeCount    Int        @default(0) @map("like_count")
   commentCount Int        @default(0) @map("comment_count")
   createdAt    DateTime   @default(now()) @map("created_at")
   updatedAt    DateTime   @updatedAt @map("updated_at")
+  // 软删除：保留审计和恢复能力，查询统一排除 deleted
   deletedAt    DateTime?  @map("deleted_at")
   author       User       @relation(fields: [authorId], references: [id])
   comments     Comment[]
   @@index([authorId, createdAt])
+  // feed 固定按 status + createdAt 过滤排序，这个索引用得上
   @@index([status, createdAt])
   @@map("posts")
 }
@@ -617,6 +629,7 @@ model Like {
   targetId   BigInt         @map("target_id")
   createdAt  DateTime       @default(now()) @map("created_at")
   user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // 唯一约束保证点赞幂等：重复请求不会插入第二行
   @@unique([userId, targetType, targetId])
   @@map("likes")
 }
@@ -627,6 +640,7 @@ model Follow {
   createdAt  DateTime @default(now()) @map("created_at")
   follower   User     @relation("follower", fields: [followerId], references: [id], onDelete: Cascade)
   followee   User     @relation("followee", fields: [followeeId], references: [id], onDelete: Cascade)
+  // 复合主键天然防重复关注；followee 索引给 feed join 用
   @@id([followerId, followeeId])
   @@index([followeeId])
   @@map("follows")
@@ -643,6 +657,7 @@ import { config } from './config.js';
 
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
 
+// 开发环境复用全局连接，tsx watch 热重载不会堆出一堆连接池
 export const prisma =
   globalForPrisma.prisma ??
   new PrismaClient({
@@ -666,6 +681,7 @@ import argon2 from 'argon2';
 const prisma = new PrismaClient();
 
 async function main() {
+  // 全部用 upsert：seed 可以重复执行，不会重复插入角色和账号
   for (const item of [
     { code: 'admin:access', name: '访问后台' },
     { code: 'post:review', name: '审核帖子' },
@@ -832,6 +848,7 @@ export function verifyAccessToken(token: string): AccessPayload {
 }
 
 export function createRefreshToken() {
+  // refresh 原文只返回给客户端一次，库里只存 sha256
   const token = randomBytes(48).toString('base64url');
   return { token, tokenHash: hashToken(token) };
 }
@@ -926,6 +943,7 @@ export async function refresh(input: { refreshToken: string }) {
   });
   if (!stored) throw new AppError('INVALID_REFRESH_TOKEN', 401, 'Refresh token invalid');
   if (stored.revokedAt) {
+    // 旧 refresh 被重放：吊销该用户全部 refresh，强制重新登录
     await prisma.refreshToken.updateMany({
       where: { userId: stored.userId, revokedAt: null },
       data: { revokedAt: new Date() },
@@ -984,6 +1002,7 @@ import { login, logout, refresh, register } from './auth.service.js';
 const COOKIE = 'refresh_token';
 
 function setCookie(res: Response, token: string) {
+  // refresh 只走 httpOnly Cookie，前端 JS 读不到；path 限定到 auth 接口
   res.cookie(COOKIE, token, {
     httpOnly: true,
     sameSite: 'lax',
@@ -1083,6 +1102,7 @@ import { authRouter } from './modules/auth/auth.routes.js';
 export function createApp(): Express {
   const app = express();
 
+  // 中间件顺序不能乱：requestId -> CORS/Cookie -> 解析 -> 路由 -> 404 -> 错误处理
   app.use(requestId);
   app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
   app.use(cookieParser());
@@ -1150,6 +1170,7 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../../common/db.js';
 import { AppError } from '../../common/errors.js';
 
+// 显式 select：只暴露 API 需要的字段，避免把 passwordHash 等带出去
 const select = {
   id: true, authorId: true, title: true, content: true,
   status: true, likeCount: true, commentCount: true, createdAt: true,
@@ -1167,6 +1188,7 @@ const toPost = (post: PostRow) => ({
 
 export async function createPost(authorId: bigint, input: { title?: string; content: string }) {
   const post = await prisma.post.create({
+    // 新帖默认待审核，只有 published 才进 feed
     data: { authorId, title: input.title ?? null, content: input.content, status: 'pending' },
     select,
   });
@@ -1286,9 +1308,11 @@ export async function findFollowingFeed(input: {
       SELECT p.id, p.author_id, p.title, p.content, p.like_count, p.comment_count, p.created_at,
              u.nickname AS author_nickname, u.avatar_url AS author_avatar_url
       FROM posts p
+      -- follower_id = 当前用户，followee_id = 帖子作者
       JOIN follows f ON f.followee_id = p.author_id AND f.follower_id = ${userId}
       JOIN users u ON u.id = p.author_id
       WHERE p.status = 'published'
+        -- 复合游标：先比时间再比 id，同一时间戳也不会重复或漏
         AND (p.created_at < ${cursorCreatedAt}
           OR (p.created_at = ${cursorCreatedAt} AND p.id < ${cursorId}))
       ORDER BY p.created_at DESC, p.id DESC
@@ -1300,6 +1324,7 @@ export async function findFollowingFeed(input: {
     SELECT p.id, p.author_id, p.title, p.content, p.like_count, p.comment_count, p.created_at,
            u.nickname AS author_nickname, u.avatar_url AS author_avatar_url
     FROM posts p
+    -- 关注流：我关注的人（followee）发的帖子
     JOIN follows f ON f.followee_id = p.author_id AND f.follower_id = ${userId}
     JOIN users u ON u.id = p.author_id
     WHERE p.status = 'published'
@@ -1320,6 +1345,7 @@ import { findFollowingFeed } from './feed.repository.js';
 
 export const feedRouter = Router();
 
+// 游标格式：ISO 时间_id；解析失败按 400 处理，不把坏参数带进 SQL
 function parseCursor(raw: unknown): { cursorCreatedAt?: Date; cursorId?: bigint } {
   if (raw === undefined) return {};
   if (typeof raw !== 'string') throw new AppError('INVALID_CURSOR', 400, 'Invalid cursor');
@@ -1348,6 +1374,7 @@ feedRouter.get('/', requireAuth, asyncHandler(async (req, res) => {
       ...row,
       id: String(row.id),
       author_id: String(row.author_id),
+      // 把 join 出来的扁平字段整理成前端直接可用的 author 结构
       author: {
         id: String(row.author_id),
         nickname: row.author_nickname,
@@ -1378,6 +1405,7 @@ import { usersRouter } from './modules/users/users.routes.js';
 export function createApp(): Express {
   const app = express();
 
+  // 中间件顺序不能乱：requestId -> CORS/Cookie -> 解析 -> 路由 -> 404 -> 错误处理
   app.use(requestId);
   app.use(cors({ origin: config.WEB_ORIGIN, credentials: true }));
   app.use(cookieParser());

@@ -61,6 +61,7 @@ infra/k8s/helm/community/
 name: api
 ports:
   - containerPort: 3000
+# readiness 失败只摘流量；liveness 失败才会重启
 readinessProbe:
   httpGet: { path: /ready, port: 3000 }
   initialDelaySeconds: 5
@@ -117,6 +118,7 @@ type PostDocument = {
   createdAt: string;
 };
 
+// 索引是派生数据，MySQL 才是真相源；失败可以重建
 export async function indexPost(post: {
   id: bigint;
   title: string | null;
@@ -166,6 +168,7 @@ import { chat } from './ai.service.js';
 export const aiRouter = Router();
 
 aiRouter.post('/chat', requireAuth, asyncHandler(async (req, res) => {
+  // SSE 流式返回；客户端 abort 时后端要停止生成、释放连接
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('X-Accel-Buffering', 'no');

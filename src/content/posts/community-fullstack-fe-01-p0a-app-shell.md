@@ -94,6 +94,7 @@ export async function apiFetch<T>(
 ): Promise<T> {
   const res = await fetch(`${base}${path}`, {
     ...init,
+    // 同源/跨域都带 Cookie；accessToken 只在需要时放 Authorization
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
@@ -130,6 +131,7 @@ export async function POST(request: Request) {
   const data = await upstream.json();
   const response = Response.json(data, { status: upstream.status });
   const setCookie = upstream.headers.get('set-cookie');
+  // 登录成功后把 refresh Cookie 原样转发；浏览器拿不到 token
   if (setCookie) response.headers.set('set-cookie', setCookie);
   return response;
 }
@@ -163,6 +165,7 @@ export async function POST(request: Request) {
   const data = await upstream.json();
   const response = Response.json(data, { status: upstream.status });
   const setCookie = upstream.headers.get('set-cookie');
+  // 刷新会轮换 refresh Cookie，同样只走 httpOnly
   if (setCookie) response.headers.set('set-cookie', setCookie);
   return response;
 }
@@ -179,6 +182,7 @@ export async function POST(request: Request) {
 
   const response = new Response(null, { status: upstream.status });
   const setCookie = upstream.headers.get('set-cookie');
+  // 登出转发清除 Cookie 的响应头，前端不需要碰 token
   if (setCookie) response.headers.set('set-cookie', setCookie);
   return response;
 }
@@ -218,6 +222,7 @@ export default function LoginPage() {
     }
 
     const data = await response.json();
+    // accessToken 只放内存/sessionStorage；refresh 用 httpOnly Cookie
     sessionStorage.setItem('accessToken', data.accessToken);
     router.push('/feed');
   }
@@ -305,6 +310,7 @@ type Post = {
 type FeedResponse = { items: Post[] };
 
 export default async function FeedPage() {
+  // 首屏在服务端取，带上 Cookie，避免白屏和客户端请求瀑布
   const response = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/feed?limit=20`, {
     headers: { cookie: (await cookies()).toString() },
     cache: 'no-store',
@@ -352,6 +358,7 @@ export default async function PostPage({ params }: { params: Promise<{ id: strin
   const response = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/posts/${id}`, {
     cache: 'no-store',
   });
+  // 404 用 notFound()，不要渲染空白页
   if (!response.ok) notFound();
   const post = (await response.json()) as Post;
 
@@ -383,6 +390,7 @@ export default function NewPostPage() {
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     const token = sessionStorage.getItem('accessToken');
+    // 新帖默认 pending，提交后不会立刻出现在 feed
     await apiFetch('/api/v1/posts', {
       method: 'POST',
       body: JSON.stringify({ content }),
@@ -416,6 +424,7 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
 export function middleware(request: NextRequest) {
+  // 只做路由级拦截，真正权限必须由后端再查一次
   const hasSession = request.cookies.has('refresh_token');
   if (!hasSession && /^\/(feed|posts\/new)/.test(request.nextUrl.pathname)) {
     return NextResponse.redirect(new URL('/login', request.url));

@@ -65,6 +65,7 @@ export default function SearchPage() {
       return;
     }
 
+    // 300ms 防抖 + AbortController：快速输入只保留最后一次请求
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       setLoading(true);
@@ -159,6 +160,7 @@ export function AiChat() {
     ]);
     setStreaming(true);
 
+    // 保存 controller，停止按钮才能真正中断请求
     const controller = new AbortController();
     controllerRef.current = controller;
 
@@ -234,6 +236,7 @@ export function AiChat() {
 NEXT_PUBLIC_API_BASE=http://127.0.0.1:3000
 API_BASE_INTERNAL=http://127.0.0.1:3000
 NEXT_PUBLIC_ADMIN_API_BASE=http://127.0.0.1:3002
+# 没配 Key 时关闭入口，不影响登录/feed/发帖
 NEXT_PUBLIC_AI_ENABLED=false
 ```
 

@@ -61,6 +61,7 @@ src/components/admin/
 ```ts
 const base = process.env.NEXT_PUBLIC_ADMIN_API_BASE ?? 'http://127.0.0.1:3001';
 
+// 统一走 admin-api；页面组件不直接拼后端 URL
 export async function adminFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${base}${path}`, {
     ...init,
@@ -86,6 +87,7 @@ import { redirect } from 'next/navigation';
 import { AdminShell } from '@/components/admin/AdminShell';
 
 export default async function AdminLayout({ children }: { children: React.ReactNode }) {
+  // 服务端再查一次角色：前端隐藏菜单不等于权限
   const response = await fetch(`${process.env.API_BASE_INTERNAL}/api/v1/users/me`, {
     headers: { cookie: (await cookies()).toString() },
     cache: 'no-store',
@@ -186,6 +188,7 @@ export function ModerationActions({ postId }: { postId: string }) {
   const router = useRouter();
 
   async function approve() {
+    // 成功后 refresh，重新从服务端取列表，不本地删行
     await adminFetch(`/api/v1/admin/posts/${postId}/approve`, { method: 'POST' });
     router.refresh();
   }
@@ -322,6 +325,7 @@ export function UserActions({ userId, banned }: { userId: string; banned: boolea
   const router = useRouter();
 
   async function setStatus() {
+    // 封禁后由后端拒绝 refresh/登录；前端只负责触发和刷新
     await adminFetch(`/api/v1/admin/users/${userId}/${banned ? 'unban' : 'ban'}`, {
       method: 'POST',
     });
