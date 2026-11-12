@@ -349,7 +349,7 @@ pnpm --filter api add bullmq ioredis
 路径：`apps/api/src/common/redis.ts`：
 
 ```ts
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { config } from './config.js';
 
 export const redis = new Redis(config.REDIS_URL, {
@@ -358,6 +358,8 @@ export const redis = new Redis(config.REDIS_URL, {
   connectTimeout: 3000,
 });
 ```
+
+> ioredis 6 的 TS 类型在 NodeNext 下用命名导入 `{ Redis }`；默认导入会报 TS2351。BullMQ 复用这个连接时，`maxRetriesPerRequest` 必须是 `null`。
 
 路径：`apps/api/src/jobs/queue.ts`：
 

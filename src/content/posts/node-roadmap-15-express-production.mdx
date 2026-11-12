@@ -214,10 +214,12 @@ export const prisma = new PrismaClient();
 ```
 
 ```ts
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { config } from './config.js';
 export const redis = new Redis(config.REDIS_URL);
 ```
+
+> ioredis 6 的 TS 类型在 NodeNext 下请用命名导入 `{ Redis }`；默认导入会报 TS2351。
 
 先建表（表结构细节见第 05 篇）：
 
