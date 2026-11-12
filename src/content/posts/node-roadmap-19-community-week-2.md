@@ -162,9 +162,9 @@ curl -i -X POST http://127.0.0.1:3000/api/v1/posts/<POST_ID>/comments \
 
 ---
 
-## Day 7：点赞幂等
+## Day 7：点赞与取消点赞幂等
 
-**今天目标**：同一用户重复点赞只加 1；取消两次不会变负。
+**今天目标**：同一用户重复点赞只加 1；取消两次不会变负；点赞和取消点赞都只允许操作 `published` 帖子。
 
 ### 1. 写 likes.service.ts
 
@@ -200,6 +200,12 @@ export async function likePost(postId: bigint, userId: bigint) {
 
 export async function unlikePost(postId: bigint, userId: bigint) {
   return prisma.$transaction(async (tx) => {
+    const post = await tx.post.findFirst({
+      where: { id: postId, status: 'published' },
+      select: { id: true },
+    });
+    if (!post) throw new AppError('POST_NOT_FOUND', 404, 'Post not found');
+
     const deleted = await tx.like.deleteMany({
       where: { userId, targetType: 'post', targetId: postId },
     });
@@ -255,7 +261,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3000/api/v1/p
 curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3000/api/v1/posts/<POST_ID>/like
 ```
 
-第一次 `changed: true`，第二次 `changed: false`；`likeCount = 1`。取消两次后 `likeCount = 0`，不会为负。
+第一次 `changed: true`，第二次 `changed: false`；`likeCount = 1`。取消两次后 `likeCount = 0`，不会为负；对 `pending`/`rejected` 帖子点赞或取消点赞都返回 404。
 
 **产出**：commit `feat: add idempotent likes`。
 
