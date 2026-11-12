@@ -198,7 +198,7 @@ export async function likePost(postId: bigint, userId: bigint) {
       });
     }
 
-    return { liked: true, changed: created.count === 1, authorId: post.authorId };
+    return { liked: true, changed: created.count === 1, authorId: post.authorId.toString() };
   });
 }
 
@@ -227,6 +227,8 @@ export async function unlikePost(postId: bigint, userId: bigint) {
   });
 }
 ```
+
+> 返回体里的 `authorId` 是 Prisma 的 BigInt，必须先 `.toString()`；`res.json()` 不能直接序列化 BigInt，否则接口会在响应阶段报 `Do not know how to serialize a BigInt` 并返回 500。
 
 ### 2. 写 likes.routes.ts
 
@@ -618,7 +620,7 @@ export async function likePost(postId: bigint, userId: bigint) {
       });
     }
 
-    return { liked: true, changed: created.count === 1, authorId: post.authorId };
+    return { liked: true, changed: created.count === 1, authorId: post.authorId.toString() };
   });
 }
 ```
