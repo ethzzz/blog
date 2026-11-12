@@ -320,48 +320,79 @@ http://example.com:80    → http://example.com:8080  ❌ 端口不同
 
 **跨域解决方案：**
 
-```javascript
-// 1. CORS（推荐，服务端配置）
-// 简单请求（GET/POST/HEAD，Content-Type 限制）
-// 复杂请求（PUT/DELETE 等，会先发 OPTIONS 预检）
+**1. CORS（推荐，服务端配置）**
 
-// 服务端响应头
-Access-Control-Allow-Origin: http://example.com  // 或 *
+简单请求直接带 `Origin`；PUT/DELETE、`application/json`、自定义头会先发 OPTIONS 预检。服务端至少要回这些头：
+
+```http
+Access-Control-Allow-Origin: https://app.example.com
 Access-Control-Allow-Methods: GET, POST, PUT, DELETE
 Access-Control-Allow-Headers: Content-Type, Authorization
-Access-Control-Allow-Credentials: true           // 允许携带 Cookie
-Access-Control-Max-Age: 86400                    // 预检结果缓存时间
+Access-Control-Allow-Credentials: true
+Access-Control-Max-Age: 86400
+Vary: Origin
+```
 
-// 2. Nginx 代理（开发/生产）
-// nginx.conf
+注意：带 Cookie 时 `Allow-Origin` 不能写 `*`，必须回显具体来源；否则浏览器直接拒绝。
+
+```javascript
+// Express：最小可用的 CORS 中间件（不引入 cors 包也能讲清逻辑）
+const ALLOWED = new Set(['https://app.example.com']);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (ALLOWED.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin); // 回显白名单
+    res.setHeader('Vary', 'Origin');                      // 防止 CDN 串号
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') return res.sendStatus(204); // 预检到此结束
+  next();
+});
+```
+
+**2. Nginx 反向代理（生产：同源化，绕开浏览器跨域限制）**
+
+```nginx
 location /api/ {
   proxy_pass http://backend-server/;
   proxy_set_header Host $host;
 }
+```
 
-// 3. Webpack Dev Server 代理（开发）
-// vue.config.js / webpack.config.js
-devServer: {
-  proxy: {
-    '/api': {
-      target: 'http://localhost:3000',
-      changeOrigin: true,
-      pathRewrite: { '^/api': '' },
-    }
-  }
-}
+**3. 开发服务器代理（开发环境）**
 
-// 4. JSONP（只支持 GET，已不推荐）
+```javascript
+// vite.config.js（Webpack 的 devServer.proxy 写法类似）
+export default defineConfig({
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3000',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/api/, ''),
+      },
+    },
+  },
+});
+```
+
+**4. JSONP（只支持 GET，已不推荐）**
+
+```javascript
 function jsonp(url, callback) {
   const script = document.createElement('script');
   const cbName = 'jsonp_' + Date.now();
-  
+
   window[cbName] = (data) => {
     callback(data);
     delete window[cbName];
     document.body.removeChild(script);
   };
-  
+
   script.src = `${url}?callback=${cbName}`;
   document.body.appendChild(script);
 }

@@ -51,6 +51,20 @@ type NonNull<T> = T extends null ? never : T;  // 条件类型
 // 实践建议：
 // 对象/类的形状 → interface（可合并、可 implements）
 // 联合、元组、工具类型、类型运算 → type
+
+// interface：同名声明自动合并，适合给第三方库补类型
+interface User {
+  id: number;
+}
+interface User {
+  name: string;
+}
+const u: User = { id: 1, name: 'a' };   // 两个字段都要有
+
+// type：联合与条件类型，interface 表达不了
+type Status = 'pending' | 'done';
+type NonNull<T> = T extends null ? never : T;
+type Result = NonNull<string | null>;   // string
 ```
 
 ### Q2: any、unknown、never 的区别？⭐ 🔥

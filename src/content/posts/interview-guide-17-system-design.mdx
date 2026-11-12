@@ -485,14 +485,7 @@ new Monitor({ appId: 'my-app', sampleRate: 0.1 });   // 10% 采样
      * 必须使用时用 DOMPurify 消毒
      * CSP 内容安全策略（限制脚本来源）
      * HttpOnly Cookie（JS 读不到，防窃取）
-
-   import DOMPurify from 'dompurify';
-   element.innerHTML = DOMPurify.sanitize(userInput);
-
-   // CSP 响应头
-   Content-Security-Policy: default-src 'self';
-                            script-src 'self' https://cdn.example.com;
-                            object-src 'none';
+     * 渲染富文本前必须白名单消毒（见下方代码）
 
 2. CSRF（跨站请求伪造）防护
    - 类型：GET 型（img src）、POST 型（自动提交表单）
@@ -518,14 +511,44 @@ new Monitor({ appId: 'my-app', sampleRate: 0.1 });   // 10% 采样
    - 打印日志脱敏（手机号、身份证）
 
 7. 第三方脚本管控
-   - SRI（Subresource Integrity）：hash 校验 CDN 脚本
-   <script src="https://cdn/x.js"
-           integrity="sha384-xxx" crossorigin="anonymous"></script>
+   - SRI（Subresource Integrity）：hash 校验 CDN 脚本（见下方代码）
 
 8. 供应链安全
    - 依赖审计：npm audit / snyk
    - lock 文件提交（package-lock.json）
    - CI 检查依赖漏洞
+```
+
+```javascript
+// 富文本必须渲染时：白名单消毒 + 服务端二次消毒
+import DOMPurify from 'dompurify';
+
+const clean = DOMPurify.sanitize(userHtml, {
+  ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'a', 'code', 'pre'],
+  ALLOWED_ATTR: ['href'],
+});
+element.innerHTML = clean;            // 不要直接塞 userHtml
+
+// React 场景
+<div dangerouslySetInnerHTML={{ __html: clean }} />
+```
+
+```http
+# 安全响应头（Nginx / 网关统一加）
+Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.example.com; object-src 'none'
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+```
+
+```html
+<!-- SRI：锁定 CDN 脚本内容；版本变了 hash 不匹配，浏览器拒绝执行 -->
+<script
+  src="https://cdn.example.com/sdk@1.2.3.min.js"
+  integrity="sha384-REPLACE_WITH_REAL_HASH"
+  crossorigin="anonymous"
+  defer
+></script>
 ```
 
 ---

@@ -438,7 +438,25 @@ const rules = {
   ],
   email: [{ type: 'email', message: '邮箱格式不正确' }],
 };
+
 // 收到 400 时，优先展示后端 message（后端规则更权威）
+async function submit(form) {
+  const res = await fetch('/api/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(form),
+  });
+
+  if (res.status === 400) {
+    const { errors } = await res.json(); // { errors: { username: '...' } }
+    for (const [field, message] of Object.entries(errors)) {
+      showFieldError(field, message);    // 用后端文案避免规则漂移；该方法由表单组件提供
+    }
+    return;
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
 ```
 
 ---

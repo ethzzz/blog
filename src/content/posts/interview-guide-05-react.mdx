@@ -763,6 +763,23 @@ const style = useMemo(() => ({ color: 'red' }), []);
 
 // 8. 状态提升 vs 下沉
 // 只在需要的组件维护状态，避免不必要的重渲染
+
+// 需要两个兄弟共享 → 提升到共同父级
+function Parent() {
+  const [keyword, setKeyword] = useState('');
+  return (
+    <>
+      <SearchInput value={keyword} onChange={setKeyword} />
+      <ResultList keyword={keyword} />
+    </>
+  );
+}
+
+// 只有输入框自己用 → 下沉，别让整页跟着重渲
+function SearchBox() {
+  const [keyword, setKeyword] = useState('');
+  return <input value={keyword} onChange={(e) => setKeyword(e.target.value)} />;
+}
 ```
 
 **追问链（性能题的天花板在这里）：**

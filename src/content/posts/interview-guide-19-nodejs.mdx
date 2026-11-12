@@ -364,11 +364,20 @@ Promise.resolve().then(() => console.log('promise'));
 process.nextTick(() => console.log('nextTick'));
 // 输出：nextTick → promise
 
-// nextTick 递归会阻塞事件循环！
-function recursive() {
-  process.nextTick(recursive);   // 永远轮不到 I/O
+// nextTick 递归会阻塞事件循环：微任务队列不排空，I/O 与定时器都轮不到
+function starve(n = 0) {
+  if (n === 5) return;                 // 这里只是演示，生产里常见的写法是无上限
+  process.nextTick(() => starve(n + 1));
 }
-// 应该用 setImmediate 递归
+
+// 修复：换成 setImmediate，每轮都回到事件循环，定时器/I/O 能插进来
+function fair(n = 0) {
+  if (n === 5) return console.log('immediate 完成');
+  setImmediate(() => fair(n + 1));
+}
+setTimeout(() => console.log('timer 得到执行'), 0);
+fair();
+// 输出两行，顺序可能互换：timer 得到执行 / immediate 完成
 
 // 综合题
 async function async1() {
@@ -432,9 +441,52 @@ buf1.length;                       // 字节长度（不是字符长度）
 
 // 内存管理：
 // Buffer 分配在 V8 堆外（不受 GC 精确管理）
-// 大量小 Buffer 建议用 Buffer.allocUnsafe + 手动清零
-// 或用 Buffer pool（Node 内部有 8KB pool）
+const unsafe = Buffer.allocUnsafe(8);   // 跳过清零，可能含旧内存数据
+const written = unsafe.write('hi');     // 只覆盖前 2 字节
+unsafe.fill(0, written);                // 剩余 6 字节必须清零，否则会把旧数据带出去
+
+// 小于 poolSize/2 的 allocUnsafe 从共享池切一块
+console.log(Buffer.poolSize);           // Node 24 上是 65536（64KB）；老版本是 8192
+const fromPool = Buffer.allocUnsafe(64);      // 来自共享池
+const standalone = Buffer.allocUnsafeSlow(64); // 绕过池，独占一块 ArrayBuffer
+
+// 切片共享内存：改 slice 会影响原 Buffer
+const base = Buffer.from('hello');
+const slice = base.slice(0, 2);
+slice[0] = 0x48;                        // 'H'
+console.log(base.toString());           // 'Hello'
+
+// slice 已被标记为 deprecated，新代码用 subarray，语义同样是共享内存
+const win = base.subarray(0, 2);
+
+// 需要独立副本时用 Buffer.from
+const copy = Buffer.from(base);
+copy[0] = 0x4a;
+console.log(base.toString(), copy.toString()); // 'Hello' 'Jello'
 ```
+
+什么时候 `allocUnsafe` 才真的更快：**只在你保证每个字节都会被覆盖时**。只写一部分再补 `fill(0)`，通常和 `alloc` 差不多——清零的成本并没有消失，只是换了个位置。量一下再决定：
+
+```javascript
+const payload = Buffer.from('x'.repeat(64));
+const N = 100000;
+
+console.time('alloc + copy');
+for (let i = 0; i < N; i++) {
+  const b = Buffer.alloc(64);   // 先清零
+  payload.copy(b);              // 再覆盖
+}
+console.timeEnd('alloc + copy');
+
+console.time('allocUnsafe + copy');
+for (let i = 0; i < N; i++) {
+  const b = Buffer.allocUnsafe(64); // 不清零
+  payload.copy(b);                  // 64 字节全部覆盖，无需 fill
+}
+console.timeEnd('allocUnsafe + copy');
+```
+
+两条纪律：**池化块不要长期持有**（否则整个 8KB 池都释放不掉）；**对外发送前确认没有未覆盖的字节**——`allocUnsafe` 的安全问题不是理论，它确实可能把上一个请求的数据带进响应。
 
 ### Q8: Stream 是什么？四种类型？⭐⭐⭐ 🔥
 
