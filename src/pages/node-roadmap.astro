@@ -66,6 +66,36 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 			</div>
 		</div>
 
+		<!-- 快速进入：Node 0→1 实战项目 -->
+		<div class="card-base card-shadow p-5 mb-6 border-l-4 border-[var(--primary)]">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white dark:text-black/70 font-bold text-base">
+					0→1
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">快速进入 · Node 0 → 1 实战项目</h2>
+					<p class="text-75 text-sm mb-3">
+						Express + NestJS 从第一天起搭一个可交付的社区 API：后端 01–21、前端 01–15 双系列，30 天节奏按天推进。
+						本路线讲原理，这个项目把它们连成一条能上线的链路。
+					</p>
+					<div class="flex flex-wrap gap-2">
+						<a href={getPostUrlBySlug("node-roadmap-17-express-zero-to-one-30-days")}
+						   class="px-3 py-1.5 rounded-lg bg-[var(--primary)] text-white dark:text-black/70 text-sm font-medium hover:opacity-85 transition-opacity">
+							30 天路线总览
+						</a>
+						<a href={getPostUrlBySlug("node-roadmap-23-community-fullstack-plan")}
+						   class="px-3 py-1.5 rounded-lg bg-[var(--btn-regular-bg)] text-[var(--btn-content)] text-sm font-medium hover:opacity-85 transition-opacity">
+							后端 00 总览
+						</a>
+						<a href={url("/community-fullstack-roadmap/")}
+						   class="px-3 py-1.5 rounded-lg bg-[var(--btn-regular-bg)] text-[var(--btn-content)] text-sm font-medium hover:opacity-85 transition-opacity">
+							项目合集
+						</a>
+					</div>
+				</div>
+			</div>
+		</div>
+
 		<!-- 总览卡片 -->
 		{overviewPost && (
 			<a href={getPostUrlBySlug(overviewPost.slug)}
