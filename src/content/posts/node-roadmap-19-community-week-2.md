@@ -893,6 +893,124 @@ export function createApp(): Express {
 pnpm --filter api add -D vitest supertest @types/supertest
 ```
 
+先给 `apps/api/package.json` 的 `scripts` 加一行，否则 `pnpm --filter api test` 找不到测试脚本，会静默退出：
+
+```json
+{
+  "scripts": {
+    "test": "vitest run"
+  }
+}
+```
+
+#### 2.1 初始化测试库
+
+测试库必须和开发库分开。首次执行：
+
+```bash
+mysql -uroot -p123456 -e "CREATE DATABASE IF NOT EXISTS community_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+DATABASE_URL="mysql://root:123456@127.0.0.1:3306/community_test" \
+  pnpm --filter api exec prisma migrate deploy
+
+DATABASE_URL="mysql://root:123456@127.0.0.1:3306/community_test" \
+  pnpm --filter api exec prisma db seed
+```
+
+`seed` 不能省：注册接口要查 `user` 角色，没 seed 会报 `ROLE_NOT_INITIALIZED`。PowerShell 用 `$env:DATABASE_URL="..."` 设置环境变量，不要照抄 `\` 续行。
+
+#### 2.2 写 tests/helpers.ts
+
+`apps/api/tests/helpers.ts` 完整文件：
+
+```ts
+import type { Express } from 'express';
+import request from 'supertest';
+import { prisma } from '../src/common/db.ts';
+
+// 只清业务数据，保留 roles/permissions，seedRoles 负责补齐
+export async function resetDb() {
+  await prisma.$transaction([
+    prisma.notification.deleteMany(),
+    prisma.outboxEvent.deleteMany(),
+    prisma.like.deleteMany(),
+    prisma.comment.deleteMany(),
+    prisma.follow.deleteMany(),
+    prisma.refreshToken.deleteMany(),
+    prisma.userRole.deleteMany(),
+    prisma.post.deleteMany(),
+    prisma.user.deleteMany(),
+  ]);
+}
+
+export async function seedRoles() {
+  const permissions = [
+    { code: 'admin:access', name: '访问后台' },
+    { code: 'post:review', name: '审核帖子' },
+    { code: 'report:handle', name: '处理举报' },
+    { code: 'user:ban', name: '封禁用户' },
+  ];
+  for (const item of permissions) {
+    await prisma.permission.upsert({
+      where: { code: item.code },
+      update: { name: item.name },
+      create: item,
+    });
+  }
+
+  const userRole = await prisma.role.upsert({
+    where: { code: 'user' },
+    update: {},
+    create: { code: 'user', name: '普通用户' },
+  });
+  const adminRole = await prisma.role.upsert({
+    where: { code: 'admin' },
+    update: {},
+    create: { code: 'admin', name: '管理员' },
+  });
+
+  for (const permission of await prisma.permission.findMany()) {
+    await prisma.rolePermission.upsert({
+      where: {
+        roleId_permissionId: { roleId: adminRole.id, permissionId: permission.id },
+      },
+      update: {},
+      create: { roleId: adminRole.id, permissionId: permission.id },
+    });
+  }
+
+  return { userRole, adminRole };
+}
+
+// 注册并登录，返回可直接放进 Authorization 的 token
+export async function registerAndLogin(
+  app: Express,
+  email = `user-${Date.now()}@test.com`,
+) {
+  const password = 'Passw0rd!';
+  const register = await request(app)
+    .post('/api/v1/auth/register')
+    .send({ email, password, nickname: 'Test' });
+  if (register.status !== 201) {
+    throw new Error(`register failed: ${register.status} ${JSON.stringify(register.body)}`);
+  }
+
+  const login = await request(app)
+    .post('/api/v1/auth/login')
+    .send({ email, password });
+  if (login.status !== 200) {
+    throw new Error(`login failed: ${login.status} ${JSON.stringify(login.body)}`);
+  }
+
+  const user = await prisma.user.findUniqueOrThrow({ where: { email } });
+  return { token: login.body.accessToken as string, userId: user.id, email, password };
+}
+```
+
+> 测试由 Vitest 直接执行 TS，所以测试文件用 `.ts` 后缀；业务源码仍按 NodeNext 的 `.js` 写法。
+
+#### 2.3 配置 Vitest
+
 `apps/api/vitest.config.ts`：
 
 ```ts
@@ -905,45 +1023,41 @@ export default defineConfig({
     fileParallelism: false,
     env: {
       NODE_ENV: 'test',
-      DATABASE_URL: process.env.TEST_DATABASE_URL ?? 'mysql://root:root@127.0.0.1:3306/community_test',
+      DATABASE_URL: process.env.TEST_DATABASE_URL ?? 'mysql://root:123456@127.0.0.1:3306/community_test',
     },
   },
 });
 ```
 
+#### 2.4 写用例
+
 `apps/api/tests/content.test.ts`：
 
 ```ts
 import request from 'supertest';
-import { beforeEach, describe, expect, it } from 'vitest';
-import { createApp } from '../src/app.js';
-import { prisma } from '../src/common/db.js';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { createApp } from '../src/app.ts';
+import { prisma } from '../src/common/db.ts';
+import { registerAndLogin, resetDb, seedRoles } from './helpers.ts';
 
 // 直接拿 createApp 测，不用真的监听端口
 const app = createApp();
 
 describe('likes', () => {
-  beforeEach(async () => {
-    await prisma.like.deleteMany();
-    await prisma.post.deleteMany();
+  beforeAll(async () => {
+    await seedRoles();
   });
 
-  async function registerAndLogin(email: string) {
-    await request(app)
-      .post('/api/v1/auth/register')
-      .send({ email, password: 'Passw0rd!', nickname: 'L' });
-    const login = await request(app)
-      .post('/api/v1/auth/login')
-      .send({ email, password: 'Passw0rd!' });
-    const user = await prisma.user.findUniqueOrThrow({ where: { email } });
-    return { token: login.body.accessToken as string, userId: user.id };
-  }
+  beforeEach(async () => {
+    await resetDb();
+  });
 
   it('is idempotent', async () => {
-    const { token, userId } = await registerAndLogin(`like-${Date.now()}@test.com`);
+    const { token, userId } = await registerAndLogin(app);
     const post = await prisma.post.create({
       data: { authorId: userId, content: 'hello', status: 'published' },
     });
+
     const first = await request(app)
       .post(`/api/v1/posts/${post.id}/like`)
       .set('Authorization', `Bearer ${token}`);
@@ -959,7 +1073,7 @@ describe('likes', () => {
 });
 ```
 
-> 测试里生成 token 的完整 helper（注册/登录、resetDb、seedRoles）见仓库 `tests/helpers.ts`；这里先把测试库和开发库分开，`fileParallelism: false` 避免互相污染。
+> `resetDb` 会删除测试库里的帖子、点赞、通知等业务数据，所以务必确认 `DATABASE_URL` 指向 `community_test`，不要指向开发库 `community`。`fileParallelism: false` 避免多个测试文件同时清库。
 
 ### 3. CI
 
