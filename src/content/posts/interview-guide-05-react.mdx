@@ -112,65 +112,173 @@ React 15 (Stack Reconciler)     React 16+ (Fiber)
 └─────────────────────┘        └─────────────────────┘
 ```
 
-**Fiber 节点结构：**
+**Fiber 节点结构（按用途分组）：**
 
 ```javascript
 const fiber = {
-  // 节点类型
-  type: 'div',
-  key: null,
-  
-  // 链表结构
-  return: parentFiber,    // 父节点
-  child: firstChildFiber, // 第一个子节点
-  sibling: nextFiber,     // 下一个兄弟节点
-  
-  // 状态
-  pendingProps: {},       // 新 props
-  memoizedProps: {},      // 上次 props
-  memoizedState: {},      // 上次 state
-  
-  // 副作用
-  flags: 0,               // 副作用标记（增删改）
-  subtreeFlags: 0,        // 子树的副作用
-  
-  // 优先级
-  lane: 0,                // 更新优先级
+  // 1. 身份
+  tag: WorkTag,            // FunctionComponent / ClassComponent / HostComponent / HostRoot ...
+  key: null,               // diff 用的稳定标识
+  type: 'div',             // 元素类型或组件函数
+  stateNode: domNode,      // 对应的真实 DOM / 类实例
+
+  // 2. 树结构：用链表把树串起来，替代递归调用栈
+  return: parentFiber,     // 父节点
+  child: firstChildFiber,  // 第一个子节点
+  sibling: nextFiber,      // 下一个兄弟节点
+  index: 0,
+
+  // 3. 状态
+  pendingProps: {},        // 本次渲染的新 props
+  memoizedProps: {},       // 上次提交的 props
+  memoizedState: {},       // 函数组件：Hook 链表头；类组件：state
+  updateQueue: [],         // 更新队列（setState / useState 的更新）
+
+  // 4. 副作用
+  flags: 0,                // 本节点的副作用位掩码：Placement / Update / Deletion / Passive ...
+  subtreeFlags: 0,         // 子树副作用冒泡，commit 时可跳过整棵干净子树
+  deletions: [],           // 被删除的子节点（挂在父节点上）
+
+  // 5. 优先级与双缓存
+  lanes: 0,                // 本节点的更新优先级（bitmask）
+  childLanes: 0,           // 子树里还有哪些 lane 待处理
+  alternate: otherFiber,   // 双缓存里的另一棵树
 };
 ```
 
-**时间切片原理：**
+三个最容易讲错的字段：
+
+- **`memoizedState` 不是"组件的 state 对象"**。函数组件里它指向第一个 Hook 节点，Hook 之间用 `next` 串成链表；`useState` 的值存在 Hook 自己的 `memoizedState` 上。
+- **`flags` 是位掩码不是布尔**。一次提交可能同时"插入 + 更新"，用按位或叠加；React 16 叫 `effectTag`，17 起改名 `flags`。
+- **`deletions` 挂在父节点**。被删的子 fiber 不在自己的 `flags` 上标，而是收集进父节点的 `deletions` 数组，commit 时统一删除。
+
+**遍历：把递归改成「链表 + 循环」**
+
+Stack Reconciler 用递归，调用栈由 JS 引擎管理，跑起来就停不下；Fiber 把树展开成 `child`/`sibling` 链表，用循环逐个处理节点，**每轮循环结束都是一个可中断点**：
 
 ```javascript
-// 简化实现
-function workLoop(deadline) {
-  let shouldYield = false;
-  
-  while (nextUnitOfWork && !shouldYield) {
+let nextUnitOfWork = root.current.alternate; // 从根开始
+
+function workLoop() {
+  while (nextUnitOfWork && !shouldYield()) {  // 时间片用完就让出主线程
     nextUnitOfWork = performUnitOfWork(nextUnitOfWork);
-    shouldYield = deadline.timeRemaining() < 1; // 剩余时间不足 1ms
   }
-  
-  if (!nextUnitOfWork && workInProgressRoot) {
-    commitRoot(); // 提交阶段
-  }
-  
-  requestIdleCallback(workLoop); // 继续调度
+  if (!nextUnitOfWork) commitRoot(root);      // 整棵树算完才提交
 }
 
-requestIdleCallback(workLoop);
+function performUnitOfWork(fiber) {
+  const child = beginWork(fiber);             // ↓ 向下：diff、生成子 fiber、打 flags
+  if (child) return child;
+
+  let node = fiber;
+  while (node) {
+    completeWork(node);                       // ↑ 向上：创建 DOM、冒泡 subtreeFlags
+    if (node.sibling) return node.sibling;    // 有兄弟就转去兄弟
+    node = node.return;                       // 没有就回父节点
+  }
+  return null;
+}
 ```
 
-> ⚠️ 上面是**教学简化模型**。React 实际没有用 `requestIdleCallback`——它自己实现了 Scheduler（基于 `MessageChannel`，5ms 时间片 + 过期时间优先级），原因是 rIC 只在「浏览器认为空闲」时回调，频率不可控（可能几秒才来一次），而 React 需要在「有高优更新时立刻抢占」。
+两个方向要分清：
+
+- **`beginWork` 是前序**：处理当前节点，算出它的子节点；
+- **`completeWork` 是后序**：子节点都处理完才回到父节点，这时才创建/更新 DOM、把 `subtreeFlags` 往上冒泡。
+
+**为什么这样就可中断**：暂停时只需要保存一个 `nextUnitOfWork` 指针，恢复时从它继续；递归做不到，因为调用栈里没有可以被外部保存的中间状态。这也是"Fiber 是一个虚拟调用栈"这句话的真正含义。
+
+**渲染流程：render 可中断，commit 不可中断**
+
+```text
+render 阶段（可中断、可丢弃、不许有副作用）
+  beginWork ↓  逐节点 diff，生成 workInProgress 子树，打 flags
+  completeWork ↑ 创建 DOM 实例、冒泡 subtreeFlags
+  ↓ 整棵树完成
+commit 阶段（同步、一次跑完）
+  ① before mutation  读 DOM（getSnapshotBeforeUpdate）、调度 passive effects
+  ② mutation         真正增删改 DOM、执行 layout effect 的销毁函数
+  ③ layout           执行 useLayoutEffect 创建、componentDidMount/Update、ref 赋值
+                     root.current = finishedWork（双缓存交换）
+  ↓ 浏览器绘制
+  ④ passive effects  useEffect 在绘制后异步 flush
+```
+
+四条边界，面试最常追问：
+
+| 问题 | 答案 |
+| --- | --- |
+| 为什么 commit 不能中断 | DOM 已经改了一半，中断会让用户看到中间态；且 layout effect / ref 必须与 DOM 一致 |
+| `useLayoutEffect` 在哪 | commit 的 layout 阶段，同步执行，**会阻塞绘制** |
+| `useEffect` 在哪 | 绘制之后异步执行（passive effect），不挡首屏 |
+| render 为什么不能写副作用 | render 可能被重复执行（StrictMode 开发期会双调用）或被高优更新打断后重来 |
+
+```jsx
+function Demo() {
+  useLayoutEffect(() => console.log('layout')); // commit 内，同步
+  useEffect(() => console.log('passive'));      // 绘制后，异步
+  console.log('render');                        // render 阶段，可能执行两次（开发期）
+}
+// 首次挂载的稳定顺序：render → layout → passive
+```
+
+**双缓存：current 与 workInProgress**
+
+内存里同时存在两棵 Fiber 树：
+
+- `current`：屏幕上正在显示的树；
+- `workInProgress`（wip）：render 阶段正在构建的树；
+- 两者通过 `alternate` 互指，节点可以复用，不是每次新建。
+
+```javascript
+// 简化：commit 的最后一步就是换根
+root.current = finishedWork;
+```
+
+好处有三个：渲染过程中屏幕上的树始终完整可用；中断或放弃只需丢掉 wip，不影响已显示内容；下次更新可以复用上一棵树的节点与部分计算结果。
+
+**调度：Scheduler 与 Lane 各管什么**
+
+```text
+优先级来源（Lane） → 调度器（Scheduler）→ 时间切片执行 render → commit
+```
+
+- **Scheduler**：React 自己实现，基于 `MessageChannel`，默认约 5ms 一个时间片（会根据是否有待处理输入动态调整），用 `shouldYield` 决定是否让出；**没有用 `requestIdleCallback`**，因为 rIC 的触发频率不可控，React 需要在高优更新到来时立刻抢占。
+- **Lane**：Fiber 内部的 31 位 bitmask，表示"这次更新属于哪一档"。`SyncLane` 通常同步执行、不走 Scheduler；`startTransition` 走 transition lane，可以被高优更新打断。
+
+**常见误区（很容易被追问打穿）**
+
+| 说法 | 问题 | 正确表述 |
+| --- | --- | --- |
+| "Fiber 就是虚拟 DOM" | 混淆了元素描述与运行时结构 | VDOM 是 React 元素（描述 UI）；Fiber 是协调用的工作单元与状态载体 |
+| "有了 Fiber，所有更新都异步" | 忽略了 SyncLane 与 legacy root | 只有并发 root 下的可打断 lane 才走时间切片；同步更新仍然一口气执行 |
+| "Fiber 用 requestIdleCallback 切片" | 实现细节记错 | 用的是 Scheduler（MessageChannel） |
+| "commit 阶段也可以被打断" | 把 render 的特性套到 commit | 只有 render 可中断，commit 一轮跑完 |
+| "useEffect 在 commit 同步执行" | 混淆 layout / passive | `useLayoutEffect` 同步；`useEffect` 绘制后异步 |
+| "每个组件每次更新都新建 Fiber" | 忽略了双缓存 | 通过 `alternate` 复用节点，commit 时交换根 |
+| "优先级就是 5 级" | 把 Scheduler 当成 Fiber | Scheduler 5 级用于调度；Fiber 用 Lane 表示可合并的优先级 |
 
 **追问链（Fiber 真正的考点）：**
 
-- **「render 阶段和 commit 阶段分别能做什么，为什么这么分？」⭐⭐⭐**
-  答：render 阶段（`beginWork`/`completeUnitOfWork`）是**可中断**的，只做计算：生成新的 fiber 树、diff 出副作用标记（flags）。commit 阶段（`commitRoot`）是**不可中断**的：一次跑完 DOM 变更、`useLayoutEffect`、`componentDidMount/Update`，然后再让浏览器绘制。这么分的根因是：DOM 操作一旦开始就不能回到中间态，否则用户会看到半个界面。所以「Fiber 能中断」严格说只适用于 render 阶段——`useLayoutEffect` 里写死循环照样卡死页面。
+- **「render 和 commit 分别能做什么，为什么这么分？」⭐⭐⭐**
+  答：render（`beginWork`/`completeWork`）只做计算：生成 wip 树、diff 出 `flags`，可中断、可丢弃；commit（`commitRoot`）不可中断：一次跑完 DOM 变更、layout effect、`componentDidMount/Update`，再让浏览器绘制。根因是 DOM 操作没有中间态可回滚——改了一半就停下，用户会看到半个界面。所以"Fiber 能中断"严格说只适用于 render；`useLayoutEffect` 里写死循环照样卡死页面。
 - **「双缓存 Fiber 树是什么？」**
-  答：内存里同时存在 `current`（屏幕上正在显示的）和 `workInProgress`（正在构建的）两棵 fiber 树，通过 `alternate` 指针互指。render 阶段在 wip 树上改，commit 阶段把 `root.current` 指向 wip，完成一次「交换」。好处是：渲染过程中屏幕上的树始终完整可用，中断/放弃重渲染只需丢掉 wip 树，不影响已显示内容。
+  答：`current`（屏幕上的）与 `workInProgress`（构建中的）两棵树通过 `alternate` 互指；render 改 wip，commit 末把 `root.current` 指向 wip，完成交换。中断时丢掉 wip 即可，屏幕不受影响。
 - **「Lane 模型解决了什么？」**
-  答：优先级。React 15 用 `expirationTime`（单一数值，比较粗暴），React 17+ 换成 31 位 bitmask 的 lanes：一次更新可以打多个 lane（比如 transition + 默认），`entangle` 保证同一批更新一起提交；高优更新（用户输入）可以打断低优渲染（大列表渲染）并复用已完成的工作。
+  答：优先级与批次。React 15 用 `expirationTime`（单值，比较粗），17+ 换成 31 位 bitmask：一次更新可以带多个 lane，按位运算合并；高优（输入）可以打断低优（大列表）渲染；`entangle` 让同一批更新一起提交。
+- **「为什么不用 generator 实现可中断？」**
+  答：生成器虽然能 `yield`，但它的中间状态不透明，React 需要"随时丢弃当前树、用新优先级重来"以及"复用已完成的部分"，用显式链表 + 指针更容易控制；此外还要在让出时判断是否有更高优先级的更新，生成器做这件事会很别扭。
+- **「高优更新打断后，低优已经算完的工作会浪费吗？」**
+  答：不一定。wip 树和 `alternate` 会保留已完成节点，恢复时能复用；但优先级不匹配或结构变化时，部分子树要重算。`childLanes` 用来快速判断"这棵子树里还有没有待处理的更新"，避免白跑。
+- **「`flags` 和 `subtreeFlags` 为什么都要？」**
+  答：`flags` 回答"我自己要做什么"，`subtreeFlags` 回答"我的子树里有没有活"。commit 时如果某棵子树的 `subtreeFlags` 为 0，就能整棵跳过，不用逐节点检查。
+- **「`createRoot` 和 `ReactDOM.render` 的 Fiber 有区别吗？」**
+  答：都有 Fiber。区别在 root 模式：`createRoot` 是并发 root，更新可以按 lane 切片、被打断；legacy 的 `ReactDOM.render` 走同步路径，Fiber 仍然存在，但不会做时间切片。
+- **「Suspense 和 Fiber 什么关系？」⭐**
+  答：Suspense 依赖 Fiber 的可中断能力：子树抛出一个 thenable 时，React 捕获它、把该子树标记为挂起、先提交 fallback，等 Promise resolve 后重新渲染；整个过程不需要阻塞主线程。能说到"捕获 promise + 挂起 + 重放"即可，不必背源码。
+
+**面试话术（先给 30 秒版，再按追问展开）**
+
+> "Fiber 是 React 16 的协调引擎。它把递归不可中断的调用栈，换成用 `return/child/sibling` 串起来的链表，每个节点是一个工作单元，循环处理，时间片用完就保存指针让出。render 阶段只算不提交、可中断可丢弃；commit 阶段同步改 DOM、跑 layout effect，不能中断。两棵 Fiber 树通过 `alternate` 做双缓存，commit 末交换根；优先级用 Lane 的 31 位 bitmask 表示，Scheduler 用 `MessageChannel` 做约 5ms 的时间切片。"
 
 #### 追问：Fiber 优先级到底是「5 级」还是 Lane？
 
