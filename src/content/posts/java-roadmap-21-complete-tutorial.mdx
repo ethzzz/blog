@@ -1,0 +1,1711 @@
+---
+title: "附录 · Java 全面精通速成（16 章）"
+published: 2026-11-12T09:00:00+08:00
+description: "独立速成教程：JDK 21 语言核心、集合与并发、Spring Boot 3 分层与 JPA、Security、测试、配置与缓存异步，16 章覆盖语言核心与 Spring Boot 后端开发。"
+tags: [Java, SpringBoot, 速成教程, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这是一份**独立速成教程**，不依赖前面的编号顺序：16 章覆盖「语言核心 → Spring Boot 后端开发」。
+> 说明：原文总览里的第三部分（17–20 章：生产环境与精通）未包含在本篇中，这部分请接着看主线的 [19 部署与排查](/blog/posts/java-roadmap-19-deploy-and-troubleshoot/) 与 [20 毕业项目](/blog/posts/java-roadmap-20-graduation-workorder/)。
+> 用法：已按 01–20 学过的人，用它做横向复习与面试前速查；刚起步的人，可以先用它跑通一遍，再回到主线按阶段补细节。
+> 示例统一 JDK 21、Spring Boot 3，命令与代码都可直接运行。
+
+每个主题先讲概念，再给出可以直接运行的代码。内容基于现代 Java（JDK 21 LTS）和 Spring Boot 3，从语言基础讲到 Spring Boot 后端开发；生产环境部分见主线的 19–20 篇。
+
+## 学习路线总览
+
+| 部分 | 内容 | 章节 |
+| --- | --- | --- |
+| 第一部分 | Java 语言核心 | 1-8 |
+| 第二部分 | Spring Boot 后端开发 | 9-16 |
+| 第三部分 | 生产环境与精通（本篇未收录，见主线 19–20） | 17-20 |
+
+## 环境准备
+
+安装 JDK 21（推荐 Temurin、Corretto 或 Oracle OpenJDK），然后检查：
+
+```bash
+java -version
+javac -version
+```
+
+创建 `Hello.java`：
+
+```java
+public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Hello, Java " + Runtime.version());
+    }
+}
+```
+
+直接运行（Java 11 及以上支持单文件运行）：
+
+```bash
+java Hello.java
+```
+
+也可以先编译再运行：
+
+```bash
+javac Hello.java
+java Hello
+```
+
+**推荐工具：** IntelliJ IDEA（Community 版免费）或 VS Code 加 Java 扩展包。
+
+**核心思想：** Java 源码先编译成字节码，再由 JVM（Java 虚拟机）运行。同一份字节码可以在任何装有 JVM 的系统上运行。
+
+---
+
+## 1. 语言基础
+
+**概念：** Java 是静态类型语言，每个变量都有明确的类型，编译器会在运行前帮你发现许多错误。
+
+### 变量与类型
+
+```java
+int age = 30;                 // 32 位整数
+long big = 10_000_000_000L;   // 64 位整数，下划线增强可读性
+double price = 19.99;         // 64 位浮点数
+boolean active = true;
+char letter = 'A';
+
+var name = "Ada";             // 类型推断，仍然是 String
+final int MAX = 100;          // final：不可再赋值
+```
+
+| 类型 | 大小 | 用途 |
+| --- | --- | --- |
+| `int` | 32 位 | 一般整数 |
+| `long` | 64 位 | 大整数、时间戳 |
+| `double` | 64 位 | 小数（不要用于金额） |
+| `boolean` | - | 真或假 |
+| `BigDecimal` | 任意精度 | 金额和精确小数 |
+
+**金额永远不要用 `double`。** 用 `BigDecimal` 或以“分”为单位的 `long`。
+
+### 字符串
+
+```java
+String s = "Hello, Java";
+System.out.println(s.length());           // 11
+System.out.println(s.toUpperCase());      // HELLO, JAVA
+System.out.println(s.substring(7));       // Java
+System.out.println(s.contains("Java"));   // true
+System.out.println(String.join("-", "a", "b", "c")); // a-b-c
+
+String msg = String.format("%s is %d years old", name, age);
+
+// 文本块：多行字符串
+String json = """
+    {
+      "name": "Ada",
+      "age": 30
+    }
+    """;
+```
+
+**重要：** 比较字符串内容要用 `equals`，不能用 `==`（`==` 比较的是对象引用）。
+
+```java
+String a = new String("hi");
+String b = new String("hi");
+System.out.println(a == b);       // false
+System.out.println(a.equals(b));  // true
+```
+
+字符串不可变。大量拼接时使用 `StringBuilder`：
+
+```java
+var sb = new StringBuilder();
+for (int i = 0; i < 5; i++) sb.append(i).append(',');
+System.out.println(sb);  // 0,1,2,3,4,
+```
+
+### 控制流
+
+```java
+int score = 85;
+if (score >= 90) {
+    System.out.println("A");
+} else if (score >= 80) {
+    System.out.println("B");
+} else {
+    System.out.println("C");
+}
+
+// switch 表达式（现代写法，有返回值，不会“穿透”）
+int day = 3;
+String type = switch (day) {
+    case 1, 7 -> "周末";
+    case 2, 3, 4, 5, 6 -> "工作日";
+    default -> throw new IllegalArgumentException("无效的日期: " + day);
+};
+
+// 循环
+for (int i = 0; i < 3; i++) System.out.println(i);
+
+int[] numbers = {5, 3, 8};
+for (int n : numbers) System.out.println(n);   // 增强 for 循环
+
+int count = 0;
+while (count < 3) count++;
+```
+
+### 方法
+
+```java
+public class MathUtil {
+    public static int add(int a, int b) {
+        return a + b;
+    }
+
+    // 方法重载：同名，参数不同
+    public static double add(double a, double b) {
+        return a + b;
+    }
+
+    // 可变参数
+    public static int sum(int... values) {
+        int total = 0;
+        for (int v : values) total += v;
+        return total;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(add(2, 3));      // 5
+        System.out.println(sum(1, 2, 3, 4)); // 10
+    }
+}
+```
+
+---
+
+## 2. 面向对象编程（OOP）
+
+**概念：** 把数据和操作数据的行为放在一起。四大支柱：封装、继承、多态、抽象。
+
+### 封装
+
+```java
+public class BankAccount {
+    private final String id;
+    private long balanceCents;   // 私有：外部不能直接修改
+
+    public BankAccount(String id, long initialCents) {
+        if (initialCents < 0) throw new IllegalArgumentException("初始余额不能为负");
+        this.id = id;
+        this.balanceCents = initialCents;
+    }
+
+    public void deposit(long cents) {
+        if (cents <= 0) throw new IllegalArgumentException("金额必须为正");
+        balanceCents += cents;
+    }
+
+    public void withdraw(long cents) {
+        if (cents > balanceCents) throw new IllegalStateException("余额不足");
+        balanceCents -= cents;
+    }
+
+    public long getBalanceCents() { return balanceCents; }
+    public String getId() { return id; }
+}
+```
+
+通过方法而不是公开字段访问数据，这样类就能保证自己的规则始终成立。
+
+### 继承、抽象类与多态
+
+```java
+abstract class Animal {
+    protected final String name;
+    Animal(String name) { this.name = name; }
+
+    abstract String sound();          // 子类必须实现
+
+    void speak() {
+        System.out.println(name + " says " + sound());
+    }
+}
+
+class Dog extends Animal {
+    Dog(String name) { super(name); }
+    @Override String sound() { return "Woof"; }
+}
+
+class Cat extends Animal {
+    Cat(String name) { super(name); }
+    @Override String sound() { return "Meow"; }
+}
+
+public class Zoo {
+    public static void main(String[] args) {
+        Animal[] animals = { new Dog("Rex"), new Cat("Tom") };
+        for (Animal a : animals) a.speak();   // 多态：运行时决定调用哪个实现
+    }
+}
+```
+
+### 接口
+
+接口定义“能做什么”，类通过 `implements` 实现。一个类可以实现多个接口，但只能继承一个类。
+
+```java
+interface PaymentMethod {
+    boolean pay(long cents);
+
+    default String describe() {          // 默认方法
+        return "支付方式: " + getClass().getSimpleName();
+    }
+}
+
+class CreditCard implements PaymentMethod {
+    public boolean pay(long cents) {
+        System.out.println("信用卡支付 " + cents);
+        return true;
+    }
+}
+```
+
+**设计原则：** 优先使用组合而不是继承，面向接口编程而不是面向具体实现。
+
+### Record、枚举与密封类型
+
+```java
+// record：不可变数据类，自动生成构造器、getter、equals、hashCode、toString
+record Point(int x, int y) {
+    Point {   // 紧凑构造器：验证
+        if (x < 0 || y < 0) throw new IllegalArgumentException("坐标不能为负");
+    }
+    double distanceTo(Point other) {
+        return Math.hypot(x - other.x, y - other.y);
+    }
+}
+
+// 枚举
+enum OrderStatus {
+    NEW("新建"), PAID("已支付"), SHIPPED("已发货");
+
+    private final String label;
+    OrderStatus(String label) { this.label = label; }
+    public String label() { return label; }
+}
+
+// 密封接口 + 模式匹配 switch：编译器会检查是否覆盖了所有情况
+sealed interface Shape permits Circle, Rectangle {}
+record Circle(double radius) implements Shape {}
+record Rectangle(double width, double height) implements Shape {}
+
+class Geometry {
+    static double area(Shape shape) {
+        return switch (shape) {
+            case Circle c -> Math.PI * c.radius() * c.radius();
+            case Rectangle r -> r.width() * r.height();
+        };
+    }
+}
+```
+
+### equals 与 hashCode
+
+如果你重写了 `equals`，就必须同时重写 `hashCode`，否则对象放进 `HashMap` 或 `HashSet` 时会出错。最简单的做法是使用 `record`，它们会自动生成。
+
+---
+
+## 3. 集合与泛型
+
+**概念：** 集合框架提供现成的数据结构。泛型让它们在编译期就保证类型安全。
+
+| 接口 | 常用实现 | 特点 |
+| --- | --- | --- |
+| `List` | `ArrayList` | 有序，可重复，按索引访问快 |
+| `Set` | `HashSet`、`TreeSet` | 不重复；`TreeSet` 有序 |
+| `Map` | `HashMap`、`TreeMap` | 键值对；`TreeMap` 按键排序 |
+| `Deque` | `ArrayDeque` | 栈和队列 |
+
+```java
+import java.util.*;
+
+List<String> names = new ArrayList<>();
+names.add("Ada");
+names.add("Linus");
+names.add("Grace");
+Collections.sort(names);
+System.out.println(names);   // [Ada, Grace, Linus]
+
+Set<Integer> unique = new HashSet<>(List.of(1, 2, 2, 3, 3));
+System.out.println(unique.size());   // 3
+
+Map<String, Integer> stock = new HashMap<>();
+stock.put("apple", 10);
+stock.put("pear", 4);
+stock.merge("apple", 5, Integer::sum);          // apple -> 15
+stock.computeIfAbsent("kiwi", k -> 0);          // 不存在才放入
+for (var entry : stock.entrySet()) {
+    System.out.println(entry.getKey() + " = " + entry.getValue());
+}
+
+// 不可变集合
+List<String> fixed = List.of("a", "b");
+// fixed.add("c");  // 抛出 UnsupportedOperationException
+```
+
+### 排序
+
+```java
+record Person(String name, int age) {}
+
+var people = new ArrayList<>(List.of(
+    new Person("Ada", 36), new Person("Bob", 25), new Person("Cy", 36)));
+
+people.sort(Comparator.comparingInt(Person::age).reversed()
+                      .thenComparing(Person::name));
+System.out.println(people);
+```
+
+### 泛型
+
+```java
+// 泛型类
+class Box<T> {
+    private final T value;
+    Box(T value) { this.value = value; }
+    T get() { return value; }
+}
+
+// 泛型方法 + 有界类型：T 必须可比较
+static <T extends Comparable<T>> T max(List<T> items) {
+    T best = items.get(0);
+    for (T item : items) {
+        if (item.compareTo(best) > 0) best = item;
+    }
+    return best;
+}
+
+System.out.println(max(List.of(3, 9, 4)));        // 9
+System.out.println(max(List.of("a", "z", "m")));   // z
+```
+
+**性能提示：** 默认使用 `ArrayList` 和 `HashMap`。只有在确实需要有序遍历、并发访问等特性时才换成别的实现。
+
+---
+
+## 4. Lambda、Stream 与 Optional
+
+**概念：** Lambda 是可以当作值传递的简短函数。Stream 用声明式的方式处理集合：说明“要什么”，而不是“怎么循环”。
+
+### Lambda 与函数式接口
+
+```java
+import java.util.function.*;
+
+Function<Integer, Integer> square = x -> x * x;
+Predicate<String> isLong = s -> s.length() > 5;
+Supplier<String> greeting = () -> "Hello";
+BiFunction<Integer, Integer, Integer> add = (a, b) -> a + b;
+Consumer<String> printer = System.out::println;   // 方法引用
+
+System.out.println(square.apply(5));        // 25
+System.out.println(isLong.test("Java"));    // false
+printer.accept(greeting.get());
+```
+
+### Stream
+
+```java
+import java.util.stream.*;
+
+record Order(String customer, String category, double amount) {}
+
+var orders = List.of(
+    new Order("Ada", "book", 30),
+    new Order("Bob", "book", 20),
+    new Order("Ada", "toy", 50),
+    new Order("Cy", "toy", 15));
+
+// 过滤 + 转换 + 收集
+List<String> bigCustomers = orders.stream()
+    .filter(o -> o.amount() >= 30)
+    .map(Order::customer)
+    .distinct()
+    .sorted()
+    .toList();
+
+// 汇总
+double total = orders.stream().mapToDouble(Order::amount).sum();
+
+// 分组
+Map<String, Double> totalByCategory = orders.stream()
+    .collect(Collectors.groupingBy(Order::category,
+             Collectors.summingDouble(Order::amount)));
+
+System.out.println(bigCustomers);      // [Ada]
+System.out.println(total);             // 115.0
+System.out.println(totalByCategory);   // {book=50.0, toy=65.0}
+
+// 其他常用操作
+boolean anyBig = orders.stream().anyMatch(o -> o.amount() > 40);
+Optional<Order> max = orders.stream().max(Comparator.comparingDouble(Order::amount));
+String names = orders.stream().map(Order::customer).collect(Collectors.joining(", "));
+```
+
+**注意：** Stream 只能消费一次。不要在 `map` 或 `filter` 里写有副作用的代码。简单循环更清晰时，就用循环。
+
+### Optional
+
+`Optional` 表示“可能没有值”，用来取代到处返回 `null`。
+
+```java
+static Optional<String> findEmail(String user) {
+    return user.equals("ada") ? Optional.of("ada@example.com") : Optional.empty();
+}
+
+String email = findEmail("bob").orElse("unknown@example.com");
+
+findEmail("ada").ifPresent(e -> System.out.println("发送邮件到 " + e));
+
+String domain = findEmail("ada")
+    .map(e -> e.substring(e.indexOf('@') + 1))
+    .orElseThrow(() -> new IllegalStateException("没有邮箱"));
+```
+
+**规则：** `Optional` 适合做方法的返回值，不要用作字段或方法参数。
+
+---
+
+## 5. 异常处理
+
+**概念：** 异常把“正常流程”和“出错处理”分开。Java 区分两类异常：
+
+| 类型 | 例子 | 是否强制处理 |
+| --- | --- | --- |
+| 受检异常（checked） | `IOException`、`SQLException` | 是，必须 `try/catch` 或 `throws` |
+| 非受检异常（unchecked） | `IllegalArgumentException`、`NullPointerException` | 否，通常表示编程错误 |
+
+```java
+import java.nio.file.*;
+import java.io.IOException;
+
+// try-with-resources：自动关闭资源，即使出错也会关闭
+static String readFirstLine(Path path) {
+    try (var lines = Files.lines(path)) {
+        return lines.findFirst().orElse("");
+    } catch (NoSuchFileException e) {
+        return "文件不存在";
+    } catch (IOException e) {
+        throw new UncheckedIOException(e);   // 包装并向上抛出
+    }
+}
+```
+
+### 自定义异常
+
+```java
+public class InsufficientFundsException extends RuntimeException {
+    private final long shortfallCents;
+
+    public InsufficientFundsException(long shortfallCents) {
+        super("余额不足，还差 " + shortfallCents + " 分");
+        this.shortfallCents = shortfallCents;
+    }
+
+    public long getShortfallCents() { return shortfallCents; }
+}
+```
+
+### 良好实践
+
+- 抛出具体的异常类型，并写清楚信息，不要抛 `Exception` 或 `RuntimeException` 本身。
+- 不要吞掉异常：`catch (Exception e) {}` 会掩盖问题。至少要记录日志。
+- 包装异常时保留原始原因：`new MyException("信息", cause)`。
+- 用异常处理“异常情况”，不要用它控制正常流程。
+- 多个异常处理方式相同时，使用多重捕获：`catch (IOException | ParseException e)`。
+
+---
+
+## 6. 文件与 I/O
+
+**概念：** `java.nio.file` 包（NIO.2）是现代的文件操作方式。用 `Path` 表示路径，用 `Files` 完成读写。
+
+```java
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.stream.Stream;
+
+public class FileDemo {
+    public static void main(String[] args) throws IOException {
+        Path dir = Path.of("data");
+        Path file = dir.resolve("notes.txt");
+
+        Files.createDirectories(dir);
+        Files.writeString(file, "第一行\n");
+        Files.writeString(file, "第二行\n", StandardOpenOption.APPEND);
+
+        String text = Files.readString(file);
+        System.out.println(text);
+
+        // 大文件：逐行读取，不要一次性读入内存
+        try (Stream<String> lines = Files.lines(file)) {
+            long count = lines.filter(l -> !l.isBlank()).count();
+            System.out.println("非空行数: " + count);
+        }
+
+        // 遍历目录
+        try (Stream<Path> entries = Files.list(dir)) {
+            entries.forEach(p -> System.out.println(p.getFileName()));
+        }
+
+        System.out.println(Files.exists(file));   // true
+        Files.deleteIfExists(file);
+    }
+}
+```
+
+**要点：**
+
+- `Files.lines` 和 `Files.list` 返回的 Stream 持有文件句柄，必须放在 `try-with-resources` 中。
+- 读写文本时明确指定字符集更稳妥：`Files.readString(file, StandardCharsets.UTF_8)`。
+- 处理用户提供的文件名时，要防止路径遍历：用 `normalize()` 后检查结果是否仍在允许的目录内。
+
+---
+
+## 7. 并发编程
+
+**概念：** 并发让程序同时处理多件事。Java 提供了线程、线程池、`CompletableFuture`，以及 Java 21 的虚拟线程。
+
+### 线程池
+
+不要手动创建大量线程，使用线程池：
+
+```java
+import java.util.concurrent.*;
+
+ExecutorService pool = Executors.newFixedThreadPool(4);
+
+Future<Integer> future = pool.submit(() -> {
+    Thread.sleep(500);        // 模拟耗时操作
+    return 42;
+});
+
+System.out.println("做其他事情...");
+System.out.println("结果: " + future.get());   // 阻塞直到完成
+
+pool.shutdown();   // 不再接受新任务；一定要关闭
+```
+
+### CompletableFuture：组合异步任务
+
+```java
+CompletableFuture<String> user = CompletableFuture.supplyAsync(() -> "ada");
+CompletableFuture<Integer> orderCount = CompletableFuture.supplyAsync(() -> 3);
+
+user.thenCombine(orderCount, (u, n) -> u + " 有 " + n + " 个订单")
+    .exceptionally(ex -> "加载失败: " + ex.getMessage())
+    .thenAccept(System.out::println)
+    .join();
+```
+
+### 虚拟线程（Java 21）
+
+虚拟线程非常轻量，可以同时创建几十万个。它特别适合大量阻塞 I/O 的场景（HTTP 调用、数据库访问），而且可以继续使用简单直白的阻塞式代码。
+
+```java
+import java.time.Duration;
+import java.util.stream.IntStream;
+
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    IntStream.range(0, 10_000).forEach(i ->
+        executor.submit(() -> {
+            Thread.sleep(Duration.ofSeconds(1));
+            return i;
+        }));
+}   // 退出 try 时会等待所有任务完成
+```
+
+**注意：** 虚拟线程适合 I/O 密集型任务。CPU 密集型任务仍然受限于 CPU 核数，不要因此创建更多线程。
+
+### 线程安全
+
+多个线程同时修改同一份数据会产生竞态条件：
+
+```java
+class Counter {
+    private int unsafe = 0;
+    private final java.util.concurrent.atomic.AtomicInteger safe =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    void incrementUnsafe() { unsafe++; }                 // 错误：不是原子操作
+    synchronized void incrementSync() { unsafe++; }      // 正确：加锁
+    void incrementAtomic() { safe.incrementAndGet(); }   // 正确：原子类，通常更快
+}
+```
+
+| 工具 | 用途 |
+| --- | --- |
+| `synchronized` | 简单的互斥锁 |
+| `AtomicInteger`、`AtomicLong` | 无锁的计数器 |
+| `ConcurrentHashMap` | 线程安全的 Map |
+| `ReentrantLock` | 需要超时、可中断等高级功能时 |
+| `CountDownLatch`、`Semaphore` | 协调多个线程 |
+
+**经验法则：** 优先使用不可变对象和 `java.util.concurrent` 里的现成工具，尽量少写 `synchronized`。
+
+---
+
+## 8. Maven 与单元测试
+
+**概念：** Maven（或 Gradle）负责管理依赖、编译、测试和打包。
+
+### 标准项目结构
+
+```
+my-app/
+  pom.xml
+  src/
+    main/
+      java/com/example/app/    源代码
+      resources/               配置文件
+    test/
+      java/com/example/app/    测试代码
+```
+
+最小的 `pom.xml`：
+
+```xml
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+```
+
+常用命令：
+
+```bash
+mvn compile          # 编译
+mvn test             # 运行测试
+mvn package          # 打成 jar
+mvn clean verify     # 清理后完整构建
+```
+
+### 用 JUnit 5 写测试
+
+```java
+// src/main/java/com/example/app/PriceCalculator.java
+package com.example.app;
+
+public class PriceCalculator {
+    public long applyDiscount(long cents, int percent) {
+        if (percent < 0 || percent > 100) {
+            throw new IllegalArgumentException("折扣必须在 0 到 100 之间");
+        }
+        return cents - cents * percent / 100;
+    }
+}
+```
+
+```java
+// src/test/java/com/example/app/PriceCalculatorTest.java
+package com.example.app;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class PriceCalculatorTest {
+    private final PriceCalculator calc = new PriceCalculator();
+
+    @Test
+    void appliesTenPercentDiscount() {
+        assertEquals(900, calc.applyDiscount(1000, 10));
+    }
+
+    @Test
+    void rejectsInvalidPercent() {
+        var ex = assertThrows(IllegalArgumentException.class,
+            () -> calc.applyDiscount(1000, 120));
+        assertTrue(ex.getMessage().contains("折扣"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1000,0,1000", "1000,50,500", "1000,100,0"})
+    void worksForManyInputs(long cents, int percent, long expected) {
+        assertEquals(expected, calc.applyDiscount(cents, percent));
+    }
+}
+```
+
+**测试原则：** 一个测试只验证一件事；名称要说明行为；既测正常路径，也测边界和错误；测试之间互不依赖。
+
+---
+
+# 第二部分：Spring Boot 后端开发
+
+## 9. 第一个 Spring Boot REST API
+
+**概念：** Spring Boot 是 Java 后端开发最主流的框架。它通过“约定优于配置”和自动配置，让你几分钟内就能跑起一个服务。
+
+**创建项目：** 打开 start.spring.io，选择 Maven、Java 21，并添加依赖 **Spring Web**、**Validation**、**Spring Data JPA**、**PostgreSQL Driver**、**Spring Security**、**Actuator**。版本号以该网站生成的为准。解压后用 IDE 打开。
+
+启动类：
+
+```java
+@SpringBootApplication
+public class DemoApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(DemoApplication.class, args);
+    }
+}
+```
+
+一个内存版的待办事项 API：
+
+```java
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+@RestController
+@RequestMapping("/api/todos")
+public class TodoController {
+
+    record Todo(Long id, String title, boolean done) {}
+    record CreateTodo(String title) {}
+
+    private final Map<Long, Todo> store = new ConcurrentHashMap<>();
+    private final AtomicLong ids = new AtomicLong();
+
+    @GetMapping
+    public List<Todo> list() {
+        return List.copyOf(store.values());
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Todo> get(@PathVariable Long id) {
+        Todo todo = store.get(id);
+        return todo == null ? ResponseEntity.notFound().build() : ResponseEntity.ok(todo);
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    public Todo create(@RequestBody CreateTodo body) {
+        long id = ids.incrementAndGet();
+        Todo todo = new Todo(id, body.title(), false);
+        store.put(id, todo);
+        return todo;
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void delete(@PathVariable Long id) {
+        store.remove(id);
+    }
+}
+```
+
+运行并测试：
+
+```bash
+./mvnw spring-boot:run
+
+curl -X POST http://localhost:8080/api/todos \
+  -H "Content-Type: application/json" \
+  -d '{"title":"学习 Spring Boot"}'
+
+curl http://localhost:8080/api/todos
+```
+
+注意：添加了 Spring Security 依赖后，默认所有接口都需要登录。学习阶段可以先在第 13 节配置放行，或暂时不添加该依赖。
+
+### 常用注解
+
+| 注解 | 作用 |
+| --- | --- |
+| `@RestController` | 声明这是 REST 控制器，返回值自动序列化为 JSON |
+| `@RequestMapping` / `@GetMapping` / `@PostMapping` | 映射 URL 和 HTTP 方法 |
+| `@PathVariable` | 读取路径参数 `/todos/{id}` |
+| `@RequestParam` | 读取查询参数 `?page=2` |
+| `@RequestBody` | 把 JSON 请求体转成对象 |
+| `@ResponseStatus` | 指定响应状态码 |
+
+---
+
+## 10. 依赖注入与分层架构
+
+**概念：** 依赖注入（DI）的意思是：对象不自己创建所依赖的对象，而是由 Spring 创建并传给它。这让代码更容易测试、替换和维护。
+
+### 分层
+
+| 层 | 注解 | 职责 |
+| --- | --- | --- |
+| Controller | `@RestController` | 处理 HTTP：解析请求、返回响应 |
+| Service | `@Service` | 业务规则和事务 |
+| Repository | `@Repository` | 访问数据库 |
+
+```java
+// 领域对象
+public record Todo(Long id, String title, boolean done) {}
+
+// Repository 接口
+public interface TodoRepository {
+    List<Todo> findAll();
+    Optional<Todo> findById(Long id);
+    Todo save(Todo todo);
+    void deleteById(Long id);
+}
+```
+
+```java
+// Service：通过构造器注入依赖（推荐）
+@Service
+public class TodoService {
+
+    private final TodoRepository repository;
+
+    public TodoService(TodoRepository repository) {
+        this.repository = repository;
+    }
+
+    public Todo get(Long id) {
+        return repository.findById(id)
+            .orElseThrow(() -> new NotFoundException("Todo " + id + " 不存在"));
+    }
+
+    public Todo create(String title) {
+        return repository.save(new Todo(null, title, false));
+    }
+}
+```
+
+```java
+// Controller 只依赖 Service
+@RestController
+@RequestMapping("/api/todos")
+public class TodoController {
+
+    private final TodoService service;
+
+    public TodoController(TodoService service) {
+        this.service = service;
+    }
+
+    @GetMapping("/{id}")
+    public Todo get(@PathVariable Long id) {
+        return service.get(id);
+    }
+}
+```
+
+**为什么用构造器注入？** 依赖可以声明为 `final`，对象创建后就是完整的，并且单元测试时可以直接 `new TodoService(fakeRepository)`，不需要启动 Spring。
+
+### Bean 与配置
+
+```java
+@Configuration
+public class AppConfig {
+
+    @Bean
+    public Clock clock() {          // 由 Spring 管理，可以注入到任何地方
+        return Clock.systemUTC();
+    }
+}
+```
+
+默认情况下，Spring Bean 是单例的：整个应用只有一个实例，因此 Bean 里不要保存和某个请求相关的可变状态。
+
+---
+
+## 11. 数据验证与统一异常处理
+
+**概念：** 永远不要信任客户端的输入。用声明式的注解验证请求，再用一个全局处理器把异常转换成统一的错误响应。
+
+```java
+import jakarta.validation.constraints.*;
+
+public record CreateTodoRequest(
+    @NotBlank(message = "标题不能为空")
+    @Size(max = 120, message = "标题最长 120 个字符")
+    String title,
+
+    @Min(value = 1, message = "优先级最小为 1")
+    @Max(value = 5, message = "优先级最大为 5")
+    int priority
+) {}
+```
+
+```java
+@PostMapping
+@ResponseStatus(HttpStatus.CREATED)
+public Todo create(@Valid @RequestBody CreateTodoRequest request) {
+    return service.create(request.title());
+}
+```
+
+### 全局异常处理
+
+```java
+public class NotFoundException extends RuntimeException {
+    public NotFoundException(String message) { super(message); }
+}
+```
+
+```java
+import org.springframework.http.*;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.*;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(NotFoundException.class)
+    public ProblemDetail handleNotFound(NotFoundException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+        var problem = ProblemDetail.forStatusAndDetail(
+            HttpStatus.BAD_REQUEST, "请求参数无效");
+        var errors = new java.util.HashMap<String, String>();
+        ex.getBindingResult().getFieldErrors()
+            .forEach(e -> errors.put(e.getField(), e.getDefaultMessage()));
+        problem.setProperty("errors", errors);
+        return problem;
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail handleUnexpected(Exception ex) {
+        // 记录日志，但不向客户端暴露内部细节
+        return ProblemDetail.forStatusAndDetail(
+            HttpStatus.INTERNAL_SERVER_ERROR, "服务器内部错误");
+    }
+}
+```
+
+`ProblemDetail` 遵循 RFC 9457（Problem Details）标准，Spring 6 开始内置支持，输出的 JSON 格式统一，前端处理起来很方便。
+
+---
+
+## 12. 数据库：Spring Data JPA
+
+**概念：** JPA 是 Java 的 ORM 标准：你操作对象，框架负责生成 SQL。Spring Data JPA 在此基础上，让你只写接口就能获得常用的增删改查。
+
+### 配置
+
+`application.yml`：
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/app
+    username: app
+    password: ${DB_PASSWORD}
+  jpa:
+    hibernate:
+      ddl-auto: validate        # 生产环境不要用 update 或 create
+    open-in-view: false         # 避免在视图层偷偷触发查询
+```
+
+表结构用迁移工具管理（Flyway 或 Liquibase），不要让 Hibernate 自动改库。添加 `flyway-core` 和 `flyway-database-postgresql` 依赖后，把脚本放进 `src/main/resources/db/migration/`：
+
+```sql
+-- V1__init.sql
+CREATE TABLE users (
+  id BIGSERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'USER'
+);
+
+CREATE TABLE posts (
+  id BIGSERIAL PRIMARY KEY,
+  author_id BIGINT NOT NULL REFERENCES users(id),
+  title VARCHAR(120) NOT NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_posts_author ON posts(author_id);
+```
+
+### 实体
+
+```java
+import jakarta.persistence.*;
+import java.time.Instant;
+
+@Entity
+@Table(name = "users")
+public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Column(name = "password_hash", nullable = false)
+    private String passwordHash;
+
+    @Column(nullable = false)
+    private String role = "USER";
+
+    protected User() {}   // JPA 需要无参构造器
+
+    public User(String email, String passwordHash) {
+        this.email = email;
+        this.passwordHash = passwordHash;
+    }
+
+    public Long getId() { return id; }
+    public String getEmail() { return email; }
+    public String getPasswordHash() { return passwordHash; }
+    public String getRole() { return role; }
+}
+
+@Entity
+@Table(name = "posts")
+public class Post {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)   // 默认用懒加载
+    @JoinColumn(name = "author_id")
+    private User author;
+
+    @Column(nullable = false, length = 120)
+    private String title;
+
+    @Column(nullable = false)
+    private String body;
+
+    @Column(name = "created_at", nullable = false)
+    private Instant createdAt = Instant.now();
+
+    protected Post() {}
+
+    public Post(User author, String title, String body) {
+        this.author = author;
+        this.title = title;
+        this.body = body;
+    }
+
+    public Long getId() { return id; }
+    public User getAuthor() { return author; }
+    public String getTitle() { return title; }
+    public String getBody() { return body; }
+    public Instant getCreatedAt() { return createdAt; }
+
+    public void update(String title, String body) {
+        this.title = title;
+        this.body = body;
+    }
+}
+```
+
+### Repository
+
+```java
+import org.springframework.data.domain.*;
+import org.springframework.data.jpa.repository.*;
+import org.springframework.data.repository.query.Param;
+
+public interface PostRepository extends JpaRepository<Post, Long> {
+
+    // 根据方法名自动生成查询
+    List<Post> findByAuthorIdOrderByCreatedAtDesc(Long authorId);
+
+    // 分页
+    Page<Post> findByTitleContainingIgnoreCase(String keyword, Pageable pageable);
+
+    // 用 join fetch 一次性取回作者，避免 N+1
+    @Query("select p from Post p join fetch p.author where p.id = :id")
+    Optional<Post> findWithAuthor(@Param("id") Long id);
+
+    // 另一种方式：EntityGraph
+    @EntityGraph(attributePaths = "author")
+    Page<Post> findAll(Pageable pageable);
+}
+
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+    boolean existsByEmail(String email);
+}
+```
+
+### Service、事务与 DTO
+
+```java
+public record PostResponse(Long id, String title, String body, String authorEmail, Instant createdAt) {
+    static PostResponse from(Post p) {
+        return new PostResponse(p.getId(), p.getTitle(), p.getBody(),
+                                p.getAuthor().getEmail(), p.getCreatedAt());
+    }
+}
+
+@Service
+public class PostService {
+    private final PostRepository posts;
+    private final UserRepository users;
+
+    public PostService(PostRepository posts, UserRepository users) {
+        this.posts = posts;
+        this.users = users;
+    }
+
+    @Transactional(readOnly = true)
+    public Page<PostResponse> list(int page, int size) {
+        var pageable = PageRequest.of(page, Math.min(size, 100),
+                                      Sort.by("createdAt").descending());
+        return posts.findAll(pageable).map(PostResponse::from);
+    }
+
+    @Transactional
+    public PostResponse create(Long authorId, String title, String body) {
+        User author = users.getReferenceById(authorId);
+        Post saved = posts.save(new Post(author, title, body));
+        return PostResponse.from(saved);
+    }
+
+    @Transactional
+    public PostResponse update(Long postId, Long userId, String title, String body) {
+        Post post = posts.findWithAuthor(postId)
+            .orElseThrow(() -> new NotFoundException("文章不存在"));
+        if (!post.getAuthor().getId().equals(userId)) {
+            throw new ForbiddenException("只能修改自己的文章");
+        }
+        post.update(title, body);   // 事务结束时，Hibernate 自动把变更写入数据库
+        return PostResponse.from(post);
+    }
+}
+```
+
+**JPA 常见陷阱**
+
+- **N+1 查询：** 遍历列表时逐个访问懒加载关联，会产生大量小查询。用 `join fetch` 或 `@EntityGraph`。
+- **`LazyInitializationException`：** 在事务之外访问懒加载字段。解决办法是在 Service 的事务内完成转换，只把 DTO 返回给 Controller。
+- **不要把实体直接返回给前端：** 会暴露内部字段（例如密码哈希），还可能触发懒加载。
+- **`@Transactional` 只对通过 Spring 代理发起的调用生效：** 同一个类里的方法互相调用不会开启事务。
+- 打开 `spring.jpa.show-sql=true`（仅开发时）检查实际生成的 SQL。
+
+---
+
+## 13. 认证与授权（Spring Security）
+
+**概念：** 认证证明“你是谁”，授权决定“你能做什么”。Spring Security 通过过滤器链在请求到达 Controller 之前完成这两件事。下面实现无状态的 JWT 认证。
+
+依赖：`spring-boot-starter-security` 和 `spring-boot-starter-oauth2-resource-server`。
+
+### 安全配置
+
+```java
+import org.springframework.context.annotation.*;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.oauth2.server.resource.authentication.*;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())    // 无状态 API，不使用 Cookie 会话
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**", "/actuator/health").permitAll()
+                .requestMatchers(HttpMethod.GET, "/api/posts/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated())
+            .oauth2ResourceServer(oauth -> oauth
+                .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthConverter())));
+        return http.build();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();     // 永远不要明文存储密码
+    }
+
+    // 把 JWT 里的 roles 声明转换成 ROLE_xxx 权限
+    private JwtAuthenticationConverter jwtAuthConverter() {
+        var authorities = new JwtGrantedAuthoritiesConverter();
+        authorities.setAuthoritiesClaimName("roles");
+        authorities.setAuthorityPrefix("ROLE_");
+        var converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(authorities);
+        return converter;
+    }
+}
+```
+
+### 签发与校验 JWT
+
+```java
+import com.nimbusds.jose.jwk.source.ImmutableSecret;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.*;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+
+@Configuration
+public class JwtConfig {
+
+    private SecretKey key(String secret) {
+        // 密钥至少 32 字节，并且来自环境变量，绝不能写进代码仓库
+        return new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+    }
+
+    @Bean
+    JwtDecoder jwtDecoder(@Value("${app.jwt.secret}") String secret) {
+        return NimbusJwtDecoder.withSecretKey(key(secret)).build();
+    }
+
+    @Bean
+    JwtEncoder jwtEncoder(@Value("${app.jwt.secret}") String secret) {
+        return new NimbusJwtEncoder(new ImmutableSecret<>(key(secret)));
+    }
+}
+```
+
+```java
+@Service
+public class TokenService {
+    private final JwtEncoder encoder;
+
+    public TokenService(JwtEncoder encoder) { this.encoder = encoder; }
+
+    public String issue(User user) {
+        Instant now = Instant.now();
+        var claims = JwtClaimsSet.builder()
+            .subject(String.valueOf(user.getId()))
+            .issuedAt(now)
+            .expiresAt(now.plus(Duration.ofMinutes(15)))   // 访问令牌要短命
+            .claim("roles", List.of(user.getRole()))
+            .build();
+        var header = JwsHeader.with(MacAlgorithm.HS256).build();
+        return encoder.encode(JwtEncoderParameters.from(header, claims)).getTokenValue();
+    }
+}
+```
+
+### 注册与登录接口
+
+```java
+public record RegisterRequest(@Email @NotBlank String email, @Size(min = 8) String password) {}
+public record LoginRequest(@NotBlank String email, @NotBlank String password) {}
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+    private final UserRepository users;
+    private final PasswordEncoder encoder;
+    private final TokenService tokens;
+
+    public AuthController(UserRepository users, PasswordEncoder encoder, TokenService tokens) {
+        this.users = users;
+        this.encoder = encoder;
+        this.tokens = tokens;
+    }
+
+    @PostMapping("/register")
+    @ResponseStatus(HttpStatus.CREATED)
+    public void register(@Valid @RequestBody RegisterRequest req) {
+        if (users.existsByEmail(req.email())) {
+            throw new ConflictException("邮箱已被注册");
+        }
+        users.save(new User(req.email(), encoder.encode(req.password())));
+    }
+
+    @PostMapping("/login")
+    public Map<String, String> login(@Valid @RequestBody LoginRequest req) {
+        User user = users.findByEmail(req.email()).orElse(null);
+        // “邮箱不存在”和“密码错误”使用相同的提示，避免泄露哪些邮箱已注册
+        if (user == null || !encoder.matches(req.password(), user.getPasswordHash())) {
+            throw new UnauthorizedException("邮箱或密码错误");
+        }
+        return Map.of("token", tokens.issue(user));
+    }
+}
+```
+
+### 在 Controller 中使用当前用户和角色
+
+```java
+@GetMapping("/api/me")
+public Map<String, Object> me(@AuthenticationPrincipal Jwt jwt) {
+    return Map.of("id", jwt.getSubject(), "roles", jwt.getClaimAsStringList("roles"));
+}
+
+@DeleteMapping("/api/admin/users/{id}")
+@PreAuthorize("hasRole('ADMIN')")     // 方法级别的授权
+public void deleteUser(@PathVariable Long id) { /* ... */ }
+```
+
+**安全清单**
+
+- 密码使用 BCrypt（或 Argon2）哈希，绝不明文存储。
+- 访问令牌有效期要短，需要长期登录时配合刷新令牌，并支持撤销。
+- JWT 密钥来自环境变量或密钥管理服务。
+- 除了角色，还要检查数据所有权（见第 12 节的 `update` 方法）。
+- 登录接口加限流，防止暴力破解。
+- 如果要做“用 Google 登录”，使用 Spring Security 的 OAuth2 Login，不要自己实现协议。
+
+---
+
+## 14. 测试 Spring 应用
+
+**概念：** 测试分层进行：越底层越快、越多；越靠近完整系统越慢、越少。
+
+| 类型 | 工具 | 速度 | 验证什么 |
+| --- | --- | --- | --- |
+| 单元测试 | JUnit 5 + Mockito | 毫秒级 | 单个类的逻辑 |
+| 切片测试 | `@WebMvcTest`、`@DataJpaTest` | 秒级 | Controller 或数据层 |
+| 集成测试 | `@SpringBootTest` + Testcontainers | 较慢 | 完整流程，使用真实数据库 |
+
+### 单元测试（Mockito）
+
+```java
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.*;
+import org.mockito.junit.jupiter.MockitoExtension;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class TodoServiceTest {
+
+    @Mock TodoRepository repository;
+    @InjectMocks TodoService service;
+
+    @Test
+    void getThrowsWhenMissing() {
+        when(repository.findById(1L)).thenReturn(Optional.empty());
+
+        assertThrows(NotFoundException.class, () -> service.get(1L));
+    }
+
+    @Test
+    void createSavesNewTodo() {
+        when(repository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        Todo todo = service.create("写测试");
+
+        assertEquals("写测试", todo.title());
+        verify(repository).save(any(Todo.class));
+    }
+}
+```
+
+### Web 层测试（MockMvc）
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.*;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@WebMvcTest(TodoController.class)
+@AutoConfigureMockMvc(addFilters = false)   // 这里只测 Controller，先跳过安全过滤器
+class TodoControllerTest {
+
+    @Autowired MockMvc mvc;
+    @MockitoBean TodoService service;
+
+    @Test
+    void returns404WhenTodoMissing() throws Exception {
+        when(service.get(99L)).thenThrow(new NotFoundException("Todo 99 不存在"));
+
+        mvc.perform(get("/api/todos/99"))
+           .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void rejectsBlankTitle() throws Exception {
+        mvc.perform(post("/api/todos")
+               .contentType(MediaType.APPLICATION_JSON)
+               .content("{\"title\":\"\",\"priority\":1}"))
+           .andExpect(status().isBadRequest());
+    }
+}
+```
+
+### 用 Testcontainers 做集成测试
+
+Testcontainers 在测试时启动一个真实的 PostgreSQL 容器，比用内存数据库更接近生产环境。
+
+```java
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.*;
+
+@SpringBootTest
+@Testcontainers
+class PostRepositoryIT {
+
+    @Container
+    @ServiceConnection              // 自动把容器的连接信息配置给 Spring
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
+
+    @Autowired UserRepository users;
+    @Autowired PostRepository posts;
+
+    @Test
+    void savesAndFindsPostsByAuthor() {
+        User author = users.save(new User("ada@example.com", "hash"));
+        posts.save(new Post(author, "Hello", "World"));
+
+        var found = posts.findByAuthorIdOrderByCreatedAtDesc(author.getId());
+
+        assertEquals(1, found.size());
+        assertEquals("Hello", found.get(0).getTitle());
+    }
+}
+```
+
+需要本机安装并运行 Docker。依赖：`spring-boot-testcontainers`、`org.testcontainers:junit-jupiter`、`org.testcontainers:postgresql`（测试范围）。
+
+---
+
+## 15. 配置、日志与监控
+
+### 类型安全的配置
+
+```yaml
+# application.yml
+app:
+  jwt:
+    secret: ${JWT_SECRET}
+  mail:
+    from: noreply@example.com
+    retries: 3
+```
+
+```java
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties(prefix = "app.mail")
+public record MailProperties(String from, int retries) {}
+```
+
+```java
+@SpringBootApplication
+@ConfigurationPropertiesScan      // 自动注册所有 @ConfigurationProperties
+public class DemoApplication { /* ... */ }
+```
+
+### Profile：不同环境用不同配置
+
+```yaml
+# application-dev.yml（本地开发）
+logging.level.com.example: DEBUG
+spring.jpa.show-sql: true
+
+# application-prod.yml（生产）
+logging.level.root: WARN
+server.shutdown: graceful
+```
+
+```bash
+java -jar app.jar --spring.profiles.active=prod
+# 或者设置环境变量 SPRING_PROFILES_ACTIVE=prod
+```
+
+**配置优先级：** 命令行参数 > 环境变量 > `application-{profile}.yml` > `application.yml`。密钥只通过环境变量传入。
+
+### 日志
+
+使用 SLF4J，Spring Boot 默认接入 Logback：
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@Service
+public class OrderService {
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
+    public void place(long orderId) {
+        log.info("下单开始 orderId={}", orderId);        // 用占位符，不要拼接字符串
+        try {
+            // ...
+        } catch (Exception e) {
+            log.error("下单失败 orderId={}", orderId, e);   // 最后一个参数传异常，会输出堆栈
+            throw e;
+        }
+    }
+}
+```
+
+**日志规则：** 使用正确的级别（ERROR、WARN、INFO、DEBUG）；绝不记录密码、令牌或完整的银行卡号；生产环境使用结构化（JSON）日志，并给每个请求附加追踪 ID。
+
+### Actuator：健康检查与指标
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true     # 提供 /actuator/health/liveness 和 /readiness，供 Kubernetes 使用
+```
+
+`/actuator/health` 用于负载均衡器和容器探针。`/actuator/prometheus`（需要 `micrometer-registry-prometheus` 依赖）供 Prometheus 采集指标，再用 Grafana 展示。不要把敏感的 Actuator 端点暴露到公网。
+
+---
+
+## 16. 缓存、异步、定时任务与消息
+
+### 缓存
+
+```java
+@SpringBootApplication
+@EnableCaching
+public class DemoApplication { /* ... */ }
+```
+
+```java
+@Service
+public class ProductService {
+
+    @Cacheable(cacheNames = "products", key = "#id")
+    public Product get(Long id) {
+        return repository.findById(id).orElseThrow();    // 只有缓存未命中才会执行
+    }
+
+    @CacheEvict(cacheNames = "products", key = "#id")
+    public void update(Long id, ProductUpdate update) {
+        // 修改数据后，让对应的缓存失效
+    }
+}
+```
+
+默认使用内存缓存。生产环境添加 `spring-boot-starter-data-redis` 和 `spring.cache.type=redis`，并为缓存设置过期时间。
+
+### 异步与定时任务
+
+```java
+@Configuration
+@EnableAsync
+@EnableScheduling
+class AsyncConfig {}
+
+@Service
+public class NotificationService {
+
+    @Async                  // 在另一个线程执行，调用方不用等待
+    public CompletableFuture<Void> sendWelcomeEmail(String to) {
+        // 发送邮件...
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Scheduled(cron = "0 0 2 * * *")      // 每天凌晨 2 点
+    public void dailyCleanup() {
+        // 清理过期数据
+    }
+}
+```
+
+如果你的应用部署了多个实例，`@Scheduled` 会在每个实例上都执行一次，需要用分布式锁（例如 ShedLock）来保证只执行一次。
+
+### 调用外部 HTTP 服务
+
+```java
+import org.springframework.web.client.RestClient;
+
+@Configuration
+class HttpConfig {
+    @Bean
+    RestClient paymentClient(RestClient.Builder builder) {
+        return builder.baseUrl("https://payments.example.com").build();
+    }
+}
+
+@Service
+class PaymentGateway {
+    private final RestClient client;
+    PaymentGateway(RestClient paymentClient) { this.client = paymentClient; }
+
+    PaymentResult charge(ChargeRequest request) {
+        return client.post()
+            .uri("/charges")
+            .body(request)
+            .retrieve()
+            .body(PaymentResult.class);
+    }
+}
+```
+
+**务必为外部调用设置连接和读取超时，** 并考虑重试与熔断（例如 Resilience4j），否则一个慢的下游服务会拖垮整个应用。
+
+### 消息队列（Kafka 概览）
+
+当一个操作需要通知多个系统，或要削峰解耦时，使用消息队列。
+
+```java
+@Service
+class OrderEvents {
+    private final KafkaTemplate<String, String> kafka;
+    OrderEvents(KafkaTemplate<String, String> kafka) { this.kafka = kafka; }
+
+    void publishPlaced(long orderId) {
+        kafka.send("orders", String.valueOf(orderId), "PLACED");
+    }
+}
+
+@Component
+class BillingListener {
+    @KafkaListener(topics = "orders", groupId = "billing")
+    void onOrder(String message) {
+        // 处理消息。消息可能被重复投递，所以处理逻辑必须是幂等的
+    }
+}
+```
+
+**设计规则：** 消息可能重复，消费者必须幂等。要保证“写数据库”和“发消息”一致，可以使用事务性发件箱（Outbox）模式。
+
+---
+
+> 回到主线：[Java 学习路线总览](/blog/posts/java-roadmap-00-overview/) · [路线合集](/blog/java-roadmap/)

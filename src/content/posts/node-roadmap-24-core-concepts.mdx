@@ -1,0 +1,2113 @@
+---
+title: "附录 · Node.js 核心概念速成（29 章）"
+published: 2026-11-12T09:30:00+08:00
+description: "独立速成教程：ESM、事件循环、流、HTTP/Express、Worker、测试与优雅关闭，再到数据库、认证、TypeScript、Fastify/NestJS、GraphQL、队列、Docker 与 CI，29 章动手跑通。"
+tags: [Node.js, 速成教程, Express, 学习路线]
+category: Node全栈学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这是一份**独立速成教程**，29 章按「核心机制 → 后端开发 → 工程化」排列，每章先讲概念再给可运行代码。
+> 用法：想快速建立 Node 全貌，从第 1 章顺序跑；已按 00–16 学过的人，用它补漏与横向复习。
+> 编号 24 是因为 17–23 已留给「社区全栈实战」系列，本篇作为附录单独编号。
+
+下面每个主题都先讲解概念，再给出可以直接运行的代码。示例使用现代 Node.js（v20 或更高版本）和 ES Modules。
+
+## 环境准备
+
+创建项目文件夹并启用 ES Modules：
+
+```bash
+mkdir node-tutorial && cd node-tutorial
+npm init -y
+npm pkg set type=module
+```
+
+创建 `hello.js`，然后用 `node hello.js` 运行：
+
+```js
+console.log("Hello from Node", process.version);
+```
+
+**核心思想：** Node.js 让 JavaScript 可以在浏览器之外运行。它提供的是 `process` 对象、文件访问和网络功能，而不是 DOM。
+
+---
+
+## 1. 模块（Modules）
+
+**概念：** 把代码拆分成多个文件。每个文件就是一个模块，可以导出内容供其他文件导入。
+
+`math.js`：
+
+```js
+export function add(a, b) {
+  return a + b;
+}
+
+export const PI = 3.14159;
+
+export default function multiply(a, b) {
+  return a * b;
+}
+```
+
+`app.js`：
+
+```js
+import multiply, { add, PI } from "./math.js";
+import { readFile } from "node:fs/promises"; // 内置模块
+
+console.log(add(2, 3));      // 5
+console.log(multiply(4, 5)); // 20
+console.log(PI);
+```
+
+**注意事项**
+
+- 相对路径导入时要写 `.js` 扩展名。
+- 内置模块使用 `node:` 前缀。
+- 旧代码使用 CommonJS（`require` 和 `module.exports`）。很多第三方包仍在使用，所以两种写法都要认识。
+
+---
+
+## 2. 异步代码与事件循环
+
+**概念：** Node 用一个线程运行你的 JavaScript。耗时操作（文件、网络、定时器）会被交给系统处理，完成后再执行回调。这样 Node 才能保持响应。
+
+### 回调、Promise、async/await
+
+```js
+// 1) 回调风格（旧）
+setTimeout(() => console.log("callback done"), 100);
+
+// 2) Promise 风格
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+wait(100).then(() => console.log("promise done"));
+
+// 3) async/await（推荐）
+async function main() {
+  await wait(100);
+  console.log("await done");
+}
+main();
+```
+
+### 并行执行任务
+
+```js
+const fakeFetch = async (name, ms) => {
+  await wait(ms);
+  return `${name} loaded`;
+};
+
+console.time("sequential");
+await fakeFetch("a", 300);
+await fakeFetch("b", 300);
+console.timeEnd("sequential"); // 约 600ms
+
+console.time("parallel");
+const results = await Promise.all([
+  fakeFetch("a", 300),
+  fakeFetch("b", 300),
+]);
+console.timeEnd("parallel"); // 约 300ms
+console.log(results);
+```
+
+### 执行顺序
+
+```js
+console.log("1 sync");
+
+setTimeout(() => console.log("4 timeout"), 0);
+
+Promise.resolve().then(() => console.log("3 microtask"));
+
+console.log("2 sync");
+```
+
+输出顺序：`1 sync`、`2 sync`、`3 microtask`、`4 timeout`。
+
+**规则：** 先执行同步代码，然后是微任务（Promise），最后是定时器和 I/O 回调。
+
+**常见错误：** 阻塞事件循环。
+
+```js
+// 错误示范：运行期间会冻结所有其他请求
+while (Date.now() < Date.now() + 5000) {}
+```
+
+繁重的 CPU 计算应该放到 worker 线程中（见第 9 节）。
+
+---
+
+## 3. 文件操作
+
+**概念：** `fs/promises` 模块可以在不阻塞的情况下读写文件。用 `path` 来安全地拼接文件路径。
+
+```js
+import { readFile, writeFile, appendFile, readdir, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// ES Modules 没有 __dirname，需要自己构造
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const dataDir = path.join(__dirname, "data");
+
+await mkdir(dataDir, { recursive: true });
+
+const file = path.join(dataDir, "notes.txt");
+await writeFile(file, "First note\n", "utf8");
+await appendFile(file, "Second note\n");
+
+const text = await readFile(file, "utf8");
+console.log(text);
+
+console.log(await readdir(dataDir)); // [ 'notes.txt' ]
+```
+
+### 错误处理
+
+```js
+try {
+  await readFile("missing.txt", "utf8");
+} catch (err) {
+  if (err.code === "ENOENT") {
+    console.log("文件不存在");
+  } else {
+    throw err; // 不要隐藏意料之外的错误
+  }
+}
+```
+
+### 处理 JSON
+
+```js
+const config = { theme: "dark", retries: 3 };
+await writeFile("config.json", JSON.stringify(config, null, 2));
+
+const loaded = JSON.parse(await readFile("config.json", "utf8"));
+console.log(loaded.theme); // dark
+```
+
+---
+
+## 4. 事件（Events）
+
+**概念：** Node 中很多对象都是事件发射器。用 `on` 注册监听器，用 `emit` 触发事件。服务器、流和许多库都基于这种模式。
+
+```js
+import { EventEmitter } from "node:events";
+
+class OrderService extends EventEmitter {
+  placeOrder(item) {
+    console.log(`Order placed: ${item}`);
+    this.emit("order", { item, time: Date.now() });
+  }
+}
+
+const orders = new OrderService();
+
+orders.on("order", (data) => console.log("Email sent for", data.item));
+orders.on("order", (data) => console.log("Stock updated for", data.item));
+orders.once("order", () => console.log("First order bonus!"));
+
+orders.placeOrder("book");
+orders.placeOrder("pen");
+```
+
+**提示：** 可能出错的发射器一定要添加 `error` 监听器。没有处理的 `error` 事件会让进程崩溃。
+
+---
+
+## 5. 流（Streams）
+
+**概念：** 流把数据分成小块逐步处理，而不是一次性全部加载到内存。处理大文件、上传和网络数据时要用流。
+
+复制大文件而不占用大量内存：
+
+```js
+import { createReadStream, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { createGzip } from "node:zlib";
+
+await pipeline(
+  createReadStream("big-file.txt"),
+  createGzip(),
+  createWriteStream("big-file.txt.gz")
+);
+console.log("压缩完成");
+```
+
+`pipeline` 会自动处理错误和资源清理。
+
+### 自定义转换流
+
+```js
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
+const upperCase = new Transform({
+  transform(chunk, encoding, callback) {
+    callback(null, chunk.toString().toUpperCase());
+  },
+});
+
+await pipeline(process.stdin, upperCase, process.stdout);
+```
+
+运行后输入一些文字，它会以大写形式输出。
+
+### 逐行读取文件
+
+```js
+import { createReadStream } from "node:fs";
+import readline from "node:readline";
+
+const rl = readline.createInterface({
+  input: createReadStream("access.log"),
+  crlfDelay: Infinity,
+});
+
+let errors = 0;
+for await (const line of rl) {
+  if (line.includes("ERROR")) errors++;
+}
+console.log(`发现 ${errors} 个错误`);
+```
+
+---
+
+## 6. 原生 HTTP 服务器
+
+**概念：** Express 是建立在 Node 的 `http` 模块之上的。不用框架写一遍，你就能明白框架替你做了什么。
+
+```js
+import http from "node:http";
+
+const todos = [{ id: 1, title: "Learn Node", done: false }];
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (req.method === "GET" && url.pathname === "/todos") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify(todos));
+  }
+
+  if (req.method === "POST" && url.pathname === "/todos") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+
+    try {
+      const { title } = JSON.parse(body);
+      const todo = { id: todos.length + 1, title, done: false };
+      todos.push(todo);
+      res.writeHead(201, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify(todo));
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Invalid JSON" }));
+    }
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
+});
+
+server.listen(3000, () => console.log("Listening on http://localhost:3000"));
+```
+
+测试：
+
+```bash
+curl http://localhost:3000/todos
+curl -X POST http://localhost:3000/todos \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Write code"}'
+```
+
+可以看到，路由、请求体解析和错误处理都要手动完成，工作量不小。这正是 Express 要解决的问题。
+
+---
+
+## 7. Express：构建 REST API
+
+**概念：** Express 提供路由和中间件。中间件是一个在路由之前运行的函数，它可以读取或修改请求、直接返回响应，或者调用 `next()` 把控制权交给下一个处理者。
+
+安装：
+
+```bash
+npm install express
+```
+
+`server.js`：
+
+```js
+import express from "express";
+
+const app = express();
+app.use(express.json()); // 解析 JSON 请求体
+
+// 自定义中间件：记录每个请求
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.url}`);
+  next();
+});
+
+let todos = [{ id: 1, title: "Learn Express", done: false }];
+let nextId = 2;
+
+// 查询全部
+app.get("/todos", (req, res) => {
+  res.json(todos);
+});
+
+// 查询单个
+app.get("/todos/:id", (req, res) => {
+  const todo = todos.find((t) => t.id === Number(req.params.id));
+  if (!todo) return res.status(404).json({ error: "Todo not found" });
+  res.json(todo);
+});
+
+// 创建
+app.post("/todos", (req, res) => {
+  const { title } = req.body;
+  if (typeof title !== "string" || title.trim() === "") {
+    return res.status(400).json({ error: "title is required" });
+  }
+  const todo = { id: nextId++, title: title.trim(), done: false };
+  todos.push(todo);
+  res.status(201).json(todo);
+});
+
+// 更新
+app.patch("/todos/:id", (req, res) => {
+  const todo = todos.find((t) => t.id === Number(req.params.id));
+  if (!todo) return res.status(404).json({ error: "Todo not found" });
+
+  if (req.body.title !== undefined) todo.title = req.body.title;
+  if (req.body.done !== undefined) todo.done = Boolean(req.body.done);
+  res.json(todo);
+});
+
+// 删除
+app.delete("/todos/:id", (req, res) => {
+  const before = todos.length;
+  todos = todos.filter((t) => t.id !== Number(req.params.id));
+  if (todos.length === before) {
+    return res.status(404).json({ error: "Todo not found" });
+  }
+  res.status(204).end();
+});
+
+// 未知路由返回 404
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
+});
+
+// 统一错误处理（必须有 4 个参数）
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: "Something went wrong" });
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`API running on port ${port}`));
+```
+
+**需要记住的 HTTP 方法和状态码**
+
+| 操作 | 方法 | 成功状态码 |
+| --- | --- | --- |
+| 列表或读取 | GET | 200 |
+| 创建 | POST | 201 |
+| 更新 | PATCH 或 PUT | 200 |
+| 删除 | DELETE | 204 |
+| 输入有误 | 任意 | 400 |
+| 未找到 | 任意 | 404 |
+| 服务器错误 | 任意 | 500 |
+
+### Express 中的异步错误
+
+在 Express 5 中，`async` 处理函数里抛出的错误会自动交给错误处理中间件。在 Express 4 中需要手动包装：
+
+```js
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+app.get("/users/:id", asyncHandler(async (req, res) => {
+  const user = await findUser(req.params.id); // 如果抛出错误，会进入错误处理器
+  res.json(user);
+}));
+```
+
+### 用路由器组织代码
+
+`routes/todos.js`：
+
+```js
+import { Router } from "express";
+
+const router = Router();
+
+router.get("/", (req, res) => res.json([]));
+router.post("/", (req, res) => res.status(201).json(req.body));
+
+export default router;
+```
+
+在 `server.js` 中：
+
+```js
+import todosRouter from "./routes/todos.js";
+app.use("/todos", todosRouter);
+```
+
+---
+
+## 8. 配置与环境变量
+
+**概念：** 不要把密钥或配置写死在代码里。从环境变量读取，这样每个部署环境都可以不同。
+
+`.env`（记得把这个文件加入 `.gitignore`）：
+
+```
+PORT=4000
+DATABASE_URL=postgres://user:pass@localhost:5432/app
+JWT_SECRET=change-me
+```
+
+Node 20 及以上版本可以直接加载：
+
+```bash
+node --env-file=.env server.js
+```
+
+在代码中使用：
+
+```js
+const config = {
+  port: Number(process.env.PORT) || 3000,
+  databaseUrl: process.env.DATABASE_URL,
+  jwtSecret: process.env.JWT_SECRET,
+};
+
+if (!config.jwtSecret) {
+  throw new Error("JWT_SECRET is required");
+}
+
+export default config;
+```
+
+**提示：** 缺少必需的变量时，应在启动时立刻报错，而不是等到线上运行时才崩溃。
+
+---
+
+## 9. 用 Worker 线程处理 CPU 密集任务
+
+**概念：** Node 只有一个主线程，所以繁重的计算会阻塞所有请求。Worker 线程可以把这类工作放到另一个线程并行运行。
+
+`worker.js`：
+
+```js
+import { parentPort, workerData } from "node:worker_threads";
+
+function fib(n) {
+  return n < 2 ? n : fib(n - 1) + fib(n - 2);
+}
+
+parentPort.postMessage(fib(workerData));
+```
+
+`main.js`：
+
+```js
+import { Worker } from "node:worker_threads";
+
+function runFib(n) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./worker.js", import.meta.url), {
+      workerData: n,
+    });
+    worker.on("message", resolve);
+    worker.on("error", reject);
+  });
+}
+
+console.log("开始计算...");
+const result = await runFib(40);
+console.log("结果:", result);
+```
+
+Worker 适合 CPU 密集型工作（图像处理、哈希、解析）。它不能加速 I/O，因为 I/O 本来就是非阻塞的。
+
+---
+
+## 10. 使用内置测试运行器测试
+
+**概念：** 测试能证明代码可以正常工作，并在你修改代码时保护你。Node 自带测试运行器，入门时不需要额外安装库。
+
+`utils.js`：
+
+```js
+export function slugify(text) {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+```
+
+`utils.test.js`：
+
+```js
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import { slugify } from "./utils.js";
+
+describe("slugify", () => {
+  test("converts spaces to dashes", () => {
+    assert.equal(slugify("Hello World"), "hello-world");
+  });
+
+  test("removes special characters", () => {
+    assert.equal(slugify("  Node.js: Fast!  "), "node-js-fast");
+  });
+});
+```
+
+运行：
+
+```bash
+node --test
+```
+
+### 测试异步代码
+
+```js
+test("rejects on bad input", async () => {
+  await assert.rejects(() => findUser("nope"), { message: "User not found" });
+});
+```
+
+---
+
+## 11. 优雅关闭与进程错误
+
+**概念：** 在生产环境中，服务器会经常被停止和重启。要干净地关闭连接，避免丢失正在处理的请求。
+
+```js
+import http from "node:http";
+
+const server = http.createServer((req, res) => res.end("ok"));
+server.listen(3000);
+
+function shutdown(signal) {
+  console.log(`${signal} received, closing server...`);
+  server.close(() => {
+    console.log("Closed. Bye.");
+    process.exit(0);
+  });
+  // 如果耗时太久，强制退出
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+  process.exit(1);
+});
+```
+
+---
+
+## 练习题
+
+1. **笔记命令行工具：** 把笔记读写到 JSON 文件，支持 `add`、`list` 和 `delete` 命令。
+2. **日志分析器：** 用流统计大日志文件中各状态码的数量。
+3. **事件驱动日志器：** 写一个发射器，把 `info` 和 `error` 事件分别写入不同的文件。
+4. **待办事项 API：** 扩展 Express 示例，把待办事项保存到 JSON 文件，然后添加输入验证和测试。
+5. **并行请求：** 用 `Promise.all` 同时调用三个公开 API，并和顺序调用的耗时做比较。
+
+## 速查表
+
+| 需求 | 使用 |
+| --- | --- |
+| 读写文件 | `node:fs/promises` |
+| 构建文件路径 | `node:path` |
+| 自定义事件 | `node:events` |
+| 大数据处理 | 流和 `pipeline` |
+| Web 服务器 | `node:http`，然后是 Express |
+| 并行异步任务 | `Promise.all` |
+| CPU 密集任务 | `worker_threads` |
+| 测试 | `node:test` 和 `node:assert` |
+| 配置 | `process.env` 和 `--env-file` |
+
+## 接下来：第二到第四部分
+
+下面的内容继续讲解数据库、认证、安全、TypeScript、Fastify、NestJS、实时通信、测试、Docker、CI/CD、性能和架构，最后是毕业项目、精通检查清单和学习计划。
+
+---
+
+# 第二部分：构建真实应用
+
+第 12 到 15 节把基础知识变成一个可运行、安全、带数据库的 API。
+
+## 12. 数据库
+
+**概念：** 服务器重启后，内存中的数据就会丢失。数据库可以永久保存数据，并支持高效查询。先学 SQL（PostgreSQL 是最佳默认选择），再学文档数据库和缓存。
+
+### 必须掌握的 SQL 基础
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE posts (
+  id SERIAL PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_posts_user_id ON posts(user_id);
+
+-- 连接查询：文章及其作者邮箱
+SELECT p.id, p.title, u.email
+FROM posts p
+JOIN users u ON u.id = p.user_id
+WHERE p.created_at > now() - interval '7 days'
+ORDER BY p.created_at DESC
+LIMIT 20;
+```
+
+**记住：** 主键标识每一行，外键连接表，索引加快读取（但会略微减慢写入），约束保护数据完整性。
+
+### 在 Node 中使用 PostgreSQL
+
+```bash
+npm install pg
+```
+
+`db.js`：
+
+```js
+import pg from "pg";
+
+export const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10, // 连接池最大连接数
+});
+
+export async function query(text, params) {
+  const result = await pool.query(text, params);
+  return result.rows;
+}
+```
+
+**一定要使用参数（`$1`、`$2`）。** 永远不要把用户输入直接拼接进 SQL，这就是 SQL 注入的来源。
+
+```js
+import { query } from "./db.js";
+
+// 安全
+const rows = await query("SELECT * FROM users WHERE email = $1", [email]);
+
+// 危险：绝对不要这样写
+// await query(`SELECT * FROM users WHERE email = '${email}'`);
+```
+
+### 事务
+
+当多条语句必须一起成功或一起失败时，使用事务。
+
+```js
+import { pool } from "./db.js";
+
+export async function transfer(fromId, toId, amount) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+      [amount, fromId]
+    );
+    await client.query(
+      "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+      [amount, toId]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release(); // 一定要把连接还给连接池
+  }
+}
+```
+
+### Repository 层
+
+不要把 SQL 写在路由处理函数里。
+
+```js
+// repositories/posts.js
+import { query } from "../db.js";
+
+export const postsRepo = {
+  list: (limit = 20, offset = 0) =>
+    query("SELECT * FROM posts ORDER BY id DESC LIMIT $1 OFFSET $2", [limit, offset]),
+
+  findById: async (id) => {
+    const rows = await query("SELECT * FROM posts WHERE id = $1", [id]);
+    return rows[0] ?? null;
+  },
+
+  create: async ({ userId, title, body }) => {
+    const rows = await query(
+      "INSERT INTO posts (user_id, title, body) VALUES ($1, $2, $3) RETURNING *",
+      [userId, title, body]
+    );
+    return rows[0];
+  },
+
+  remove: (id) => query("DELETE FROM posts WHERE id = $1", [id]),
+};
+```
+
+### ORM 与查询构建器
+
+理解 SQL 之后，**Prisma**、**Drizzle**、**Kysely** 和 **TypeORM** 这类工具可以减少样板代码并提供类型安全。它们的配置方式会随大版本变化，请以各工具当前的入门文档为准。先学原生 SQL，会让你更容易理解和调试任何 ORM。
+
+### N+1 查询问题
+
+```js
+// 慢：1 次查询文章 + N 次查询作者
+const posts = await postsRepo.list();
+for (const post of posts) {
+  post.author = await usersRepo.findById(post.user_id);
+}
+
+// 快：一次 JOIN，或一次使用 IN (...) 的查询
+const postsWithAuthors = await query(
+  `SELECT p.*, u.email AS author_email
+   FROM posts p JOIN users u ON u.id = p.user_id
+   LIMIT 20`
+);
+```
+
+### MongoDB 简介
+
+```bash
+npm install mongodb
+```
+
+```js
+import { MongoClient } from "mongodb";
+
+const client = new MongoClient(process.env.MONGO_URL);
+await client.connect();
+const notes = client.db("app").collection("notes");
+
+await notes.insertOne({ title: "Hello", tags: ["node"], createdAt: new Date() });
+const found = await notes.find({ tags: "node" }).limit(10).toArray();
+await notes.createIndex({ tags: 1 });
+```
+
+**选 SQL 还是 MongoDB？** 数据存在关联关系、需要强一致性时选 SQL（大多数业务应用）。记录结构灵活、自成一体、通常整体读取时，可以选文档数据库。
+
+### 用 Redis 做缓存
+
+```bash
+npm install redis
+```
+
+```js
+import { createClient } from "redis";
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+export async function getPostCached(id) {
+  const key = `post:${id}`;
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const post = await postsRepo.findById(id);
+  if (post) await redis.set(key, JSON.stringify(post), { EX: 60 }); // 60 秒后过期
+  return post;
+}
+```
+
+**缓存规则：** 数据变化时，要删除或更新缓存（`await redis.del(key)`），或者接受在过期时间内数据略有滞后。
+
+---
+
+## 13. 数据验证与项目结构
+
+**概念：** 永远不要信任输入。在应用边界验证每个请求体、查询参数和路径参数，再把干净的数据传入内部。
+
+```bash
+npm install zod
+```
+
+```js
+import { z } from "zod";
+
+export const createPostSchema = z.object({
+  title: z.string().trim().min(3).max(120),
+  body: z.string().min(1),
+  tags: z.array(z.string()).max(5).default([]),
+});
+
+// 可复用的 Express 中间件
+export const validate = (schema) => (req, res, next) => {
+  const result = schema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: result.error.issues.map((i) => ({
+        field: i.path.join("."),
+        message: i.message,
+      })),
+    });
+  }
+  req.body = result.data; // 清理后的数据
+  next();
+};
+```
+
+```js
+app.post("/posts", validate(createPostSchema), async (req, res) => {
+  const post = await postsService.create(req.user.id, req.body);
+  res.status(201).json(post);
+});
+```
+
+### 可扩展的目录结构
+
+```
+src/
+  config/          环境变量和常量
+  routes/          只定义 URL
+  controllers/     读取请求、调用 service、返回响应
+  services/        业务逻辑
+  repositories/    数据库访问
+  middleware/      认证、验证、错误处理
+  utils/           小工具函数
+  app.js           构建 Express 应用（不调用 listen）
+  server.js        启动服务器
+```
+
+**为什么要拆分 `app.js` 和 `server.js`？** 这样测试可以直接导入 `app`，而不必占用网络端口。
+
+### 自定义错误
+
+```js
+// utils/errors.js
+export class AppError extends Error {
+  constructor(message, status = 500, code = "INTERNAL_ERROR") {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+export class NotFoundError extends AppError {
+  constructor(what = "Resource") {
+    super(`${what} not found`, 404, "NOT_FOUND");
+  }
+}
+
+// middleware/errorHandler.js
+export function errorHandler(err, req, res, next) {
+  if (err instanceof AppError) {
+    return res.status(err.status).json({ error: err.message, code: err.code });
+  }
+  console.error(err); // 意外错误：记录日志，但不向客户端暴露细节
+  res.status(500).json({ error: "Internal server error" });
+}
+```
+
+```js
+// services/posts.js
+import { NotFoundError } from "../utils/errors.js";
+
+export async function getPost(id) {
+  const post = await postsRepo.findById(id);
+  if (!post) throw new NotFoundError("Post");
+  return post;
+}
+```
+
+### 分页
+
+```js
+app.get("/posts", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 100); // 设置上限
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const items = await postsRepo.list(limit, (page - 1) * limit);
+  res.json({ page, limit, items });
+});
+```
+
+---
+
+## 14. 认证与授权
+
+**概念：** *认证（Authentication）* 证明你是谁（登录）。*授权（Authorization）* 决定你能做什么（权限）。
+
+```bash
+npm install bcrypt jsonwebtoken
+```
+
+### 注册与登录
+
+```js
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+import { query } from "../db.js";
+import { AppError } from "../utils/errors.js";
+
+const JWT_SECRET = process.env.JWT_SECRET;
+
+export async function register(email, password) {
+  const hash = await bcrypt.hash(password, 12); // 永远不要明文存储密码
+  try {
+    const rows = await query(
+      "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, role",
+      [email, hash]
+    );
+    return rows[0];
+  } catch (err) {
+    if (err.code === "23505") throw new AppError("Email already used", 409, "EMAIL_TAKEN");
+    throw err;
+  }
+}
+
+export async function login(email, password) {
+  const [user] = await query("SELECT * FROM users WHERE email = $1", [email]);
+  const ok = user && (await bcrypt.compare(password, user.password_hash));
+  if (!ok) throw new AppError("Invalid email or password", 401, "BAD_CREDENTIALS");
+
+  const token = jwt.sign({ sub: user.id, role: user.role }, JWT_SECRET, {
+    expiresIn: "15m",
+  });
+  return { token };
+}
+```
+
+对“邮箱不存在”和“密码错误”使用相同的提示。不同的提示会让攻击者发现哪些邮箱已注册。
+
+### 认证中间件与角色检查
+
+```js
+import jwt from "jsonwebtoken";
+import { AppError } from "../utils/errors.js";
+
+export function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [scheme, token] = header.split(" ");
+  if (scheme !== "Bearer" || !token) {
+    return next(new AppError("Missing token", 401, "NO_TOKEN"));
+  }
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = { id: payload.sub, role: payload.role };
+    next();
+  } catch {
+    next(new AppError("Invalid or expired token", 401, "BAD_TOKEN"));
+  }
+}
+
+export const requireRole = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role)) {
+    return next(new AppError("Forbidden", 403, "FORBIDDEN"));
+  }
+  next();
+};
+```
+
+```js
+app.get("/me", requireAuth, (req, res) => res.json(req.user));
+app.delete("/users/:id", requireAuth, requireRole("admin"), deleteUserHandler);
+```
+
+### 所有权检查
+
+只检查角色是不够的。用户还必须只能修改自己的数据。
+
+```js
+app.delete("/posts/:id", requireAuth, async (req, res) => {
+  const post = await getPost(Number(req.params.id));
+  if (post.user_id !== req.user.id && req.user.role !== "admin") {
+    throw new AppError("Forbidden", 403, "FORBIDDEN");
+  }
+  await postsRepo.remove(post.id);
+  res.status(204).end();
+});
+```
+
+### Token 策略简介
+
+| Token | 有效期 | 存放位置 |
+| --- | --- | --- |
+| 访问令牌（JWT） | 5-15 分钟 | 内存或 `Authorization` 请求头 |
+| 刷新令牌 | 数天到数周 | `HttpOnly`、`Secure` 的 Cookie；在服务端保存其哈希，以便撤销 |
+
+如果需要“用 Google/GitHub 登录”，请使用维护良好的库（如 Passport.js 或 Auth.js）实现 OAuth 2.0 / OpenID Connect，不要自己从零编写。
+
+---
+
+## 15. 安全要点
+
+**概念：** 大多数安全事故都源于一小撮众所周知的错误。把下面这些默认做法用到每个项目里。
+
+```bash
+npm install helmet cors express-rate-limit
+```
+
+```js
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+
+app.use(helmet()); // 安全的 HTTP 响应头
+
+app.use(cors({
+  origin: ["https://myapp.com"], // 携带凭据时绝不能用 "*"
+  credentials: true,
+}));
+
+app.use(express.json({ limit: "100kb" })); // 限制请求体大小
+
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, limit: 300 }));
+
+// 对登录接口设置更严格的限制，减缓暴力破解
+app.use("/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, limit: 10 }));
+```
+
+### 安全检查清单
+
+- [ ] 密码使用 bcrypt 或 argon2 哈希
+- [ ] SQL 查询全部参数化
+- [ ] 所有输入都经过验证（请求体、查询参数、路径参数、请求头）
+- [ ] 密钥只放在环境变量中，绝不提交到 Git
+- [ ] 全站使用 HTTPS；Cookie 设置 `HttpOnly`、`Secure`、`SameSite`
+- [ ] 登录和公开接口设置了限流
+- [ ] 每个受保护路由都做了授权检查，包括所有权
+- [ ] 错误响应不暴露堆栈信息或 SQL
+- [ ] 定期运行 `npm audit` 并保持依赖更新
+- [ ] 日志中不包含密码、令牌或完整银行卡号
+
+### 避免危险写法
+
+```js
+// 永远不要用用户输入拼接 shell 命令
+import { execFile } from "node:child_process";
+
+// 错误：exec(`convert ${req.query.file} out.png`)  -> 命令注入
+// 更好：用数组传递参数，并验证文件名
+execFile("convert", [safeFilename, "out.png"], callback);
+
+// 永远不要信任用户提供的路径：防止路径遍历
+import path from "node:path";
+const base = path.resolve("uploads");
+const target = path.resolve(base, userSuppliedName);
+if (!target.startsWith(base + path.sep)) throw new Error("Invalid path");
+```
+
+---
+
+# 第三部分：TypeScript、框架与实时通信
+
+## 16. 在 Node.js 中使用 TypeScript
+
+**概念：** TypeScript 添加了在代码运行前就会检查的类型。它能提前发现拼写错误、参数错误和缺失字段，并让大型代码库更容易修改。大多数专业的 Node.js 团队都在使用它。
+
+```bash
+npm install -D typescript tsx @types/node @types/express
+npx tsc --init
+```
+
+`tsconfig.json` 的关键设置：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+开发时用 `npx tsx watch src/server.ts` 运行。生产环境先用 `npx tsc` 编译，再用 `node dist/server.js` 启动。较新的 Node 版本也可以通过剥离类型直接运行简单的 `.ts` 文件。
+
+### 日常会用到的类型
+
+```ts
+interface User {
+  id: number;
+  email: string;
+  role: "user" | "admin"; // 字面量联合类型
+  bio?: string;           // 可选属性
+}
+
+type CreateUserInput = Omit<User, "id">;
+type UserPatch = Partial<CreateUserInput>;
+
+function greet(user: User): string {
+  return `Hello ${user.email}`;
+}
+
+// 泛型：适用于多种类型的函数
+function firstOrNull<T>(items: T[]): T | null {
+  return items.length > 0 ? items[0] : null;
+}
+
+const n = firstOrNull([1, 2, 3]); // 类型：number | null
+```
+
+### 类型收窄
+
+```ts
+function parseId(value: string | number): number {
+  if (typeof value === "string") {
+    return Number.parseInt(value, 10); // 这里 value 是 string
+  }
+  return value; // 这里 value 是 number
+}
+```
+
+### 带类型的 Express 应用
+
+```ts
+import express, { type Request, type Response, type NextFunction } from "express";
+import { z } from "zod";
+
+const app = express();
+app.use(express.json());
+
+const CreateTodo = z.object({ title: z.string().min(1) });
+type CreateTodoInput = z.infer<typeof CreateTodo>; // 类型由 schema 推导
+
+const todos: { id: number; title: string }[] = [];
+
+app.post("/todos", (req: Request, res: Response) => {
+  const parsed = CreateTodo.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() });
+  }
+  const input: CreateTodoInput = parsed.data;
+  const todo = { id: todos.length + 1, title: input.title };
+  todos.push(todo);
+  res.status(201).json(todo);
+});
+
+app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+  console.error(err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+app.listen(3000);
+```
+
+### 安全地为环境变量加类型
+
+```ts
+const Env = z.object({
+  PORT: z.coerce.number().default(3000),
+  DATABASE_URL: z.string().url(),
+  JWT_SECRET: z.string().min(16),
+});
+
+export const env = Env.parse(process.env); // 无效时启动即崩溃
+```
+
+**良好习惯：** 保持 `strict` 开启，避免使用 `any`（用 `unknown` 再收窄），并从验证 schema 推导类型，这样运行时检查和编译时类型永远不会脱节。
+
+---
+
+## 17. Fastify
+
+**概念：** Fastify 是一个快速的、基于插件的框架，用 JSON Schema 验证输入，并能快速序列化输出。它是高性能 API 的有力选择。
+
+```bash
+npm install fastify
+```
+
+```js
+import Fastify from "fastify";
+
+const app = Fastify({ logger: true }); // 内置结构化日志
+
+const todos = [];
+
+// 基于 schema 的验证：无效请求会自动返回 400
+app.post(
+  "/todos",
+  {
+    schema: {
+      body: {
+        type: "object",
+        required: ["title"],
+        properties: { title: { type: "string", minLength: 1 } },
+      },
+      response: {
+        201: {
+          type: "object",
+          properties: { id: { type: "integer" }, title: { type: "string" } },
+        },
+      },
+    },
+  },
+  async (request, reply) => {
+    const todo = { id: todos.length + 1, title: request.body.title };
+    todos.push(todo);
+    return reply.code(201).send(todo);
+  }
+);
+
+app.get("/todos", async () => todos);
+
+// Hook 在请求生命周期的特定时刻运行
+app.addHook("onRequest", async (request) => {
+  request.log.info(`incoming ${request.method} ${request.url}`);
+});
+
+await app.listen({ port: 3000, host: "0.0.0.0" });
+```
+
+### 插件与封装
+
+```js
+// plugins/todos.js
+export default async function todosPlugin(app, options) {
+  app.get("/", async () => []);
+  app.post("/", async (request, reply) => reply.code(201).send(request.body));
+}
+
+// server.js
+import todosPlugin from "./plugins/todos.js";
+app.register(todosPlugin, { prefix: "/todos" });
+```
+
+**Express 与 Fastify 对比：** Express 生态最大，也最容易上手。Fastify 更快，按 schema 验证，并鼓励模块化结构。两者都很好，你学过的概念（路由、中间件或 hook、验证）可以直接迁移。
+
+---
+
+## 18. NestJS
+
+**概念：** NestJS 是一个有明确主张、以 TypeScript 为先的框架。它把代码组织成模块、控制器和提供者，并使用依赖注入。因为每个功能都遵循相同的结构，所以特别适合大型团队。
+
+```bash
+npm install -g @nestjs/cli
+nest new my-api
+cd my-api
+nest generate resource todos   # 生成 module、controller、service 和 DTO
+npm run start:dev
+```
+
+### 三个基本构件
+
+```ts
+// todos/todos.service.ts  （provider：业务逻辑）
+import { Injectable, NotFoundException } from "@nestjs/common";
+
+@Injectable()
+export class TodosService {
+  private todos: { id: number; title: string; done: boolean }[] = [];
+  private nextId = 1;
+
+  findAll() {
+    return this.todos;
+  }
+
+  findOne(id: number) {
+    const todo = this.todos.find((t) => t.id === id);
+    if (!todo) throw new NotFoundException(`Todo ${id} not found`);
+    return todo;
+  }
+
+  create(title: string) {
+    const todo = { id: this.nextId++, title, done: false };
+    this.todos.push(todo);
+    return todo;
+  }
+}
+```
+
+```ts
+// todos/dto/create-todo.dto.ts  （验证规则）
+import { IsString, MinLength } from "class-validator";
+
+export class CreateTodoDto {
+  @IsString()
+  @MinLength(1)
+  title: string;
+}
+```
+
+```ts
+// todos/todos.controller.ts  （路由）
+import { Body, Controller, Get, Param, ParseIntPipe, Post } from "@nestjs/common";
+import { TodosService } from "./todos.service";
+import { CreateTodoDto } from "./dto/create-todo.dto";
+
+@Controller("todos")
+export class TodosController {
+  constructor(private readonly todosService: TodosService) {} // 自动注入
+
+  @Get()
+  findAll() {
+    return this.todosService.findAll();
+  }
+
+  @Get(":id")
+  findOne(@Param("id", ParseIntPipe) id: number) {
+    return this.todosService.findOne(id);
+  }
+
+  @Post()
+  create(@Body() dto: CreateTodoDto) {
+    return this.todosService.create(dto.title);
+  }
+}
+```
+
+```ts
+// todos/todos.module.ts  （把功能组合在一起）
+import { Module } from "@nestjs/common";
+import { TodosController } from "./todos.controller";
+import { TodosService } from "./todos.service";
+
+@Module({
+  controllers: [TodosController],
+  providers: [TodosService],
+})
+export class TodosModule {}
+```
+
+```ts
+// main.ts
+import { NestFactory } from "@nestjs/core";
+import { ValidationPipe } from "@nestjs/common";
+import { AppModule } from "./app.module";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true })); // 剔除未知字段
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+### 接下来要学的 Nest 概念
+
+| 概念 | 作用 |
+| --- | --- |
+| Pipes（管道） | 验证并转换输入 |
+| Guards（守卫） | 允许或拦截请求（认证、角色） |
+| Interceptors（拦截器） | 包装处理函数（日志、缓存、响应映射） |
+| Exception filters（异常过滤器） | 把错误转换成 HTTP 响应 |
+| 依赖注入 | Nest 创建并提供你的服务 |
+
+---
+
+## 19. 使用 Next.js 做全栈开发（概览）
+
+**概念：** Next.js 是运行在 Node.js 上的 React 框架。它在服务端渲染页面，提供 API 接口，并且可以在服务端代码中直接获取数据。
+
+```bash
+npx create-next-app@latest my-app
+```
+
+一个从数据库读取数据的服务端渲染页面（App Router）：
+
+```tsx
+// app/posts/page.tsx  （在服务端运行）
+import { query } from "@/lib/db";
+
+export default async function PostsPage() {
+  const posts = await query("SELECT id, title FROM posts ORDER BY id DESC LIMIT 10");
+
+  return (
+    <main>
+      <h1>Posts</h1>
+      <ul>
+        {posts.map((p: { id: number; title: string }) => (
+          <li key={p.id}>{p.title}</li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+一个 API 路由处理函数：
+
+```ts
+// app/api/posts/route.ts
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  return NextResponse.json([{ id: 1, title: "Hello" }]);
+}
+
+export async function POST(request: Request) {
+  const body = await request.json();
+  return NextResponse.json(body, { status: 201 });
+}
+```
+
+**如何选择：** 独立后端和微服务用 Express、Fastify 或 NestJS。前后端关系紧密时用 Next.js（或 Nuxt、SvelteKit、Remix）。如果选 Next.js，请先学 React。
+
+---
+
+## 20. 使用 WebSocket 实现实时通信
+
+**概念：** HTTP 是“请求—响应”模式。WebSocket 会保持连接打开，服务器可以随时主动推送数据（聊天、实时仪表盘、游戏）。
+
+```bash
+npm install socket.io
+```
+
+服务端：
+
+```js
+import { createServer } from "node:http";
+import { Server } from "socket.io";
+
+const httpServer = createServer();
+const io = new Server(httpServer, { cors: { origin: "http://localhost:5173" } });
+
+io.on("connection", (socket) => {
+  console.log("connected:", socket.id);
+
+  socket.on("join", (room) => {
+    socket.join(room);
+    socket.to(room).emit("system", `${socket.id} joined ${room}`);
+  });
+
+  socket.on("message", ({ room, text }) => {
+    io.to(room).emit("message", { from: socket.id, text, at: Date.now() });
+  });
+
+  socket.on("disconnect", () => console.log("disconnected:", socket.id));
+});
+
+httpServer.listen(3001);
+```
+
+浏览器客户端：
+
+```js
+import { io } from "socket.io-client";
+
+const socket = io("http://localhost:3001");
+socket.emit("join", "general");
+socket.on("message", (msg) => console.log(msg));
+socket.emit("message", { room: "general", text: "Hello everyone" });
+```
+
+**生产环境注意事项：** 要对连接做认证（例如在 `io.use(...)` 中间件里检查令牌）。运行多个服务器实例时，要添加共享适配器（如 Redis adapter），这样消息才能到达连接在其他实例上的用户。
+
+---
+
+## 21. GraphQL（概览）
+
+**概念：** 使用 GraphQL 时，客户端通过单一接口精确请求自己需要的字段。它减少了过度获取数据，适合有多种客户端的应用。
+
+```bash
+npm install graphql graphql-yoga
+```
+
+```js
+import { createServer } from "node:http";
+import { createYoga, createSchema } from "graphql-yoga";
+
+const posts = [
+  { id: "1", title: "Hello GraphQL", authorId: "10" },
+  { id: "2", title: "Node is great", authorId: "10" },
+];
+const authors = { "10": { id: "10", name: "Ada" } };
+
+const schema = createSchema({
+  typeDefs: /* GraphQL */ `
+    type Author { id: ID!, name: String! }
+    type Post { id: ID!, title: String!, author: Author! }
+    type Query {
+      posts: [Post!]!
+      post(id: ID!): Post
+    }
+    type Mutation {
+      addPost(title: String!, authorId: ID!): Post!
+    }
+  `,
+  resolvers: {
+    Query: {
+      posts: () => posts,
+      post: (_, { id }) => posts.find((p) => p.id === id) ?? null,
+    },
+    Mutation: {
+      addPost: (_, { title, authorId }) => {
+        const post = { id: String(posts.length + 1), title, authorId };
+        posts.push(post);
+        return post;
+      },
+    },
+    Post: {
+      author: (post) => authors[post.authorId], // 只有被请求时才会解析
+    },
+  },
+});
+
+createServer(createYoga({ schema })).listen(4000);
+```
+
+查询示例：
+
+```graphql
+query {
+  posts {
+    title
+    author { name }
+  }
+}
+```
+
+**注意 N+1 问题：** 像 `Post.author` 这样的 resolver 如果每次都查数据库，就会产生 N+1。请使用 DataLoader 之类的批处理工具。
+
+---
+
+## 22. 后台任务与队列
+
+**概念：** 不要让用户等待耗时的工作（发邮件、缩放图片、生成报表）。把任务放进队列，让独立的 worker 去处理。
+
+```bash
+npm install bullmq
+```
+
+`queue.js`（生产者）：
+
+```js
+import { Queue } from "bullmq";
+
+const connection = { host: "127.0.0.1", port: 6379 };
+export const emailQueue = new Queue("emails", { connection });
+
+// 在请求处理函数中
+await emailQueue.add(
+  "welcome",
+  { to: "user@example.com" },
+  { attempts: 3, backoff: { type: "exponential", delay: 2000 } }
+);
+```
+
+`worker.js`（消费者，作为独立进程运行）：
+
+```js
+import { Worker } from "bullmq";
+
+const connection = { host: "127.0.0.1", port: 6379 };
+
+const worker = new Worker(
+  "emails",
+  async (job) => {
+    console.log(`Sending ${job.name} email to ${job.data.to}`);
+    // await sendEmail(job.data.to) ...
+  },
+  { connection, concurrency: 5 }
+);
+
+worker.on("completed", (job) => console.log(`Job ${job.id} done`));
+worker.on("failed", (job, err) => console.error(`Job ${job?.id} failed:`, err.message));
+```
+
+**设计规则：** 任务可能因为重试而运行多次，所以要保证它们是**幂等**的：运行两次不能导致重复扣款或重复发送。
+
+---
+
+# 第四部分：生产环境与精通
+
+## 23. 日志与可观测性
+
+**概念：** 在生产环境中你无法附加调试器。日志、指标和链路追踪是你了解应用运行状况的方式。
+
+```bash
+npm install pino pino-http
+```
+
+```js
+import pino from "pino";
+import pinoHttp from "pino-http";
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL || "info",
+  redact: ["req.headers.authorization", "*.password"], // 绝不记录敏感信息
+});
+
+app.use(pinoHttp({ logger })); // 以 JSON 记录每个请求及耗时
+
+logger.info({ userId: 42, action: "login" }, "user logged in");
+logger.error({ err }, "payment failed");
+```
+
+**日志规则**
+
+- 记录**结构化 JSON**，而不是随意的字符串，方便工具检索。
+- 正确使用级别：`error`（需要处理）、`warn`（异常但已处理）、`info`（关键事件）、`debug`（开发细节）。
+- 给每条日志附加**请求 ID**，这样才能跨服务追踪同一个请求。
+- 为负载均衡器添加健康检查接口：
+
+```js
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ status: "ok" });
+  } catch {
+    res.status(503).json({ status: "database_unavailable" });
+  }
+});
+```
+
+想获得更深入的可见性，可以添加指标（Prometheus 和 Grafana）、分布式追踪（OpenTelemetry）和错误追踪（Sentry）。
+
+---
+
+## 24. 端到端测试 API
+
+**概念：** 单元测试检查小函数。集成测试调用真实的路由，验证整个流程，包括验证逻辑和数据库。
+
+```bash
+npm install -D supertest
+```
+
+`app.js` 必须导出 app，且不要调用 `listen`：
+
+```js
+// app.js
+import express from "express";
+export const app = express();
+app.use(express.json());
+app.post("/todos", (req, res) => {
+  if (!req.body.title) return res.status(400).json({ error: "title is required" });
+  res.status(201).json({ id: 1, title: req.body.title });
+});
+```
+
+```js
+// app.test.js
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import request from "supertest";
+import { app } from "./app.js";
+
+describe("POST /todos", () => {
+  test("creates a todo", async () => {
+    const res = await request(app).post("/todos").send({ title: "Test" });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.title, "Test");
+  });
+
+  test("rejects missing title", async () => {
+    const res = await request(app).post("/todos").send({});
+    assert.equal(res.status, 400);
+  });
+});
+```
+
+### Mock（模拟）
+
+```js
+import { mock, test } from "node:test";
+import assert from "node:assert/strict";
+
+test("calls the email sender once", async () => {
+  const sendEmail = mock.fn(async () => true);
+
+  await registerUser({ email: "a@b.com" }, { sendEmail }); // 依赖通过参数传入
+
+  assert.equal(sendEmail.mock.callCount(), 1);
+});
+```
+
+**测试建议**
+
+- 把依赖作为参数传入，这样就能用假对象替换它们。
+- 使用独立的测试数据库，并在每个测试之间重置。
+- 测试不顺利的路径：错误输入、缺少认证、资源不存在。
+- 追求的是信心，而不是覆盖率数字。
+
+---
+
+## 25. Docker
+
+**概念：** 容器把你的应用和它精确的运行环境打包在一起，因此在你的笔记本、CI 和生产环境中运行结果一致。
+
+`Dockerfile`：
+
+```dockerfile
+FROM node:22-alpine AS base
+WORKDIR /app
+
+# 先安装依赖，让 Docker 可以缓存这一层
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+COPY . .
+
+ENV NODE_ENV=production
+EXPOSE 3000
+
+# 不要以 root 身份运行
+USER node
+
+CMD ["node", "src/server.js"]
+```
+
+`.dockerignore`：
+
+```
+node_modules
+.git
+.env
+npm-debug.log
+```
+
+用于本地开发、带数据库的 `docker-compose.yml`：
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://app:secret@db:5432/app
+      JWT_SECRET: dev-secret-change-me
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up --build
+```
+
+对于 TypeScript 应用，请使用多阶段构建：在一个阶段编译，然后只把 `dist/` 和生产依赖复制到最终镜像，让镜像保持小巧。
+
+---
+
+## 26. 使用 GitHub Actions 实现 CI/CD
+
+**概念：** 持续集成（CI）在每次推送时运行你的检查。持续交付（CD）在检查通过后自动部署。
+
+`.github/workflows/ci.yml`：
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          JWT_SECRET: test-secret-at-least-16-chars
+
+      - run: npm audit --audit-level=high
+```
+
+真正的密钥要保存在仓库加密的 **Secrets** 设置里，并通过 `${{ secrets.NAME }}` 读取。绝不要提交到仓库。
+
+**部署选项：** 托管平台（Render、Railway、Fly.io）是最容易的起点。之后可以学习一个主流云（AWS、Google Cloud、Azure）、无服务器函数，以及面向大型系统的 Kubernetes。
+
+---
+
+## 27. 性能与 Node.js 内部机制
+
+**概念：** Node 处理 I/O 很快，但只有一个主线程。性能优化的本质，就是让这个线程保持空闲，并合理使用资源。
+
+### 事件循环的执行顺序
+
+```js
+setTimeout(() => console.log("timeout"), 0);
+setImmediate(() => console.log("immediate"));
+process.nextTick(() => console.log("nextTick"));
+Promise.resolve().then(() => console.log("promise"));
+console.log("sync");
+// sync、nextTick、promise，然后是 timeout/immediate
+```
+
+需要记住的顺序：同步代码，然后是 `process.nextTick`，然后是 Promise 微任务，最后才是事件循环各阶段（定时器、I/O 回调、`setImmediate`）。
+
+### 用 cluster 使用所有 CPU 核心
+
+```js
+import cluster from "node:cluster";
+import { availableParallelism } from "node:os";
+import http from "node:http";
+
+if (cluster.isPrimary) {
+  const count = availableParallelism();
+  for (let i = 0; i < count; i++) cluster.fork();
+
+  cluster.on("exit", (worker) => {
+    console.log(`worker ${worker.process.pid} died, starting a new one`);
+    cluster.fork();
+  });
+} else {
+  http
+    .createServer((req, res) => res.end(`handled by ${process.pid}\n`))
+    .listen(3000);
+}
+```
+
+在容器环境中，许多团队改为每个容器只运行一个进程，由编排系统来扩展容器数量。
+
+### 先测量，再优化
+
+```bash
+# 压力测试
+npx autocannon -c 100 -d 20 http://localhost:3000/posts
+
+# CPU 分析：运行后，用 Chrome DevTools 打开生成的文件
+node --cpu-prof server.js
+
+# 用调试器检查
+node --inspect server.js
+```
+
+### 典型的内存泄漏
+
+```js
+const cache = {}; // 会无限增长
+
+app.get("/user/:id", async (req, res) => {
+  cache[req.params.id] = await loadUser(req.params.id); // 从不清除
+  res.json(cache[req.params.id]);
+});
+```
+
+解决办法：使用有上限的缓存（限制最大条目数的 LRU 缓存）或 TTL（过期时间）。还要留意被遗忘的定时器、每个请求都添加的监听器，以及占用大量内存的闭包。
+
+### 性能检查清单
+
+- [ ] 请求处理函数中没有同步的文件或加密调用
+- [ ] 数据库查询使用索引，没有 N+1 模式
+- [ ] 响应已分页；大数据用流传输
+- [ ] 高频读取使用带过期时间的缓存
+- [ ] CPU 密集型工作运行在 worker 线程或队列中
+- [ ] 连接池大小设置合理
+- [ ] 文本响应启用了压缩
+- [ ] 每次优化前后都做了测量
+
+---
+
+## 28. 架构模式
+
+**概念：** 好的架构能让代码在增长过程中仍然易于修改。目标是关注点分离：每个部分只负责一件事。
+
+### 分层
+
+| 层 | 职责 | 了解的内容 |
+| --- | --- | --- |
+| 路由 / 控制器 | 解析请求，调用 service，返回响应 | HTTP |
+| Service（服务层） | 业务规则 | 领域概念 |
+| Repository（仓储层） | 读写数据 | 数据库 |
+
+### 不用框架也能做依赖注入
+
+```js
+// service 接收自己需要的依赖，而不是自己去导入
+export function createPostsService({ postsRepo, cache, logger }) {
+  return {
+    async get(id) {
+      const cached = await cache.get(`post:${id}`);
+      if (cached) return cached;
+
+      const post = await postsRepo.findById(id);
+      if (!post) throw new NotFoundError("Post");
+
+      await cache.set(`post:${id}`, post);
+      logger.debug({ id }, "post loaded from database");
+      return post;
+    },
+  };
+}
+
+// 在启动时一次性完成组装
+const postsService = createPostsService({ postsRepo, cache, logger });
+```
+
+这样测试会很容易：传入假的 repository 和 cache 即可。
+
+### 常用设计模式
+
+| 模式 | 适用场景 |
+| --- | --- |
+| Repository | 想隐藏数据库细节 |
+| Factory（工厂） | 对象创建有多种变体 |
+| Strategy（策略） | 需要替换算法（支付渠道、存储后端） |
+| Observer（观察者，事件） | 多个部分需要响应同一件事 |
+| Adapter（适配器） | 把第三方 API 包装成自己的接口 |
+
+### 先做单体
+
+先从**模块化单体**开始：一个可部署的应用，内部有清晰的模块划分。只有在有具体理由时（独立扩展、独立团队、不同的发布节奏）才拆分成微服务，因为微服务会带来网络故障、部署复杂度和调试成本。
+
+### API 设计规则
+
+- 资源用名词（`/posts`、`/posts/:id/comments`），动作用 HTTP 方法表达。
+- 返回一致的错误结构：`{ error, code, details? }`。
+- 必须破坏兼容性时再做版本化（`/v1/...`）。
+- 对可能被重试的 `POST` 操作，用幂等键保证**幂等**。
+- 用 OpenAPI 编写 API 文档。
+
+---
+
+## 29. 毕业项目
+
+做一个综合运用以上所有内容的项目。建议：**一个博客或任务平台 API**。
+
+**需求**
+
+1. TypeScript、Express 或 NestJS、PostgreSQL
+2. 注册、登录、访问令牌和刷新令牌、角色（用户、管理员）
+3. 文章和评论的增删改查，并带所有权规则
+4. 所有输入都经过验证，错误格式一致
+5. 分页、过滤和搜索
+6. 为读取最多的接口加上 Redis 缓存
+7. 使用 BullMQ 的后台任务（欢迎邮件或每日摘要）
+8. 使用 WebSocket 的实时通知
+9. 主要流程的集成测试（在 CI 中运行）
+10. 结构化日志、健康检查接口、优雅关闭
+11. Docker 镜像、`docker-compose.yml` 和自动化部署
+12. 一份包含安装步骤、API 文档和架构图的 README
+
+**进阶目标：** 限流、上传文件到兼容 S3 的存储、OpenTelemetry 追踪、带书面性能报告的压力测试。
+
+---
+
+## 精通检查清单
+
+只有在**不抄代码**的情况下也能做到时，才勾选对应项目。
+
+**基础**
+
+- [ ] 能解释事件循环、微任务，以及阻塞事件循环为什么有害
+- [ ] 能正确使用流、事件、`fs/promises` 和 `path`
+- [ ] 能用 `async/await` 编写异步代码，并处理每一条错误路径
+
+**后端技能**
+
+- [ ] 能设计 REST API，使用正确的方法、状态码和验证
+- [ ] 能编写参数化 SQL、连接查询、索引和事务
+- [ ] 能实现安全的认证和授权
+- [ ] 能落实第 15 节的安全检查清单
+
+**工程实践**
+
+- [ ] 能编写单元测试和集成测试，并在 CI 中运行
+- [ ] 能在严格模式下使用 TypeScript
+- [ ] 能把应用容器化并部署，带日志和健康检查
+- [ ] 能分析慢接口并修复瓶颈
+
+**生态**
+
+- [ ] 能用 Express、Fastify 和 NestJS 构建同一个 API，并解释它们的取舍
+- [ ] 能构建实时功能和后台任务
+- [ ] 读过自己所依赖的某个库的源码
+
+**职业成长**
+
+- [ ] 为某个开源项目贡献过修复或文档
+- [ ] 审查过别人的 pull request，并能解释你的反馈
+- [ ] 在开发功能之前写过简短的设计文档
+
+---
+
+## 学习计划
+
+| 周数 | 重点 | 本教程对应章节 |
+| --- | --- | --- |
+| 1-3 | Node 核心 | 1-6 |
+| 4-6 | 用 Express 构建 API | 7-8、13 |
+| 7-9 | 数据库与缓存 | 12 |
+| 10-11 | 认证与安全 | 14-15 |
+| 12-13 | 测试与 TypeScript | 10、16、24 |
+| 14-17 | 框架 | 17-19 |
+| 18-20 | 实时通信与后台任务 | 20-22 |
+| 21-24 | 生产环境 | 23、25-27 |
+| 25+ | 架构、毕业项目、开源 | 28-29 |
+
+每周投入 10 到 15 小时，大约需要六个月的专注学习。精通来自反复练习：构建、搞坏、调试、重构真实项目。
+
+## 延伸资源
+
+- **官方文档：** nodejs.org/docs、MDN Web Docs、TypeScript Handbook，以及各框架自己的文档
+- **书籍：** 《Node.js Design Patterns》、《Eloquent JavaScript》、《Designing Data-Intensive Applications》
+- **练习：** Exercism、build-your-own-X 类项目、开源项目中的 “good first issue” 标签
+- **安全：** OWASP Top 10 和 OWASP Cheat Sheet Series
+- **保持更新：** Node.js 官方博客和发布说明，以及你所用框架的更新日志
+
+---
+
+> 回到主线：[Node 学习路线总览](/blog/posts/node-roadmap-00-overview/) · [路线合集](/blog/node-roadmap/) · [Node 0→1 实战](/blog/community-fullstack-roadmap/)
