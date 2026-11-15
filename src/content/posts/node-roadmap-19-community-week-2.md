@@ -434,7 +434,7 @@ async function tick() {
 
       try {
         await notificationQueue.add(event.type, event.payload, {
-          jobId: event.id.toString(),
+          jobId: `outbox-${event.id}`,
         });
         await prisma.outboxEvent.update({
           where: { id: event.id },
