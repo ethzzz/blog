@@ -128,7 +128,8 @@
 }
 
 ::selection {
-    background-color: var(--selection-bg)
+    background-color: var(--selection-bg);
+    color: var(--selection-fg);
 }
 
 .dash-line {
