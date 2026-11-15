@@ -1371,9 +1371,13 @@ feedRouter.get('/', requireAuth, asyncHandler(async (req, res) => {
 
   res.json({
     items: page.map((row) => ({
-      ...row,
       id: String(row.id),
-      author_id: String(row.author_id),
+      authorId: String(row.author_id),
+      title: row.title,
+      content: row.content,
+      likeCount: row.like_count,
+      commentCount: row.comment_count,
+      createdAt: new Date(row.created_at as string | Date).toISOString(),
       // 把 join 出来的扁平字段整理成前端直接可用的 author 结构
       author: {
         id: String(row.author_id),
