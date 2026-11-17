@@ -1,7 +1,7 @@
 ---
 title: '前端 13–15：搜索与 AI 助手交互'
 published: 2026-11-10T12:00:00+08:00
-updated: 2026-11-10T12:00:00+08:00
+updated: 2026-11-18T09:20:00+08:00
 description: 'Day 13–15：Meilisearch 搜索页、AI 助手流式对话、中断/重试/降级，以及前端毕业验收。'
 tags: [社区全栈, 前端, 搜索, AI]
 category: 社区全栈实战
@@ -71,8 +71,9 @@ export default function SearchPage() {
       setLoading(true);
       setError('');
       try {
-        const data = await apiFetch<{ items: Post[] }>(
-          `/api/v1/search/posts?q=${encodeURIComponent(query)}`,
+        // 走 Next BFF，浏览器不需要知道后端地址
+        const data = await apiFetch<{ items: Post[]; source: 'meilisearch' | 'mysql' }>(
+          `/api/search?q=${encodeURIComponent(query)}`,
           { signal: controller.signal },
         );
         setResults(data.items);
@@ -134,28 +135,36 @@ export default function SearchPage() {
 
 ### 1. 对话组件
 
-`src/components/ai-chat.tsx` 完整文件：
+`src/components/ai-chat.tsx` 完整文件（样式依赖前端的 `Avatar`、`SparkIcon` 和全局 `.card` 等类）：
 
 ```tsx
 'use client';
 
 import { useRef, useState } from 'react';
+import { Avatar } from '@/components/avatar';
+import { SparkIcon } from '@/components/icons';
 
 type Message = { role: 'user' | 'assistant'; content: string };
 
+const suggestions = ['怎么发帖？', '搜索是怎么工作的？', '这个项目用了哪些技术？'];
+
 export function AiChat() {
+  const enabled = process.env.NEXT_PUBLIC_AI_ENABLED !== 'false';
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
+  const [error, setError] = useState('');
   const controllerRef = useRef<AbortController | null>(null);
 
-  async function send() {
-    if (!input.trim() || streaming) return;
-    const question = input;
+  async function send(question?: string) {
+    const message = (question ?? input).trim();
+    if (!message || streaming) return;
+
     setInput('');
+    setError('');
     setMessages((items) => [
       ...items,
-      { role: 'user', content: question },
+      { role: 'user', content: message },
       { role: 'assistant', content: '' },
     ]);
     setStreaming(true);
@@ -165,34 +174,59 @@ export function AiChat() {
     controllerRef.current = controller;
 
     try {
-      const response = await fetch('/api/v1/ai/chat', {
+      // 走 BFF：浏览器不直接访问后端，Cookie 由 Next Route Handler 转发
+      const response = await fetch('/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question }),
+        body: JSON.stringify({ message }),
         signal: controller.signal,
       });
-      if (!response.body) throw new Error('No stream');
+      if (!response.ok || !response.body) throw new Error('AI 暂时不可用');
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
       let answer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        answer += decoder.decode(value, { stream: true });
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') continue;
+
+          try {
+            // 后端发的是 data: {"token":"..."}，不是裸文本
+            const data = JSON.parse(payload) as { token?: string };
+            if (!data.token) continue;
+            answer += data.token;
+            setMessages((items) => {
+              const next = [...items];
+              next[next.length - 1] = { role: 'assistant', content: answer };
+              return next;
+            });
+          } catch {
+            // 忽略不完整的 SSE 行
+          }
+        }
+      }
+    } catch (chatError) {
+      if ((chatError as Error).name !== 'AbortError') {
+        setError('AI 暂时不可用，请稍后再试。');
         setMessages((items) => {
           const next = [...items];
-          next[next.length - 1] = { role: 'assistant', content: answer };
+          next[next.length - 1] = {
+            role: 'assistant',
+            content: '这次没有连上助手。主链路不受影响，可以稍后再试。',
+          };
           return next;
         });
-      }
-    } catch (error) {
-      if ((error as Error).name !== 'AbortError') {
-        setMessages((items) => [
-          ...items,
-          { role: 'assistant', content: 'AI 暂时不可用，请稍后再试。' },
-        ]);
       }
     } finally {
       setStreaming(false);
@@ -204,40 +238,142 @@ export function AiChat() {
     controllerRef.current?.abort();
   }
 
-  return (
-    <div className="space-y-3">
-      {messages.map((message, index) => (
-        <p key={index} className={message.role === 'user' ? 'font-medium' : 'text-75'}>
-          {message.content}
+  if (!enabled) {
+    return (
+      <div className="card px-6 py-14 text-center">
+        <p className="font-display text-2xl font-semibold">AI 助手未开启</p>
+        <p className="mt-2 text-sm text-[var(--muted)]">
+          设置 NEXT_PUBLIC_AI_ENABLED=true 后重新启动前端即可。
         </p>
-      ))}
-      <div className="flex gap-2">
-        <input
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          className="flex-1 rounded border p-2"
-        />
-        <button onClick={send} disabled={streaming}>发送</button>
-        {streaming && <button onClick={stop}>停止</button>}
       </div>
+    );
+  }
+
+  return (
+    <div className="card overflow-hidden">
+      <div className="border-b border-[var(--line)] px-5 py-4">
+        <div className="flex items-center gap-2">
+          <SparkIcon className="h-4 w-4 text-[var(--accent)]" />
+          <p className="text-sm font-semibold">围炉助手</p>
+          <span className="chip ml-auto">演示模式</span>
+        </div>
+        <p className="mt-1 text-xs text-[var(--muted)]">
+          当前使用本地流式回复；接入真实模型后只替换 BFF。
+        </p>
+      </div>
+
+      <div className="min-h-[320px] space-y-4 px-5 py-5">
+        {messages.length === 0 && (
+          <div className="rounded-2xl bg-[var(--surface-2)] p-5">
+            <p className="font-display text-xl font-semibold">想问点什么？</p>
+            <p className="mt-2 text-sm leading-6 text-[var(--ink-soft)]">
+              可以先试一个示例，看看流式输出和停止按钮。
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {suggestions.map((item) => (
+                <button className="chip hover:border-[var(--line-strong)]" key={item} onClick={() => void send(item)} type="button">
+                  {item}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {messages.map((message, index) => (
+          <div
+            className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}
+            key={`${message.role}-${index}`}
+          >
+            <Avatar name={message.role === 'user' ? '我' : 'AI'} size="sm" />
+            <div
+              className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-7 ${
+                message.role === 'user'
+                  ? 'bg-[var(--accent)] text-white'
+                  : 'bg-[var(--surface-2)] text-[var(--ink-soft)]'
+              }`}
+            >
+              {message.content || (streaming ? '正在想...' : '')}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <form
+        className="flex gap-2 border-t border-[var(--line)] p-4"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void send();
+        }}
+      >
+        <input
+          className="field"
+          onChange={(event) => setInput(event.target.value)}
+          placeholder="问问围炉助手..."
+          value={input}
+        />
+        {streaming ? (
+          <button className="admin-danger shrink-0" onClick={stop} type="button">
+            停止
+          </button>
+        ) : (
+          <button className="btn-primary shrink-0" type="submit">
+            发送
+          </button>
+        )}
+      </form>
+      {error && <p className="px-5 pb-4 text-xs text-red-600">{error}</p>}
     </div>
   );
 }
 ```
 
-- 停止按钮 abort 请求；后端要停止生成/清理连接。
-- 无 Key/超时显示 fallback，不让页面崩。
+BFF 只做透传，不解析协议（`src/app/api/ai/chat/route.ts`）：
+
+```ts
+import { NextResponse } from 'next/server';
+import { callBackendWithAuth } from '@/lib/server-api';
+
+export async function POST(request: Request) {
+  const body = await request.text();
+  const { response: upstream, cookiesToSet } = await callBackendWithAuth('/api/v1/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const message = await upstream.text().catch(() => 'AI unavailable');
+    return NextResponse.json({ code: 'AI_UNAVAILABLE', message }, { status: upstream.status || 502 });
+  }
+
+  const response = new NextResponse(upstream.body, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+
+  for (const cookie of cookiesToSet) {
+    response.cookies.set(cookie.name, cookie.value, cookie.options);
+  }
+  return response;
+}
+```
+
+- 停止按钮 abort 请求；后端监听 `req.on('close')` 中断上游生成。
+- 前端解析 `data: {"token":...}`，协议变化只改这一处。
+- 无 Key 时后端返回 mock 流；失败显示 fallback，不让页面崩。
 
 ### 2. 开关与降级
 
-`apps/web/.env.local` 完整内容（在 01–03 的基础上加最后一行）：
+`apps/web/.env.local` 完整内容（浏览器只拿到开关，后端地址留在服务端）：
 
 ```ini
-NEXT_PUBLIC_API_BASE=http://127.0.0.1:3000
 API_BASE_INTERNAL=http://127.0.0.1:3000
-NEXT_PUBLIC_ADMIN_API_BASE=http://127.0.0.1:3002
-# 没配 Key 时关闭入口，不影响登录/feed/发帖
-NEXT_PUBLIC_AI_ENABLED=false
+ADMIN_API_URL=http://127.0.0.1:3002
+# false 时隐藏 AI 入口，不影响登录/feed/发帖
+NEXT_PUBLIC_AI_ENABLED=true
 ```
 
 关闭时隐藏 AI 入口；搜索/AI 失败不影响主页面。
