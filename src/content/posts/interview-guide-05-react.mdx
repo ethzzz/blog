@@ -1,14 +1,14 @@
 ---
 title: 'React 框架面试题（中高级）'
 published: 2026-09-15T15:00:00+08:00
-description: '深入讲解 React Fiber、Hooks、JSX、虚拟 DOM、状态管理、性能优化等高频面试题。'
+description: '深入讲解 React 虚拟 DOM/Diff、Fiber、Hooks 原理与陷阱、合成事件、状态管理、性能优化、React 18/19 新特性等高频面试题。'
 tags: [前端面试, React, Hooks, Fiber, 性能优化]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 30+ 道 React 框架面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 50+ 道 React 框架面试题（含追问链），难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考。覆盖虚拟 DOM/Diff、Fiber、Hooks 原理与陷阱、合成事件、状态管理、性能优化、React 18/19 新特性与 RSC/并发深水区。
 
 ---
 
@@ -16,9 +16,9 @@ draft: false
 
 | 层级 | 目标 | 必须能回答 |
 |:--|:--|:--|
-| 浅 | 说清概念 | Fiber 为什么需要可中断？Hooks 为什么不能写在条件里？`setState` 到底是同步还是异步？ |
-| 中 | 讲机制/代码 | render 与 commit 阶段分别能做什么、为什么这么切？闭包陷阱的根因与三种解法？`useEffect` 与 `useLayoutEffect` 各在哪一帧执行？ |
-| 深 | 讲取舍/线上 | RSC 与 SSR 差在哪、划的界线是什么？并发渲染下哪些「渲染期假设」会失效？React Compiler 优化不了什么代码？ |
+| 浅 | 说清概念 | 虚拟 DOM 一定快吗？key 是干什么的？Fiber 为什么需要可中断？Hooks 为什么不能写在条件里？`setState` 到底是同步还是异步？ |
+| 中 | 讲机制/代码 | Diff 的三层策略与 `lastPlacedIndex`？render 与 commit 阶段分别能做什么？闭包陷阱的根因与三种解法？合成事件委托到哪、优先级怎么映射？中间件洋葱模型？`useEffect` 清理函数何时执行？ |
+| 深 | 讲取舍/线上 | RSC 与 SSR 差在哪？并发渲染下哪些「渲染期假设」会失效？`use()` 为什么能条件调用？Actions 与 effect 发请求的边界？React Compiler 优化不了什么代码？服务端状态为什么不进 Redux？ |
 
 ---
 
@@ -84,6 +84,72 @@ const element = React.createElement(
 - 结构清晰，接近 HTML
 - 编译时检查，减少错误
 - 性能更好（编译优化）
+
+**追问：「React 17 之后 JSX 编译有什么变化？」** 答：新的 JSX Transform 不再编译成 `React.createElement`，而是自动从 `react/jsx-runtime` 引入 `jsx()`，所以**组件文件里不再需要 `import React`**。收益除了少写一行 import，还有：`jsx()` 把 `key` 从 props 里单独传参（`jsx(type, props, key)`），children 也不再走 `createElement` 的可变参数归一化，编译产物更小更快。
+
+---
+
+## 虚拟 DOM 与 Diff 算法
+
+### Q2b: 虚拟 DOM 一定比直接操作 DOM 快吗？⭐⭐ 🔥
+
+**答：** 不一定，这是个经典的「立场题」。虚拟 DOM 的价值不是「快」，而是**在保证声明式编程模型的前提下，把 DOM 操作控制在一个可接受的下限**。
+
+三种更新策略对比：
+
+| 策略 | 更新方式 | 代价 |
+|:--|:--|:--|
+| 原生 DOM 精准操作 | 手写 `el.textContent = x` | 最快，但状态一多就难以维护 |
+| 虚拟 DOM（React） | 每次渲染生成新树 → diff → 批量打补丁 | 有 diff 的运行时开销，换来声明式 + 可预测 |
+| 编译时精准更新（Svelte / Solid） | 编译期就知道哪个状态绑定哪个节点，直接更新 | 无虚拟 DOM、无 diff，但依赖编译器分析能力 |
+
+所以正确的表述是：
+
+1. 虚拟 DOM **比「无脑全量重建 innerHTML」快**（diff 后只改变化部分）；
+2. 虚拟 DOM **比「手工精准操作 DOM」慢**（多了一层 JS 对象的创建与比较）；
+3. 它真正的收益是**开发体验与跨平台**：同一棵元素树可以渲染到 DOM、Native、测试渲染器，UI 变成数据的纯函数。
+
+**追问：「那 React 为什么还坚持虚拟 DOM？」** 答：因为 React 的并发模型需要一个「可以被打断、丢弃、重来」的中间表示——直接改 DOM 没法回滚，虚拟 DOM/Fiber 树可以。这也是 React Compiler 选择「编译期自动 memo」而不是「编译期消灭虚拟 DOM」的原因：保留运行时模型，才能保留并发能力。
+
+### Q2c: React 的 Diff 算法是怎么做的？key 到底起什么作用？⭐⭐ 🔥
+
+**答：** 完整的树对比是 O(n³)，React 用三个假设把它降到 **O(n) 的单层同序遍历**：
+
+**① Tree Diff（树级）**：只比较同一层级的节点。类型不同（`div` → `span`、`ComponentA` → `ComponentB`）直接**卸载整棵旧子树、重建新子树**，不做跨层级移动复用。所以「切换组件类型」意味着内部状态全部丢失——这是很多「弹窗切换后表单被清空」bug 的根因。
+
+**② Component Diff（组件级）**：同一类型的组件，React 默认认为其子树结构相似，继续往下 diff；`shouldComponentUpdate` / `React.memo` 可以直接剪掉整棵子树的比较。
+
+**③ Element Diff（元素级）**：同一层的一组子节点，靠 **key** 判断「谁是谁」：
+
+```jsx
+// 旧：[A(key=a), B(key=b), C(key=c)]
+// 新：[C(key=c), A(key=a), B(key=b)]
+// React 按 key 认出三个节点都还在 → 只做移动，不销毁重建
+```
+
+**key 的本质是「节点身份」**，不是「渲染优化开关」。没有 key（或用 index）时，React 只能按位置对齐：
+
+```jsx
+// ❌ index 作 key：在头部插入一项后，所有 item 的 index 都变了
+// React 认为「每个位置的内容都变了」→ 全量更新文本；
+// 如果行内有输入框/勾选框等非受控状态，状态会跟着位置串位
+{list.map((item, index) => <Row key={index} item={item} />)}
+
+// ✅ 稳定唯一 id：插入/删除/排序后，React 精确识别哪个节点动了
+{list.map(item => <Row key={item.id} item={item} />)}
+```
+
+**React 的多节点 diff 流程（能讲到这个深度就是加分项）：**
+
+1. **第一轮**：按位置逐个对比新旧列表，key 不同立刻跳出（处理「前缀相同」的常见场景）；
+2. **第二轮**：把剩余旧节点放进 `Map<key, fiber>`，遍历剩余新节点去 Map 里找可复用节点；
+3. **移动判断**：维护一个 `lastPlacedIndex`（已复用旧节点的最大下标），旧节点下标小于它就右移，否则不动。**这解释了为什么「把最后一个挪到最前」只移动一个节点，而「把最前一个挪到最后」在 React 里可能触发大量移动**——React 不做两端对比。
+
+**追问链：**
+
+- **「为什么 React 不像 Vue 那样做双端对比？」** 答：Vue2 的双端对比、Vue3 的最长递增子序列（LIS）都在优化「移动次数最少」；React 选择单向遍历 + Map 查找，实现更简单，且 Fiber 架构下 diff 要能随时中断，单向循环更容易保存进度。React 的取舍是「移动 DOM 的次数可能不是最优，但算法可中断、可预测」。
+- **「key 用 Math.random() 行不行？」** 答：比 index 更糟——每次渲染 key 都变，等于每次全量卸载重建，状态全丢、性能最差。
+- **「两个不同组件想保留状态怎么办？」** 答：提升状态到父级/外部 store，或用同一个组件类型 + 不同 props；`key` 也可以反过来用——**故意改 key 来强制重置组件**（如 `<Form key={userId} />` 切换用户时重置表单），这是 key 的第二个正当用途。
 
 ---
 
@@ -617,6 +683,97 @@ const list = useMemo(() => filterHugeList(deferredQuery), [deferredQuery]);
 - **「transition 和 debounce 有什么区别？」** 答：debounce 是**延迟**（等用户停下再算），transition 是**让路**（立刻开始算，但一有紧急更新就丢弃重来）。所以 transition 不会让结果变慢，只是保证输入不卡；debounce 会牺牲响应时效。搜索框这类「输入必须跟手、结果可以稍慢」的场景，transition 更合适，且不需要猜延迟时长。
 - **「`useDeferredValue` 什么时候真的有用？」** 答：只在「子组件渲染成本高、且数据能从当前 props 派生」时有用。如果渲染很便宜，它只是多一层状态反而更慢——这是典型的「看起来高级但不该用」的 API。
 
+### Q7f: useEffect 的依赖是怎么比较的？清理函数什么时候执行？⭐⭐ 🔥
+
+**答：** 两个容易被背错的细节：
+
+**① 依赖比较用 `Object.is` 逐项浅比较**，不是深比较：
+
+```jsx
+// ❌ 每次渲染 options 都是新对象 → Object.is 判定不同 → effect 每次都重跑
+useEffect(() => {
+  fetchData(options);
+}, [options]); // options = { page: 1 } 在渲染函数里创建
+
+// ✅ 依赖拆到原始值
+useEffect(() => {
+  fetchData({ page });
+}, [page]);
+```
+
+`NaN` 用 `Object.is` 判定相等（`===` 则不等），`+0/-0` 判定不等——冷门但被问过。
+
+**② 清理函数不是「卸载时才执行」，而是「下一次 effect 执行前 + 卸载时」都执行：**
+
+```text
+挂载:        render → commit → effect₁ 执行
+依赖变化:    render → commit → cleanup₁ 执行 → effect₂ 执行
+卸载:        cleanup₂ 执行
+```
+
+这个设计的目的是**竞态防护**——每个 effect 只清理「自己这一次」的资源：
+
+```jsx
+useEffect(() => {
+  let cancelled = false;
+  fetchUser(id).then(user => {
+    if (!cancelled) setUser(user); // 快速切换 id 时，旧请求的结果被丢弃
+  });
+  return () => { cancelled = true; };
+}, [id]);
+```
+
+**追问：「为什么 React 不在 commit 前同步清理旧 effect？」** 答：`useEffect` 的清理也被推迟到绘制后，避免大列表卸载时清理逻辑阻塞画面；如果清理必须发生在 DOM 变更前（如移除测量监听），用 `useLayoutEffect`，它的清理在 mutation 阶段同步执行。
+
+### Q7g: useReducer 和 useState 怎么选？自定义 Hook 复用的是逻辑还是状态？⭐⭐
+
+**答：**
+
+**useReducer 的三个适用信号**（不是「复杂就上」）：
+
+1. **下一个状态依赖多个前值字段**：`dispatch({ type: 'submit' })` 里能拿到完整 state 做联合判断，比多个 `setState` 各自函数式更新更清晰；
+2. **状态转换有明确语义**：请求状态机 `idle → loading → success/error`，用 reducer 把非法转换收敛到一处；
+3. **需要把「怎么改」传下去**：给子组件传 `dispatch`（引用稳定）而不是多个 setter，配合 Context 能避免 value 频繁变化。
+
+```jsx
+function requestReducer(state, action) {
+  switch (action.type) {
+    case 'fetch':   return { status: 'loading', data: state.data, error: null };
+    case 'success': return { status: 'success', data: action.data, error: null };
+    case 'error':   return { status: 'error', data: null, error: action.error };
+    default: throw new Error(`unknown action: ${action.type}`);
+  }
+}
+const [state, dispatch] = useReducer(requestReducer, { status: 'idle', data: null, error: null });
+```
+
+顺带一个冷知识：`useState` 内部就是用 `useReducer` 实现的（一个只会「替换值」的内置 reducer），所以两者性能没有本质差别。
+
+**自定义 Hook 的本质：复用「状态逻辑」，不复用「状态本身」。**
+
+```jsx
+function useOnlineStatus() {
+  const [online, setOnline] = useState(navigator.onLine);
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => {
+      window.removeEventListener('online', on);
+      window.removeEventListener('offline', off);
+    };
+  }, []);
+  return online;
+}
+
+// 组件 A 和组件 B 各调一次 useOnlineStatus()
+// → 各自拥有独立的 state、各自注册一份监听
+// 共享的是「订阅/清理的逻辑」，不是同一份数据
+```
+
+**追问：「两个组件要共享同一份状态怎么办？」** 答：自定义 Hook 做不到，要换成 Context、外部 store（Zustand 等）或模块级单例 + `useSyncExternalStore`。能分清「逻辑复用（Hook）≠ 状态共享（store）」是这道题的考点。这也是 HOC → Render Props → Hooks 演进的核心：前两者靠「包一层组件」注入逻辑，会带来嵌套地狱和 props 来源不明；Hooks 把逻辑抽成普通函数调用，组合是平的。
+
 ### Q8: 受控组件和非受控组件？⭐⭐ 🔥
 
 **答：**
@@ -731,6 +888,88 @@ class MyComponent extends React.PureComponent {
 // 都是浅比较 props（和 state）
 ```
 
+**追问：「PureComponent 浅比较 state 有什么坑？」** 答：直接 mutate state（`this.state.list.push(x)` 后 `setState(this.state)`）时引用没变，浅比较判定「没变化」而跳过渲染——不可变更新不是风格偏好，是浅比较机制的硬前提。`React.memo` 同理：父组件传下来的对象如果是原地修改的，memo 会「该渲染时不渲染」。
+
+---
+
+## 合成事件与错误处理
+
+### Q10b: React 合成事件是什么？和原生事件有什么区别？⭐⭐ 🔥
+
+**答：** React 不直接把监听器绑在每个 DOM 节点上，而是做**事件委托**：在 root 容器上统一监听，事件冒泡到 root 后，React 沿 Fiber 树收集路径上的处理器，构造一个**合成事件对象（SyntheticEvent）**再依次派发。
+
+```text
+原生事件流:  target → ... → document → window
+React 17+:   监听挂在 createRoot(container) 的 container 上（16 及以前挂 document）
+派发顺序:    沿「React 组件树」路径模拟捕获 → 冒泡，而不是 DOM 树
+```
+
+**为什么这么设计：**
+
+1. **性能**：一万个列表项只需要 root 上一份监听，而不是每行一份；
+2. **跨浏览器一致性**：SyntheticEvent 抹平浏览器差异，接口与原生事件对齐（`preventDefault`/`stopPropagation` 都有）；
+3. **配合优先级调度**：React 按事件类型映射更新优先级——`click/keydown` 是离散事件（SyncLane，立即响应），`scroll/drag` 是连续事件（可稍缓），这正是「输入跟手」的底层来源。
+
+**版本演进的三个考点：**
+
+| 版本 | 变化 | 影响 |
+|:--|:--|:--|
+| 16 | 事件池（event pooling）：事件对象用完回收，异步访问要先 `e.persist()` | 经典坑：`setTimeout(() => console.log(e.target))` 拿到 null |
+| 17 | **移除事件池**；委托从 document 改到 root 容器 | 异步访问事件不再需要 persist；多个 React 版本/微前端共存时事件互不干扰 |
+| 18+ | 事件处理器里的更新自动批处理 | 一次点击里多次 setState 只渲染一次 |
+
+**追问链：**
+
+- **「`e.stopPropagation()` 能阻止原生 document 上的监听吗？」** 答：17+ 不能简单这么说——React 监听在 root 上，原生监听在 document 上时，事件先经过 root（React 派发、执行 stopPropagation）**可以**阻止继续冒泡到 document；但如果原生监听绑在 root **内部**的某个节点上，它会在 React 派发之前就触发，合成事件的 stopPropagation 管不到它。**混用原生监听和合成事件时，时序以真实 DOM 流为准**，这是微前端/第三方 SDK 场景的高频坑。
+- **「React 里 `onClick` 是捕获还是冒泡？」** 答：默认冒泡阶段；捕获用 `onClickCapture`。且 React 的「捕获」也是委托到 root 后模拟的，不是真的在每个节点上绑捕获监听。
+- **「`onScroll` 会冒泡吗？」** 答：React 17 起 `onScroll` 不再冒泡（与原生一致），16 时代会——升级时的行为差异点。
+
+### Q10c: Error Boundary 能捕获哪些错误？为什么捕获不了事件处理器里的？⭐⭐
+
+**答：** Error Boundary 是实现了 `getDerivedStateFromError` 或 `componentDidCatch` 的类组件，捕获**子树在渲染期、生命周期、构造函数里抛出的错误**，展示降级 UI。
+
+```jsx
+class ErrorBoundary extends React.Component {
+  state = { hasError: false };
+  static getDerivedStateFromError() { return { hasError: true }; } // render 阶段，必须纯
+  componentDidCatch(error, info) { reportToSentry(error, info.componentStack); } // commit 阶段，可发请求
+  render() {
+    return this.state.hasError ? <Fallback /> : this.props.children;
+  }
+}
+```
+
+**捕获不了的四类**（必背）：
+
+1. **事件处理器**：处理器在 commit 之后由事件派发直接调用，不在渲染调用栈里——用 try/catch；
+2. **异步代码**：`setTimeout`、Promise 回调同理，早已脱离渲染栈；
+3. **服务端渲染**；
+4. **Error Boundary 自己抛的错**：会向上冒给更外层的 boundary。
+
+**追问：「函数组件怎么写 Error Boundary？」** 答：官方没有 Hook 版 API（截至 React 19），因为错误捕获需要「渲染失败后换一棵树重试」的类组件机制；实践中用 `react-error-boundary` 库的 `<ErrorBoundary fallbackRender={...}>`，它内部仍是类组件，但提供了 `useErrorBoundary` 让函数组件**主动把异步错误抛给边界**（`showBoundary(error)`），补齐事件/异步场景。
+
+**实战姿势**：按「区域」而不是「整页」包边界——侧边栏一个、主内容区一个、每个懒加载块一个，坏一块不拖垮整页；配合 `resetKeys`（如路由变化）自动恢复。
+
+### Q10d: Portal 是什么？事件为什么还能冒泡到父组件？⭐⭐
+
+**答：** `createPortal(children, domNode)` 把子节点渲染到**DOM 上任意位置**（通常是 `document.body`），但**React 树上它仍是原父组件的子节点**。
+
+```jsx
+function Modal({ open, children }) {
+  if (!open) return null;
+  return createPortal(
+    <div className="modal">{children}</div>,
+    document.body
+  );
+}
+// 解决的实际问题：父容器 overflow: hidden / z-index / transform
+// 会把 fixed 弹窗裁掉或压住 → 挂到 body 一劳永逸
+```
+
+**关键特性：事件冒泡跟随 React 树，不跟随 DOM 树。** 弹窗里的点击依然会触发外层父组件的 `onClick`——因为 React 是沿 Fiber 路径派发合成事件的。这既是特性（父组件能统一处理弹窗内交互）也是坑（父级的点击埋点会把弹窗点击也算进去）。
+
+**追问：「Portal 里的 Context 还拿得到吗？」** 答：拿得到。Context 也走 React 树，与 DOM 位置无关。这两问本质是同一个知识点：**Portal 只改 DOM 挂载点，不改 React 树结构**。
+
 ---
 
 ## 状态管理
@@ -771,35 +1010,95 @@ store.subscribe(() => {
 });
 ```
 
-### Q12: Redux、MobX、Zustand 的区别？⭐⭐
+**追问链（Redux 的中高级考点全在这三条）：**
+
+- **「中间件是怎么实现的？」⭐⭐⭐** 答：本质是**增强 `dispatch` 的洋葱模型**。`applyMiddleware` 把每个中间件签名为 `store => next => action => {...}` 的函数层层包裹，`compose` 串起来后替换 `store.dispatch`。redux-thunk 的源码核心只有几行：
+
+```javascript
+const thunkMiddleware = ({ dispatch, getState }) => next => action => {
+  if (typeof action === 'function') {
+    return action(dispatch, getState); // action 是函数就执行它，把 dispatch 交给它
+  }
+  return next(action);                 // 否则放行给下一层
+};
+```
+
+  redux-saga 则是中间件里启动 generator 执行器，用 `take/put/call` 这些 effect 描述把「监听 action → 执行副作用 → 派发新 action」写成可测试的声明式流程。**能画出 `dispatch → mw1 → mw2 → reducer` 这条链，比背 API 有用。**
+- **「现在新项目还手写 action type / reducer 吗？」** 答：不。官方标准是 **Redux Toolkit（RTK）**：`createSlice` 用 Immer 让你写「看似 mutate」的不可变更新，自动生成 action creators；`createAsyncThunk` 收敛 pending/fulfilled/rejected 三态；RTK Query 直接管数据获取与缓存。手写 switch-case 的 Redux 是 2019 年前的写法，面试要能说清「为什么 RTK 解决了样板代码问题」。
+- **「`useSelector` 有什么性能陷阱？」⭐⭐⭐** 答：两个。① **每次返回新引用必然重渲染**：`useSelector(s => ({ a: s.a, b: s.b }))` 每次构造新对象，默认引用相等比较判定「变了」——要么拆成两个 `useSelector`，要么传 `shallowEqual` 作第二参。② **selector 在每次 store 更新时都会执行**（不只是本组件相关的那部分 state 变化），所以 selector 里不要做昂贵计算/派生大数组，昂贵派生用 `createSelector`（Reselect）做 memo。这两条是「用了 Redux 反而更卡」的最常见根因。
+
+```jsx
+// ❌ 每次 store 任意变化都重渲染
+const { user, theme } = useSelector(s => ({ user: s.user, theme: s.theme }));
+
+// ✅ 方案一：拆开订阅
+const user = useSelector(s => s.user);
+const theme = useSelector(s => s.theme);
+
+// ✅ 方案二：浅比较
+import { shallowEqual } from 'react-redux';
+const { user, theme } = useSelector(s => ({ user: s.user, theme: s.theme }), shallowEqual);
+```
+
+### Q12: Redux、MobX、Zustand 的区别？怎么选？⭐⭐ 🔥
 
 **答：**
 
-| 特性 | Redux | MobX | Zustand |
+| 维度 | Redux (RTK) | MobX | Zustand |
 |:--|:--|:--|:--|
-| 数据流 | 单向 | 双向 | 单向 |
-| 学习曲线 | 陡峭 | 中等 | 简单 |
-| 代码量 | 多 | 少 | 少 |
-| 性能 | 好 | 好（细粒度） | 好 |
-| TypeScript | 支持 | 支持 | 优秀 |
-| 体积 | ~7KB | ~15KB | ~1KB |
+| 心智模型 | 单一 store + 纯函数 reducer，严格单向 | 响应式可变状态（observable + 自动追踪依赖） | 单一 store + 直接 set，无 action 约束 |
+| 更新粒度 | 订阅 selector，靠引用相等剪枝 | **属性级**精确追踪，谁用了谁更新 | 订阅 selector，靠引用相等剪枝 |
+| 样板代码 | RTK 后中等 | 少（装饰器/makeAutoObservable） | 极少 |
+| 调试/时间旅行 | 强（DevTools、可回放） | 弱（状态可变，难回放） | 中（支持 DevTools 中间件） |
+| 体积（min+gzip 约） | RTK ~12KB+ | ~16KB | ~1KB |
+| 适合场景 | 大团队、强审计、复杂事件流 | 领域模型复杂、表单/编辑器类 | 中小应用、想摆脱 Context 性能问题 |
+
+注意两个容易说错的点：
+
+1. **MobX 不是「双向数据流」**——它仍是「状态 → 视图」单向渲染，只是允许**直接修改状态**（mutable），由 Proxy 追踪谁读了哪个属性，改的时候精确通知。和 Vue 的响应式是同一思路。
+2. **Zustand 的 selector 陷阱与 useSelector 相同**：`useStore(s => ({ a: s.a }))` 返回新对象会无限重渲，用 `useShallow` 包一层或拆 selector。
 
 ```javascript
-// Zustand 示例（简洁）
 import { create } from 'zustand';
 
 const useCounterStore = create((set) => ({
   count: 0,
   increment: () => set((state) => ({ count: state.count + 1 })),
-  reset: () => set({ count: 0 }),
 }));
 
-// 使用
-function Counter() {
-  const { count, increment } = useCounterStore();
-  return <button onClick={increment}>{count}</button>;
-}
+// 正确姿势：按字段订阅
+const count = useCounterStore(s => s.count);
+const increment = useCounterStore(s => s.increment);
+// 只有 count 变了才重渲染；increment 引用稳定，永远不触发
+
+// Zustand 也能在组件外读写（Redux 的 store.getState 同款能力）
+useCounterStore.getState().increment();
 ```
+
+**面试话术**：「选型先看状态性质再看库：跨组件共享的**客户端状态**少就 useState/Context，多了上 Zustand；需要严格事件溯源、大团队协作选 RTK；领域对象关系复杂、想要属性级响应式选 MobX。而**服务端数据**（接口返回的列表/详情）根本不该进这些库——见下一问。」
+
+### Q12b: 服务端状态和客户端状态为什么要分开管？⭐⭐⭐
+
+**答：** 这是近年状态管理最大的认知升级：
+
+| | 客户端状态 | 服务端状态 |
+|:--|:--|:--|
+| 例子 | 弹窗开关、主题、表单草稿 | 用户列表、订单详情 |
+| 所有权 | 你的应用独占 | **远端才是真相**，本地只是缓存快照 |
+| 核心问题 | 怎么共享、怎么改 | 何时失效、怎么重新拉、多组件去重 |
+| 合适的工具 | useState / Zustand / Redux | **React Query（TanStack Query）/ SWR** |
+
+把接口数据塞进 Redux 的代价：手写 loading/error/分页/轮询/失效/竞态处理，每个接口一套 thunk——这些 React Query 用 `useQuery` 一行全包（缓存、去重、窗口聚焦重拉、staleTime、乐观更新）：
+
+```jsx
+const { data, isPending, error } = useQuery({
+  queryKey: ['orders', page],
+  queryFn: () => fetchOrders(page),
+  staleTime: 30_000, // 30 秒内视为新鲜，不重复请求
+});
+```
+
+**追问：「那 Redux 还剩什么？」** 答：跨页面共享的纯客户端状态（向导流程、全局筛选器、撤销栈）。很多项目引入 React Query 后，Redux 里 80% 的代码（接口三态）可以删掉——**「先分类状态，再选工具」比「全家桶一把梭」更能体现架构判断力**。
 
 ---
 
@@ -901,6 +1200,136 @@ function SearchBox() {
 
 ---
 
+## React 18 / 19 新特性
+
+### Q13b: React 18 到底带来了什么？（先铺底再谈 19）⭐⭐
+
+**答：** 一句话：**并发渲染器落地**。前面 Q7d/Q7e 讲过的自动批处理、`useTransition`/`useDeferredValue` 都源于此，此外还有三件常被漏掉的：
+
+1. **`createRoot` 取代 `ReactDOM.render`**：不升级 root 就享受不到任何并发特性（这是「为什么我用了 18 还是没批处理」的标准答案）；
+2. **流式 SSR + 选择性 hydration**：`renderToPipeableStream` 配合 `<Suspense>`，慢的数据块不阻塞整页 HTML 下发；客户端到达的交互区域可以**优先 hydration**，不必等整棵树上次序完成；
+3. **`useId` / `useSyncExternalStore` / `useInsertionEffect`**：分别解决 SSR/CSR id 对齐、外部 store 撕裂（见深水区）、CSS-in-JS 注入时机。
+
+### Q14: React 19 的 Actions 是什么？useActionState / useOptimistic / useFormStatus 怎么配合？⭐⭐⭐ 🔥
+
+**答：** Actions 是 19 的核心范式：**把「异步状态转换」交给 React 管理**。约定是——向 `startTransition` 或表单 `action` 传入**异步函数**，React 自动接管 pending、错误、乐观更新与表单重置，不再手写 `isLoading` 三件套。
+
+```jsx
+import { useActionState, useOptimistic, useFormStatus } from 'react';
+
+// ① useActionState：取代手写 loading/error/data 三个 useState
+async function submitOrder(prevState, formData) {
+  const res = await api.createOrder(formData.get('sku'));
+  if (!res.ok) return { error: res.message };   // 返回值成为新 state
+  return { error: null, orderId: res.id };
+}
+
+function OrderForm() {
+  const [state, formAction, isPending] = useActionState(submitOrder, { error: null });
+  return (
+    <form action={formAction}>
+      <input name="sku" />
+      <SubmitButton />
+      {state.error && <p>{state.error}</p>}
+    </form>
+  );
+}
+
+// ② useFormStatus：子组件读取「所在 form」的提交状态，不用 props 传 pending
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return <button disabled={pending}>{pending ? '提交中…' : '提交'}</button>;
+}
+
+// ③ useOptimistic：先展示预期结果，失败自动回滚
+function CommentList({ comments, send }) {
+  const [optimistic, addOptimistic] = useOptimistic(
+    comments,
+    (list, text) => [...list, { text, sending: true }]
+  );
+  async function action(formData) {
+    addOptimistic(formData.get('text')); // 立刻上屏
+    await send(formData);                // 真实请求；抛错则 optimistic 回滚到 comments
+  }
+  return (
+    <>
+      {optimistic.map((c, i) => <p key={i}>{c.text}{c.sending && ' (发送中)'}</p>)}
+      <form action={action}><input name="text" /></form>
+    </>
+  );
+}
+```
+
+**追问链：**
+
+- **「和 useEffect 里发请求有什么区别？」** 答：effect 是「渲染后同步外部系统」，请求生命周期要自己管（竞态、清理、三态）；Action 是「事件驱动的状态转换」，React 知道它的开始/结束，才能自动做 pending、乐观回滚、`<form>` 提交成功后自动 reset。**19 之后「提交类请求」首选 Action，「订阅/同步类」仍用 effect。**
+- **「useActionState 和旧的 useFormState 什么关系？」** 答：同一个 API 改名（19 正式版从 `useFormState` 更名为 `useActionState`），因为它不限于 form，任何 transition 都能用。
+- **「乐观更新失败后 UI 怎么回滚？」** 答：`useOptimistic` 的乐观值是**派生值**：真实 state 不变时展示乐观值，Action 结束（成功则真实 state 更新、失败则不变）后自动回落到真实 state——不需要手写 catch 里 setState 还原。
+
+### Q15: use() 是什么？为什么它能在条件语句里调用？⭐⭐⭐
+
+**答：** `use()` 是 19 新增的「在渲染期读取资源」的 API，支持两种资源：
+
+```jsx
+import { use, Suspense } from 'react';
+
+// ① 读 Promise：挂起组件，交给 Suspense 显示 fallback
+function Comments({ commentsPromise }) {
+  const comments = use(commentsPromise); // resolve 前组件挂起
+  return comments.map(c => <p key={c.id}>{c.text}</p>);
+}
+<Suspense fallback={<Spinner />}><Comments commentsPromise={promise} /></Suspense>
+
+// ② 读 Context：可以在条件里！
+function Button({ showTheme }) {
+  if (showTheme) {
+    const theme = use(ThemeContext); // ✅ 合法，useContext 做不到
+    return <button className={theme}>OK</button>;
+  }
+  return <button>OK</button>;
+}
+```
+
+**为什么它能违反「Hook 不能条件调用」？** 因为普通 Hook 靠**调用顺序**对齐链表状态（见 Q7b），而 `use()` **不创建状态**——它只是读取：Context 直接从 fiber 上找 Provider；Promise 则把 thenable 挂到最近 Suspense 边界。没有链表节点，就没有顺序依赖。
+
+**三个必考细节：**
+
+1. **Promise 必须来自缓存**（React Query / RSC / 框架 loader / 模块级缓存）。在渲染里现 `fetch()` 每次生成新 Promise → 永远挂起 → 无限循环。**这是 `use(fetch(...))` 直接写会死循环的根因**；
+2. Promise reject 时错误抛给最近的 Error Boundary（所以 `use` + Suspense + ErrorBoundary 是标配三件套）；
+3. 在事件回调/effect 里不能用 `use()`，它只在渲染期工作。
+
+### Q16: React 19 还有哪些值得说的变化？⭐⭐
+
+**答：** 按面试提及率排序：
+
+| 变化 | 内容 | 一句话考点 |
+|:--|:--|:--|
+| **ref as prop** | 函数组件直接收 `ref` prop，`forwardRef` 进入废弃轨道 | 「19 里给函数组件传 ref 还要 forwardRef 吗？」——不用了 |
+| **Context 直接当 Provider** | `<ThemeContext value="dark">` 替代 `<ThemeContext.Provider>` | 少一层 API，旧写法仍兼容 |
+| **ref 回调支持返回清理函数** | `ref={el => { setup(el); return () => cleanup(el); }}` | 对齐 effect 的清理心智；注意写了返回值就不再按「双调用」兼容模式处理 |
+| **hydration 错误报告改进** | 不再刷屏「Text content did not match」，直接给出服务端/客户端 diff | SSR 排错体验质变 |
+| **文档元数据提升** | 组件里写 `<title>/<meta>/<link>` 自动 hoist 到 `<head>` | 不再必须 react-helmet |
+| **资源预加载 API** | `preload` / `preinit`（react-dom）声明式预热字体/脚本/样式 | 与性能优化题联动 |
+| **`<Activity>`（19.2，原 Offscreen）** | 隐藏子树时保留状态、降低优先级渲染 | 「隐藏 tab 不丢状态」的官方解法：`<Activity mode="hidden">` |
+
+```jsx
+// ref as prop + 清理函数（19 写法）
+function Input({ ref }) {
+  return (
+    <input
+      ref={el => {
+        el?.focus();
+        return () => console.log('input 卸载，清理监听');
+      }}
+    />
+  );
+}
+```
+
+**追问：「19 是破坏性升级吗？」** 答：主体平滑（`createRoot` 项目基本直接升），但有三个实际断点：① 移除了 `ReactDOM.render`/`hydrate` 与 `defaultProps`（函数组件）；② `ref` 回调双调用行为变化（StrictMode 下）；③ 字符串 ref、`propTypes` 等远古 API 移除。升级路径官方给了 codemod，面试能说出「先 18.3 看警告，再升 19」这个官方推荐节奏就是加分项。
+
+---
+
 ## 常见坑速查表
 
 | 现象 | 根因 | 解法 |
@@ -914,6 +1343,13 @@ function SearchBox() {
 | Context 一改整棵树都重渲染 | Provider value 每次新建对象 | value 用 useMemo，或按域拆多个 Context |
 | SSR 报 `window is not defined` | 渲染期访问浏览器 API | 移到 useEffect / 动态 import `ssr: false` |
 | StrictMode 下 effect 执行两次 | 开发期故意双调用以暴露副作用 | 清理函数写完整，别关 StrictMode |
+| 切换组件类型后内部状态全丢 | Tree Diff：type 不同直接卸载重建 | 状态提升 / 保持同一组件类型换 props |
+| `useSelector`/Zustand 返回新对象导致狂重渲 | 默认引用相等比较 | 拆 selector / shallowEqual / useShallow |
+| Error Boundary 捕不到点击/异步错误 | 不在渲染调用栈里 | try/catch + react-error-boundary 的 showBoundary |
+| 异步回调里读 `e.target` 是 null（React 16） | 事件池回收 | 升 17+（已移除事件池）或 `e.persist()` |
+| `use(promise)` 无限挂起死循环 | 渲染里现 fetch，每次新 Promise | Promise 必须来自缓存（loader/React Query/模块级） |
+| 弹窗被父容器 overflow/z-index 裁掉 | DOM 层级限制 | createPortal 挂到 body（事件仍沿 React 树冒泡） |
+| memo 包了还是重渲染 | children/内联对象每次新建，浅比较必失败 | 先 Profiler 定位是哪个 prop，再定点修 |
 
 ## 深水区追问（2026 补充）
 
@@ -933,18 +1369,27 @@ SSR 是**同一棵组件树渲染两遍**：服务端产出 HTML，客户端把�
 
 它做的是**编译期自动插 memo 缓存**：把 `useMemo` / `useCallback` / `memo` 的职责收归编译器，前提是组件满足 Rules of React（渲染纯、props 与 state 不可变、hook 无条件调用）。一旦检测到违反（渲染期改 props、render 里读 `ref.current`、依赖里藏了可变捕获），该组件会 **bailout**：不优化但照常运行，也可以显式写 `"use no memo"` 跳过。代价不在运行时而在工程侧：构建时间变长、调试栈里多出缓存调用、旧代码混用时容易出现「编译器认为没变、手写 useMemo 认为变了」的心智负担。它能消掉的是「重复渲染」，消不掉「一次渲染本身很贵」——那还是得靠虚拟化、拆组件、少 DOM。
 
-## 自测清单（能答上 8 条算过关）
+## 自测清单（能答上 12 条算过关）
 
-1. Fiber 把渲染拆成哪两个阶段？哪个可中断、为什么？
-2. 双缓存 Fiber 树的 `alternate` 指针解决了什么问题？
-3. React 为什么不用 requestIdleCallback 而自研 Scheduler？
-4. Hook 为什么不能条件调用？状态存在哪里、靠什么对齐？
-5. 闭包陷阱的根因是什么？三种解法各自的代价？
-6. `setCount(count+1)` 连续三次和 `setCount(c=>c+1)` 连续三次，结果差多少？为什么？
-7. React 18 的自动批处理覆盖了哪些新场景？`flushSync` 什么时候该用（及为什么慎用）？
-8. transition 与 debounce 的本质区别？`useDeferredValue` 什么情况下反而更慢？
-9. 怎么用工具证明「这个组件在无谓重渲染」？
-10. React Compiler 能自动化的边界在哪？为什么仍要懂依赖规则？
+1. 虚拟 DOM 比手工操作 DOM 快吗？它真正买到了什么？
+2. Diff 的三层策略是什么？为什么类型切换会丢状态？
+3. key 用 index 会在什么操作下出 bug？`lastPlacedIndex` 怎么决定移动？
+4. Fiber 把渲染拆成哪两个阶段？哪个可中断、为什么？
+5. 双缓存 Fiber 树的 `alternate` 指针解决了什么问题？
+6. React 为什么不用 requestIdleCallback 而自研 Scheduler？
+7. Hook 为什么不能条件调用？状态存在哪里、靠什么对齐？`use()` 为什么例外？
+8. 闭包陷阱的根因是什么？三种解法各自的代价？
+9. `setCount(count+1)` 连续三次和 `setCount(c=>c+1)` 连续三次，结果差多少？为什么？
+10. useEffect 的清理函数在哪两个时机执行？竞态防护怎么写？
+11. React 18 的自动批处理覆盖了哪些新场景？`flushSync` 什么时候该用（及为什么慎用）？
+12. transition 与 debounce 的本质区别？`useDeferredValue` 什么情况下反而更慢？
+13. 合成事件委托在哪？17 为什么从 document 改到 root？事件池是什么、为什么移除？
+14. Redux 中间件的洋葱模型怎么画？`useSelector` 的两个性能陷阱？
+15. 服务端状态为什么不进 Redux？React Query 替你管了哪些事？
+16. Actions（useActionState/useOptimistic）和手写 loading 三件套的边界在哪？
+17. Error Boundary 捕获不了哪四类错误？函数组件怎么办？
+18. 怎么用工具证明「这个组件在无谓重渲染」？
+19. React Compiler 能自动化的边界在哪？为什么仍要懂依赖规则？
 
 ---
 
@@ -952,14 +1397,20 @@ SSR 是**同一棵组件树渲染两遍**：服务端产出 HTML，客户端把�
 
 | 知识点 | 关键记忆 |
 |:--|:--|
+| 虚拟 DOM | 不是更快，是声明式 + 可回滚的中间表示 |
+| Diff | 单层同序 O(n)；type 不同整棵重建；key 即身份 |
 | Fiber | 可中断渲染，时间切片，优先级调度 |
-| Hooks 规则 | 只能在顶层调用，只能在函数组件调用 |
-| useEffect | 绘制后执行，异步不阻塞 |
+| Hooks 规则 | 只能在顶层调用；顺序即身份；`use()` 不建状态所以例外 |
+| useEffect | 绘制后执行；清理在「下次执行前 + 卸载时」都跑 |
 | useLayoutEffect | 绘制前执行，同步阻塞 |
-| useCallback | 缓存函数引用 |
-| useMemo | 缓存计算结果 |
-| React.memo | 浅比较优化函数组件 |
-| 性能优化 | memo + useCallback + 懒加载 + 虚拟列表 |
+| useCallback / useMemo | 缓存函数引用 / 缓存计算结果 |
+| React.memo | 浅比较 props；引用不变是前提 |
+| 合成事件 | 委托到 root（17+）；事件池已移除；优先级映射 lane |
+| Redux 中间件 | dispatch 洋葱模型；useSelector 忌返回新对象 |
+| 状态选型 | 客户端状态进 store，服务端状态进 React Query |
+| React 19 | Actions 管异步转换；use 读缓存 Promise/Context；ref 即 prop |
+| Error Boundary | 只捕渲染期错误；事件/异步要 try-catch |
+| 性能优化 | 先 Profiler 实测，再 memo + 懒加载 + 虚拟列表 |
 
 > [!TIP]
 > 下一篇：[跨端框架面试题](/blog/posts/interview-guide-06-cross-platform/)
