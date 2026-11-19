@@ -40,7 +40,7 @@ draft: false
 ├── 综合面试
 │   └── 软素质与 HR 面（项目介绍、STAR、职业规划、薪资）
 ├── 深水区实战（资深扩展）
-│   ├── 核心能力问答（双栈选型、图形渲染、Hybrid、AI 研发 24 问）
+│   ├── 核心能力问答（双栈选型、图形渲染、Hybrid、AI 研发 25 问）
 │   └── 深水区实战（配置驱动、2D×3D、硬件链路、离线包、AI 协作流）
 └── AI 工程（2026 新增）
     └── AI 应用 / Agent 面试（RAG、评估、流式、function calling/MCP、Agent、注入、系统设计）
@@ -71,16 +71,16 @@ draft: false
 | 07 | [前端构建工具面试题](/blog/posts/interview-guide-07-build-tools/) | Webpack、Vite、Babel、Tree Shaking |
 | 08 | [网络与 HTTP 面试题](/blog/posts/interview-guide-08-network-http/) | TCP/IP、HTTP/2、HTTPS、缓存、跨域 |
 | 15 | [前端工程化实践](/blog/posts/interview-guide-15-engineering-practice/) | Monorepo、微前端、组件库、npm 发包、CI/CD |
-| 16 | [实时通信面试题](/blog/posts/interview-guide-16-realtime/) | WebSocket、SSE、WebRTC、协同编辑、弹幕 |
+| 16 | [实时通信面试题](/blog/posts/interview-guide-16-realtime/) | WebSocket 帧协议与鉴权、SSE、Socket.IO 多实例、WebRTC、协同编辑 |
 
 ### 后端知识
 
 | 序号 | 文章 | 核心考点 |
 |:--|:--|:--|
-| 09 | [Nginx 面试题](/blog/posts/interview-guide-09-nginx/) | 反向代理、负载均衡、配置优化 |
-| 10 | [MySQL 面试题](/blog/posts/interview-guide-10-mysql/) | 索引、事务、SQL优化、锁机制 |
-| 11 | [后端知识面试题](/blog/posts/interview-guide-11-backend/) | RESTful、Node.js、Java基础、微服务 |
-| 19 | [Node.js 面试题专篇](/blog/posts/interview-guide-19-nodejs/) | 事件循环、Stream、进程线程、Express/Koa/NestJS、部署 |
+| 09 | [Nginx 面试题](/blog/posts/interview-guide-09-nginx/) | 反向代理、负载均衡、CORS、一致性哈希、proxy_cache |
+| 10 | [MySQL 面试题](/blog/posts/interview-guide-10-mysql/) | 索引、事务、三大日志与两阶段提交、主从复制 |
+| 11 | [后端知识面试题](/blog/posts/interview-guide-11-backend/) | RESTful、JWT 双 Token、SSO、Java基础、微服务 |
+| 19 | [Node.js 面试题专篇](/blog/posts/interview-guide-19-nodejs/) | 事件循环、Stream、进程线程、Express/Koa/NestJS、优雅关闭、部署 |
 
 ### 进阶必修
 
@@ -89,7 +89,7 @@ draft: false
 | 12 | [TypeScript 进阶面试题](/blog/posts/interview-guide-12-typescript/) | 泛型、条件类型、infer、映射类型、协变逆变 |
 | 13 | [性能优化面试题](/blog/posts/interview-guide-13-performance/) | LCP/INP/CLS、白屏优化、虚拟列表、内存泄漏 |
 | 14 | [手写代码题专篇](/blog/posts/interview-guide-14-handwritten-code/) | 防抖节流、深拷贝、Promise.all、并发控制、发布订阅 |
-| 17 | [前端系统设计场景题](/blog/posts/interview-guide-17-system-design/) | 大文件上传、权限系统、监控、低代码、JSBridge |
+| 17 | [前端系统设计场景题](/blog/posts/interview-guide-17-system-design/) | 大文件上传与秒传、权限系统、监控与白屏检测、低代码、JSBridge |
 
 ### 综合面试
 
@@ -101,7 +101,7 @@ draft: false
 
 | 序号 | 文章 | 核心考点 |
 |:--|:--|:--|
-| 20 | [资深前端核心能力问答](/blog/posts/interview-guide-20-frontend-core-qa/) | 双栈选型、Next.js SSR、Konva/Three.js、Hybrid N-API、工程化性能、AI 研发 24 问 |
+| 20 | [资深前端核心能力问答](/blog/posts/interview-guide-20-frontend-core-qa/) | 双栈选型、Next.js SSR/ISR 生产细节、Konva/Three.js、Hybrid N-API、工程化性能、AI 研发 25 问 |
 | 21 | [前端深水区实战](/blog/posts/interview-guide-21-frontend-deep-practice/) | 配置驱动渲染、2D×3D 协同、Hybrid 硬件链路、离线包热更新、AI 协作流 |
 
 ### AI 工程（2026 新增）
@@ -190,6 +190,7 @@ R (Result) - 取得了什么成果
 | Node.js | ⭐⭐⭐⭐ | 2-3 天（全栈方向重点） |
 | 资深核心能力问答 | ⭐⭐⭐⭐ | 1-2 天（查漏补缺） |
 | 深水区实战 | ⭐⭐⭐⭐ | 1-2 天（架构思路） |
+| AI 工程 | ⭐⭐⭐⭐ | 1-2 天（2026 增量考点） |
 
 > [!TIP]
 > 建议按顺序阅读，先打牢基础再看框架和工程化。已经熟悉的部分可以直接跳到对应文章当作速查表使用。
