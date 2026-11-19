@@ -1,7 +1,7 @@
 ---
 title: '跨端框架面试题（uniapp / React Native / Flutter）'
 published: 2026-09-16T10:00:00+08:00
-description: '深入讲解 uniapp、React Native、Flutter 等跨端方案的原理、架构、性能对比与选型策略。'
+description: '深入讲解 uniapp、React Native、Flutter 等跨端方案的原理、架构、性能对比、小程序分包加载、Flutter 状态管理与选型策略。'
 tags: [前端面试, uniapp, ReactNative, Flutter, 跨端开发]
 category: 前端面试宝典
 draft: false
@@ -143,6 +143,51 @@ wx.login({});
   答：nvue 是基于 Weex 的原生渲染页面，每个页面是一个独立原生视图，适合长列表、弹幕、直播这类 WebView 渲染会卡的场景。但组件和 CSS 支持受限（默认 flex 布局、不支持部分选择器），所以典型做法是**普通页面用 vue、性能瓶颈页用 nvue 混合**。
 - **「条件编译是编译时还是运行时？」**
   答：编译时。`#ifdef` 代码块在构建阶段就被裁剪掉，产物里根本不存在其它端的代码，所以不影响包体积。这也是它和「运行时判断平台」的本质区别。
+
+### Q3b: 小程序分包加载怎么做？主包体积超限怎么治理？⭐⭐ 🔥
+
+**答：** 小程序对包体积有硬限制（微信：主包 2MB、整包 30MB，各平台略有差异），超了直接**无法上传**。分包是唯一的结构性解法：
+
+```json
+// app.json（uniapp 对应 pages.json 的 subPackages 字段）
+{
+  "pages": ["pages/index/index", "pages/mine/mine"],
+  "subPackages": [
+    { "root": "pkgOrder", "pages": ["pages/list/list", "pages/detail/detail"] },
+    { "root": "pkgLive", "pages": ["pages/room/room"], "independent": true }
+  ],
+  "preloadRule": {
+    "pages/index/index": {
+      "network": "wifi",
+      "packages": ["pkgOrder"]
+    }
+  }
+}
+```
+
+**三个概念要分清：**
+
+| 类型 | 特点 | 适用 |
+|:--|:--|:--|
+| 普通分包 | 依赖主包，进入分包页面时才下载 | 低频业务模块（订单、设置） |
+| 独立分包 | 不依赖主包，可独立运行（不能引用主包资源/App.wxss） | 活动页、广告落地页（秒开） |
+| 分包预下载 | 进入某页面时按网络条件提前下载指定分包 | 高频跳转路径，消掉首次进入的下载等待 |
+
+**主包瘦身清单（按收益排序）：**
+1. 静态资源上 CDN——图片/字体/大 JSON 绝不进包，这是最大头；
+2. 低频页面整体迁分包，tabBar 页面必须留主包；
+3. 依赖分析：`uni-app` 用条件编译裁掉其它端代码；检查是否整包引入了 lodash/moment（换 lodash-es 按需、dayjs）；
+4. 开启压缩与 tree-shaking，vendor 拆分；
+5. 组件库按需引入（uview/uni-ui 只引用到的组件）。
+
+**追问链：**
+
+- **「分包页面首次进入白屏/转圈怎么优化？」**
+  答：下载是物理耗时，只能「提前」不能「消除」——用 `preloadRule` 在用户必经的前置页面预下载；独立分包用于投放场景直接秒开；再配合骨架屏让等待可感知。
+- **「独立分包为什么不能引用主包资源？」**
+  答：独立分包的设计目标是**不下载主包就能运行**，如果允许依赖主包，这个前提就被破坏了。所以 App.vue 的全局样式、主包 utils 都不可用，公共逻辑要下沉到独立分包内或走 npm 包各自打包。
+- **「uniapp 里怎么验证分包真的生效？」**
+  答：看构建产物目录结构（分包 root 独立成目录）+ 微信开发者工具的「代码依赖分析」，上传时面板会列出主包/各分包体积。别只看配置写了没有，要以产物为准。
 
 ### Q4: uniapp 的生命周期？⭐⭐
 
@@ -371,6 +416,54 @@ class _CounterState extends State<CounterWidget> {
 }
 ```
 
+### Q8b: Flutter 状态管理怎么选？setState / Provider / Riverpod / Bloc？⭐⭐ 🔥
+
+**答：** 先分清两类状态：**局部状态**（动画进度、输入框焦点、页内计数）用 `setState` 就够；**共享状态**（登录用户、购物车、主题）才需要状态管理方案。
+
+```dart
+// 1. setState：StatefulWidget 内重建，作用域 = 当前 State 的 build 子树
+setState(() => _count++);
+
+// 2. InheritedWidget：Flutter 原生的"自上而下共享 + 依赖订阅"机制
+// Provider / Theme.of / MediaQuery.of 底层都是它
+// 核心：updateShouldNotify 决定哪些依赖者重建
+
+// 3. Provider：InheritedWidget 的易用封装（官方曾推荐）
+ChangeNotifierProvider(
+  create: (_) => CartModel(),
+  child: Consumer<CartModel>(
+    builder: (_, cart, __) => Text('${cart.total}'),  // 只有 Consumer 内重建
+  ),
+);
+
+// 4. Riverpod：Provider 作者的重写版，编译期安全、不依赖 BuildContext
+final cartProvider = NotifierProvider<CartNotifier, CartState>(CartNotifier.new);
+// ref.watch 订阅、ref.read 一次性读取、ref.listen 副作用
+
+// 5. Bloc：事件驱动 + 不可变状态，适合大型团队强约束
+// Event → Bloc(mapEventToState) → State，UI 只消费 State
+bloc.add(AddItem(item));   // 发事件
+BlocBuilder<CartBloc, CartState>(builder: (_, state) => ...);
+```
+
+**选型对照：**
+
+| 方案 | 心智模型 | 优势 | 代价 |
+|:--|:--|:--|:--|
+| setState | 命令式重建 | 零依赖、局部状态最优解 | 跨组件共享会层层传参 |
+| Provider | 依赖注入 + 通知 | 简单、官方生态、与 Widget 树贴合 | 运行时才报错（找不到 Provider）、依赖 context |
+| Riverpod | 编译期安全的 Provider | 不依赖 context、可测试性好、自动销毁 | 概念多一层（ref/provider 家族） |
+| Bloc | 事件 → 状态流 | 强约束、可追溯、适合大团队 | 模板代码多、小项目过重 |
+
+**追问链：**
+
+- **「为什么 Consumer / BlocBuilder 能只重建局部？」**
+  答：重建范围 = 订阅点所在的 build 子树。把 `Consumer` 包在尽可能小的 Widget 外，通知到来时只有这一小块重建；反模式是把 Consumer 包在整页根部，等于每次通知全页重建。
+- **「Riverpod 比 Provider 到底好在哪？」**
+  答：三点——provider 是全局声明的编译期对象，拼错/漏声明在编译期就报错（Provider 是运行时抛 `ProviderNotFoundException`）；不依赖 BuildContext，逻辑层可以脱离 Widget 树单测；ref.watch/read/listen 把「订阅、读取、副作用」三种语义显式分开，避免 build 里误用 read 导致的漏更新。
+- **「setState 会不会重建整棵树？」**
+  答：不会。它只标记当前 State 为 dirty，重建从该 State 的 build 开始；子 Widget 如果配置没变（const/相同实例），Element 层会跳过重建——这正是 Q8 三棵树复用的意义。
+
 ---
 
 ## 跨端方案对比与选型
@@ -465,6 +558,9 @@ export default codePush(codePushOptions)(App);
 | Flutter 真机上文字显示异常 | 未集成系统字体/引擎内置字体缺字 | 配置字体回退链，中文场景显式声明字体 |
 | iOS 审核因热更新被拒 | 下发了可执行代码，触碰 3.3.2 | 只走资源/脚本解释层，控制下发范围 |
 | 双端 UI 不一致（RN） | 原生组件随系统版本差异 | 关键组件用一致性组件库或自绘 |
+| 小程序上传报主包超 2MB | 图片/低频页面全塞主包 | 静态资源上 CDN + 分包 + 依赖分析裁包 |
+| 分包页面首次进入转圈久 | 进入时才下载分包 | preloadRule 预下载 + 骨架屏；投放页用独立分包 |
+| Flutter 一处 setState 全页卡顿 | Consumer/setState 作用域包得太大 | 订阅点下沉到最小子树；共享状态用 ref.watch 精确订阅 |
 
 ## 深水区追问（2026 补充）
 
@@ -484,7 +580,7 @@ export default codePush(codePushOptions)(App);
 
 答：它是双线程架构的**补丁**。逻辑层改动要走 `setData` 跨线程序列化，滚动、拖拽这类每帧都变的交互，一次往返就掉帧；WXS 是运行在视图层的一段受限脚本，可以在渲染线程里直接响应事件、改写样式（不能调小程序 API、不能与逻辑层自由通信），所以「跟随手指移动」的动效用它才不卡。回答时要划清边界：它解决的是**高频、低复杂度、只改视图**的交互；需要业务数据的逻辑仍只能回逻辑层，靠减少 `setData` 的字段数与频率来优化。
 
-## 自测清单（能答上 8 条算过关）
+## 自测清单（能答上 10 条算过关）
 
 1. RN 旧架构 Bridge 的三个缺点分别导致什么用户可感知的问题？
 2. JSI 是什么？它和 Bridge 在通信模型上的本质区别？
@@ -496,6 +592,8 @@ export default codePush(codePushOptions)(App);
 8. useNativeDriver 为 true 和 false 时动画分别跑在哪个线程？
 9. 三种方案的热更新能力排序，以及 Flutter 受限的技术根因？
 10. 你会给一个「小程序 + App + H5 全都要」的项目选什么？说出一票否决的理由。
+11. 普通分包、独立分包、分包预下载各解决什么问题？独立分包为什么不能引用主包资源？
+12. Flutter 局部状态和共享状态分别怎么管？Riverpod 相比 Provider 的三个改进？
 
 ---
 
@@ -511,6 +609,8 @@ export default codePush(codePushOptions)(App);
 | Hermes | RN 引擎，减少启动时间 |
 | 热更新 | RN/uniapp 支持，Flutter 受限 |
 | 选型 | 多端选 uniapp，性能选 Flutter，生态选 RN |
+| 小程序分包 | 主包 2MB 硬限；普通/独立分包 + preloadRule 预下载 |
+| Flutter 状态管理 | 局部 setState，共享 Provider/Riverpod/Bloc；订阅点下沉最小子树 |
 
 > [!TIP]
 > 下一篇：[前端构建工具面试题](/blog/posts/interview-guide-07-build-tools/)

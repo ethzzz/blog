@@ -1,14 +1,14 @@
 ---
 title: 'TypeScript 进阶面试题（中高级必考）'
 published: 2026-09-16T16:00:00+08:00
-description: '深入讲解泛型、条件类型、infer、映射类型、内置工具类型实现原理、类型收窄、协变逆变等 TypeScript 高频进阶面试题。'
+description: '深入讲解泛型、条件类型、infer、映射类型、内置工具类型实现原理、类型收窄、协变逆变、结构化类型、函数重载、enum 选型等 TypeScript 高频进阶面试题。'
 tags: [前端面试, TypeScript, 泛型, 类型体操, 工具类型]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 20+ 道 TypeScript 进阶面试题，中高级岗位 TS 考察比重越来越高，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 25+ 道 TypeScript 进阶面试题，中高级岗位 TS 考察比重越来越高，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -100,6 +100,45 @@ function area(s: Shape) {
 }
 ```
 
+### Q2b: 什么是结构化类型？多余属性检查为什么时灵时不灵？⭐⭐ 🔥
+
+**答：** TS 是**结构化类型系统**（structural typing，俗称鸭子类型）：两个类型只要形状兼容就互相 assignable，不看名字、不看声明出处。这和 Java/C# 的**名义类型**（nominal，必须显式继承/实现）是根本区别。
+
+```typescript
+interface Point { x: number; y: number }
+class Vec { constructor(public x: number, public y: number) {} }
+
+const p: Point = new Vec(1, 2);  // ✅ 类没有 implements Point，但形状匹配就行
+
+// 唯一的例外：private / protected 成员让类变成"名义化"
+class A { private secret = 1; x = 0 }
+class B { private secret = 1; x = 0 }
+const a: A = new B();  // ❌ private 成员来源不同，形状相同也不兼容
+
+// 多余属性检查（excess property checking / freshness）
+interface Config { url: string; timeout?: number }
+
+const c1: Config = { url: '/api', timeout: 3000, retry: 3 };
+// ❌ 报错：'retry' 不在 Config 中 —— 对象字面量是"新鲜的"，触发严格检查
+
+const raw = { url: '/api', timeout: 3000, retry: 3 };
+const c2: Config = raw;  // ✅ 不报错！变量赋值只查结构兼容，多余字段被放过
+
+// 三种"绕过"方式（理解原理，而不是背技巧）
+const c3: Config = { url: '/api', retry: 3 } as Config;  // 断言：跳过检查（危险）
+interface LooseConfig { url: string; [key: string]: unknown }  // 索引签名：显式允许额外字段
+const c4 = { url: '/api', retry: 3 } satisfies Config;  // ❌ satisfies 同样做多余属性检查
+```
+
+**追问链：**
+
+- **「为什么字面量要额外检查，变量就不查？」**
+  答：结构化兼容的本意是「多给字段不影响使用」（里氏替换的宽化方向）。但字面量直接赋值时，多出来的字段几乎一定是**拼写错误或误解了接口**（比如把 `timeout` 写成 `timeOut`），所以编译器对「新鲜对象字面量」加一道严格检查防笔误；经过变量中转后字面量失去 freshness，就回归纯结构判定。这不是 bug，是刻意设计。
+- **「satisfies 能放过多余字段吗？」**
+  答：不能。`satisfies` 做的是完整的 assignable 检查，包含多余属性检查。想显式允许额外字段，正路是加索引签名或 `Pick` 出需要的子集，而不是换语法糖。
+- **「实际项目怎么利用这个机制？」**
+  答：配置对象、API 请求体尽量**直接以字面量传入**（保留 freshness 防拼错）；需要透传额外字段时用泛型 `<T extends Config>(cfg: T)` 保留完整类型，而不是 `as any` 一路放行。
+
 ### Q3: 什么是类型收窄（Narrowing）？有哪些方式？⭐⭐ 🔥
 
 ```typescript
@@ -190,6 +229,43 @@ type IsString<T> = T extends string ? true : false;
 type A = IsString<'x'>;    // true
 type B = IsString<1>;      // false
 ```
+
+### Q5b: 函数重载怎么写？和联合参数、泛型怎么选？⭐⭐
+
+```typescript
+// 重载 = 多个调用签名 + 一个实现签名（实现签名对外不可见）
+function parse(input: string): object;
+function parse(input: string, raw: true): string;
+function parse(input: string, raw?: boolean): object | string {
+  const result = JSON.parse(input);
+  return raw ? input : result;
+}
+
+parse('{}');        // 命中第 1 个签名 → object
+parse('{}', true);  // 命中第 2 个签名 → string
+// parse('{}', 1);  // ❌ 没有匹配的重载（实现签名不参与调用匹配）
+
+// 坑 1：解析顺序自上而下，第一个匹配即命中 → 最具体的签名放最前面
+function f(x: string): string;
+function f(x: string | number): string | number;  // 若放前面，string 入参永远命中它
+function f(x: any): any { return x; }
+
+// 坑 2：实现签名必须兼容所有重载，但它本身不能被调用
+// 坑 3：重载不是运行时多态，编译后只有一个函数，分发逻辑要自己写
+
+// 选型对照：
+// ① 参数类型不同、返回类型也不同，且组合有限 → 重载（签名清晰、文档友好）
+// ② 返回类型随入参联动 → 泛型 + 条件类型（重载写不出"精确联动"）
+declare function wrap<T>(v: T): T extends string ? string[] : T[];
+// ③ 只是参数可接受多种类型、返回统一 → 联合参数（最简单，别滥用重载）
+function len(x: string | number[]): number { return x.length; }  // string 和数组都有 length
+
+// .d.ts 里给第三方库补重载：直接写多个 declare 签名即可
+declare function query(sel: string): Element | null;
+declare function query(sel: string, all: true): NodeListOf<Element>;
+```
+
+**追问：** 为什么官方文档建议「能用联合参数就别用重载」？—— 重载每多一个签名，调用方就要多理解一种形态，且实现签名的兼容约束容易写错；联合参数 + 类型收窄在大多数场景下更简单、推断更准。重载的价值在**返回类型随参数形态变化**的 API（如 `addEventListener`、DOM 查询）。
 
 ---
 
@@ -378,6 +454,41 @@ async function request<T>(url: string, config?: RequestInit): Promise<ApiResult<
 const { data } = await request<PageResult<UserVO>>('/api/users');
 data.list.forEach(u => u.username);  // ✅ 全程有提示
 ```
+
+### Q11b: enum、const enum、字面量联合怎么选？⭐⭐ 🔥
+
+```typescript
+// 1. 普通 enum：编译后是真实存在的运行时对象
+enum Direction { Up, Down, Left, Right }
+// 编译产物（数字 enum 有双向映射）：
+// var Direction;
+// (function (Direction) {
+//   Direction[Direction["Up"] = 0] = "Up";   // Up → 0 且 0 → "Up"
+//   ...
+// })(Direction || (Direction = {}));
+Direction.Up;          // 0
+Direction[0];          // 'Up'（反向映射，字符串 enum 没有）
+Object.values(Direction);  // 可运行时遍历 → 这是 enum 不可替代的场景
+
+// 2. 字符串 enum：无反向映射，值即语义（日志/接口字段友好）
+enum Status { Active = 'ACTIVE', Disabled = 'DISABLED' }
+
+// 3. const enum：编译期内联，不生成对象
+const enum Color { Red = 'red', Green = 'green' }
+const c = Color.Red;   // 编译后直接是 const c = 'red'
+// ⚠️ isolatedModules: true（Vite/esbuild/SWC 项目默认）下禁用：
+// 单文件转译器看不到跨文件的 const enum 定义，无法内联 → 直接报错
+
+// 4. 字面量联合 + as const（现代项目首选）
+const OrderStatus = { Pending: 'pending', Paid: 'paid', Done: 'done' } as const;
+type OrderStatus = typeof OrderStatus[keyof typeof OrderStatus];
+// 'pending' | 'paid' | 'done'
+// 优点：零运行时开销、tree-shaking 友好、可 Object.values 遍历、satisfies 可校验
+```
+
+**选型一句话：** 需要「类型 + 运行时可遍历的常量对象」→ `as const` 对象 + 派生联合类型；需要双向映射或给旧代码兼容 → 普通 enum；`const enum` 在 bundler 工具链下基本不要用。
+
+**追问：** 为什么数字 enum 有反向映射而字符串没有？—— 数字成员编译时同时写入 `obj[key] = value` 和 `obj[value] = key` 两条；字符串值不是合法的下标键语义（且容易与正向键冲突），规范只给数字 enum 生成反向映射。面试常拿 `Object.keys(数字enum)` 的长度是成员数两倍来挖坑。
 
 ### Q12: declare、.d.ts、模块声明怎么用？⭐⭐
 
@@ -598,6 +709,19 @@ type DeepPartial<T> = {
 
 ---
 
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 字面量赋值报「属性不存在」，经变量中转就不报 | 多余属性检查只作用于新鲜字面量 | 保留字面量直传防笔误；确需额外字段用索引签名或泛型透传 |
+| `const enum` 开发正常、构建报错 | `isolatedModules` 下跨文件无法内联 | 换普通 enum 或 `as const` + 字面量联合 |
+| 重载调用总命中第一个签名 | 解析自上而下、首个匹配即停 | 最具体的签名放最前面 |
+| `satisfies` 仍报多余字段 | 它做完整 assignable 检查（含 freshness） | 加索引签名，别指望语法糖放行 |
+| 数字 enum 的 `Object.keys` 长度翻倍 | 数字成员生成双向映射 | 用字符串 enum 或 `as const` 对象 |
+| 类型体操让 `tsc` 变慢 / excessively deep | 条件类型实例化次数爆炸 | `--generateTrace` 定位；尾递归累加、interface 缓存 |
+| `any` 沿调用链静默扩散 | any 与任何类型双向兼容 | `noImplicitAny` + lint `no-explicit-any`，入口用 unknown |
+| 方法写法与属性写法同名签名报错不一致 | 方法参数双向协变、属性写法严格逆变 | 统一用属性写法 `(x: T) => void` |
+
 ## 深水区追问（2026 补充）
 
 **Q：同一个 `infer` 出现在协变和逆变位置，推断结果为什么不一样？**
@@ -615,6 +739,23 @@ type DeepPartial<T> = {
 **Q：类型体操为什么会拖慢 `tsc`？怎么定位和收敛？**
 
 答：主因是**实例化次数**而不是代码行数：每展开一层条件类型、映射类型，编译器都要实例化一次并缓存中间结果。定位三步：`tsc --extendedDiagnostics` 看 Instantiations 与 Check time 是否异常；`tsc --generateTrace` 后用 analyze-trace 找到具体类型别名；单测式地把可疑 alias 注释掉二分。收敛手段：把递归改成**尾递归累加**（TS 4.5 起对条件类型做尾递归消除，深度上限约 1000），中间结构用 `interface` 缓存（有名字、可惰性引用，`type` 别名会被反复展开），避免对超大联合全量分布（先关掉分发或收窄到已知成员）。超过约 50 层仍会直接报 excessively deep，这不是性能问题而是能力上限。
+
+## 自测清单（能答上 10 条算过关）
+
+1. 结构化类型和名义类型的区别？TS 里什么情况下类会「名义化」？
+2. 多余属性检查为什么只对字面量生效？变量中转后为什么不查？
+3. `any` / `unknown` / `never` 各举一个必须用它的场景。
+4. 穷尽检查（exhaustive check）怎么写？新增联合成员时它怎么报错？
+5. 分布式条件类型为什么会分发？`[T] extends [U]` 为什么能关掉？
+6. `infer` 在协变位置和逆变位置的推断结果分别是什么？
+7. 手写 `Pick` / `Omit` / `ReturnType`，说出每个用了哪个机制。
+8. 重载、联合参数、泛型三种写法各自的适用边界？
+9. `const enum` 在 Vite 项目里为什么不能用？替代方案是什么？
+10. `as const` 和 `satisfies` 连用时顺序为什么不能反？
+11. `strictFunctionTypes` 开启后，方法写法和属性写法的行为差异？
+12. 类型体操拖慢 tsc 的定位三步和收敛手段？
+13. 类型擦除意味着什么？接口返回值为什么还需要 zod 校验？
+14. JS → TS 渐进迁移的顺序和「any 占比」收敛策略？
 
 ---
 
@@ -635,6 +776,9 @@ type DeepPartial<T> = {
 > 10. **编译流程**：tsc 检查+发射；Vite 只转译；类型运行时擦除
 > 11. **高频体操题**：UnionToIntersection、DeepReadonly、CamelToKebab
 > 12. **渐进迁移**：allowJs 共存 → 自底向上 → any 占比收敛
+> 13. **结构化类型**：形状兼容即可赋值；private 成员让类名义化
+> 14. **多余属性检查**：只查新鲜字面量；satisfies 同样查；索引签名可放行
+> 15. **enum 选型**：as const + 联合首选；const enum 遇 isolatedModules 禁用；数字 enum 双向映射
 
 ---
 

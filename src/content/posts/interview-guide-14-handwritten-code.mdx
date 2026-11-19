@@ -1,14 +1,14 @@
 ---
-title: '手写代码题专篇（笔试必考 18 题）'
+title: '手写代码题专篇（笔试必考 21 题）'
 published: 2026-09-16T18:00:00+08:00
-description: '防抖节流、深拷贝、call/apply/bind、new、instanceof、Promise 系列、并发控制、发布订阅、数组扁平化、柯里化等笔试必考题逐行解析。'
+description: '防抖节流、深拷贝、call/apply/bind、new、instanceof、Promise 系列、并发控制、发布订阅、数组扁平化、柯里化、LRU 缓存、手写数组方法、大数相加等笔试必考题逐行解析。'
 tags: [前端面试, 手写代码, 防抖节流, 深拷贝, Promise]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 18 道手写代码必考题，每题给出**可运行代码 + 关键追问**。手写题是笔试/面试白板环节的硬通货，务必动手敲熟。难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 21 道手写代码必考题，每题给出**可运行代码 + 关键追问**。手写题是笔试/面试白板环节的硬通货，务必动手敲熟。难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -658,6 +658,195 @@ new LazyLoad();  // 自动接管页面所有 img[data-src]
 
 ---
 
+## 数据结构与算法类
+
+### T19: 手写 LRU 缓存 ⭐⭐⭐ 🔥
+
+```javascript
+// 版本一：Map 版（面试首选，简洁且读写 O(1)）
+// 依据：Map 迭代顺序 = 插入顺序，delete + set 即可把键移到"最新"端
+class LRUCache {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.map = new Map();
+  }
+
+  get(key) {
+    if (!this.map.has(key)) return -1;
+    const value = this.map.get(key);
+    this.map.delete(key);          // 命中后重插 → 移到最新端
+    this.map.set(key, value);
+    return value;
+  }
+
+  put(key, value) {
+    if (this.map.has(key)) this.map.delete(key);  // 已存在先删，保证重插到最新
+    this.map.set(key, value);
+    if (this.map.size > this.capacity) {
+      // keys().next().value = 最旧的键（迭代器第一个）
+      this.map.delete(this.map.keys().next().value);
+    }
+  }
+}
+
+const lru = new LRUCache(2);
+lru.put(1, 'a'); lru.put(2, 'b');
+lru.get(1);          // 'a'，1 变最新
+lru.put(3, 'c');     // 淘汰 2
+lru.get(2);          // -1
+```
+
+```javascript
+// 版本二：哈希表 + 双向链表（追问"严格 O(1) 且不用 Map 重插"时写这个）
+// 表头最新、表尾最旧；哨兵节点省掉所有空链表边界判断
+class Node {
+  constructor(key = 0, value = 0) {
+    this.key = key; this.value = value;
+    this.prev = null; this.next = null;
+  }
+}
+
+class LRUCacheLinked {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.map = new Map();               // key → Node
+    this.head = new Node();             // 哨兵：head.next 是最新
+    this.tail = new Node();             // 哨兵：tail.prev 是最旧
+    this.head.next = this.tail;
+    this.tail.prev = this.head;
+  }
+
+  #remove(node) {
+    node.prev.next = node.next;
+    node.next.prev = node.prev;
+  }
+
+  #addToHead(node) {
+    node.next = this.head.next;
+    node.prev = this.head;
+    this.head.next.prev = node;
+    this.head.next = node;
+  }
+
+  get(key) {
+    const node = this.map.get(key);
+    if (!node) return -1;
+    this.#remove(node);                 // 摘下 → 插到表头
+    this.#addToHead(node);
+    return node.value;
+  }
+
+  put(key, value) {
+    const node = this.map.get(key);
+    if (node) {
+      node.value = value;
+      this.#remove(node);
+      this.#addToHead(node);
+      return;
+    }
+    if (this.map.size >= this.capacity) {
+      const oldest = this.tail.prev;    // 淘汰表尾
+      this.#remove(oldest);
+      this.map.delete(oldest.key);      // 链表节点必须存 key，否则删不掉 Map 项
+    }
+    const fresh = new Node(key, value);
+    this.#addToHead(fresh);
+    this.map.set(key, fresh);
+  }
+}
+```
+
+**追问：** 为什么链表节点要存 key？—— 淘汰表尾节点时，需要拿它的 key 去 Map 里删除对应项，只存 value 就删不掉了。这是手写版最常见的漏点。
+
+### T20: 手写 map / filter / reduce ⭐⭐
+
+```javascript
+// map：注意 thisArg、回调三参、稀疏数组跳过空位
+Array.prototype.myMap = function (callback, thisArg) {
+  if (typeof callback !== 'function') throw new TypeError('not a function');
+  const arr = Object(this);
+  const len = arr.length >>> 0;
+  const result = new Array(len);
+  for (let i = 0; i < len; i++) {
+    if (i in arr) {                     // 跳过稀疏空位（与原生一致）
+      result[i] = callback.call(thisArg, arr[i], i, arr);
+    }
+  }
+  return result;
+};
+
+// filter：回调返回真值才保留
+Array.prototype.myFilter = function (callback, thisArg) {
+  const arr = Object(this);
+  const len = arr.length >>> 0;
+  const result = [];
+  for (let i = 0; i < len; i++) {
+    if (i in arr && callback.call(thisArg, arr[i], i, arr)) {
+      result.push(arr[i]);
+    }
+  }
+  return result;
+};
+
+// reduce：无初始值时取第一个有效元素作累加器；空数组无初始值要抛错
+Array.prototype.myReduce = function (callback, initialValue) {
+  const arr = Object(this);
+  const len = arr.length >>> 0;
+  let acc = initialValue;
+  let i = 0;
+  if (arguments.length < 2) {
+    while (i < len && !(i in arr)) i++;  // 找第一个非空位
+    if (i >= len) throw new TypeError('Reduce of empty array with no initial value');
+    acc = arr[i++];
+  }
+  for (; i < len; i++) {
+    if (i in arr) acc = callback(acc, arr[i], i, arr);
+  }
+  return acc;
+};
+
+[1, 2, 3].myMap(x => x * 2);            // [2, 4, 6]
+[1, 2, 3, 4].myFilter(x => x % 2 === 0); // [2, 4]
+[1, 2, 3].myReduce((a, b) => a + b, 0);  // 6
+```
+
+**追问：** 为什么用 `i in arr` 而不是直接遍历？—— 原生方法对稀疏数组的空位（hole）是跳过的，`forEach/map` 不执行回调、`reduce` 不累加；直接 `for` 取值会把 hole 读成 undefined，行为就和原生不一致了。
+
+### T21: 大数相加（字符串模拟竖式）⭐⭐
+
+```javascript
+// 超出 Number.MAX_SAFE_INTEGER（2^53 - 1）的整数运算会丢精度
+// 经典笔试：两个用字符串表示的非负整数相加
+function bigAdd(a, b) {
+  let i = a.length - 1;
+  let j = b.length - 1;
+  let carry = 0;
+  let result = '';
+
+  while (i >= 0 || j >= 0 || carry > 0) {
+    const x = i >= 0 ? +a[i--] : 0;      // 从个位向前逐位取
+    const y = j >= 0 ? +b[j--] : 0;
+    const sum = x + y + carry;
+    result = (sum % 10) + result;        // 当前位拼到结果前面
+    carry = Math.floor(sum / 10);        // 进位
+  }
+  return result;
+}
+
+bigAdd('9007199254740991', '12345678901234567890');
+// '12354686100489308881'（Number 直接加会丢精度）
+
+// 现代环境一行版：BigInt（注意不能与 Number 混算）
+const bigSum = (a, b) => (BigInt(a) + BigInt(b)).toString();
+
+// 变体追问：大数相乘？—— 同样竖式模拟，m 位 × n 位结果最多 m+n 位，
+// 用长度 m+n 的数组存每位，双重循环累加 num[i+j+1] += a[i]*b[j]，最后统一进位。
+```
+
+**追问：** 为什么 `carry > 0` 也要作为循环条件？—— 最高位相加后可能还剩进位（如 `99 + 1`），漏掉这个条件结果就少一位。
+
+---
+
 ## 深水区追问（2026 补充）
 
 **Q：`Promise.all` 只要一个失败就 reject，其余任务真的停了吗？**
@@ -674,7 +863,7 @@ new LazyLoad();  // 自动接管页面所有 img[data-src]
 
 **Q：LRU 怎么做到 O(1)？为什么只用数组或只用 Map 都不行？**
 
-答：`Map` 的迭代顺序是插入顺序，所以命中后 `delete` 再 `set` 一次就把键移到「最新」端，淘汰时取 `keys().next().value`——容量不大时这一个 Map 就够，读写都是 O(1)。要严格 O(1) 且避免删除带来的迭代器开销，用**哈希表 + 双向链表**：表头最新、表尾最旧，命中时把节点摘下插到表头，淘汰时删表尾，全靠哨兵节点省掉边界判断。只用数组不行——命中后要移动元素，退化成 O(n)；只用 Map 但不做「重插」也不行，那只是 FIFO，不是 LRU。加分点：这招成立的依据是规范保证 Map 迭代顺序，别用普通对象模拟。
+答：`Map` 的迭代顺序是插入顺序，所以命中后 `delete` 再 `set` 一次就把键移到「最新」端，淘汰时取 `keys().next().value`——容量不大时这一个 Map 就够，读写都是 O(1)（两个版本的完整代码见 T19）。要严格 O(1) 且避免删除带来的迭代器开销，用**哈希表 + 双向链表**：表头最新、表尾最旧，命中时把节点摘下插到表头，淘汰时删表尾，全靠哨兵节点省掉边界判断。只用数组不行——命中后要移动元素，退化成 O(n)；只用 Map 但不做「重插」也不行，那只是 FIFO，不是 LRU。加分点：这招成立的依据是规范保证 Map 迭代顺序，别用普通对象模拟。
 
 ---
 
@@ -693,9 +882,12 @@ new LazyLoad();  // 自动接管页面所有 img[data-src]
 > | P1 高频 | new/instanceof | 原型链遍历、返回对象优先级 |
 > | P1 高频 | 发布订阅 | once 包装、Set 存储、链式返回 |
 > | P1 高频 | 数组扁平化 | 递归/迭代/toString 三种写法 |
+> | P1 高频 | LRU 缓存 | Map 重插保序、哨兵双向链表、节点存 key |
+> | P1 高频 | map/filter/reduce | thisArg、稀疏空位跳过、reduce 无初始值抛错 |
 > | P2 加分 | Promise 手写 | A+ 状态机、resolvePromise、穿透 |
 > | P2 加分 | 柯里化 | fn.length、递归收集参数 |
 > | P2 加分 | 重试/超时 | 指数退避、Promise.race |
+> | P2 加分 | 大数相加 | 竖式进位、循环条件带 carry、BigInt |
 >
 > **练习建议**：每题至少独立手写 3 遍（看题解 → 默写 → 隔天再写），面试白板环境没有代码提示，肌肉记忆很重要。
 
