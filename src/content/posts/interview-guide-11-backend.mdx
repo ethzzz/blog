@@ -1,14 +1,14 @@
 ---
 title: '后端知识面试题（前端工程师需要了解的部分）'
 published: 2026-09-16T15:00:00+08:00
-description: '讲解 RESTful API 设计、Node.js 核心、Java 基础、微服务架构、认证鉴权等中高级前端工程师需要了解的后端知识。'
+description: '讲解 RESTful API 设计、Node.js 核心、Java 基础、微服务架构、认证鉴权、双 Token 刷新、SSO 单点登录等中高级前端工程师需要了解的后端知识。'
 tags: [前端面试, RESTful, Node.js, Java, 微服务]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 20+ 道后端知识面试题，面向中高级前端工程师（全栈方向加分项），难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 25+ 道后端知识面试题，面向中高级前端工程师（全栈方向加分项），难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -178,6 +178,60 @@ axios.interceptors.request.use(config => {
 });
 ```
 
+### Q4b: JWT 过期了怎么办？双 Token 无感刷新怎么设计？⭐⭐ 🔥
+
+**答：** 单 Token 的矛盾：有效期短则频繁掉登录，有效期长则被盗后风险窗口大。**双 Token** 把「访问凭证」和「续期凭证」分开：
+
+```
+accessToken：短命（15min~2h），每次请求携带，服务端无状态校验
+refreshToken：长命（7~30 天），只用于换新 accessToken，
+              存 HttpOnly Cookie（防 XSS 读取），服务端可落库/Redis 以便吊销
+
+刷新流程：
+1. 请求返回 401（accessToken 过期）
+2. 前端用 refreshToken 调 /auth/refresh
+3. 服务端校验 refreshToken → 签发新 accessToken（可同时轮换 refreshToken）
+4. 重放刚才失败的请求
+```
+
+```javascript
+// axios 拦截器：无感刷新的关键 = 并发 401 只刷新一次，其余排队等结果
+let refreshing = null;          // 共享同一个刷新 Promise
+
+axios.interceptors.response.use(null, async err => {
+  const { config, response } = err;
+  if (response?.status !== 401 || config._retried || config.url === '/auth/refresh') {
+    return Promise.reject(err);
+  }
+  config._retried = true;       // 防止刷新后仍 401 造成死循环
+
+  refreshing ??= axios.post('/auth/refresh')   // 并发请求共享这一次刷新
+    .then(res => {
+      localStorage.setItem('token', res.data.accessToken);
+      return res.data.accessToken;
+    })
+    .catch(e => {
+      clearAuth();
+      router.push('/login');    // refreshToken 也失效 → 真掉线
+      throw e;
+    })
+    .finally(() => { refreshing = null; });
+
+  const token = await refreshing;
+  config.headers.Authorization = `Bearer ${token}`;
+  return axios(config);         // 重放原请求
+});
+```
+
+**追问链：**
+
+- **「为什么 refreshToken 要放 HttpOnly Cookie 而不是 localStorage？」**
+  答：localStorage 里的任何 token 都能被 XSS 一锅端；HttpOnly Cookie JS 读不到，配合 `SameSite=Strict/Lax` + CSRF Token 使用。accessToken 放内存（变量/Pinia）最安全，刷新页面靠 refreshToken 静默恢复——「内存 + HttpOnly Cookie」是当前的主流组合。
+- **「JWT 无状态，怎么实现『踢人下线』？」**
+  答：纯无状态做不到即时吊销，工程上三选一：① 短有效期 + 黑名单（Redis 存已吊销的 jti，TTL 与 token 剩余寿命一致）；② refreshToken 落库，吊销即删记录，accessToken 到期后自然续不上；③ 版本号机制（用户表存 tokenVersion，签发时写入 payload，改密码/踢人时 +1）。面试要主动说破「无状态与即时吊销不可兼得」。
+- **「refreshToken 轮换（rotation）是什么？」**
+  答：每次刷新同时作废旧 refreshToken、发新的。若某个已作废的 refreshToken 再次被使用，说明可能被盗（攻击者和合法用户各持一份），服务端应**吊销整条 token 家族**强制重新登录——这是 OAuth 2.0 BCP 推荐的防盗用手段。
+
 ### Q5: 什么是 OAuth 2.0？常见授权模式？⭐⭐⭐
 
 ```
@@ -209,6 +263,39 @@ OAuth 2.0 角色：
 - token 通过后端信道（服务器间通信）换取，不暴露给浏览器
 - 配合 PKCE 可防授权码拦截攻击
 ```
+
+### Q5b: SSO 单点登录是怎么实现的？同域和跨域方案差在哪？⭐⭐⭐ 🔥
+
+**答：** SSO 的目标：一处登录，多个子系统免登。核心是**把认证收敛到一个独立的认证中心（SSO Server），各子系统只认它签发的凭证**。
+
+```
+跨域 SSO 标准流程（CAS 风格）：
+1. 访问 app-a.com，未登录 → 302 到 sso.com/login?redirect=app-a.com/callback
+2. sso.com 检查自己的全局会话 Cookie：
+   - 无 → 展示登录页，用户输入账密
+   - 有（之前登过 app-b）→ 跳过登录，直接下一步
+3. 认证中心签发一次性 ticket，302 回 app-a.com/callback?ticket=xxx
+4. app-a 后端拿 ticket 去 sso.com 后端校验（后端信道，防伪造）
+5. 校验通过 → app-a 建立自己的局部会话（Set-Cookie）
+6. 之后访问 app-b.com：同样跳 sso.com，但全局会话已存在 → 秒回 ticket → 免登
+```
+
+**三种落地形态对比：**
+
+| 方案 | 原理 | 适用 |
+|:--|:--|:--|
+| 同域共享 Cookie | Cookie 设 `domain=.example.com`，各子域共用一个 session/JWT | 所有系统在同一主域下，最简单 |
+| CAS / OAuth 授权码 | 认证中心 + ticket/code 后端校验 | 跨域名、多团队系统（上图流程） |
+| Token 广播（前端信道） | 登录后向各子域种 token（iframe/postMessage/重定向带参） | 历史方案，token 暴露面大，不推荐新项目 |
+
+**追问链：**
+
+- **「单点登出怎么做？」**
+  答：比登录难——认证中心销毁全局会话后，要**通知所有已登录的子系统销毁局部会话**：CAS 用后端回调（back-channel logout），OIDC 有 Front-Channel / Back-Channel Logout 规范；只删认证中心 Cookie 而不清子系统会话，会出现「登出了但子系统还能用」的事故。
+- **「ticket 为什么要一次性 + 短时效？」**
+  答：ticket 走浏览器重定向（前端信道），会出现在 URL、日志、Referer 里，必须用完即焚（几十秒有效、校验一次即作废），真正的会话凭证由后端校验后另发——和 OAuth「code 换 token」是同一个安全模型。
+- **「SSO 和 OAuth 是一回事吗？」**
+  答：不是。SSO 解决「**认证**复用」（你是谁，一次登录处处通行）；OAuth 解决「**授权**委托」（允许第三方应用访问你的资源，不交出密码）。企业内网多系统免登用 SSO/CAS/OIDC；「用微信登录某网站」是 OAuth。OIDC = OAuth 2.0 + 身份层（id_token），是目前新建系统的默认选择。
 
 ### Q6: RBAC 权限模型？⭐⭐
 
@@ -664,6 +751,18 @@ git push → 触发流水线
 
 ---
 
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 并发请求同时 401，触发 N 次刷新 | 每个失败请求各自调 refresh | 共享一个刷新 Promise，其余排队重放 |
+| 刷新后仍 401，拦截器死循环 | 重放请求没打标记 | `_retried` 标记 + refresh 接口本身排除 |
+| 「登出了」但子系统还能访问 | 只清了认证中心会话，子系统局部会话还在 | back-channel 登出通知所有子系统 |
+| JWT 被盗后无法即时失效 | 无状态 token 签发后不可撤回 | 短有效期 + jti 黑名单 / tokenVersion |
+| 前端校验通过、后端仍 400 | 前后端校验规则漂移 | 以后端 message 为准展示；规则同源（共享 schema） |
+| 401 被当成跨域错误 | 错误响应没带 CORS 头 | 网关 CORS 头加 always（见 Nginx 篇） |
+| 重复扣款/重复订单 | 重试与连点没有幂等兜底 | 唯一索引/Token 机制 + 前端 requestId |
+
 ## 深水区追问（2026 补充）
 
 **Q：REST、GraphQL、gRPC 三者怎么选？前端侧的成本差在哪？**
@@ -692,6 +791,21 @@ GraphQL 把「聚合成本」从后端搬到了客户端：N+1、字段级权限
 
 答：MQ 只提供至少一次或至多一次，「恰好一次」是业务侧用**幂等消费**拼出来的：消费端拿消息唯一键（业务单号 / 事件 id）写去重表或唯一索引，重复消息直接返回成功。顺序性只在单分区、单队列内成立，跨分区要按业务键分区；否则「先扣库存后发券」两条消息可能倒序。还有两个必答点：消费失败重试会堆积（死信队列 + 堆积告警），以及「先落库还是先 ack」——先 ack 会丢消息，先落库后 ack 会重复，所以幂等是前提而不是优化。
 
+## 自测清单（能答上 10 条算过关）
+
+1. REST 的资源/方法/状态码三件套？PUT 与 PATCH 的语义和幂等差异？
+2. 401 和 403 前端分别怎么处理？为什么 401 有时表现为「跨域错误」？
+3. JWT 三段结构？为什么说 Payload 不是加密？
+4. 双 Token 各自存哪里、有效期怎么定？并发 401 的无感刷新怎么写？
+5. 无状态 JWT 怎么实现踢人下线？三种方案的代价？
+6. OAuth 授权码模式为什么安全？PKCE 防什么？
+7. 跨域 SSO 的 ticket 流转六步？ticket 为什么必须一次性？
+8. SSO 与 OAuth 的本质区别？OIDC 是什么？
+9. 幂等与限流各防什么？能互相替代吗？
+10. 事务边界为什么不能跨服务？outbox 模式怎么拼最终一致？
+11. 消息队列「恰好一次」是怎么拼出来的？先落库还是先 ack？
+12. BFF 聚合接口的超时、降级、缓存怎么设计？
+
 ---
 
 ## 复习卡片
@@ -711,6 +825,8 @@ GraphQL 把「聚合成本」从后端搬到了客户端：N+1、字段级权限
 > 10. **限流**：令牌桶最常用，429 + 指数退避重试
 > 11. **部署**：Nginx / Docker 多阶段构建 / CDN
 > 12. **CI/CD**：提交触发 → 检查 → 测试 → 构建 → 部署 → 可回滚
+> 13. **双 Token**：短命 access + HttpOnly refresh；并发 401 共享刷新 Promise；轮换防盗用
+> 14. **SSO**：认证中心 + 一次性 ticket 后端校验；登出要 back-channel 通知；SSO 管认证、OAuth 管授权
 
 ---
 

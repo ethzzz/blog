@@ -1,14 +1,14 @@
 ---
 title: 'MySQL 面试题（前端工程师必备后端知识）'
 published: 2026-09-16T14:00:00+08:00
-description: '讲解索引原理（B+树）、事务 ACID 与隔离级别、SQL 优化、锁机制、分库分表等前端工程师需要了解的后端知识。'
+description: '讲解索引原理（B+树）、事务 ACID 与隔离级别、redo/undo/binlog 与两阶段提交、SQL 优化、锁机制、主从复制、分库分表等前端工程师需要了解的后端知识。'
 tags: [前端面试, MySQL, 索引, 事务, SQL优化]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 20+ 道 MySQL 面试题，面向需要了解后端知识的中高级前端工程师，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级
+> 本文包含 25+ 道 MySQL 面试题，面向需要了解后端知识的中高级前端工程师，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级
 
 ---
 
@@ -201,6 +201,40 @@ UPDATE account SET balance = balance + 100 WHERE id = 2;
 COMMIT;  -- 或 ROLLBACK;
 ```
 
+### Q6b: redo log、undo log、binlog 各干什么？两阶段提交在保什么？⭐⭐⭐ 🔥
+
+**答：** 三大日志分工一句话：**redo 保崩溃恢复（D）、undo 保回滚与 MVCC（A+I）、binlog 保复制与归档**。
+
+| 日志 | 层级 | 内容 | 写入方式 | 用途 |
+|:--|:--|:--|:--|:--|
+| redo log | InnoDB 引擎层 | 物理日志：「某数据页某偏移改了什么」 | 循环写、固定大小（WAL） | 崩溃后重放，保证已提交事务不丢 |
+| undo log | InnoDB 引擎层 | 逻辑日志：反向操作（insert→delete） | 随事务生成， purge 线程回收 | 回滚 + MVCC 版本链 |
+| binlog | Server 层 | 逻辑日志：语句或行变更 | 追加写、不覆盖 | 主从复制、时间点恢复 |
+
+**为什么需要两阶段提交（2PC）？** redo 和 binlog 是两个独立日志，如果先写一个再写另一个，中间崩溃就会不一致：
+
+```
+事务提交的真实顺序：
+1. 写 redo log，标记 prepare 状态
+2. 写 binlog（落盘）
+3. 写 redo log，标记 commit 状态
+
+崩溃恢复时的裁决规则：
+- redo 是 commit → 直接恢复
+- redo 是 prepare：
+    binlog 完整 → 补提交（从库可能已经同步了这条，主库必须认）
+    binlog 不完整 → 回滚（从库没有这条，主库也不能有）
+```
+
+**追问链：**
+
+- **「WAL 是什么？为什么先写日志比直接刷数据页快？」**
+  答：Write-Ahead Logging——修改先顺序追加到 redo log，数据页可以晚点再刷脏。顺序写远快于随机写，且崩溃后靠 redo 重放就能恢复，不必每次提交都把随机分布的数据页刷盘。
+- **「binlog 三种格式的区别？」**
+  答：`statement` 记原始 SQL（省空间，但 NOW()/RAND() 等不确定函数会导致主从不一致）；`row` 记每行变更前后值（最安全，默认推荐，缺点是批量更新日志量大）；`mixed` 折中自动切换。生产基本都用 row。
+- **「redo log 写满了会怎样？」**
+  答：它是环形缓冲（write pos 追 checkpoint），写满意味着脏页还没刷盘腾不出空间，MySQL 会**阻塞所有更新**直到刷脏推进 checkpoint——线上表现为「写入突然全部卡住」，要查 `innodb_io_capacity` 与磁盘 IOPS 是否匹配。
+
 ### Q7: 事务隔离级别？⭐⭐ 🔥
 
 **答：**
@@ -323,6 +357,35 @@ JOIN orders o ON u.id = o.user_id;  -- ✅ 通常比子查询快
 -- 大事务占用锁时间长，影响并发
 ```
 
+### Q9b: count(*)、count(1)、count(列) 有什么区别？大表计数怎么优化？⭐⭐ 🔥
+
+```sql
+-- 语义差异（先说清语义，再谈性能）
+SELECT COUNT(*) FROM users;          -- 统计总行数（含 NULL 行）
+SELECT COUNT(1) FROM users;          -- 与 COUNT(*) 完全等价
+SELECT COUNT(name) FROM users;       -- 只统计 name 非 NULL 的行
+SELECT COUNT(DISTINCT name) FROM users;  -- 去重计数，最贵
+
+-- InnoDB 下 COUNT(*) 的执行：
+-- 优化器会选最小的可用二级索引树遍历（叶子只存索引列+主键，比聚簇树小得多）
+-- 没有二级索引才扫聚簇索引 → 所以「给大表建个窄索引」也能加速 count
+```
+
+**性能排序（InnoDB）：** `count(*) ≈ count(1) > count(主键) > count(普通列)`。前两者优化器同等对待，别信「count(1) 比 count(*) 快」的传言；`count(列)` 要逐行判 NULL 且可能走更宽的索引，最慢。
+
+**为什么 MyISAM 的 count(*) 是 O(1) 而 InnoDB 不是？** MyISAM 把总行数存在元信息里（无事务、无 MVCC，一个全局计数就够）；InnoDB 因为 MVCC，**同一时刻不同事务看到的行数可能不同**，不存在一个对所有事务都正确的全局计数，只能实时遍历。
+
+**大表计数的工程方案：**
+
+| 方案 | 精确性 | 适用 |
+|:--|:--|:--|
+| `EXPLAIN` 的 rows 估算 | 估算值 | 监控大盘、允许误差 |
+| Redis 计数（incr/decr） | 最终一致 | 高频读、可容忍短暂偏差 |
+| 计数表（业务事务内同步更新） | 精确 | 需要精确且读多写少 |
+| 定时任务离线统计 | 延迟精确 | 报表类 |
+
+**追问：** `SELECT COUNT(*) FROM t WHERE status = 1` 怎么优化？—— 给 status 建索引让它走窄索引扫描；如果 status 区分度低（一半行都是 1），索引收益有限，考虑把高频计数沉淀到计数表/缓存，别每次实时算。
+
 ---
 
 ## 锁机制
@@ -379,6 +442,8 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 | count(*) 很慢 | 全索引扫描 | 精确计数用计数表/缓存；业务允许用估算 |
 | 主从延迟读不到新数据 | 从库回放滞后 | 关键读走主库；或写后短窗口内强制主库 |
 | 死锁频发 | 事务加锁顺序不一致 | 统一按主键序加锁 + 缩小事务 |
+| `count(列)` 比总行数少 | 该列有 NULL，count(列) 只数非 NULL | 数总行数用 `count(*)` |
+| 写入高峰全库更新卡住 | redo log 写满，等刷脏腾空间 | 调 `innodb_io_capacity` 匹配磁盘 IOPS |
 
 ## 深水区追问（2026 补充）
 
@@ -398,7 +463,7 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 
 答：这类 SQL 的问题基本都不在执行计划，而在等待与 IO：① **锁等待**——`performance_schema.data_lock_waits` 或 `SHOW ENGINE INNODB STATUS` 看是否在等行锁，常见于长事务；② **刷脏页**——写入高峰时 redo/脏页落盘打满磁盘，`innodb_io_capacity` 与实际 IOPS 不匹配；③ **Buffer Pool 命中率低**——刚重启或大表把热数据挤出去，一次点查变成多次随机 IO；④ **大字段与行溢出**——`TEXT` / `BLOB` 走溢出页，行数少但读的页多；⑤ 从库回放延迟，读到的从库还在补日志。定位手段是 `EXPLAIN ANALYZE` 看实际耗时分布与 `performance_schema` 的阶段事件，而不是只盯 `rows` 这一列。
 
-## 自测清单（能答上 8 条算过关）
+## 自测清单（能答上 10 条算过关）
 
 1. B+ 树对比 B 树的两个结构性优势？各带来什么查询收益？
 2. 「2000 万行分表」这个数字是怎么估算出来的？
@@ -410,6 +475,8 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 8. RC 为什么死锁更少？Read View 的创建时机差异是根因吗？
 9. 「行锁加在索引上」会推导出什么线上事故？
 10. EXPLAIN 里 type 和 Extra 各最关注哪几个值？
+11. redo/undo/binlog 各保什么？两阶段提交崩溃后的裁决规则？
+12. 主从延迟的四个根因？写后读一致性在业务侧怎么兜底？
 
 ---
 
@@ -442,6 +509,47 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
                   → 从库2（读）
 ```
 
+### Q11b: 主从复制的原理？延迟怎么产生的、怎么治？⭐⭐⭐ 🔥
+
+```
+复制链路（三个线程）：
+主库                          从库
+binlog ──→ [dump 线程] ──→ [I/O 线程] ──→ relay log ──→ [SQL 线程] ──→ 回放
+           推送变更          拉取落盘中继日志            重放写入从库
+
+1. 主库提交事务写 binlog
+2. 从库 I/O 线程连主库，dump 线程把 binlog 推过来
+3. 从库先写 relay log（中继日志），I/O 线程即可返回
+4. SQL 线程读 relay log 回放 → 数据才真正可见
+```
+
+**延迟的根因（按出现频率）：**
+1. **回放是单线程/并行度不足**：主库并发写，从库 SQL 线程回放跟不上（MySQL 5.7+ 基于组提交的并行复制、8.0 WRITESET 可大幅缓解）；
+2. **大事务**：主库一个事务删百万行，从库要原样回放这么久，期间后续全部排队；
+3. **从库机器差/负载高**：从库常被拿去跑报表、备份，IOPS 被抢；
+4. **DDL 阻塞**：主库在线 DDL 完成后，从库回放同样的 DDL 会锁表。
+
+**治理与兜底：**
+
+```sql
+-- 看延迟：Seconds_Behind_Master（粗略，大事务/空闲时会失真）
+SHOW REPLICA STATUS\G   -- 8.0.22+；老版本 SHOW SLAVE STATUS
+
+-- 更准：对比主从 GTID 位点
+SELECT @@global.gtid_executed;
+```
+
+- 开启并行复制：`replica_parallel_type=LOGICAL_CLOCK` + `replica_parallel_workers=N`（8.0 用 WRITESET 提高并行度）；
+- 大事务拆小批（每批几千行、批间 sleep）；
+- **业务侧兜底**：写后立刻要读的请求强制走主库（「写后读窗口」），或前端提交成功后用本地乐观更新，不依赖从库即时可见。
+
+**追问链：**
+
+- **「异步复制、半同步、组复制的区别？」**
+  答：异步——主库提交不等从库，主库宕机可能丢最后一段 binlog；半同步（`rpl_semi_sync`）——至少一个从库确认收到 binlog 才返回客户端成功，兼顾性能与安全（注意是「收到」不是「回放完」）；组复制（MGR）——基于 Paxos 的多节点强一致，代价是写延迟与运维复杂度。
+- **「主从切换后怎么防数据回退？」**
+  答：用 GTID 定位新主（执行过的事务集合最全者），切换后旧主降级为从库时靠 GTID 自动跳过已执行事务；没有 GTID 的时代靠 binlog 文件名+位点对齐，极易出错——这也是「为什么新项目一律开 GTID」的答案。
+
 ---
 
 ## 复习卡片
@@ -457,6 +565,10 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 | MVCC | 多版本并发控制，非锁定读 |
 | EXPLAIN | type: ALL 最差，const 最好 |
 | 索引失效 | 函数、类型转换、LIKE '%x' |
+| 三大日志 | redo 崩溃恢复、undo 回滚+MVCC、binlog 复制归档 |
+| 两阶段提交 | prepare → binlog → commit，崩溃按 binlog 完整性裁决 |
+| count | count(*)≈count(1)，count(列) 跳 NULL；InnoDB 无全局计数 |
+| 主从复制 | dump→I/O→relay log→SQL 线程；延迟靠并行复制+写后读走主库 |
 
 > [!TIP]
 > 下一篇：[后端知识面试题](/blog/posts/interview-guide-11-backend/)

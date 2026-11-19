@@ -1,7 +1,7 @@
 ---
 title: 'Node.js 面试题专篇（前端全栈必备）'
 published: 2026-09-16T23:00:00+08:00
-description: '讲解 Node.js 事件循环、模块系统、Stream、Buffer、进程线程、HTTP 服务器、Express/Koa/NestJS 对比、性能优化、部署运维等前端全栈必备知识。'
+description: '讲解 Node.js 事件循环、模块系统、Stream、Buffer、进程线程、HTTP 服务器、Express/Koa/NestJS 对比、性能优化、优雅关闭、部署运维等前端全栈必备知识。'
 tags: [前端面试, Node.js, Stream, 事件循环, Express, NestJS]
 category: 前端面试宝典
 draft: false
@@ -872,7 +872,7 @@ app.use(async (ctx, next) => {
 
 ## 数据库与 ORM
 
-### Q13: Node.js 连接数据库的方案？⭐⭐
+### Q13b: Node.js 连接数据库的方案？⭐⭐
 
 ```javascript
 // MySQL
@@ -1102,6 +1102,75 @@ process.on('SIGINT', () => {             // 优雅关闭
   server.close(() => process.exit(0));
 });
 ```
+
+### Q16b: 优雅关闭的完整实现长什么样？⭐⭐⭐ 🔥
+
+深水区讲了「先摘流量再退出」的顺序，这里给出可直接抄的实现：
+
+```javascript
+const http = require('http');
+const server = http.createServer(app);
+server.listen(3000);
+
+// 就绪信号：PM2 wait_ready / K8s readiness 都靠它
+process.send?.('ready');
+
+let shuttingDown = false;
+
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;            // 幂等：SIGTERM 可能连发
+  shuttingDown = true;
+  console.log(`${signal} received, shutting down`);
+
+  // 1. readiness 置失败（K8s 场景：让 /healthz 返回 503，等 Endpoints 摘除）
+  //    PM2 场景可省略，但 preStop sleep 几秒同理
+
+  // 2. 停止接受新连接，等存量请求完成
+  const closed = new Promise(resolve => server.close(resolve));
+
+  // 3. 主动断开 keep-alive 空闲连接（Node 18.2+）
+  server.closeIdleConnections?.();
+
+  // 4. 硬超时兜底：到点强杀，防止个别慢请求拖死整个发布
+  const timer = setTimeout(() => {
+    console.error('force exit after timeout');
+    server.closeAllConnections?.();    // 掐掉仍在处理的连接
+    process.exit(1);
+  }, 15000);
+  timer.unref();
+
+  await closed;
+
+  // 5. 依次清理：连接池 → 定时器 → 日志 flush
+  await pool.end();                    // 数据库连接池
+  await redis.quit();
+  await logger.flush?.();
+  clearTimeout(timer);
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));  // K8s / PM2 reload
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));   // Ctrl+C
+
+// 未捕获异常：先留证据再退出（交给进程管理器拉起），别带病运行
+process.on('uncaughtException', err => {
+  logger.fatal(err);
+  process.exit(1);
+});
+process.on('unhandledRejection', reason => {
+  logger.error({ reason }, 'unhandled rejection');
+  // Node 15+ 默认会抛成 uncaughtException，这里显式记录便于排查
+});
+```
+
+**追问链：**
+
+- **「`server.close()` 为什么可能永远不回调？」**
+  答：它只停止 accept 新连接，**存量 keep-alive 连接不会主动断**——只要有一个空闲长连接挂着，回调就不触发。所以必须配 `closeIdleConnections()` + 硬超时，这是优雅关闭最常见的「卡住不退」根因。
+- **「为什么 uncaughtException 后建议退出而不是继续跑？」**
+  答：异常冒到顶层说明程序状态已不可信（可能有半完成的事务、损坏的内存结构），继续服务会产生更隐蔽的错误。正确姿势：记录 → 退出 → 由 PM2/K8s 拉起新进程，配合多实例保证可用性。
+- **「PM2 的 kill_timeout 和这里的 15s 什么关系？」**
+  答：`kill_timeout` 必须**大于**应用内硬超时，否则 PM2 提前 SIGKILL，应用自己的收尾逻辑根本没跑完——配置倒挂是滚动发布 502 的常见原因。
 
 ### Q17: Node.js Docker 部署最佳实践？⭐⭐
 
@@ -1393,6 +1462,19 @@ http.createServer(async (req, res) => {
 
 ---
 
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| 所有接口同时偶发卡顿 | 同步代码阻塞事件循环（大 JSON/正则回溯/fs sync） | monitorEventLoopDelay 取证 + clinic flame 定位 |
+| pipe 时内存一路涨 | data 事件里手动 write 不看返回值，背压失效 | 用 pipeline；手动写必须 pause/drain |
+| cluster 一个 worker 打满其余空闲 | 长连接建立后不再重新分配 | 网关按连接数调度；计算任务用 worker_threads |
+| 滚动发布一批 502 | 流量未摘干净进程就退出 / kill_timeout 倒挂 | 先 readiness 失败 → close → 硬超时；PM2 超时调大 |
+| server.close 永不回调 | keep-alive 空闲连接未断 | closeIdleConnections + 硬超时兜底 |
+| allocUnsafe 响应带出旧数据 | 未覆盖字节未清零 | 写满或 fill(0)；对外发送前检查 |
+| CJS 解构后拿不到模块最新值 | 解构是值拷贝 | 保留模块对象引用再读属性 |
+| Express 4 async 错误进程崩溃 | 不自动捕获 rejected promise | asyncHandler 包装 / 升级 Express 5 |
+
 ## 深水区追问（2026 补充）
 
 **Q：线上接口偶发 2 秒卡顿，怎么证明是事件循环被阻塞，而不是下游慢？**
@@ -1423,6 +1505,21 @@ A：因为共享端口这件事并不是内核直接做的。Linux 上 `cluster`
 
 A：502 通常不是"退出太慢"，而是"流量还没摘干净进程就没了"。K8s 里 Pod 进入 Terminating 与 Endpoints 摘除是并行发生的，kube-proxy / Ingress 生效有几百毫秒到几秒延迟，这段时间新连接还会打到正在退出的进程；同时 keep-alive 长连接不会因为 SIGTERM 自己断开。正确顺序：① 收到 SIGTERM 先把 readiness 置为失败（或在 `preStop` 里 sleep 几秒），等流量真正摘除；② `server.close()` 停止接受新连接，等存量请求跑完；③ 主动给 keep-alive 连接回 `Connection: close`，并设一个硬超时（如 15s）到点强杀；④ 依次关连接池、清定时器、flush 日志，最后 `process.exit(0)`。PM2 部署时 `kill_timeout` 必须大于这个硬超时，否则 PM2 提前 SIGKILL，正在收尾的请求照样 502。
 
+## 自测清单（能答上 10 条算过关）
+
+1. Node 单线程高并发的原理与边界？libuv 线程池管哪些 I/O？
+2. CJS「导出值快照」与 ESM「活绑定」在对象属性修改/变量重赋值下的四种行为？
+3. 事件循环六阶段？nextTick、Promise、setTimeout、setImmediate 的优先级？
+4. 背压靠哪两个信号？哪四种写法会让它失效？
+5. cluster / worker_threads / child_process 的隔离性、通信、内存成本对比？
+6. 怎么证明卡顿是事件循环阻塞而不是下游慢？
+7. 优雅关闭的五步顺序？server.close 为什么不回调？
+8. Express 与 Koa 中间件模型差异？错误处理各怎么写？
+9. BFF 聚合的并行、超时、降级、缓存四件套？
+10. Docker 部署为什么用 node 直启而不是 npm start？PID 1 问题是什么？
+11. PM2 reload 与 restart 的区别？wait_ready 解决什么？
+12. 连接池关键参数？连接泄漏怎么发现？
+
 ---
 
 ## 复习卡片
@@ -1449,6 +1546,7 @@ A：502 通常不是"退出太慢"，而是"流量还没摘干净进程就没了
 > 17. **安全**：helmet + rate limit + 参数化查询 + 依赖审计 + 请求体大小限制
 > 18. **BFF 实践**：接口聚合 + 数据裁剪 + 并行调用 + 降级 + 缓存
 > 19. **SSR**：Next.js / Nuxt / Astro；数据脱水注水 + 环境判断 + 内存泄漏防范
+> 20. **优雅关闭**：readiness 失败 → server.close → closeIdleConnections → 硬超时 → 清资源；kill_timeout 必须大于硬超时
 
 ---
 

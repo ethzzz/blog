@@ -1,14 +1,14 @@
 ---
 title: 'Nginx 面试题（中高级前端必备）'
 published: 2026-09-16T13:00:00+08:00
-description: '讲解 Nginx 反向代理、负载均衡、静态资源配置、SPA 路由、HTTPS、性能优化等前端工程师必备知识。'
+description: '讲解 Nginx 反向代理、负载均衡、CORS 跨域、一致性哈希、proxy_cache 缓存、静态资源配置、SPA 路由、HTTPS、性能优化等前端工程师必备知识。'
 tags: [前端面试, Nginx, 反向代理, 负载均衡, 运维]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 20+ 道 Nginx 面试题，重点覆盖前端工程师需要掌握的部分，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级
+> 本文包含 25+ 道 Nginx 面试题，重点覆盖前端工程师需要掌握的部分，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级
 
 ---
 
@@ -284,6 +284,44 @@ server {
 }
 ```
 
+### Q6b: Nginx 怎么配 CORS 跨域？预检请求怎么处理？⭐⭐ 🔥
+
+```nginx
+# 统一在网关层处理 CORS（比每个后端服务各配一遍更可控）
+map $http_origin $cors_origin {
+    default                        "";      # 不在白名单 → 不下发允许头
+    "~^https://(www\.)?example\.com$" $http_origin;
+    "~^https://admin\.example\.com$"  $http_origin;
+}
+
+server {
+    location /api/ {
+        # 带 credentials 时不能用 *，必须回显具体 Origin
+        add_header Access-Control-Allow-Origin  $cors_origin always;
+        add_header Access-Control-Allow-Credentials "true" always;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With" always;
+        add_header Access-Control-Max-Age 86400 always;   # 预检结果缓存 24h
+        add_header Vary "Origin" always;                  # 多 Origin 必须加，防 CDN 串缓存
+
+        # 预检请求直接返回 204，不打到后端
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+
+        proxy_pass http://backend;
+    }
+}
+```
+
+**三个必踩的坑：**
+
+1. **`add_header` 的继承规则**：子 location 里只要写了**任意一条** `add_header`，父级的全部 `add_header` 都不再继承——CORS 头配在 server 层、某个 location 又加了别的头，跨域就悄悄失效。要么全写在一层，要么每层写全。
+2. **`always` 不能省**：默认 `add_header` 只对 2xx/3xx 生效，后端返回 401/500 时没有 CORS 头，浏览器把响应拦掉，前端看到的是「跨域错误」而不是真实状态码——排查时极具迷惑性。
+3. **后端也配了 CORS 会重复**：网关和后端各加一份 `Access-Control-Allow-Origin`，响应里出现两个同名头，浏览器直接拒绝。统一在一层配，另一层关掉。
+
+**追问：** 为什么带 Cookie 的请求 `Allow-Origin` 不能写 `*`？—— 规范禁止：`Allow-Credentials: true` 时 Origin 必须是具体值，否则浏览器拒绝携带凭据。这也是「本地开发好好的，上线带 Cookie 就跨域」的常见根因。
+
 ### Q7: proxy_pass 末尾有无斜杠的区别？⭐⭐⭐
 
 ```nginx
@@ -355,6 +393,57 @@ server {
     }
 }
 ```
+
+### Q8b: 一致性哈希解决什么问题？Nginx 怎么用？⭐⭐⭐
+
+**答：** `ip_hash` 有两个硬伤：① 节点增减时**几乎所有 key 重新映射**（hash % N 的 N 变了），缓存集体失效、session 大面积漂移；② 同一出口 IP 的大量用户（公司 NAT、移动网络）全压到一台。一致性哈希把节点和 key 都映射到同一个哈希环上，key 顺时针找最近节点——**增删一个节点只影响环上相邻的一小段 key**。
+
+```
+哈希环（0 ~ 2^32-1 首尾相接）：
+
+        nodeA
+       /     \
+   key1       key2 → 顺时针落到 nodeB
+      |        |
+   nodeD ---- nodeB
+       \     /
+        nodeC
+
+新增 nodeE 插在 A、B 之间：只有原本落到 B 的一小段 key 改落 E，其余不动。
+```
+
+**虚拟节点**：物理节点少时环上分布不均，给每个物理节点生成上百个虚拟节点散列到环上，负载才均衡；节点下线时它的虚拟节点一起摘除，流量平滑摊给其余节点。
+
+```nginx
+# Nginx 原生支持（1.7.2+）：hash 指令 + consistent
+upstream backend {
+    hash $request_uri consistent;   # 按 URI 一致性哈希 → 同一资源固定打到同一台（利于本地缓存）
+    server 192.168.1.1:3000;
+    server 192.168.1.2:3000;
+    server 192.168.1.3:3000;
+}
+
+# 按客户端 IP 一致性哈希（替代 ip_hash 的更优写法）
+upstream session_backend {
+    hash $remote_addr consistent;
+    server 192.168.1.1:3000;
+    server 192.168.1.2:3000;
+}
+
+# 按自定义键（如用户 ID 参数）
+upstream user_backend {
+    hash $arg_uid consistent;
+    server 192.168.1.1:3000;
+    server 192.168.1.2:3000;
+}
+```
+
+**追问链：**
+
+- **「一致性哈希是不是就彻底解决了 session 问题？」**
+  答：不是，它只是把「节点变动时的迁移面」从全量缩小到相邻段。正解仍是 **session 外置到 Redis**，一致性哈希适合的是「缓存亲和」场景（同一资源尽量落同一台，提高本地缓存命中），别拿它当有状态服务的唯一保障。
+- **「ketama 是什么？」**
+  答：Memcached 客户端常用的一致性哈希算法实现（每个物理节点 160 个虚拟点、MD5 取 4 段），Nginx 的 `consistent` 用的就是 ketama 兼容算法——所以 Nginx 层和 Memcached 客户端层可以用同一套映射。
 
 ---
 
@@ -454,6 +543,53 @@ proxy_buffers 8 4k;
 access_log off;                 # 静态资源关闭访问日志
 ```
 
+### Q10b: proxy_cache 怎么做接口/页面缓存？缓存键和失效怎么设计？⭐⭐⭐
+
+```nginx
+# http 块：定义缓存区（共享内存存 key 元数据，磁盘存响应体）
+proxy_cache_path /var/cache/nginx/api
+    levels=1:2                    # 两级目录，避免单目录文件过多
+    keys_zone=api_cache:10m       # 10m 约存 8 万个 key
+    max_size=1g                   # 磁盘上限，超了按 LRU 淘汰
+    inactive=60m                  # 60 分钟没被访问就清掉（不管有没有过期）
+    use_temp_path=off;            # 直接写目标目录，少一次 rename
+
+server {
+    location /api/ {
+        proxy_cache api_cache;
+        # 缓存键：方法 + 域名 + URI + 查询参数，缺一不可
+        proxy_cache_key "$request_method$scheme$host$request_uri";
+        proxy_cache_valid 200 10m;        # 200 缓存 10 分钟
+        proxy_cache_valid 404 1m;         # 404 短缓存，防穿透
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503;
+        # 上游挂了/超时 → 先返回过期旧数据兜底（stale），宁可旧不可挂
+        proxy_cache_background_update on; # 返回 stale 的同时异步回源更新
+        proxy_cache_lock on;              # 同一 key 并发 miss 只放一个请求回源（防击穿）
+        proxy_cache_min_uses 2;           # 被请求 2 次才缓存，防一次性 URL 撑爆磁盘
+
+        add_header X-Cache-Status $upstream_cache_status;  # HIT/MISS/BYPASS/EXPIRED/STALE
+        proxy_pass http://backend;
+    }
+
+    # 带登录态的接口绝不能进公共缓存：按 Cookie/Authorization 区分或直接 bypass
+    location /api/user/ {
+        proxy_cache api_cache;
+        proxy_cache_key "$request_method$host$request_uri$http_authorization";
+        proxy_cache_bypass $http_authorization;   # 带鉴权头的请求直接回源
+        proxy_pass http://backend;
+    }
+}
+```
+
+**追问链：**
+
+- **「怎么主动清除某个缓存？」**
+  答：开源版没有 purge 指令，三种办法：① 按 key 算出磁盘路径直接删文件（key 的 MD5 按 levels 分层）；② 把 `proxy_cache_valid` 设短，靠自然过期；③ 上 `nginx-cache-purge` 第三方模块或 OpenResty。商业版才有原生 purge。
+- **「`inactive` 和 `proxy_cache_valid` 什么区别？」**
+  答：`valid` 是**内容保质期**（过期后回源验证/更新）；`inactive` 是**冷数据回收**（这么久没人访问就从磁盘清掉，与内容是否过期无关）。两个维度各管各的。
+- **「为什么 `use_stale` 要配 `updating`？」**
+  答：某个 key 过期瞬间，第一个请求去回源更新，其余并发请求如果都等回源就排队了；`updating` 让它们先拿旧数据走，配合 `background_update` 实现「一人回源、众人吃旧」，热点 key 过期不会打出一波尖峰。
+
 ### Q11: 如何实现灰度发布 / A-B 测试？⭐⭐⭐
 
 ```nginx
@@ -544,6 +680,9 @@ netstat -anp | grep nginx
 | reload 后配置没生效 | 只改了文件没 reload，或 `nginx -t` 报错被忽略 | 改配置后必跑 `nginx -t` 再 `nginx -s reload` |
 | Gzip 开了但 JS 还是没压缩 | `gzip_types` 没包含 `application/javascript`，或响应走了代理缓冲 | 补类型；确认 `gzip_vary on` 兼容 CDN |
 | 图片等二进制被压缩损坏 | gzip_types 里加了 image 类型（svg 除外） | 只压缩文本类资源 |
+| 后端返回 401/500 时前端报「跨域错误」 | `add_header` 默认只对 2xx/3xx 生效，错误响应没带 CORS 头 | 所有 CORS 头加 `always` |
+| 响应里出现两个 Allow-Origin，浏览器拒绝 | 网关和后端各配了一份 CORS | 统一在一层配，另一层关闭 |
+| 缓存命中串用户（A 看到 B 的数据） | 缓存键没带鉴权维度，登录态接口进了公共缓存 | key 加 Authorization/Cookie，或 `proxy_cache_bypass` |
 
 ## 深水区追问（2026 补充）
 
@@ -563,7 +702,7 @@ netstat -anp | grep nginx
 
 答：动态 `gzip` 是**每个请求现场压缩**，级别越高 CPU 越贵，高并发下先打满 CPU 再打满带宽；`gzip_static on` 直接发送构建期生成的 `.gz`，零 CPU 开销，`brotli_static` 同理发 `.br`（体积比 gzip 再小 15%~20%，但浏览器基本只在 HTTPS 下协商 brotli）。实践组合：构建期同时产出 `.br` 与 `.gz`，Nginx 用 `brotli_static` / `gzip_static` 直出，动态 `gzip` 只兜底小文本；`gzip_vary on` 必须开，否则 CDN 会把未压缩副本缓存下来发给支持压缩的客户端。另外 `gzip_types` 只放文本类型，图片/字体再压只会浪费 CPU 甚至撑大体积。
 
-## 自测清单（能答上 8 条算过关）
+## 自测清单（能答上 10 条算过关）
 
 1. location 六种写法的匹配优先级？`^~` 的实际作用是什么？
 2. `try_files` 最后一个参数和前面参数的本质区别？
@@ -575,6 +714,8 @@ netstat -anp | grep nginx
 8. WebSocket 反向代理需要哪三个关键配置？
 9. 413 状态码的常见根因和修复？
 10. 一致性哈希解决 ip_hash 的什么问题？Nginx 原生支持吗？
+11. CORS 预检请求怎么在 Nginx 层拦下？`always` 和 `Vary: Origin` 各防什么坑？
+12. `proxy_cache_key` 怎么设计？`use_stale` + `background_update` + `proxy_cache_lock` 三件套各防什么？
 
 ---
 
@@ -590,6 +731,9 @@ netstat -anp | grep nginx
 | HTTPS | `ssl_certificate` + HTTP 301 跳转 |
 | 灰度发布 | `map` + `weight` 或 Cookie/Header |
 | alias vs root | alias 替换路径，root 拼接路径 |
+| CORS | 白名单回显 Origin + always + OPTIONS 返 204 + Vary |
+| 一致性哈希 | `hash $key consistent`，节点增减只迁移相邻段 |
+| proxy_cache | key 带全维度；stale 兜底 + lock 防击穿 + bypass 鉴权 |
 
 > [!TIP]
 > 下一篇：[MySQL 面试题](/blog/posts/interview-guide-10-mysql/)
