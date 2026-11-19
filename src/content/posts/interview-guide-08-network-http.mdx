@@ -1,14 +1,14 @@
 ---
 title: '网络与 HTTP 面试题（中高级）'
 published: 2026-09-16T12:00:00+08:00
-description: '深入讲解 TCP/IP、HTTP/1.1 vs HTTP/2、HTTPS 握手、缓存策略、跨域解决方案、Web 安全等高频面试题。'
+description: '深入讲解 TCP/IP、DNS 解析、HTTP/1.1 vs HTTP/2 vs HTTP/3、HTTPS 握手、缓存策略与 Service Worker、WebSocket、跨域解决方案、Web 安全等高频面试题。'
 tags: [前端面试, HTTP, TCP, HTTPS, 跨域, 缓存]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 25+ 道网络与 HTTP 面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 30+ 道网络与 HTTP 面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -18,7 +18,7 @@ draft: false
 |:--|:--|:--|
 | 浅（能说清概念） | 概念不串味，能一句话下定义 | ① 强缓存与协商缓存分别由哪些响应头决定？② HTTP/2 的多路复用解决了 1.1 的什么问题？③ 跨域请求实际是被谁拦下的？ |
 | 中（能讲机制与代码） | 能说清一层协议内部在做什么 | ① 为什么 HTTP/2 的队头阻塞还留在 TCP 层？② TLS 1.3 怎样把握手压到一个 RTT？③ 带 Cookie 的 CORS 有哪两条硬规则？ |
-| 深（能讲取舍与线上） | 能给出线上方案组合与失败兜底 | ① 带 hash 的静态资源与 HTML 该用怎样的缓存组合才能「发版即生效」？② 弱网/移动端该先上 HTTP/3 还是先做资源瘦身？③ 实时推送选 SSE 还是 WebSocket，各自的运维代价是什么？ |
+| 深（能讲取舍与线上） | 能给出线上方案组合与失败兜底 | ① 带 hash 的静态资源与 HTML 该用怎样的缓存组合才能「发版即生效」？② 弱网/移动端该先上 HTTP/3 还是先做资源瘦身？③ 实时推送选 SSE 还是 WebSocket，各自的运维代价是什么？④ 改了 sw.js 用户为什么还是旧页面，更新链路怎么设计？ |
 
 ## TCP/IP 基础
 
@@ -84,6 +84,38 @@ draft: false
 | 流量控制 | 有（滑动窗口） | 无 |
 | 应用场景 | HTTP、FTP、SMTP | DNS、视频、游戏 |
 
+### Q2b: DNS 解析的完整链路？前端能做什么优化？⭐⭐
+
+**答：** 以解析 `www.example.com` 为例，缓存逐级兜底，都没有才走完整查询：
+
+```
+① 浏览器 DNS 缓存（Chrome 约 1 分钟）
+② 操作系统缓存 + hosts 文件
+③ 路由器缓存
+④ 本地 DNS 服务器（运营商/公共 DNS，如 223.5.5.5）
+   └─ 它也没有 → 由它代你完成「迭代查询」：
+      根域名服务器（.）→ 返回 .com 顶级域服务器地址
+      .com 顶级域服务器 → 返回 example.com 权威服务器地址
+      权威服务器 → 返回 www.example.com 的 A/AAAA 记录
+```
+
+**关键概念：递归 vs 迭代**
+- 客户端 → 本地 DNS 是**递归**：「我只要最终答案，你去查」；
+- 本地 DNS → 根/顶级/权威是**迭代**：「我不知道，但你去问它」。
+- 面试一句话：**对客户端递归、对服务器迭代**，压力集中在本地 DNS，所以它的缓存命中率决定了全网解析速度。
+
+**前端/工程侧能做的：**
+
+| 手段 | 解决什么 |
+|:--|:--|
+| `dns-prefetch` / `preconnect` | 把解析/建连提前到空闲期（见性能篇 Q3b） |
+| HTTPDNS（App 常用） | 绕过运营商 LocalDNS，防域名劫持与调度不准 |
+| DoH / DoT | DNS 查询加密，防窃听篡改（浏览器已支持 DoH） |
+| 减少域名数量 | 每个新域名都要付一次解析成本，别为「并行下载」滥拆域名（HTTP/2 后更无必要） |
+
+**追问：「TTL 是什么？改了解析为什么很久不生效？」**
+答：TTL 是记录在各级缓存里的存活时间，由权威服务器设置。改 IP 后旧记录要等 TTL 过期才刷新，所以**迁移服务器前要提前把 TTL 调低**（如 300s），切完再调回——这是运维常识题，答上加分。
+
 ---
 
 ## HTTP 协议
@@ -107,6 +139,32 @@ DELETE /users/1     // 幂等（第一次成功，后续返回 404）
 POST /users         // 不幂等（每次创建新用户）
 PUT /users/1        // 幂等（全量更新，结果一致）
 ```
+
+### Q3b: GET 和 POST 的区别？（别只背参数位置）⭐ 🔥
+
+**答：** 分三层答：语义 → 行为 → 工程约定。
+
+| 维度 | GET | POST |
+|:--|:--|:--|
+| 语义 | **安全**（只读，不应有副作用）+ 幂等 | 不安全、不幂等（提交/创建） |
+| 参数位置 | URL query（约定） | body（约定） |
+| 缓存 | 可被缓存/收藏/留在历史记录 | 默认不缓存 |
+| 重试 | 浏览器/代理可放心自动重试 | 不可自动重试（可能重复下单） |
+| 编码 | URL 编码 | 多种（form/json/multipart） |
+
+**两个流传很广的误区（面试官最爱钓鱼）：**
+
+1. **「GET 有长度限制、POST 没有」——协议层都不限**。HTTP 规范没有限制 URL 或 body 长度，限制来自浏览器和服务器实现（如 Chrome URL 约 2MB、Nginx 默认 body 1MB）。超长 URL 会被中间设备截断，这才是「别用 GET 传大数据」的真实原因。
+2. **「GET 发一个 TCP 包、POST 发两个」——不成立**。POST 是否先发 header 再发 body 取决于 `Expect: 100-continue` 与实现，不是方法本身的属性；GET 带 body 也完全合法（只是语义未定义，很多代理会丢弃）。
+
+**追问链：**
+
+- **「GET 能带 body 吗？」**
+  答：语法上可以，RFC 9110 没有禁止，但语义未定义——缓存/代理可能忽略或拒绝。Elasticsearch 的 `_search` 曾用 GET+body，后来也提供 POST 替代。**工程结论：别依赖 GET body**。
+- **「POST 不幂等，网络超时后客户端重试怎么防重复下单？」⭐⭐⭐**
+  答：**幂等键（Idempotency-Key）**：客户端为一次业务操作生成唯一 ID 放请求头，服务端用它做去重（Redis setnx / 数据库唯一约束），同一 key 的重复请求直接返回首次结果。Stripe 的支付 API 就是这个模式。注意幂等键要绑定「业务意图」而不是「每次请求」——重试必须复用同一个 key，否则等于没做。
+- **「为什么 RESTful 里更新用 PUT/PATCH 而不是 POST？」**
+  答：语义决定基础设施行为：PUT 幂等，网关/客户端库可以放心重试；POST 不行。用对方法，重试、缓存、监控策略都能按语义自动化。
 
 ### Q4: HTTP 状态码分类？⭐ 🔥
 
@@ -169,6 +227,65 @@ HTTP/2（并行多路复用，同一连接）
   答：两个原因：① TCP 栈在**操作系统内核**里，客户端和服务端的内核升级周期以年计，无法快速普及新特性；UDP 在用户态实现，QUIC 协议升级随应用走。② 内核 TCP 栈无法做到**连接迁移**——TCP 四元组（源 IP/端口 + 目标 IP/端口）变了连接就断，WiFi 切 4G 必然重连；QUIC 用 Connection ID 标识连接，IP 变了会话还在。选 UDP 只是因为它是「能自定义传输行为的最低层」，可靠性由 QUIC 自己在用户态重做。
 - **「0-RTT 是什么？有什么风险？」**
   答：复用之前会话的密钥参数，第一个包就带上应用数据，省一次往返。风险是 **0-RTT 数据可被重放**（没有完整握手防重放保护），所以只允许幂等请求（GET）走 0-RTT，支付类请求必须等 1-RTT 完整握手。
+- **「HTTP/2 的服务端推送（Server Push）现在还能用吗？」⭐⭐⭐**
+  答：**基本退出历史舞台**——Chrome 106 已移除支持。失败原因：服务端猜不准客户端缺什么资源，推过去的往往已在缓存里，白白浪费带宽，命中率实测很低。替代方案是 **103 Early Hints**：服务端在处理请求的「思考时间」里先回一个 103 响应，带上 `Link: </app.css>; rel=preload`，让浏览器提前发资源请求，最终 200 响应照常——把「猜你要什么」换成「告诉你我要给你什么」，决策权回到 HTML/服务端渲染逻辑手里。表格里「HTTP/2 支持服务端推送」是协议事实，但 2026 年面试要主动补上「已被弃用 + Early Hints 替代」，否则显得知识停在 2018。
+
+### Q5b: WebSocket 的握手过程？怎么保活和重连？⭐⭐ 🔥
+
+**答：** WebSocket 借用 HTTP 完成握手，然后「升级」为独立的双向帧协议：
+
+```http
+# 客户端：带 Upgrade 的 GET 请求
+GET /chat HTTP/1.1
+Host: example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==   # 随机 16 字节的 base64
+Sec-WebSocket-Version: 13
+
+# 服务端：101 切换协议
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+**`Sec-WebSocket-Key` 的校验机制（追问必考）：**
+服务端把 Key 拼上固定 GUID `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`，做 SHA-1 再 base64，结果放进 `Sec-WebSocket-Accept`。目的不是安全（算法公开），而是**证明双方真的理解 WebSocket 协议**——防止普通 HTTP 服务器/缓存代理误把这次请求当普通响应处理。
+
+**握手之后：不再是 HTTP**
+- 数据按**帧（frame）**传输：opcode 区分文本/二进制/ping/pong/close，头部最小 2 字节（对比 HTTP 每次几百字节头部）；
+- 全双工：两端随时可发，无需请求-响应配对。
+
+**保活与重连（线上真正的难点）：**
+
+```javascript
+// 心跳：应用层定时 ping，超时未收到 pong 判定死连接
+// （协议层 ping/pong 帧浏览器 JS 不可控，所以要应用层自己做）
+const HEARTBEAT = 30_000;
+let timer = setInterval(() => {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'ping' }));
+  // 若 10s 内没收到 pong → ws.close() 触发重连
+}, HEARTBEAT);
+
+// 重连：指数退避 + 抖动，防止服务端重启时万客户端同时冲击
+let attempt = 0;
+function reconnect() {
+  const delay = Math.min(30_000, 1000 * 2 ** attempt) + Math.random() * 1000;
+  setTimeout(() => { attempt++; connect(); }, delay);
+}
+// 连接成功后 attempt 归零；重连后要用 Last-Event-ID/序号补拉离线期间消息
+```
+
+**追问链：**
+
+- **「为什么需要心跳？TCP 不是有 keepalive 吗？」**
+  答：TCP keepalive 默认 2 小时才探测，且只能证明「对端内核活着」，证明不了应用进程还能处理消息（进程假死、Nginx 静默断连都探不出来）。中间代理（Nginx `proxy_read_timeout` 默认 60s）还会主动掐掉长时间无数据的连接——心跳同时承担「保活」和「探活」两个职责。
+- **「WebSocket 和长轮询、SSE 怎么选？」**
+  答：长轮询（请求挂起等数据，返回后立刻再发）实现最土但兼容性最好；SSE 单向推送、自带重连，HTTP/2 下无连接数问题；WebSocket 双向高频。详细取舍见本篇深水区「SSE vs WebSocket」一问。
+- **「wss 和 ws 的关系？」**
+  答：就是 WebSocket  over TLS，对应 https 与 http。HTTPS 页面里连 `ws://` 会被当 Mixed Content 拦截，生产必须 `wss://`。
 
 ---
 
@@ -300,6 +417,56 @@ location ~* \.html$ {
   答：优先 ETag（内容级精确到字节，Last-Modified 只有秒级精度且改内容不改时间会漏）。坑有两个：① Nginx 默认 ETag 由 mtime + size 生成，内容改了 mtime 没变（反代/同步工具保留时间戳）会误 304；② 多机部署时如果各机器用强 ETag（inode 相关）会不一致，同一资源在不同节点返回不同 ETag，导致缓存命中率崩塌——**多机场景要么统一 hash 算法，要么只依赖 Last-Modified**。
 - **「强缓存生效时浏览器行为上有什么可见证据？」**
   答：DevTools Network 里显示 `from memory cache`（当前会话内重复访问）或 `from disk cache`（跨会话），状态 200、请求本体没发出去。这可作为「我配了强缓存」的现场验证手段。
+
+### Q8b: Service Worker 缓存和 HTTP 缓存什么关系？策略怎么选？⭐⭐⭐
+
+**答：** SW 是插在「页面与网络之间」的可编程代理层，**优先级在 HTTP 缓存之前**：
+
+```
+页面 fetch
+   ↓
+Service Worker（Cache API，JS 完全可控）
+   ↓ 未命中 / 放行
+HTTP 缓存（强缓存 → 协商缓存，浏览器自动）
+   ↓ 未命中
+网络
+```
+
+两层缓存职责不同：HTTP 缓存管「单资源的新鲜度」，SW 管「应用级的离线与秒开」。
+
+**四种经典策略（Workbox 内置）：**
+
+| 策略 | 行为 | 适用 |
+|:--|:--|:--|
+| Cache First | 缓存有就直接回，没有才回源并写缓存 | 带 hash 的静态资源、字体图片 |
+| Network First | 先请求网络，失败/超时回退缓存 | HTML 入口、时效性接口 |
+| Stale-While-Revalidate | 先回缓存（秒开），后台静默更新 | 头像、列表页、非关键 API |
+| Network Only | 不走 SW 缓存 | 支付、登录等绝不能旧的请求 |
+
+```javascript
+// 手写 SWR 策略（理解原理，生产用 Workbox）
+self.addEventListener('fetch', (event) => {
+  event.respondWith(
+    caches.open('v1').then(async (cache) => {
+      const cached = await cache.match(event.request);
+      const network = fetch(event.request).then((res) => {
+        cache.put(event.request, res.clone());  // 响应流只能读一次，必须 clone
+        return res;
+      });
+      return cached || network;   // 有缓存先回缓存，网络结果留给下次
+    })
+  );
+});
+```
+
+**追问链（SW 真正的难点在更新）：**
+
+- **「改了 sw.js，用户为什么还是旧页面？」⭐⭐⭐**
+  答：SW 更新是**字节级对比 + 等待接管**：浏览器每次导航都会后台重新下载 sw.js，逐字节比较，有差异才安装新版本；但新 SW 进入 `waiting` 状态，**要等旧 SW 控制的所有页签都关闭**才 activate。解法：`self.skipWaiting()`（安装后立即接管）+ `clients.claim()`（接管现有页签），但要注意新旧版本缓存结构不兼容时的清理逻辑（activate 里删旧 cache）。另外 sw.js 本身**绝不能被强缓存**（`Cache-Control: no-cache`），否则更新链路从源头断掉。
+- **「SW 能拦截所有请求吗？」**
+  答：只拦截其 scope 内页面发出的请求；首次注册 SW 的那次加载不受控（要 `clients.claim()` 或刷新后才生效）；跨域请求默认 opaque 响应，`cache.put` 可以存但读不到内容、状态码不可判——缓存跨域资源要显式处理。
+- **「SW 和 Web Worker 什么区别？」**
+  答：同源于 Worker 线程模型，但生命周期与职责完全不同：Web Worker 随页面销毁、做计算；SW 独立于页面存活、做请求拦截与推送，没有 DOM 也不能直接访问页面，靠 `postMessage`/`clients` 通信。
 
 ---
 
@@ -508,6 +675,9 @@ Set-Cookie: session=xxx; SameSite=Lax     // 允许顶级导航
 | 502 和 504 分不清 | 502 上游挂/返回非法响应；504 上游超时 | 502 查进程存活，504 查上游耗时与超时配置 |
 | 抓不到 HTTPS 包 | 证书链验证失败 | 信任抓包工具根证书；注意 App 可能走证书锁定（SSL Pinning） |
 | ETag 多机不一致 | 强 ETag 含 inode/mtime 各机不同 | 多机统一 hash 或退回 Last-Modified |
+| WebSocket 线上总是 60s 左右断 | Nginx `proxy_read_timeout` 默认 60s 掐空闲连接 | 应用层心跳 + 调大代理超时 + 指数退避重连 |
+| 改了 sw.js 用户还是旧页面 | 新 SW 在 waiting 等旧页签全关；或 sw.js 被强缓存 | skipWaiting + clients.claim；sw.js 配 no-cache |
+| POST 超时重试导致重复下单 | POST 不幂等，重试无去重 | Idempotency-Key + 服务端唯一约束去重 |
 
 ## 深水区追问（2026 补充）
 
@@ -539,6 +709,10 @@ Set-Cookie: session=xxx; SameSite=Lax     // 允许顶级导航
 8. ETag 和 Last-Modified 的优先级及 ETag 的两个坑？
 9. 简单请求与预检请求的判定条件？怎么减少预检？
 10. XSS 与 CSRF 的防御分别是什么？为什么 HttpOnly 防不了 CSRF？
+11. DNS 的递归与迭代分别发生在哪一段？迁移服务器前为什么要先调低 TTL？
+12. GET/POST 的两个流传误区是什么？POST 重试防重复下单怎么做？
+13. WebSocket 握手为什么要校验 Sec-WebSocket-Key？心跳为什么不能用 TCP keepalive 代替？
+14. SW 缓存与 HTTP 缓存的层级关系？sw.js 更新后为什么用户还是旧页面？
 
 ---
 
@@ -555,6 +729,12 @@ Set-Cookie: session=xxx; SameSite=Lax     // 允许顶级导航
 | 跨域 | CORS（推荐）、代理、JSONP |
 | XSS 防御 | 输入过滤 + CSP + HttpOnly |
 | CSRF 防御 | CSRF Token + SameSite Cookie |
+| DNS | 对客户端递归、对服务器迭代；TTL 决定生效速度 |
+| GET vs POST | 语义（安全/幂等）决定缓存与重试；长度限制是实现不是协议 |
+| WebSocket | HTTP 101 升级 → 帧协议；应用层心跳 + 指数退避重连 |
+| HTTP/2 Push | 已弃用（Chrome 106 移除），替代是 103 Early Hints |
+| SW 缓存 | 在 HTTP 缓存之前；Cache First/SWR 分资源类型；更新靠字节对比 + skipWaiting |
+| 幂等重试 | POST 配 Idempotency-Key，服务端唯一约束去重 |
 
 > [!TIP]
 > 下一篇：[Nginx 面试题](/blog/posts/interview-guide-09-nginx/)

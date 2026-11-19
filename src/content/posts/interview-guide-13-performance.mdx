@@ -1,14 +1,14 @@
 ---
 title: '前端性能优化面试题（中高级核心考点）'
 published: 2026-09-16T17:00:00+08:00
-description: '讲解核心指标 LCP/INP/CLS、加载优化、渲染优化、内存泄漏排查、Performance API 监控与真实优化案例。'
+description: '讲解核心指标 LCP/INP/CLS、加载优化、资源提示、渲染优化、Web Worker、V8 GC、内存泄漏排查、Performance API 监控与真实优化案例。'
 tags: [前端面试, 性能优化, LCP, 白屏时间, 内存泄漏]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 20+ 道性能优化面试题，这是中高级岗位**最能拉开差距**的模块，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 25+ 道性能优化面试题，这是中高级岗位**最能拉开差距**的模块，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -18,7 +18,7 @@ draft: false
 |:--|:--|:--|
 | 浅（说清概念） | 能用自己的话定义术语，相近概念不混 | ① Core Web Vitals 是哪三个，优秀阈值各是多少？② 重排、重绘、合成分别由什么触发？③ 虚拟列表凭什么能渲染 10 万条数据？ |
 | 中（讲机制） | 能用 DevTools 抓到证据，写出对应代码 | ① LCP 的四段拆解怎么算，怎么判断卡在哪一段？② INP 的三段构成里，长任务如何让出主线程？③ 两次 Heap Snapshot 怎么对比出泄漏对象，看哪一列？ |
-| 深（讲取舍） | 能说清阈值来源、失败模式与线上兜底 | ① 长任务都拆到 50ms 以下了，为什么 INP 还可能超标？② 不定高虚拟列表怎么做到滚动不跳、快速滚动不白屏？③ 性能预算的阈值从哪来、卡口放哪，回滚看哪个指标？ |
+| 深（讲取舍） | 能说清阈值来源、失败模式与线上兜底 | ① 长任务都拆到 50ms 以下了，为什么 INP 还可能超标？② 不定高虚拟列表怎么做到滚动不跳、快速滚动不白屏？③ 性能预算的阈值从哪来、卡口放哪，回滚看哪个指标？④ 计算丢进 Worker 为什么反而更慢，什么时候才值得开线程？ |
 
 ---
 
@@ -186,6 +186,36 @@ input.addEventListener('input', (e) => {
 <link rel="preload" href="/fonts/main.woff2" as="font" crossorigin>
 <link rel="prefetch" href="/next-page.js">  <!-- 空闲时预取下一页 -->
 ```
+
+### Q3b: preload / prefetch / preconnect / modulepreload 怎么选？⭐⭐ 🔥
+
+**答：** 资源提示是「向浏览器调度器表达意图」，用错了不是没效果，而是**负优化**。先分清优先级语义：
+
+| 提示 | 语义 | 优先级 | 典型场景 |
+|:--|:--|:--|:--|
+| `dns-prefetch` | 只做 DNS 解析 | 极低 | 第三方域名兜底（成本几乎为零） |
+| `preconnect` | DNS + TCP + TLS 全建好 | 低 | 马上要请求的关键第三方源（字体/CDN/API） |
+| `preload` | **当前页必需**，提前高优下载 | 高（随 `as` 类型） | LCP 图片、关键字体、被 JS 晚发现的资源 |
+| `prefetch` | **未来导航可能用**，空闲下载 | 最低 | 下一页的 chunk |
+| `modulepreload` | preload + 解析 + 递归预加载依赖图 | 高 | ESM 入口及其 import 链 |
+
+```html
+<!-- preload 必须写 as，否则按最低优先级下载且可能重复请求 -->
+<link rel="preload" href="/hero.avif" as="image" fetchpriority="high">
+<link rel="preload" href="/font.woff2" as="font" type="font/woff2" crossorigin>
+
+<!-- modulepreload：连依赖一起预热，Vite 构建产物自动注入 -->
+<link rel="modulepreload" href="/assets/index-a1b2.js">
+```
+
+**三个高频坑（追问必考）：**
+
+1. **preload 了但没用上**：控制台警告 `was preloaded but not used within a few seconds`。preload 是强制下载，资源 3 秒内没被消费就是白占带宽——只 preload「确定首屏要用」的资源。
+2. **字体 preload 忘写 `crossorigin`**：字体请求默认匿名 CORS 模式，不带 `crossorigin` 会**下载两次**（preload 一次、实际使用一次）。
+3. **preconnect 开太多**：每条连接占着 socket 和拥塞窗口预热成本，超过 4~6 个域名收益递减；只留给「10 秒内一定会请求」的源，其余用 dns-prefetch。
+
+**追问：「`fetchpriority` 和 preload 什么关系？」**
+答：preload 解决「**何时发现**」（把请求提前），fetchpriority 解决「**排多高**」（同批请求里的相对优先级）。LCP 图片两个一起用：`<link rel="preload" as="image" fetchpriority="high">` + `<img fetchpriority="high">`；反过来，非首屏大图可以 `fetchpriority="low"` 给关键资源让路。HTTP/2 下它们最终映射为流的优先级权重。
 
 ### Q4: script 标签的 defer 和 async 区别？⭐ 🔥
 
@@ -415,6 +445,53 @@ function VirtualList({ container, itemHeight, total, renderItem }) {
 // 不定高场景：预估高度 + 渲染后实测缓存高度（react-virtuoso 内置）
 ```
 
+### Q10b: Web Worker 怎么用？什么时候值得开线程？⭐⭐⭐ 🔥
+
+**答：** Worker 是主线程之外的**独立线程**，有自己的事件循环，**不能碰 DOM**，与主线程靠消息通信。适合「计算密集、可异步、结果晚一点到也行」的活：
+
+| 适合丢给 Worker | 不适合 |
+|:--|:--|
+| 大数组排序/过滤/聚合（万级以上） | 需要读写 DOM 的逻辑 |
+| 解析大 JSON / CSV、加解密、压缩 | 小计算（通信开销 > 计算本身） |
+| 图片处理（配 OffscreenCanvas）、音视频编解码 | 强依赖主线程状态、要同步拿结果 |
+| 埋点批量序列化、diff 计算 | 频繁小消息来回（每帧 postMessage） |
+
+```javascript
+// main.js
+const worker = new Worker(new URL('./heavy.worker.js', import.meta.url), { type: 'module' });
+worker.postMessage({ list: hugeArray });
+worker.onmessage = (e) => render(e.data);
+
+// heavy.worker.js
+self.onmessage = (e) => {
+  const result = heavyCompute(e.data.list);
+  self.postMessage(result);
+};
+```
+
+**核心考点：数据怎么传（三种方式，成本差几个数量级）**
+
+```javascript
+// 1. 结构化克隆（默认）：深拷贝，大对象会卡主线程「发送」这一刻
+worker.postMessage({ buf: bigArrayBuffer });          // 拷贝 100MB ≈ 卡几十 ms
+
+// 2. Transferable：所有权转移，零拷贝，原线程立即失效
+worker.postMessage({ buf: bigArrayBuffer }, [bigArrayBuffer]);
+// 发送后主线程 bigArrayBuffer.byteLength === 0，防止双写
+
+// 3. SharedArrayBuffer：共享内存，真·多线程
+// 需要跨源隔离头（COOP/COEP），配合 Atomics 做同步，复杂度最高
+```
+
+**追问链：**
+
+- **「开了 Worker 为什么不快反而更慢？」**
+  答：三笔账：① 序列化/克隆成本——传 10MB 对象默认深拷贝，光发送就卡主线程，必须 Transferable 或传「索引/参数」让 Worker 自己取数；② 线程启动成本——new Worker 要加载脚本，高频小任务应复用常驻 Worker 池而不是用完即弃；③ 结果回传也要克隆一次。**经验阈值：单次计算 < 10ms 别开 Worker，通信开销吃掉收益**。
+- **「Worker 里能发请求吗？能用什么 API？」**
+  答：能 fetch/XHR/WebSocket/IndexedDB，有 `self`、`performance.now()`；没有 window/document/localStorage。DedicatedWorker 之外还有 SharedWorker（多页签共享，调试麻烦）和 ServiceWorker（拦截请求，见网络篇）。
+- **「怎么优雅地封装？」**
+  答：用 comlink 把 postMessage 包装成 `await worker.heavyCompute(list)` 的 RPC 形式（Proxy + 消息 id 配对），避免手写 onmessage 状态机；Vite 用 `new Worker(new URL(...), { type: 'module' })` 原生支持打包。
+
 ### Q11: 防抖和节流在性能优化中的应用？⭐ 🔥
 
 ```javascript
@@ -445,6 +522,41 @@ function throttle(fn, interval = 200) {
 // 只关心最终结果 → 防抖（搜索框）
 // 需要持续响应但要限频 → 节流（滚动条）
 ```
+
+### Q11b: 动画为什么用 requestAnimationFrame？requestIdleCallback 有什么坑？⭐⭐
+
+**答：** 关键是理解一帧里各时机的位置：
+
+```
+一帧（60Hz ≈ 16.7ms）的事件循环：
+宏任务 → 微任务 → rAF 回调 → 样式计算/布局/绘制 → （有空闲）rIC 回调
+```
+
+```javascript
+// ❌ setTimeout 做动画：不与刷新率对齐
+// 屏幕 60Hz 但你 10ms 一次 → 一半计算白做；屏幕 120Hz → 动画显得慢
+// 且后台标签页 setTimeout 仍被节流到 1s，回来动画跳变
+setInterval(() => { el.style.left = x++ + 'px'; }, 16);
+
+// ✅ rAF：浏览器在「下一次重绘前」统一回调
+// - 与屏幕刷新率对齐（120Hz 屏自动 120fps）
+// - 后台标签页自动暂停，省电
+// - 同一帧多个 rAF 合并成一次布局/绘制
+function tick() {
+  el.style.transform = `translateX(${x++}px)`;
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+```
+
+**requestIdleCallback 的三个坑：**
+
+1. **不保证执行**：一直忙就永远不回调，必须带 `{ timeout: 2000 }` 兜底，否则埋点上报可能永远发不出去。
+2. **回调里别改 DOM**：空闲期在绘制之后，改 DOM 会把布局推到下一帧，造成掉帧；要做 DOM 变更应在回调里再套一层 rAF。
+3. **deadline.timeRemaining() 通常只有几 ms**：任务要自己切片，用 `deadline.didTimeout` 区分「真空闲」和「超时强制执行」。Safari 长期不支持，生产代码要 rIC + setTimeout 降级。
+
+**追问：「rAF 里能读布局吗？」**
+答：能，而且是**最佳读取点**——rAF 回调在一帧的布局/绘制之前，此时读 `offsetTop` 拿到的是上一帧的稳定布局，不会触发强制同步布局；「rAF 里读、下一段 rAF 里写」是 fastdom 库的核心思路。
 
 ---
 
@@ -491,6 +603,48 @@ function outer() {
    - React：useEffect 返回清理函数
    - WeakMap/WeakSet 存"附属数据"，键被回收时自动释放
 ```
+
+### Q12b: V8 垃圾回收机制？和内存泄漏是什么关系？⭐⭐⭐ 🔥
+
+**答：** 先给结论：**GC 回收的是「不可达」对象，泄漏的对象全都「可达」——所以泄漏永远等不来 GC**。这是把 Q12 的排查和 GC 原理串起来的一句话。
+
+**分代回收（核心设计）：**
+
+```
+新生代（Young Generation，几 MB）
+  ├─ 存活率低的临时对象：函数局部变量、中间结果
+  ├─ 算法：Scavenge（复制式）
+  │   From 空间 ──存活对象复制──> To 空间，然后整体翻转
+  │   两次 Scavenge 还活着 → 晋升老生代
+  └─ 特点：频繁、快（只扫新生代）
+
+老生代（Old Generation，可达 GB 级）
+  ├─ 存活率高的对象：全局缓存、闭包持有的大对象、晋升对象
+  ├─ 算法：Mark-Sweep（标记-清除）+ Mark-Compact（标记-整理）
+  │   标记：从根（全局/栈/句柄）遍历，可达的打标
+  │   清除：回收未标记对象 → 产生碎片
+  │   整理：存活对象向一端移动 → 消除碎片（贵，按需触发）
+  └─ 特点：低频、慢 → 必须增量/并发化
+```
+
+**为什么老生代不能全停顿标记？——Orinoco 项目的三招：**
+
+| 技术 | 做法 | 解决什么 |
+|:--|:--|:--|
+| 增量标记（Incremental） | 标记拆成小段，穿插在 JS 执行间隙 | 避免一次停顿几百 ms |
+| 并发标记（Concurrent） | 辅助线程在后台标记，主线程不停 | 大堆标记不占主线程 |
+| 并行清除/整理（Parallel） | 多个辅助线程一起清扫 | 缩短停顿尾部 |
+
+配合**写屏障（Write Barrier）**：增量标记期间 JS 改了引用关系，记录下来补标，保证不漏。
+
+**追问链：**
+
+- **「新生代为什么用复制而不是标记清除？」**
+  答：新生代对象「朝生夕死」，存活率极低（通常 `<10%`）。复制算法只搬存活对象、天然无碎片，成本与存活量成正比；标记清除要扫全空间，成本与总量成正比。老生代存活率高，复制要搬的对象太多，才改用标记清除。**算法选择是被存活率决定的**——这句是加分点。
+- **「GC 会造成卡顿吗？怎么观测？」**
+  答：会，Major GC 的停顿仍可能到几十 ms。Performance 面板里黄色长条若标注 `Minor GC` / `Major GC` 即 GC 耗时；频繁 Minor GC 说明临时对象分配过猛（每帧 new 大数组），优化方向是对象复用/池化，而不是「调 GC 参数」——浏览器不暴露 GC 调参，`--expose-gc` 只用于排查。
+- **「WeakMap 为什么能防泄漏？强引用和弱引用差在哪？」**
+  答：GC 判定可达性时**忽略弱引用**：WeakMap 的键没有其它强引用时，键值对整体可回收。所以「DOM 节点 → 附属数据」用 WeakMap 存，节点移除后数据自动释放；用 Map 存则节点被 Map 强引用，永远回收不了——这正是 Q12 游离 DOM 泄漏的机制解释。
 
 ### Q13: 如何优化包体积？⭐⭐ 🔥
 
@@ -664,6 +818,9 @@ SSR 首屏流程：
 | 上报监控后页面变慢 | 上报本身同步执行/频率过高 | `sendBeacon` + 批量 + 采样 + 空闲上报 |
 | 虚拟列表滚动白屏 | buffer 太小、滚动事件未节流 | 增加缓冲区、rAF 对齐滚动计算 |
 | 性能预算总是刚过线 | 阈值定得贴着现状 | 设预算时留 10~20% 余量，否则每次迭代都红灯 |
+| 字体被下载了两次 | preload 没写 `crossorigin`，与实际请求模式不一致 | `<link rel="preload" as="font" crossorigin>` |
+| 开了 Worker 反而更卡 | 大对象默认结构化克隆，发送/回传各卡一次 | Transferable 转移 ArrayBuffer，或只传参数让 Worker 自取数据 |
+| preload 的资源控制台报警告 | 预加载了 3 秒内没用上的资源 | 只 preload 首屏确定要用的；其余改 prefetch |
 
 ## 深水区追问（2026 补充）
 
@@ -697,6 +854,10 @@ SSR 首屏流程：
 8. 内存泄漏的标准排查流程（Heap Snapshot 怎么对比、看哪一列）？
 9. 性能预算的阈值怎么定？卡口放哪最有效？
 10. 你的性能案例里，哪个改动收益最大、哪个改动几乎没效果？为什么？
+11. preload / prefetch / preconnect / modulepreload 的优先级语义差别？字体 preload 为什么要写 crossorigin？
+12. Worker 传数据的三种方式与成本差异？什么量级的计算才值得开 Worker？
+13. rAF 为什么比 setTimeout 适合做动画？rIC 的三个坑是什么？
+14. 新生代为什么用复制算法、老生代用标记整理？GC 为什么救不了内存泄漏？
 
 ---
 
@@ -718,6 +879,10 @@ SSR 首屏流程：
 > 11. **内存泄漏**：定时器/监听/闭包/游离 DOM；Heap Snapshot 对比排查
 > 12. **包体积**：Tree Shaking + 按需引入 + 大依赖替换 + 可视化分析
 > 13. **案例回答**：STAR + 量化数据 + 沉淀，务必提前准备 1-2 个
+> 14. **资源提示**：preload 当前页必需（写 as + crossorigin）、prefetch 未来导航、preconnect 关键源
+> 15. **Worker**：计算密集才开；大 buffer 用 Transferable 零拷贝；小计算通信开销反而亏
+> 16. **动画时机**：rAF 对齐刷新率、后台自动暂停；rIC 要 timeout 兜底、别在里面改 DOM
+> 17. **V8 GC**：新生代 Scavenge 复制、老生代标记整理 + 增量并发；泄漏对象可达，GC 救不了
 
 ---
 
