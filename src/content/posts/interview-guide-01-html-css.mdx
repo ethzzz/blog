@@ -1,14 +1,14 @@
 ---
 title: 'HTML & CSS 高频面试题（中高级）'
 published: 2026-09-15T11:00:00+08:00
-description: '覆盖语义化、盒模型、BFC、选择器优先级、Flex/Grid 布局、响应式设计、CSS 动画等 30+ 道高频面试题。'
+description: '覆盖语义化、盒模型、BFC、行内布局、选择器优先级、Flex/Grid 布局与空间分配、sticky、响应式设计、CSS 变量主题切换、现代 CSS 等 35+ 道高频面试题。'
 tags: [前端面试, HTML, CSS, 布局, Flex, Grid]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 30+ 道 HTML/CSS 高频面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 35+ 道 HTML/CSS 高频面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -189,6 +189,39 @@ screen.width
   /* 实际高度 margin = 30px */
 }
 ```
+
+### Q6b: 图片底部为什么总有几像素缝隙？vertical-align 到底在对齐什么？⭐⭐ 🔥
+
+**答：** 这是行内格式化上下文（IFC）的经典问题。`img` 默认是**行内替换元素**，参与行盒（line box）排版：
+
+```
+行盒内的对齐基准线：
+─────────────────────  top
+   文字文字文字
+─────────────────────  baseline（基线：字母 x 的底边）
+   img 的底边默认对齐这里 ← 缝隙来源
+─────────────────────  bottom（含 g/y/p 的下延部分）
+```
+
+**机制**：行内元素默认 `vertical-align: baseline`，而替换元素（img/video/canvas）的「基线」被定义为**底边**。行盒里还有一个看不见的「支柱」（strut，由父元素 font-size/line-height 生成的匿名行内盒），它给基线以下留了 descender 空间——图片底边对齐基线后，下面那段空间就露出来成了缝隙。
+
+**四种解法（按推荐度）：**
+
+```css
+/* ✅ 1. 图片改块级：退出 IFC，最干净 */
+img { display: block; }
+
+/* ✅ 2. 改对齐基准：底边对齐行盒底部 */
+img { vertical-align: bottom; }   /* middle/top 也可，看设计 */
+
+/* ⚠️ 3. 消灭支柱：父级 font-size: 0（副作用是文字也没了，要重设） */
+.wrap { font-size: 0; }
+
+/* ⚠️ 4. line-height: 0：行盒高度塌掉，可能影响其它行内内容 */
+```
+
+**追问：「`vertical-align: middle` 是垂直居中吗？」**
+答：不是相对父容器居中，是相对**行盒的「基线 + x-height/2」**对齐——所以单行文字配图标用 middle 基本对齐，多行文本里图标会跟着第一行走。真正的垂直居中用 flex `align-items: center`，别指望 vertical-align。另外 `vertical-align` 只对**行内/行内块/表格单元格**生效，给块级元素写它没有任何效果。
 
 ---
 
@@ -421,6 +454,45 @@ p::selection {}
 .right { flex: 0 0 150px; }
 ```
 
+### Q10b: `flex: 1` / `flex: auto` / `flex: none` 到底怎么分配空间？⭐⭐⭐ 🔥
+
+**答：** 先把三个简写展开，差别全在 **flex-basis**：
+
+| 简写 | 展开 | 含义 |
+|:--|:--|:--|
+| `flex: 1` | `1 1 0%` | 基准为 0，**剩余空间全按比例分** → 等宽 |
+| `flex: auto` | `1 1 auto` | 基准为内容尺寸，先占内容再分剩余 → 内容多的更宽 |
+| `flex: none` | `0 0 auto` | 不伸不缩，按内容尺寸固定 |
+| `flex: 0 0 200px` | — | 固定 200px，侧边栏标准写法 |
+
+**分配算法（两步）：**
+
+```
+① 先按 flex-basis 给每个子项占位（basis 优先于 width！）
+② 算剩余空间 = 容器主轴尺寸 - Σbasis
+   剩余 > 0 → 按 flex-grow 比例分配
+   剩余 < 0 → 按「flex-shrink × basis」加权收缩
+```
+
+```css
+/* 经典追问：容器 600px，三个子项 basis 分别 100/200/300，grow 都是 1 */
+/* 剩余 = 600 - 600 = 0，谁都不长 */
+
+/* 容器 900px：剩余 300，按 1:1:1 各加 100 → 200/300/400 */
+/* 若 flex: 1（basis 全 0）：剩余 900 按 1:1:1 → 300/300/300 等宽 */
+```
+
+**收缩为什么按「shrink × basis」加权？** 因为规范认为「本来就大的项应该多缩」，避免小项被缩没。例：容器 400px，两项 basis 300/300、shrink 1/2 → 溢出 200，加权 300×1 : 300×2 = 1:2 → 分别缩 66.7/133.3。
+
+**追问链：**
+
+- **「为什么子项写了 `width: 200px` 却不生效？」**
+  答：`flex-basis` 优先级高于 `width`（basis 非 auto 时 width 被忽略）。`flex: 1` 的 basis 是 0%，所以 width 写多少都没用——这是「设了宽度却被 flex 吃掉」的根因。
+- **「文字超长把 flex 布局撑破，为什么加 `min-width: 0` 就好？」⭐⭐⭐**
+  答：flex 子项的 `min-width` 默认是 **auto**（= 内容最小尺寸），收缩不能突破这个下限。长文本/图片的最小尺寸很大，子项拒绝收缩就撑破容器。显式 `min-width: 0`（或 `overflow: hidden`）解除下限，再配 `text-overflow: ellipsis` 才能正常截断。**这是 flex 布局最高频的线上 bug**。
+- **「`flex-grow` 设成 2 就是占两倍吗？」**
+  答：是「剩余空间」的两倍份额，不是总宽的两倍。只有 basis 为 0（`flex: 1` 类写法）时，总宽才恰好等于份额比。
+
 ### Q11: Grid 布局怎么用？⭐⭐
 
 **答：**
@@ -520,6 +592,33 @@ p::selection {}
   text-align: center;
 }
 ```
+
+### Q12b: `position: sticky` 为什么不生效？⭐⭐ 🔥
+
+**答：** sticky = 「relative + 到达阈值后 fixed」，但它的 fixed 是**相对最近的滚动祖先**、且**活动范围被限制在父容器内**。失效几乎总是这四个原因之一：
+
+| 原因 | 表现 | 修复 |
+|:--|:--|:--|
+| 没写阈值 | 只写 `position: sticky` 不写 top/bottom | 必须给 `top: 0`（或 bottom 等） |
+| 祖先有 `overflow: hidden/auto/scroll` | sticky 相对那个祖先滚动，而它根本不滚 | 去掉祖先 overflow，或把 sticky 挪进真正的滚动容器 |
+| 父容器高度不够 | 父级和子项一样高，没有「可吸附的行程」 | 父级高度必须大于 sticky 元素（如列表容器包裹吸顶头） |
+| 父级 `display: flex` 且子项被 stretch | 子项被拉到和父级一样高，行程为 0 | 给 sticky 子项 `align-self: flex-start` |
+
+```css
+/* 正确的吸顶表头 */
+.table-wrap { max-height: 400px; overflow: auto; }  /* 真正的滚动容器 */
+thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;   /* 压住滚动经过的单元格 */
+  background: #fff;  /* 不透明背景，否则内容透出来 */
+}
+```
+
+**排查口诀**：DevTools 选中 sticky 元素 → 看 Computed 里 position 是否被覆盖 → 沿 DOM 树向上找第一个 `overflow ≠ visible` 的祖先 → 检查父级高度是否大于自身。
+
+**追问：「sticky 和 fixed 的本质区别？」**
+答：fixed 相对**视口**定位、脱离文档流；sticky 相对**最近滚动祖先**、**不脱离文档流**（原位置保留占位），且只能在父容器范围内吸附——父容器滚出视口，sticky 元素跟着一起走。这就是「吸顶导航滚到父区块底部就停」的原因。
 
 ---
 
@@ -681,6 +780,54 @@ column-gap: 20px;
 :root { --primary: #3498db; }
 .btn { color: var(--primary); }
 ```
+
+### Q15b: CSS 变量怎么做主题切换 / 暗黑模式？⭐⭐ 🔥
+
+**答：** 核心是「**token 集中声明、组件只引用变量**」，切换主题 = 换一组变量值，组件代码零改动：
+
+```css
+/* 1. 语义化 token（不要 --blue-500，要 --color-primary） */
+:root {
+  --bg: #ffffff;
+  --text: #1a1a1a;
+  --color-primary: #3498db;
+  --border: #e5e5e5;
+}
+
+/* 2. 暗黑主题：覆盖同一组变量 */
+[data-theme='dark'] {
+  --bg: #121212;
+  --text: #e5e5e5;
+  --color-primary: #5dade2;
+  --border: #333;
+}
+
+/* 3. 跟随系统（未手动选择时的默认） */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #121212;
+    --text: #e5e5e5;
+  }
+}
+
+/* 4. 组件只引用变量 */
+.card { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+```
+
+```javascript
+// 切换：改一个属性，整棵 DOM 树的变量继承自动生效
+document.documentElement.dataset.theme = 'dark';
+localStorage.setItem('theme', 'dark');   // 持久化用户选择
+```
+
+**追问链：**
+
+- **「CSS 变量和 Sass 变量的本质区别？」**
+  答：Sass 变量是**编译期**替换，产物里没有变量，无法运行时切换；CSS 变量是**运行时**的、沿 DOM 树**继承**的活值——改 `:root` 一处，所有引用处即时更新，还能被 JS 读写（`getComputedStyle().getPropertyValue('--bg')`）。主题切换、动态换肤只能用 CSS 变量。
+- **「`var()` 的兜底怎么写？变量没定义会怎样？」**
+  答：`var(--x, fallback)` 第二参数兜底，还能嵌套 `var(--x, var(--y, 16px))`。变量未定义且无兜底时，该声明按「无效值」处理（继承属性回退到继承值，非继承属性回退到初始值）——不是报错，是静默失效，排查时要注意。
+- **「两个坑」**
+  答：① 变量**不能用于媒体查询条件**（`@media (min-width: var(--bp))` 无效），断点只能用字面量或预处理器；② 变量在 `url()` 里不能拼接路径（`url(var(--path)/img.png)` 无效），整个 url 值可以是一个变量。
 
 ### Q16: transition 和 animation 的区别？⭐⭐
 
@@ -878,6 +1025,9 @@ element.style.transform = 'translateX(100px)';
 | 刘海屏/小黑条遮挡 | 未适配安全区 | `padding-bottom: env(safe-area-inset-bottom)` |
 | 动画卡顿 | 动了 `width/top/left`，每帧回流 | 改用 `transform` / `opacity`，必要时 `will-change` |
 | 列表滚动抖动 | 图片无尺寸占位 | 显式 `width/height` 或 `aspect-ratio` |
+| `position: sticky` 不吸顶 | 没写 top 阈值 / 祖先 overflow / 父级高度不够 | 给 top:0；去掉祖先 overflow；父级高度大于子项 |
+| flex 子项设了 width 却被吃掉 | `flex-basis` 优先于 width | 固定尺寸用 `flex: 0 0 200px`，别只写 width |
+| 图片底部有几像素缝隙 | 行内替换元素基线对齐 + strut 下延空间 | `display: block` 或 `vertical-align: bottom` |
 
 ## 深水区追问（2026 补充）
 
@@ -916,6 +1066,10 @@ element.style.transform = 'translateX(100px)';
 8. 容器查询与媒体查询的本质区别？什么场景只能用容器查询？
 9. `@layer` 如何解决「覆盖第三方组件库样式」的老大难问题？
 10. flex 子项里文字溢出，为什么必须加 `min-width: 0`？
+11. `flex: 1` 和 `flex: auto` 的分配结果差在哪？收缩为什么按 shrink × basis 加权？
+12. 图片底部缝隙的成因（IFC/strut）？四种解法各自的副作用？
+13. sticky 失效的四个原因？它和 fixed 的定位基准与文档流差异？
+14. CSS 变量与 Sass 变量的本质区别？var() 未定义时的行为？
 
 ---
 
@@ -931,6 +1085,10 @@ element.style.transform = 'translateX(100px)';
 | 居中方案 | Flex `place-items: center` 最简洁 |
 | 响应式 | 媒体查询 + 弹性布局 + 视口单位 |
 | 重绘回流 | `transform` 动画不回流，批量修改 |
+| flex 分配 | `flex:1`=1 1 0% 等宽；basis 优先于 width；min-width:auto 撑破布局 |
+| 行内缝隙 | img 基线对齐 + strut；display:block 根治 |
+| sticky | 相对最近滚动祖先、父容器内吸附；必写 top |
+| CSS 变量 | 运行时继承的活值；主题切换 = 换 token；Sass 是编译期 |
 
 > [!TIP]
 > 下一篇：[JavaScript 核心面试题](/blog/posts/interview-guide-02-javascript-core/)

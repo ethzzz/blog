@@ -1,14 +1,14 @@
 ---
 title: 'JS 异步与事件循环面试题（中高级）'
 published: 2026-09-15T13:00:00+08:00
-description: '深入讲解 Event Loop、宏任务微任务、Promise、async/await、Generator 等异步编程核心面试题。'
+description: '深入讲解 Event Loop、宏任务微任务、Promise 静态方法与超时控制、async/await、主线程让出、异步迭代器与流式消费等异步编程核心面试题。'
 tags: [前端面试, JavaScript, EventLoop, Promise, async]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 20+ 道 JS 异步编程面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 25+ 道 JS 异步编程面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -335,6 +335,47 @@ Promise.any([p1, p2])        // ES2021，第一个成功的结果
   .then(value => {});
 ```
 
+### Q6b: all / allSettled / race / any 怎么选？超时控制怎么写才对？⭐⭐ 🔥
+
+**答：** 一张表说清选型：
+
+| 方法 | 成功条件 | 失败条件 | 典型场景 |
+|:--|:--|:--|:--|
+| `all` | 全部成功 | **任一失败即失败**（fail-fast） | 首屏必需数据，缺一不可 |
+| `allSettled` | 永远成功（返回状态数组） | 不会 reject | 批量上报/批量保存，允许部分失败 |
+| `race` | 第一个**settled**（成功或失败都算） | 第一个就是失败则失败 | 超时控制、多源竞速 |
+| `any` | 第一个**成功** | 全部失败才失败（AggregateError） | 多 CDN 容灾，只要一个能用 |
+
+**超时控制的正确写法（高频手写题）：**
+
+```javascript
+// ❌ 常见错误：race 之后定时器没人清，页面卸载后还在跑
+const withTimeoutBad = (p, ms) =>
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
+// ✅ 正确：finally 里清定时器
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timeout')), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ✅ 更现代：fetch 直接用内置超时信号，无需手写 race
+fetch(url, { signal: AbortSignal.timeout(5000) });
+// 组合「用户取消 + 超时」：AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])
+```
+
+**追问链：**
+
+- **「race 做超时，原请求会被取消吗？」**
+  答：不会。race 只是「不再等它」，原 fetch 仍在跑、仍占连接。要真取消必须配 AbortController（见深水区）。**「超时」和「取消」是两件事**，这句是加分点。
+- **「all 里一个失败，其它成功的结果还能拿到吗？」**
+  答：拿不到，all 只回第一个 rejection。需要「部分成功也要结果」就用 allSettled，再按 status 分拣。
+- **「any 全失败时抛的是什么？」**
+  答：`AggregateError`，`errors` 数组里装着每个任务的失败原因——排查多源容灾时要把这个数组打全，别只打 message。
+
 ### Q7: 如何实现 Promise.all？⭐⭐⭐
 
 ```javascript
@@ -425,6 +466,15 @@ function fetchData() {
 }
 ```
 
+**追问链：**
+
+- **「`await` 一个非 Promise 值会怎样？」**
+  答：会被 `Promise.resolve()` 包一层，所以 `await 1` 也要等一个微任务才继续——**await 永远让出一次主线程**，哪怕后面是同步值。这也是「await 优化」讨论的来源：引擎在努力减少这层包装的 tick 数。
+- **「顶层 await（Top-level await）是什么？有什么风险？」⭐⭐⭐**
+  答：ESM 模块里可以直接在顶层 `await`（不需要包 async 函数），模块会等它完成才算加载完，**依赖它的模块全部被阻塞**。风险是「模块级死锁」：A 顶层 await B、B 顶层 await A，或 await 了一个永不 settle 的 Promise，整条 import 链卡死且无报错。工程约定：顶层 await 只用于「确定会 settle 的初始化」（如读配置、建连接），且要配超时；CJS 里不可用。
+- **「async 函数里 return 和 return await 有区别吗？」**
+  答：有。`return promise` 直接把 promise 透传给调用方；`return await promise` 会多等一层，**且能被本函数的 try/catch 捕获**——在 try 块里 `return promise` 的 rejection 捕获不到，必须 `return await`。这是「catch 不住 return 的 Promise」的根因。
+
 ### Q10: async/await 错误处理？⭐⭐
 
 ```javascript
@@ -496,6 +546,49 @@ async function parallelSafe() {
 }
 ```
 
+### Q11b: 长任务怎么让出主线程？setTimeout / MessageChannel / scheduler.yield 怎么选？⭐⭐⭐ 🔥
+
+**答：** 拆长任务的目标是「每段 < 50ms，段间让浏览器有机会处理输入和渲染」。让出方式有四档：
+
+| 方式 | 让出粒度 | 代价 | 适用 |
+|:--|:--|:--|:--|
+| `setTimeout(fn, 0)` | 宏任务 | **嵌套 5 层后钳制到 4ms**，拆 20 段白送 80ms | 粗粒度分片、兼容性兜底 |
+| `MessageChannel` | 宏任务 | 无 4ms 钳制，比 setTimeout 快 | React 调度器早期方案 |
+| `scheduler.yield()` | 续接当前优先级 | 最新 API，让出后**回到队首**而非队尾 | 2026 首选（Chrome 已支持） |
+| `scheduler.postTask(fn, { priority })` | 按优先级排队 | 可设 user-blocking/background | 区分「交互相关」与「后台」任务 |
+
+```javascript
+// ✅ 用 scheduler.yield 分片处理大数组（保留优先级，不饿死）
+async function processInChunks(items, chunkSize = 200) {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+    heavyCompute(chunk);                    // 每段控制在几十 ms
+    if (i + chunkSize < items.length) {
+      await scheduler.yield();              // 让出，浏览器可插入输入/渲染
+    }
+  }
+}
+
+// 降级：不支持 scheduler 时用 MessageChannel（无 4ms 钳制）
+function yieldToMain() {
+  if ('scheduler' in window && 'yield' in scheduler) return scheduler.yield();
+  return new Promise(resolve => {
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => resolve();
+    ch.port2.postMessage(null);
+  });
+}
+```
+
+**追问链：**
+
+- **「为什么不用 `await Promise.resolve()` 让出？」**
+  答：微任务不让出渲染——微任务队列清空前浏览器不绘制（见 Q1）。`await Promise.resolve()` 只是插了个微任务，长任务依旧霸占主线程。**让出必须用宏任务级或 scheduler API**。
+- **「拆得越细越好吗？」**
+  答：不是。每次让出都有调度开销，拆太细总时长反而变长，还可能把一次 16ms 的绘制拆成两帧。经验值：每段 30~50ms、段间让出一次；用 `performance.now()` 实测每段耗时来定 chunkSize，别拍脑袋。
+- **「怎么知道该不该让出？」**
+  答：`scheduler.isInputPending()`（实验性）可检测是否有待处理输入，有就提前让出；更通用的做法是 PerformanceObserver 监听 longtask，线上看哪段超 50ms 再针对性拆。
+
 ---
 
 ## Generator
@@ -550,6 +643,59 @@ function run(gen) {
   return step(it.next());
 }
 ```
+
+### Q12b: 异步迭代器与 `for await...of`？怎么消费流式数据？⭐⭐⭐
+
+**答：** 同步迭代器靠 `[Symbol.iterator]` + `next()` 返回 `{value, done}`；**异步迭代器**靠 `[Symbol.asyncIterator]`，`next()` 返回的是 **Promise**。`for await...of` 就是「每轮 await 一次 next()」的语法糖：
+
+```javascript
+// 手写异步迭代器：每秒吐一个数
+const asyncCounter = {
+  [Symbol.asyncIterator]() {
+    let i = 0;
+    return {
+      next() {
+        return new Promise(resolve =>
+          setTimeout(() => resolve({ value: i++, done: i > 5 }), 1000)
+        );
+      }
+    };
+  }
+};
+
+for await (const n of asyncCounter) {
+  console.log(n);   // 0,1,2,3,4 每隔 1s 一个
+}
+```
+
+**实战：消费 fetch 流式响应（AI 流式输出 / 大文件下载）**
+
+```javascript
+// ReadableStream 本身就是异步可迭代的（现代浏览器）
+const res = await fetch('/api/chat-stream');
+for await (const chunk of res.body) {
+  // chunk 是 Uint8Array，需解码
+  const text = new TextDecoder().decode(chunk, { stream: true });
+  appendToUI(text);   // 边收边渲染，不等整个响应
+}
+
+// 手动读法（需要更细控制时）
+const reader = res.body.getReader();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  process(value);
+}
+```
+
+**追问链：**
+
+- **「`for await` 里 break/throw 会发生什么？」**
+  答：会隐式调用迭代器的 `return()` 做清理（释放 reader、关连接）。如果清理逻辑自己又抛错，会**替换掉原始错误**——这是深水区「静默丢失」的第⑤种形态。
+- **「异步迭代器能并发吗？」**
+  答：`for await` 是**串行**的（等上一个 next 完成才取下一个）。要并发消费多个流，用 `Promise.all` 包多个迭代，或把流 merge 成一个（如 RxJS 的 mergeMap）。**「for await 天然背压」**——消费慢就自动暂停生产，这是它相对「一次性 buffer 全部数据」的优势。
+- **「Node 里哪些东西是异步可迭代的？」**
+  答：`fs.createReadStream()`、HTTP 请求对象、MongoDB 游标、`readline` 接口都实现了 asyncIterator，可以直接 `for await (const line of rl)` 逐行处理大文件，不用一次性读进内存。
 
 ---
 
@@ -714,6 +860,8 @@ Promise.all([a(), b()]).catch(() => {}); // a 失败后 b 仍在跑、仍占资�
 | `setTimeout(fn, 0)` 实际等了 4ms+ | 浏览器嵌套层级钳制、后台标签页节流 | 精确调度用 postMessage/MessageChannel 替代 |
 | Node 里服务偶发卡顿 | nextTick 递归饿死 I/O / 同步 fs 阻塞 | 检查 nextTick 递归，替换为异步 fs API |
 | 定时器越走越偏 | setTimeout 漂移累积 | 用「下一次基于目标时间戳重算」的自校正定时器 |
+| race 超时后请求还在跑 | race 只是不等，不取消原请求 | 配 AbortController / AbortSignal.timeout 真取消 |
+| 拆长任务用了 await Promise.resolve 仍卡 | 微任务不让出渲染 | 用宏任务级让出：scheduler.yield / MessageChannel |
 
 ## 深水区追问（2026 补充）
 
@@ -745,6 +893,10 @@ INP 测的是**一次交互的全链路**：输入延迟（从用户操作到事
 8. forEach + async 会得到什么结果？正确写法有哪两种？
 9. `Promise.all` 有一个失败时，其他任务会停止吗？怎么真正取消？
 10. 手写并发控制器时，怎么加「失败重试」和「整体取消」？
+11. all/allSettled/race/any 的选型？race 超时为什么必须清定时器、为什么不等于取消？
+12. 顶层 await 的死锁风险？try 里 return promise 和 return await 的捕获差异？
+13. 让出主线程为什么不能用微任务？setTimeout/MessageChannel/scheduler.yield 的差别？
+14. for await...of 的串行语义与背压？怎么消费 fetch 流式响应？
 
 ---
 
@@ -781,6 +933,10 @@ I/O / UI 渲染
 | async/await | Generator + Promise 语法糖 |
 | Promise.all | 全部成功才成功 |
 | Promise.race | 第一个完成的结果 |
+| 静态方法选型 | all 缺一不可 / allSettled 容错 / race 竞速 / any 容灾 |
+| 超时 vs 取消 | race 只是不等；真取消靠 AbortSignal.timeout |
+| 让出主线程 | 微任务不让渲染；scheduler.yield 首选，MessageChannel 降级 |
+| 异步迭代 | for await 串行 + 背压；ReadableStream 流式消费 |
 
 > [!TIP]
 > 下一篇：[Vue 框架面试题](/blog/posts/interview-guide-04-vue/)

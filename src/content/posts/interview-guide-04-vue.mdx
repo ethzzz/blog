@@ -1,14 +1,14 @@
 ---
 title: 'Vue 框架面试题（中高级）'
 published: 2026-09-15T14:00:00+08:00
-description: '深入讲解 Vue2/Vue3 响应式原理、虚拟 DOM、Diff 算法、生命周期、组件通信、Vuex/Pinia 等高频面试题。'
+description: '深入讲解 Vue2/Vue3 响应式原理、watch/watchEffect、虚拟 DOM、Diff 与编译优化（PatchFlags/Block Tree）、生命周期、nextTick、组件通信、keep-alive、路由模式、Vuex/Pinia 等高频面试题。'
 tags: [前端面试, Vue, 响应式, 虚拟DOM, Pinia]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 30+ 道 Vue 框架面试题，涵盖 Vue2 和 Vue3，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 35+ 道 Vue 框架面试题，涵盖 Vue2 和 Vue3，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -314,6 +314,52 @@ const { list } = toRefs(state); // ✅ 保持响应式
 - **「`ref` 放进 `reactive` 里还要 `.value` 吗？」**
   答：不用。`reactive` 在 get 时会对「值为 ref 的属性」自动解包，所以 `state.count` 直接可用。但**数组/Map 里的 ref 不会自动解包**，`arr[0]` 仍是 ref 对象——这是最容易让人困惑的不一致，官方文档也明确标注了。
 
+### Q5b: watch 和 watchEffect 的区别？flush 的三个时机怎么选？⭐⭐ 🔥
+
+**答：**
+
+| 维度 | `watch` | `watchEffect` |
+|:--|:--|:--|
+| 依赖来源 | **显式指定**源（ref/getter/数组） | **自动收集**回调里读到的所有响应式依赖 |
+| 首次执行 | 默认不执行（`immediate: true` 才执行） | 立即执行一次（为了收集依赖） |
+| 拿旧值 | 回调有 `(newVal, oldVal)` | 拿不到旧值 |
+| 适用 | 精确监听某几个值、需要新旧对比 | 副作用依赖多且懒得逐个列 |
+
+```javascript
+// watch：精确监听 + 旧值
+watch(() => state.count, (n, o) => console.log(o, '->', n));
+watch([a, b], ([na, nb], [oa, ob]) => {});   // 多源
+
+// watchEffect：自动追踪，立即跑一次
+watchEffect(() => {
+  console.log(state.count, state.name);  // 读了谁就追踪谁
+});
+```
+
+**flush 三个时机（决定回调在渲染前还是后跑）：**
+
+| flush | 执行时机 | 典型用途 |
+|:--|:--|:--|
+| `'pre'`（默认） | 组件更新**前** | 大多数场景；此时读 DOM 是旧的 |
+| `'post'` | 组件更新**后**（DOM 已就绪） | 回调里要操作更新后的 DOM、测量尺寸 |
+| `'sync'` | 数据一变**同步**执行 | 极少数必须同步的场景；**慎用**，失去批处理、易死循环 |
+
+```javascript
+// 回调里要读更新后的 DOM → 必须 post（等价于 nextTick 后再跑）
+watch(source, () => {
+  console.log(el.offsetHeight);   // 拿到新布局
+}, { flush: 'post' });
+```
+
+**追问链：**
+
+- **「watch 监听 reactive 对象，为什么默认拿不到深层变化？」**
+  答：直接 `watch(obj, cb)` 时 Vue 会**自动开 deep**（监听整个代理），但 `watch(() => obj.a, cb)` 这种 getter 只追踪 `a`，`a` 内部嵌套变化不触发——要 `{ deep: true }` 或改成监听 `() => obj.a.b`。**「getter 返回对象才需要手动 deep」**是易混点。
+- **「watchEffect 里条件分支读了依赖，会怎样？」**
+  答：依赖收集是「运行时读到才算」。`if (flag) read(a) else read(b)` 只会追踪当前分支读到的那个，flag 切换后重新收集——所以它天然「按需追踪」，但也意味着**没读到的依赖变化不会触发**，别指望它监听所有字段。
+- **「watch 的清理函数（onCleanup）解决什么？」**
+  答：竞态。异步回调回来时源可能已变，用 `onCleanup` 注册取消逻辑（abort 上一次请求/置失效标志），Vue 会在下次回调前或停止监听时调用它——等价于 React useEffect 的 return 清理。
+
 ---
 
 ## 虚拟 DOM 与 Diff
@@ -496,6 +542,62 @@ for (let i = toBePatched - 1; i >= 0; i--) {
 - **「那 key 到底影响哪一步？」**
   答：只影响第 ⑤ 步的 map 查找与 LIS 结果。没有 key 时只能按索引对齐（就地复用），一旦顺序变了就是「内容全错位 + 全部重渲染」；用 index 做 key 等价于没有 key（因为索引永远连续），列表插入/删除时同样会错位。
 
+### Q7c: Vue3 编译器做了哪些优化？PatchFlags / 静态提升 / Block Tree 是什么？⭐⭐⭐ 🔥
+
+**答：** Vue3 快的核心不只是 Proxy 和 LIS，更是「**编译时就知道哪里会变，运行时只 diff 会变的部分**」——这叫**靶向更新（targeted update）**。三大手段：
+
+**① 静态提升（Static Hoisting）**
+
+```javascript
+// 模板里的静态节点，编译后提到 render 函数外，只创建一次
+const _hoisted_1 = /*#__PURE__*/_createElementVNode("p", null, "静态文字", -1 /* HOISTED */)
+
+function render() {
+  // 每次渲染复用 _hoisted_1，不再重新创建 vnode
+  return (_openBlock(), _createElementBlock("div", null, [
+    _hoisted_1,
+    _createElementVNode("p", null, _toDisplayString(ctx.msg), 1 /* TEXT */)
+  ]))
+}
+```
+
+**② PatchFlags（补丁标记）—— 每个动态 vnode 带一个数字标记**
+
+| Flag | 值 | 含义：运行时只需检查这一项 |
+|:--|:--|:--|
+| TEXT | 1 | 只有文本会变 |
+| CLASS | 2 | 只有 class 会变 |
+| STYLE | 4 | 只有 style 会变 |
+| PROPS | 8 | 只有特定 props 会变（还附带动态 prop 名数组） |
+| FULL_PROPS | 16 | 有 key 动态，需全量 diff props |
+| STABLE_FRAGMENT | 64 | 子节点顺序不变的 fragment |
+
+```javascript
+// 运行时 patch 看到 flag=1，直接比文本，跳过 class/style/props 全部检查
+if (patchFlag & 1 /* TEXT */) {
+  if (n1.children !== n2.children) hostSetText(el, n2.children);
+}
+```
+
+**③ Block Tree（区块树）—— 把「全树遍历」降为「只遍历动态节点」**
+
+```
+传统 diff：递归整棵 vnode 树，静态节点也要走一遍
+Block Tree：
+  每个「结构稳定」的节点（带 PatchFlag 或组件根）成为一个 Block
+  Block 内部把所有动态后代收集进一个扁平数组 dynamicChildren
+  更新时：只遍历 dynamicChildren，静态节点整棵跳过
+```
+
+**追问链：**
+
+- **「为什么 `v-if`/`v-for` 会『切断』Block？」**
+  答：Block 的前提是「结构稳定」。`v-if` 切换会增删节点、`v-for` 长度会变，结构不稳定就没法用扁平数组追踪——所以它们各自成为新的 Block 边界。这也是「`v-if` 和 `v-for` 别同用」之外的另一层编译原理。
+- **「PatchFlags 和 React 的 memo 有什么本质不同？」**
+  答：React 靠**运行时**比较 props（memo）或开发者手动声明依赖；Vue3 靠**编译时**分析模板，自动给每个节点打标记，开发者零心智负担。代价是 Vue 的优化强依赖模板编译——**手写 render 函数 / JSX 会丢失大部分编译优化**（没有静态分析），这是「为什么 Vue 推荐模板而非 JSX」的性能理由。
+- **「`-1 /* HOISTED */` 和 `64 /* STABLE_FRAGMENT */` 这些负数/特殊值干嘛的？」**
+  答：是编译器的内部标记：-1 表示已提升的静态节点（运行时直接跳过），-2 表示带缓存的静态 vnode。面试能说出「负数是跳过标记」即可，不用背全表。
+
 ---
 
 ## 生命周期
@@ -569,6 +671,53 @@ export default {
 // 销毁过程
 父 beforeDestroy -> 子 beforeDestroy -> 子 destroyed -> 父 destroyed
 ```
+
+### Q9b: nextTick 的实现原理？为什么改数据后要在 nextTick 里读 DOM？⭐⭐ 🔥
+
+**答：** 因为 Vue 的更新是**异步批处理**的：`trigger` 把组件的更新 effect 推进微任务队列，同一轮里多次改数据只触发一次渲染。所以改完数据**同步读 DOM 拿到的是旧值**，`nextTick` 就是「等这次渲染完成后再执行」的钩子。
+
+```javascript
+count.value++;
+console.log(el.textContent);        // 旧值！渲染还没发生
+await nextTick();
+console.log(el.textContent);        // 新值，渲染已完成
+```
+
+**实现原理（降级链）：**
+
+```javascript
+// 简化：nextTick 本质是把回调推进微任务队列，排在更新 effect 之后
+const callbacks = [];
+let pending = false;
+
+function nextTick(cb) {
+  callbacks.push(cb);
+  if (!pending) {
+    pending = true;
+    // 优先 Promise.then（微任务），降级 MutationObserver → setImmediate → setTimeout
+    Promise.resolve().then(flushCallbacks);
+  }
+}
+
+function flushCallbacks() {
+  pending = false;
+  const copies = callbacks.slice(0);
+  callbacks.length = 0;
+  copies.forEach(cb => cb());
+}
+```
+
+**关键：为什么 nextTick 的回调一定在渲染之后？**
+因为更新 effect 先入队、nextTick 回调后入队，微任务按 FIFO 清空——更新先跑完，回调才执行。Vue3 里 `nextTick()` 不传回调时返回 Promise，就是 `await` 当前这轮微任务队列刷完。
+
+**追问链：**
+
+- **「nextTick 和 `flush: 'post'` 的 watch 什么关系？」**
+  答：目的相同（DOM 更新后执行），机制不同：nextTick 是「手动等一轮」，post-watch 是「声明式地在每次更新后跑」。一次性操作用 nextTick，持续监听用 post-watch。
+- **「Vue2 为什么用过 MutationObserver / setImmediate？」**
+  答：历史降级链——早期要兼容不支持 Promise 的环境，且某些场景微任务优先级过高会饿死 I/O，曾尝试宏任务方案。Vue3 已统一为 Promise 微任务。**面试答「微任务 + 降级链」即可，不用背 MutationObserver 细节**。
+- **「连续改三次数据，nextTick 回调执行几次？」**
+  答：一次。三次 trigger 的更新 effect 被去重合并，nextTick 回调也只入队一次（同一轮 pending 期间不重复调度）——这正是批处理的意义。
 
 ---
 
@@ -764,6 +913,56 @@ methods: {
 }
 ```
 
+### Q12b: keep-alive 的实现原理？LRU 缓存怎么工作？⭐⭐⭐
+
+**答：** keep-alive 是 Vue 内置的**抽象组件**（不渲染真实 DOM、不出现在父组件链），它把被包裹组件的 **vnode 和组件实例缓存起来**，切换时不销毁而是「 deactivated → 重新 activated」。
+
+```
+首次进入 A：创建实例 → 渲染 → 缓存 { key: A, vnode, instance }
+切到 B：A 不卸载，触发 onDeactivated，DOM 移入隐藏容器
+切回 A：命中缓存 → 取出实例 → DOM 移回 → 触发 onActivated（不重新 created/mounted）
+```
+
+**LRU（最近最少使用）淘汰策略：**
+
+```javascript
+// keep-alive 内部简化：cache + keys 数组
+const cache = new Map();   // key → vnode
+const keys = new Set();    // 维护访问顺序
+
+function cacheSubtree(key, vnode) {
+  if (cache.has(key)) {
+    keys.delete(key);      // 命中：移到最新
+  } else if (keys.size >= max) {
+    // 超上限：淘汰最久未用的（keys 里第一个）
+    const oldest = keys.values().next().value;
+    pruneCacheEntry(cache.get(oldest));   // 真正卸载该实例
+    keys.delete(oldest);
+    cache.delete(oldest);
+  }
+  cache.set(key, vnode);
+  keys.add(key);
+}
+```
+
+**三个属性 + 两个钩子：**
+
+| 配置/钩子 | 作用 |
+|:--|:--|
+| `include` / `exclude` | 按组件名正则/数组/字符串决定缓存谁 |
+| `max` | 缓存上限，触发 LRU 淘汰 |
+| `onActivated` | 缓存组件重新进入时（替代 mounted 做刷新） |
+| `onDeactivated` | 离开时（暂停定时器/视频，省资源） |
+
+**追问链：**
+
+- **「为什么 keep-alive 缓存后数据不刷新？」**
+  答：因为切回时**不走 created/mounted**，只走 onActivated。如果拉数据写在 mounted 里，第二次进入就不执行了——要把刷新逻辑放 onActivated，或用 `:key` 强制重建。这是最高频的 keep-alive 坑。
+- **「include 匹配的是什么？」**
+  答：组件的 **name 选项**（`<script setup>` 里需用 `defineOptions({ name: 'X' })` 或额外 script 块声明），不是文件名/路由名。匹配不上就静默不缓存——「配了 include 却没缓存」多半是 name 没对上。
+- **「keep-alive 缓存的组件会内存泄漏吗？」**
+  答：会，如果不在 onDeactivated 里暂停定时器/监听/动画。缓存意味着实例长期存活，mounted 里注册的副作用不会随切换自动清理。max 也要设，否则路由越多缓存越多。
+
 ---
 
 ## Vue Router
@@ -825,6 +1024,46 @@ export default {
 };
 ```
 
+### Q13b: hash 模式和 history 模式的区别？为什么 history 要服务端配置？⭐⭐ 🔥
+
+**答：**
+
+| 维度 | hash 模式 | history 模式 |
+|:--|:--|:--|
+| URL 形态 | `example.com/#/user/1` | `example.com/user/1` |
+| 原理 | `location.hash` + `hashchange` 事件 | `history.pushState/replaceState` + `popstate` |
+| 是否发请求 | hash 变化**不发请求**（# 后不属于路径） | pushState 不发请求，但**刷新/直接访问会发请求** |
+| 服务端配置 | 不需要 | **必须配 fallback** |
+| SEO/美观 | # 不优雅，爬虫忽略 hash | 干净路径，SEO 友好 |
+
+**为什么 history 模式刷新会 404？**
+
+```
+用户直接访问 example.com/user/1（或刷新）
+→ 浏览器向服务器请求 /user/1 这个真实路径
+→ 服务器上并没有 /user/1 这个文件/路由
+→ 404
+
+解法：服务端把所有「非静态资源」的请求都回退到 index.html，
+让前端路由接管解析。
+```
+
+```nginx
+# Nginx 配置（history 模式必备）
+location / {
+  try_files $uri $uri/ /index.html;   # 找不到文件就回 index.html
+}
+```
+
+**追问链：**
+
+- **「pushState 会触发 popstate 吗？」**
+  答：不会。`pushState/replaceState` 只改 URL 和历史栈，**不触发 popstate**；只有用户点前进/后退（或 `history.back()`）才触发 popstate。所以前端路由要「主动监听 popstate + 拦截链接点击调 pushState」两条腿走路。
+- **「hash 模式为什么 SEO 不友好？」**
+  答：搜索引擎爬虫传统上忽略 `#` 后的内容（视为同一页面的锚点），所有 hash 路由在爬虫眼里都是同一个 URL。history 模式每个路径是独立 URL，可被分别收录——这也是 SSR/SSG 常配 history 的原因。
+- **「history 模式的 base 路径怎么配？」**
+  答：部署在子目录（如 `/app/`）时，`createWebHistory('/app/')` 要传 base，Nginx 的 fallback 也要指向 `/app/index.html`，否则资源路径和回退全错。
+
 ---
 
 ## 常见坑速查表
@@ -841,6 +1080,9 @@ export default {
 | provide 的值不是响应式 | provide 了普通值 | provide 一个 ref/reactive，或 `readonly` 包装响应式对象 |
 | keep-alive 缓存后数据不刷新 | `onActivated` 没做重新拉取 | 用 `onActivated` 触发刷新，或用 `:key` 控制缓存粒度 |
 | 大列表滚动卡顿 | 一次渲染全部节点 | 虚拟滚动（vue-virtual-scroller / vueuc） |
+| history 模式刷新 404 | 服务器没有该真实路径 | Nginx `try_files ... /index.html` 回退 |
+| watch 回调里读 DOM 是旧值 | 默认 flush:'pre' 在渲染前跑 | 改 `{ flush: 'post' }` 或 nextTick |
+| keep-alive include 配了却不缓存 | 匹配的是组件 name 不是文件名 | `defineOptions({ name })` 声明组件名 |
 
 ## 深水区追问（2026 补充）
 
@@ -884,6 +1126,11 @@ export default {
 8. 没有 key、用 index 当 key、用业务 id 当 key，三者在 diff 结果上的差别？
 9. 父子组件 mounted 的执行顺序？父组件 onMounted 时子组件 DOM 一定就绪吗？
 10. `v-if` 与 `v-for` 同用时，Vue3 里谁优先？正确写法是什么？
+11. watch 与 watchEffect 的依赖收集差异？flush 的 pre/post/sync 分别何时跑？
+12. PatchFlags 和 Block Tree 怎么把全树 diff 降为靶向更新？为什么 JSX 会丢优化？
+13. nextTick 为什么能保证读到新 DOM？它的降级链和批处理去重？
+14. keep-alive 的 LRU 淘汰怎么工作？为什么缓存后要在 onActivated 刷新？
+15. hash 与 history 的原理差异？history 刷新 404 的根因与服务端解法？
 
 ---
 
@@ -899,6 +1146,11 @@ export default {
 | 生命周期 | 父 beforeCreate -> 子 mounted -> 父 mounted |
 | 组件通信 | props/emit、v-model、provide/inject、Pinia |
 | 性能优化 | v-if/v-show、key、懒加载、keep-alive |
+| watch | 显式源 + 旧值；watchEffect 自动追踪；flush post 读新 DOM |
+| 编译优化 | 静态提升 + PatchFlags + Block Tree = 靶向更新 |
+| nextTick | 微任务 FIFO，排在更新 effect 后；批处理去重 |
+| keep-alive | 缓存实例 + LRU(max)；onActivated 刷新；include 匹配 name |
+| 路由模式 | hash 不发请求；history 需 try_files 回退 index.html |
 
 > [!TIP]
 > 下一篇：[React 框架面试题](/blog/posts/interview-guide-05-react/)
