@@ -1,7 +1,7 @@
 ---
 title: '资深前端核心能力问答（双栈 / 图形渲染 / Hybrid / AI 研发）'
 published: 2026-09-16T23:30:00+08:00
-description: '以问答形式沉淀 6 年前端实战经验，覆盖 React/Vue 双栈选型、TypeScript 落地、Next.js SSR/SSG/ISR、Konva/Three.js 图形渲染、Hybrid 硬件跨端、工程化性能、状态管理、BFF 全栈、国际化、AI 辅助研发与部署 SEO 共 24 问。'
+description: '以问答形式沉淀 6 年前端实战经验，覆盖 React/Vue 双栈选型、TypeScript 落地、Next.js SSR/SSG/ISR 生产细节、Konva/Three.js 图形渲染、Hybrid 硬件跨端、工程化性能、状态管理、BFF 全栈、国际化、AI 辅助研发与部署 SEO 共 25 问。'
 tags: [前端面试, 双栈选型, 图形渲染, Hybrid跨端, 工程化, AI研发]
 category: 前端面试宝典
 draft: false
@@ -58,6 +58,13 @@ draft: false
 
 一句话总结：**Vue 把优化做在框架里，React 把优化交给开发者**。这也解释了为什么 React 项目更容易出现"改一处、渲染一片"的性能问题——它是心智模型层面的差异。
 
+**追问与接法：**
+
+- **「Vue 的编译时优化具体做了什么？为什么说它不只是 Proxy？」**
+  答：Vue 3 的模板编译器会做三件事：① **PatchFlag**——编译时标记每个动态节点「哪部分是动态的」（文本/类名/样式），diff 时只对比标记位，跳过静态内容；② **静态提升**——纯静态节点提升到 render 函数外，重渲染直接复用；③ **事件缓存**——内联事件处理器缓存引用，避免子组件因 props 变化无效重渲染。所以 Vue 的精确更新是「Proxy 依赖收集（运行时）+ 编译时标记」两条腿，只答 Proxy 是半个答案。
+- **「React Compiler 出来之后，还需要手写 memo/useMemo 吗？」⭐⭐⭐**
+  答：React Compiler（React 19 配套，2025 年稳定）在构建时自动分析组件与 hook 的依赖，自动插入等价于 memo 的缓存，目标是让「改一处渲染一片」的默认行为消失。但要答出边界：① 它只优化**符合 React 规则的代码**——违反 Rules of React（渲染期改 ref、不纯的组件）会被跳过优化，eslint-plugin-react-compiler 会标出来；② 自动缓存不是零成本， bailout 的组件仍回退手动优化；③ 存量项目可以渐进启用（按目录/文件粒度）。结论话术：「新项目默认开 Compiler，手写 memo 从『日常必需』变成『Compiler 覆盖不到时的兜底』——但理解手动优化的原理仍然是排查 bailout 的前提。」
+
 ### Q3：TypeScript 在大型项目里怎么落地，遇到过哪些深水区问题？⭐⭐⭐
 
 **参考回答**：
@@ -90,6 +97,35 @@ draft: false
 | ISR | 构建时 + 过期后台再生成 | 商品详情、资讯列表 | 有短暂的数据陈旧窗口 |
 
 ISR 原理：页面带 `revalidate` 时间，过期后的**第一个请求仍返回旧页面**（stale），同时后台触发再生成，生成完成后原子替换缓存——即 stale-while-revalidate 策略。它把 SSG 的性能和 SSR 的时效性折中了。
+
+### Q4b: ISR 上生产后会遇到哪些「教程里不讲」的问题？⭐⭐⭐
+
+**参考回答：** ISR 的 demo 很美好，生产有三个坑，都来自「缓存到底存在哪、谁说了算」：
+
+**① 多实例缓存不一致。** Next.js 默认的 ISR 缓存写在**每个实例自己的文件系统**里。部署 3 个 Pod，就有 3 份独立缓存：实例 A 再生成了新页面，实例 B 还在吐旧的，用户刷新一次变一次——负载均衡把「数据陈旧窗口」放大成「数据随机窗口」。解法两条路：
+- 自定义 **cache handler**（Next.js 14+ 的 `cacheHandler` 配置），把增量缓存写到共享存储（Redis/S3），所有实例读同一份；
+- 或者干脆**把缓存职责上移到 CDN**：源站只生成一次，CDN 按 `s-maxage + stale-while-revalidate` 统一分发，源站无状态。
+
+**② 被动过期不够，要主动失效。** `revalidate: 60` 意味着内容改了最多等 60s + 一次请求触发。运营改价、CMS 发文这类场景等不起，用**按需再验证**：
+
+```javascript
+// CMS 发布 webhook → 调 Next.js 的再验证接口
+import { revalidatePath, revalidateTag } from 'next/cache';
+
+export async function POST(req) {
+  const { slug, secret } = await req.json();
+  if (secret !== process.env.REVALIDATE_SECRET) return new Response('forbidden', { status: 403 });
+  revalidatePath(`/products/${slug}`);   // 按路径
+  revalidateTag('product-list');         // 按标签（fetch 时打的 tag）
+  return Response.json({ revalidated: true });
+}
+```
+
+注意多实例下 `revalidatePath` 只作用于**收到请求的那个实例**——共享 cache handler 或 CDN purge 才是全量生效，这和第①点是同一个根因。
+
+**③ 首次访问未生成页面的 fallback。** 动态路由（`/products/[id]`）没预渲染的 id，第一次请求要现场生成：`fallback: 'blocking'` 让用户干等 SSR 全程（TTFB 高但无闪烁），`fallback: true` 先吐骨架再补数据（体验好但要处理加载态）。商品详情页这类 SEO 页面选 blocking——爬虫拿到完整 HTML 优先。
+
+**追问：** 「ISR 和 CDN 的 stale-while-revalidate 是什么关系？」—— 同一个思想的两层实现：ISR 是**源站侧**的 SWR（旧页面先回、后台再生成），CDN 的 `stale-while-revalidate` 是**边缘侧**的 SWR（过期缓存先回、边缘回源刷新）。两层可以叠加，但要统一口径：CDN 的 max-age 必须小于等于源站 revalidate，否则边缘缓存把源站的新页面挡在后面，「再生成了但用户看不到」。
 
 ### Q5：SSR 项目最常见的坑有哪些？⭐⭐⭐
 
@@ -433,7 +469,7 @@ BFF 解决的是"**端的诉求和服务端的领域模型不匹配**"：
 
 ---
 
-## 自测清单（资深面自查，能答上 7 条算过关）
+## 自测清单（资深面自查，能答上 8 条算过关）
 
 1. 双栈选型时，你的判断维度有哪三个？举一个「选你不擅长的那个」的理由。
 2. 「Vue 把优化做在框架里，React 交给开发者」——各自的可观测后果是什么？
@@ -445,13 +481,15 @@ BFF 解决的是"**端的诉求和服务端的领域模型不匹配**"：
 8. 性能预算的数字怎么定？「优化了没提升」怎么归因？
 9. BFF 的三道防故障设计？什么时候该拆 BFF？
 10. 你最近一次「因为踩坑而改变做法」是什么？改变了什么？
+11. ISR 多实例部署为什么会「刷新一次变一次」？两条解法路线？
+12. React Compiler 之后手写 memo 的角色变成什么？它优化不了什么样的代码？
 
 ---
 
 ## 复习卡片速记
 
 > [!TIP]
-> **24 问核心结论一句话速记**
+> **25 问核心结论一句话速记**
 >
 > 1. **双栈选型**：看团队基因 + 业务形态 + 渲染目标，不看"谁更好"
 > 2. **响应式本质**：Vue 把优化做在框架里，React 把优化交给开发者
@@ -477,6 +515,7 @@ BFF 解决的是"**端的诉求和服务端的领域模型不匹配**"：
 > 22. **AI 工具链**：Claude Code 主力 + Skill 固化流程 + MCP 打通内部系统
 > 23. **运维程度**：能独立完成"部署与排障闭环"即可，不需 SRE 深度
 > 24. **SEO**：SSR/SSG 化 + 结构化数据 + 性能即 SEO + 工程细节
+> 25. **ISR 生产**：多实例共享 cache handler / CDN 收口 + 按需 revalidate + fallback 选型
 
 ---
 
@@ -486,6 +525,6 @@ BFF 解决的是"**端的诉求和服务端的领域模型不匹配**"：
 ---
 
 > [!TIP]
-> 上面 24 问给出了"怎么想"的答案，如果想看这些方案**如何完整落地**（四层架构、求解器代码、CanvasTexture 单向数据流、N-API 桥接、离线包 manifest、AI 协作流），请继续阅读实战深化篇：[前端深水区实战](/blog/posts/interview-guide-21-frontend-deep-practice/)，把五个最有复用价值的实践从"分析 → 设计 → 落地 → 治理"完整拆解。
+> 上面 25 问给出了"怎么想"的答案，如果想看这些方案**如何完整落地**（四层架构、求解器代码、CanvasTexture 单向数据流、N-API 桥接、离线包 manifest、AI 协作流），请继续阅读实战深化篇：[前端深水区实战](/blog/posts/interview-guide-21-frontend-deep-practice/)，把五个最有复用价值的实践从"分析 → 设计 → 落地 → 治理"完整拆解。
 >
 > 返回 [面试宝典总览](/blog/posts/interview-guide-00-overview/) | [面试宝典合集页](/blog/interview-guide/)

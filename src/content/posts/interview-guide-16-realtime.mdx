@@ -1,14 +1,14 @@
 ---
 title: '实时通信面试题（WebSocket/SSE/WebRTC）'
 published: 2026-09-16T20:00:00+08:00
-description: '讲解 WebSocket 协议与握手、心跳重连、SSE、长轮询对比、Socket.IO、WebRTC P2P、协同编辑（OT/CRDT）、直播弹幕等实时通信场景。'
+description: '讲解 WebSocket 协议与握手、帧协议与掩码、心跳重连、鉴权安全、SSE、长轮询对比、Socket.IO 多实例部署、WebRTC P2P、协同编辑（OT/CRDT）、直播弹幕等实时通信场景。'
 tags: [前端面试, WebSocket, SSE, WebRTC, 实时通信]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 18+ 道实时通信面试题，覆盖聊天、通知、协同编辑、直播、多人游戏等场景，是差异化竞争的加分模块。难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 21+ 道实时通信面试题，覆盖聊天、通知、协同编辑、直播、多人游戏等场景，是差异化竞争的加分模块。难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -94,6 +94,41 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
 - Sec-WebSocket-Key/Accept 用于防止普通 HTTP 请求误升级
 - 建立后全双工，客户端和服务端都可以主动发消息
 ```
+
+### Q2b: WebSocket 帧协议长什么样？为什么客户端必须掩码？⭐⭐⭐
+
+**答：** 握手之后传的不是 HTTP，是二进制帧。能画出帧结构、说清掩码的动机，这题就从「背过握手」升级到「懂协议」。
+
+```
+帧结构（RFC 6455）：
+ 0               1               2               3
+ 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
++-+-+-+-+-------+-+-------------+-------------------------------+
+|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+|I|S|S|S|  (4)  |A|     (7)     |            (16/64)            |
+|N|V|V|V|       |S|             |                               |
+| |1|2|3|       |K|             |                               |
++-+-+-+-+-------+-+-------------+-------------------------------+
+|     Masking-key (0 or 4 bytes)  |          Payload Data         |
++---------------------------------------------------------------+
+
+关键字段：
+- FIN：是否消息的最后一帧（分片用）
+- opcode：0x1 文本 / 0x2 二进制 / 0x8 关闭 / 0x9 ping / 0xA pong / 0x0 延续帧
+- MASK：客户端→服务端的帧必须置 1，并带 4 字节掩码键
+- Payload len：7 位（≤125）/ 16 位（126）/ 64 位（127）三档长度
+```
+
+**为什么客户端必须掩码（masking）？** 不是加密——掩码键就在帧里明文传着，谁都能解开。它防的是**缓存投毒**：早期透明代理可能把 WebSocket 流量误当 HTTP 缓存，攻击者构造一段「看起来像 HTTP 响应」的 payload，诱导代理缓存后污染其他用户。逐帧用随机掩码异或后，payload 在中间设备眼里是随机字节，无法被识别成 HTTP 报文。服务端→客户端的帧不掩码（服务端没有这个攻击面，省 CPU）。
+
+**追问链：**
+
+- **「浏览器 JS 能发原生 ping 帧吗？」**
+  答：不能。`WebSocket` API 没有暴露控制帧接口，ping/pong 由浏览器内核自动处理（收到服务端 ping 会自动回 pong）。所以应用层心跳要自己定义 `{type:'ping'}` 文本消息——这也是 Q4 心跳代码用 JSON 而不是协议帧的原因。
+- **「大消息怎么传？分片机制是什么？」**
+  答：发送方可以把一条消息拆成多帧：首帧带真实 opcode + FIN=0，中间帧 opcode=0x0（延续帧），末帧 FIN=1。接收方按序拼装。意义是**多路复用**：大文件传输的分片之间可以插入高优先级的小消息（如心跳、聊天），不必等大消息传完。浏览器 API 自动处理分片，`onmessage` 收到的是完整消息。
+- **「TCP 不是可靠传输吗，为什么应用层还要 ACK？」**
+  答：TCP 保证的是「字节流到达对端内核」，不保证「对端应用处理成功」——进程崩溃、消息处理抛异常、连接半开（写成功但对端已死）都会丢业务消息。所以 IM 的 ACK 是**应用层语义**：服务端落库成功才回 ACK，和 TCP 的 ACK 是两层完全不同的保证。
 
 ### Q3: WebSocket API 与常见用法？⭐ 🔥
 
@@ -310,6 +345,38 @@ upstream backend_ws {
 # 或者使用 sticky session（Nginx Plus / OpenResty）
 ```
 
+### Q6b: WebSocket 怎么做鉴权？有哪些安全注意点？⭐⭐⭐ 🔥
+
+**答：** WebSocket 握手是一个普通 HTTP 请求，但浏览器 `new WebSocket(url)` **不能带自定义 header**——这是鉴权设计的核心约束。三种方案：
+
+| 方案 | 做法 | 优缺点 |
+|:--|:--|:--|
+| Cookie | 同域 Cookie 随握手自动携带，服务端握手时校验 | 最省事；但跨域要处理 SameSite，且天然暴露 CSRF 面（必须校验 Origin） |
+| URL 参数 | `wss://host/ws?token=xxx` | 简单直接；**token 会进 Nginx 访问日志、浏览器历史、Referer**，只适合短命一次性 ticket |
+| 首条消息鉴权 | 先建连，`onopen` 后发 `{type:'auth', token}`，服务端限时（如 5s）未认证就断开 | token 不落日志，最常用；代价是未认证连接也占资源，必须配超时清理 |
+
+生产推荐组合：**短命 ticket（URL）换长连接，或首条消息鉴权 + 未认证超时踢除**。ticket 模式：先走普通 HTTPS 接口用登录态换一次性 ticket（30s 有效、用后即焚），再 `wss://host/ws?ticket=xxx`——日志里泄露的也只是已失效的 ticket。
+
+**安全清单：**
+
+```
+1. 必须 wss（TLS）：ws 明文可被中间人读改，且更容易被代理拦截
+2. 校验 Origin 头：WebSocket 不受同源策略保护！
+   任何网站的 JS 都能向你的 ws 服务发起连接并带上用户 Cookie
+   ——这就是「跨站 WebSocket 劫持」（CSWSH），防御靠服务端白名单校验 Origin
+3. 消息级限流：单连接消息频率/大小上限，防恶意客户端刷爆服务端
+4. 认证前不分配业务资源：未认证连接不进房间、不占路由表
+5. token 过期处理：长连接期间 token 过期，服务端发 auth.expired 事件，
+   客户端走刷新流程重新认证，而不是直接断连（体验）或直接放行（安全）
+```
+
+**追问链：**
+
+- **「为什么说 WebSocket 没有同源策略？」**
+  答：同源策略限制的是「读响应」（XHR/fetch 拿不到跨域响应体），而 WebSocket 是建连后双向通信，浏览器不拦跨域建连——恶意页面 `new WebSocket('wss://bank.com/ws')` 会自动带上用户在 bank.com 的 Cookie，连接建立后就能以用户身份收发消息。所以服务端**必须**校验 `Origin`，这是和 HTTP 接口 CSRF 防御同源但更容易被漏掉的一环。
+- **「连接数被恶意刷怎么办？」**
+  答：四层递进：单 IP 并发连接上限（Nginx `limit_conn`）→ 未认证连接 5s 超时 → 认证后单用户连接数上限（多端登录策略）→ 消息速率限制。注意 WebSocket 的连接成本远高于 HTTP 请求（常驻内存 + 文件描述符），限流阈值要按「连接」而不是「QPS」设计。
+
 ### Q7: Socket.IO 相比原生 WebSocket 有什么优势？⭐⭐
 
 ```
@@ -347,6 +414,47 @@ socket.to('room-1').emit('chat', msg);         // 房间内广播
 - 与第三方标准 WebSocket 服务对接 → 原生 WebSocket
 - 极致性能 / 二进制协议 → 原生 WebSocket + Protobuf
 ```
+
+### Q7b: Socket.IO 多实例部署为什么必须 sticky session？房间广播怎么跨实例？⭐⭐⭐
+
+**答：** 两个独立问题，根因都是「状态在单机内存里」。
+
+**① 为什么必须 sticky session：** Socket.IO 默认先走 HTTP 长轮询再升级 WebSocket。一次「连接」在轮询阶段是**多个独立 HTTP 请求**（发一条、收一条），会话状态（sid、缓冲区）存在接受握手的那台实例内存里。负载均衡把后续请求轮转到另一台，那台不认识这个 sid，直接报 `Session ID unknown`。所以多实例必须让同一客户端的所有请求落到同一台：
+
+```nginx
+upstream socketio {
+    ip_hash;                          # 按客户端 IP 固定路由
+    server 10.0.0.1:3000;
+    server 10.0.0.2:3000;
+}
+# 注意：客户端都从同一出口 NAT 出来时 ip_hash 会倾斜，
+# 可改用 hash $cookie_io consistent;（Socket.IO 的 io cookie 就是 sid）
+```
+
+如果能保证客户端**只用 WebSocket 传输**（`transports: ['websocket']`），一条 TCP 连接天然固定在一台机器上，可以不做 sticky——这是很多团队「升级后就不需要 ip_hash」的原因。
+
+**② 房间广播怎么跨实例：** `socket.join('room')` 的房间表也在单机内存。实例 A 上的用户给 room-1 发消息，实例 B 上同房间的用户收不到。解法是 **Redis Adapter**：
+
+```javascript
+import { createAdapter } from '@socket.io/redis-adapter';
+import { createClient } from 'redis';
+
+const pubClient = createClient({ url: 'redis://localhost:6379' });
+const subClient = pubClient.duplicate();
+await Promise.all([pubClient.connect(), subClient.connect()]);
+
+io.adapter(createAdapter(pubClient, subClient));
+// 之后 io.to('room-1').emit(...) 自动经 Redis Pub/Sub 扩散到所有实例
+```
+
+原理：每个实例订阅 Redis 频道，`emit` 时把「房间 + 事件 + 数据」发布出去，各实例收到后只投递给**自己机器上**属于该房间的连接。
+
+**追问链：**
+
+- **「Redis Adapter 的广播会丢消息吗？」**
+  答：会。Redis Pub/Sub 是 fire-and-forget，订阅端断连期间的消息直接丢。所以它只解决「在线实时扩散」，可靠性仍要靠 Q13 的「落库 + seq 拉取补偿」——推送是加速，拉取是兜底，这两层不能互相替代。
+- **「原生 WebSocket 多实例需要这些吗？」**
+  答：不需要 sticky（一条 TCP 连接本来就固定在一台），但**同样需要跨实例消息路由**——自己维护连接路由表 + Redis Pub/Sub（深水区第三问展开）。Socket.IO Adapter 只是把这套 plumbing 产品化了。
 
 ---
 
@@ -694,6 +802,23 @@ IM 系统三大难题：不丢、不重、有序
 
 ---
 
+## 常见坑速查表
+
+| 现象 | 根因 | 解法 |
+|:--|:--|:--|
+| WebSocket 连上后 60s 准时断开 | Nginx `proxy_read_timeout` 默认 60s，空闲即断 | 调大超时 + 应用层心跳间隔小于链路上最小空闲超时 |
+| 握手成功但立刻被断开 | 反代没传 Upgrade/Connection 头，或没开 HTTP/1.1 | `proxy_http_version 1.1` + 两个头必配 |
+| Socket.IO 多实例报 Session ID unknown | 轮询请求被轮转到不同实例 | sticky session（ip_hash / hash $cookie_io）或只用 websocket 传输 |
+| 房间广播只有部分人收到 | 房间表在单机内存，跨实例不互通 | Redis Adapter；可靠性另配落库 + seq 补偿 |
+| 弱网下消息「已发送」但对方没收到 | TCP 写成功 ≠ 对端应用处理成功 | 应用层 ACK + 超时重发（相同 msg_id 幂等） |
+| 重连后消息重复/乱序 | 补发与实时推送交叉 | 客户端按 seq 排序 + msg_id 去重，补发走拉取通道 |
+| SSE 消息攒着一批才到 | Nginx `proxy_buffering` 默认开启 | SSE location 单独 `proxy_buffering off` + `X-Accel-Buffering: no` |
+| EventSource 带不上 Authorization | API 不支持自定义 header | Cookie / 一次性 ticket URL / 改 fetch + ReadableStream |
+| 页面开几个 SSE 后普通请求全排队 | HTTP/1.1 同域 6 连接被长连接占满 | 上 HTTP/2，或收敛为单条 WebSocket |
+| 服务端内存暴涨、推送延迟越来越大 | 慢消费者缓冲堆积，没有背压 | 监控 bufferedAmount/writableLength，按业务选丢帧/聚合/踢重连 |
+| 恶意网站能连上你的 ws 并以用户身份发消息 | WebSocket 不受同源策略保护，Cookie 自动携带 | 服务端校验 Origin 白名单（CSWSH 防御） |
+| 手机切 WiFi→4G 后长时间收不到消息 | TCP 半开连接，客户端不知道已断 | 心跳 pong 超时主动 close 触发重连 + online 事件立即重连 |
+
 ## 深水区追问（2026 补充）
 
 **Q：通知走 SSE、聊天走 WebSocket，这种双通道方案的真实成本在哪？**
@@ -723,6 +848,23 @@ SSE 一侧同理：`res.write()` 返回 `false` 说明内核缓冲满了，要�
 
 ---
 
+## 自测清单（能答上 10 条算过关）
+
+1. 五种通信方式各自的适用场景？「AI 流式响应」为什么首选 SSE 而不是 WebSocket？
+2. `Sec-WebSocket-Accept` 怎么算？它防的是什么攻击？
+3. 客户端帧为什么必须掩码？掩码是加密吗？
+4. 心跳间隔怎么定？为什么 TCP keepalive 不能替代应用层心跳？
+5. 指数退避重连为什么要加随机抖动？online 事件补的是什么场景？
+6. WebSocket 鉴权三方案的取舍？token 放 URL 有哪三处泄露面？
+7. 什么是跨站 WebSocket 劫持（CSWSH）？为什么同源策略防不住它？
+8. Socket.IO 多实例为什么必须 sticky session？只用 websocket 传输后还需要吗？
+9. Redis Adapter 解决什么、不解决什么？为什么它不能替代消息落库？
+10. IM「不丢、不重、有序」分别靠什么机制？TCP 可靠为什么还不够？
+11. 慢消费者背压的四档策略分别适用什么业务？`bufferedAmount` 在哪一端看？
+12. OT 和 CRDT 的核心差别？为什么 CRDT 能离线编辑而 OT 不行？
+
+---
+
 ## 复习卡片
 
 > [!TIP]
@@ -740,6 +882,9 @@ SSE 一侧同理：`res.write()` 返回 `false` 说明内核缓冲满了，要�
 > 10. **协同编辑**：OT（Google Docs）vs CRDT（Yjs/Figma），后者可离线
 > 11. **弹幕设计**：房间模型 + 分级扩散 + Canvas 渲染 + 限流
 > 12. **IM 可靠性**：ACK + msg_id 去重 + seq 排序 + 离线消息 + 已读回执
+> 13. **帧协议**：FIN + opcode + MASK；客户端掩码防缓存投毒，不是加密
+> 14. **鉴权安全**：首条消息鉴权/一次性 ticket；必须校验 Origin（CSWSH）
+> 15. **Socket.IO 多实例**：sticky session 保轮询会话；Redis Adapter 扩散房间广播
 
 ---
 
