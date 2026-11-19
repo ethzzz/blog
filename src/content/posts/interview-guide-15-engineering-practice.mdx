@@ -1,14 +1,14 @@
 ---
 title: '前端工程化实践面试题（Monorepo/微前端/组件库）'
 published: 2026-09-16T19:00:00+08:00
-description: '讲解 Monorepo 架构、微前端方案选型、组件库设计、npm 发包、代码质量、单元测试、CI/CD、灰度发布等工程化落地实践。'
+description: '讲解 Monorepo 架构、微前端方案选型、组件库设计、npm 发包、依赖安全、代码质量、单元测试、CI/CD、灰度发布、错误监控等工程化落地实践。'
 tags: [前端面试, 工程化, Monorepo, 微前端, 组件库, CI/CD]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 20+ 道前端工程化实践面试题，覆盖从代码组织到发布的完整工程链路，中高级岗位重点考察项。难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 25+ 道前端工程化实践面试题（含追问链），覆盖从代码组织到发布、监控的完整工程链路，中高级岗位重点考察项。难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
@@ -16,9 +16,9 @@ draft: false
 
 | 层级 | 达标标准 | 自测问题 |
 |:--|:--|:--|
-| 浅（说清概念） | 能用自己的话定义术语，方案不混 | ① Monorepo 与 Multirepo 各自的代价是什么？② 微前端的隔离有几层（JS / 样式 / 路由）？③ 组件库为什么同时产出 ESM、CJS、UMD？ |
-| 中（讲机制） | 能画出链路、写出配置、说清每一步在拦什么 | ① pnpm 的三层 node_modules 如何杜绝幽灵依赖？② qiankun 的 HTML Entry、Proxy 沙箱、样式隔离怎么串起来？③ CI 从 push 到灰度上线，每个卡口分别拦什么？ |
-| 深（讲取舍） | 能说出方案边界、失败模式与回滚路径 | ① 增量构建为什么会出现「缓存命中但产物是旧的」？② 微前端号称的样式隔离到底管不管 `body` 和合成事件？③ 静态资源带 hash 发布时 HTML 与 JS 谁先上，回滚按什么顺序？ |
+| 浅（说清概念） | 能用自己的话定义术语，方案不混 | ① Monorepo 与 Multirepo 各自的代价是什么？② 微前端的隔离有几层（JS / 样式 / 路由）？③ 组件库为什么同时产出 ESM、CJS、UMD？④ lockfile 锁的是什么？ |
+| 中（讲机制） | 能画出链路、写出配置、说清每一步在拦什么 | ① pnpm 的三层 node_modules 如何杜绝幽灵依赖？② qiankun 的 HTML Entry、Proxy 沙箱、样式隔离怎么串起来？③ CI 从 push 到灰度上线，每个卡口分别拦什么？④ 错误监控六类错误各用什么采集手段？ |
+| 深（讲取舍） | 能说出方案边界、失败模式与回滚路径 | ① 增量构建为什么会出现「缓存命中但产物是旧的」？② 微前端号称的样式隔离到底管不管 `body` 和合成事件？③ 静态资源带 hash 发布时 HTML 与 JS 谁先上，回滚按什么顺序？④ 供应链攻击的四层防线？压缩堆栈还原为什么依赖 release 对齐？ |
 
 ---
 
@@ -455,6 +455,25 @@ pnpm changeset publish
 // 3. 更好的封装性
 ```
 
+### Q9b: lockfile 到底锁了什么？依赖安全怎么管？⭐⭐ 🔥
+
+**答：** `package.json` 声明的是**版本范围**（`^1.2.0` 允许 1.x 任意更高版本），lockfile 锁的是**本次解析的精确结果**：每个包（含间接依赖）的确切版本、下载地址、完整性哈希（integrity）。没有 lockfile，「我本地是好的」就永远成立不了——两次安装可能拿到不同的间接依赖。
+
+**CI 的铁律：**
+
+```bash
+npm ci                      # 严格按 package-lock.json 装，lock 与 manifest 不一致直接报错
+pnpm install --frozen-lockfile  # pnpm 同款（CI 默认就是 frozen）
+# ❌ CI 里跑 npm install / pnpm install：会悄悄更新 lock，等于放弃锁定
+```
+
+**追问链：**
+
+- **「lockfile 要不要提交？」** 答：**应用必须提交**（可复现构建）；**库有争议**——npm 官方建议库也提交（保证贡献者环境一致），但发布时 lockfile 不会进包，消费者按自己的 lock 解析，所以库的 lock 只影响开发不影响用户。
+- **「`^` 和 `~` 差在哪？什么依赖该锁死？」** 答：`^1.2.3` 允许 minor+patch（`<2.0.0`），`~1.2.3` 只允许 patch（`<1.3.0`）。SemVer 是**约定不是保证**——上游完全可能在 patch 里引入 bug（真实事故屡见不鲜）。关键基础设施（构建链、加密库）可以精确版本 + 定期人工升级，业务依赖用 `^` + lockfile + CI 回归兜底。
+- **「供应链攻击怎么防？」** 答：四层——① **安装期**：lockfile integrity 校验防篡改；`pnpm audit` / `npm audit` 扫已知漏洞（注意 audit 只是提示，`audit fix --force` 会乱升 major，别在 CI 自动跑）；② **来源期**：私有 registry 代理 + 内部包白名单，防 typosquatting（`lodahs` 这类仿冒名）与依赖混淆（内部包名被公网抢注，私有源必须优先）；③ **执行期**：警惕 `postinstall` 脚本（`pnpm approve-builds` / `--ignore-scripts` 按需放行），近年多起投毒都走安装脚本；④ **升级期**：Renovate/Dependabot 小步自动 PR + CI 全量回归，比「攒一年一次性大升级」安全得多。
+- **「同一个包出现两个版本怎么办？」** 答：先 `pnpm why <pkg>` 看谁引的；能用 `overrides`（npm）/ `pnpm.overrides` / `resolutions`（yarn）强制统一，但**强制统一等于替上游做兼容承诺**，要跑测试验证；React 这类单例库出现双版本会直接 `Invalid hook call`，必须统一。
+
 ---
 
 ## 代码质量与规范
@@ -767,6 +786,51 @@ dist/
 - 用户轨迹：Session Replay（rrweb 录制 DOM 变化）
 ```
 
+### Q15b: 前端错误监控 SDK 怎么设计？压缩堆栈怎么还原？⭐⭐⭐ 🔥
+
+**答：** 错误采集比埋点难在**「错误的种类决定采集方式」**，一张表说清：
+
+| 错误类型 | 采集手段 | 注意点 |
+|:--|:--|:--|
+| JS 运行时错误 | `window.addEventListener('error')` | 拿 message/stack/行列号 |
+| **资源加载错误**（img/script/css 404） | 同一个 `error` 监听，**必须捕获阶段** | 资源错误不冒泡；`e.target` 是元素不是 window |
+| Promise 未处理 rejection | `unhandledrejection` | async 函数抛错走这里，`window.onerror` 接不到 |
+| 框架渲染错误 | React Error Boundary / Vue `errorHandler` | 框架会吞掉错误，不主动上报就丢了 |
+| 接口错误 | 拦截 fetch/XHR | 区分网络失败、超时、业务码、HTTP 5xx |
+| 跨域脚本错误 | `crossorigin` + CDN CORS 头 | 否则只有 `Script error.` 一行，无堆栈 |
+
+```javascript
+// 采集层骨架
+window.addEventListener('error', (e) => {
+  if (e.target !== window) {
+    report({ type: 'resource', url: e.target.src || e.target.href });
+  } else {
+    report({ type: 'js', message: e.message, stack: e.error?.stack });
+  }
+}, true); // ← 捕获阶段，兼顾资源错误
+
+window.addEventListener('unhandledrejection', (e) => {
+  report({ type: 'promise', reason: String(e.reason), stack: e.reason?.stack });
+});
+```
+
+**还原链路（和构建篇 Sourcemap 题联动）：**
+
+```text
+构建: hidden-source-map 生成 .map
+CI:   map + 版本号上传错误平台 → 产物里删除 map
+线上: SDK 上报压缩堆栈 + 版本号(release)
+平台: 按 release 找到对应 map → VLQ 反解 → 源码文件:行:列 + 上下文代码
+```
+
+**版本号是还原的钥匙**：SDK 必须携带与 map 一致的 release（构建时注入），否则平台拿错版本的 map 还原出错误位置——比不还原更误导。
+
+**追问链：**
+
+- **「错误那么多，怎么防止上报风暴？」** 答：四件套——**去重**（同 message+stack 指纹合并计数）、**采样**（高频错误按比例采）、**限流**（单页面单会话上限）、**聚合窗口**（批量合并上报）。白屏/死循环类错误一秒能产生上千条，不做指纹去重会把采集接口打爆。
+- **「`Script error.` 是怎么回事？」** 答：跨域脚本的错误详情被浏览器安全策略屏蔽。解法两步：`<script crossorigin="anonymous">` + CDN 响应 `Access-Control-Allow-Origin`。第三方脚本（统计/广告）加不了 crossorigin 的，只能接受无堆栈，按 message 归类。
+- **「怎么衡量监控本身的健康度？」** 答：两个指标——**错误覆盖率**（有堆栈可还原的错误占比，反映 sourcemap 流程是否断链）和**上报成功率**（sendBeacon 失败/被拦截的比例）。监控 SDK 自己挂了而没人知道，是这类系统最常见的失效模式。
+
 ---
 
 ## 深水区追问（2026 补充）
@@ -807,6 +871,8 @@ dist/
 > 11. **CI/CD**：PR 阶段自动检查 + 主分支自动部署测试环境 + 灰度发布到生产
 > 12. **灰度**：Nginx 权重 / 版本目录 / 特性开关，配错误率监控自动回滚
 > 13. **埋点**：sendBeacon + 批量节流 + 采样率，Kafka + ClickHouse 存储
+> 14. **lockfile**：锁精确版本 + integrity；CI 用 `--frozen-lockfile`；供应链四层防线
+> 15. **错误监控**：六类错误六种采集；资源错误要捕获阶段；release 对齐 map 才能还原堆栈
 
 ---
 

@@ -1,24 +1,24 @@
 ---
 title: '前端构建工具面试题（Webpack / Vite）'
 published: 2026-09-16T11:00:00+08:00
-description: '深入讲解 Webpack 核心原理、Loader/Plugin、Vite 为何快、Tree Shaking、HMR、代码分割等高频面试题。'
+description: '深入讲解 Webpack 核心原理、Loader/Plugin、ESM/CJS、Vite 为何快、Tree Shaking、HMR、Sourcemap、ChunkLoadError 兜底等高频面试题。'
 tags: [前端面试, Webpack, Vite, TreeShaking, HMR]
 category: 前端面试宝典
 draft: false
 ---
 
 > [!NOTE]
-> 本文包含 25+ 道前端构建工具面试题，难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
+> 本文包含 35+ 道前端构建工具面试题（含追问链），难度标注：⭐ 基础 · ⭐⭐ 进阶 · ⭐⭐⭐ 高级 · 🔥 高频必考
 
 ---
 
 ## 三层复习路径（浅 → 中 → 深）
 
-| 层级 | 目标 | 本模块的三个问题 |
+| 层级 | 目标 | 自测问题 |
 |:--|:--|:--|
-| 浅（能说清概念） | 用一句话区分工具职责，不说错名词 | ① Webpack 从入口到产物落盘要经过哪几步？② Loader 与 Plugin 的职责边界在哪？③ Vite 开发态凭什么可以跳过打包？ |
-| 中（能讲机制与代码） | 能写出配置、能解释每个参数在干什么 | ① 插件里什么时候拿 `compiler`、什么时候拿 `compilation`？② `usedExports` 与 `sideEffects` 分别在哪一层做删除？③ `contenthash` 配 `moduleIds: deterministic` 是怎么稳住缓存的？ |
-| 深（能讲取舍与线上） | 说得清代价、失效边界与事故现场 | ① Vite 生产构建并不比 Webpack 快，那「Vite 快」该怎么讲才不被追问穿？② 发版后旧 HTML 去请求已删除的 chunk 报错，链路是什么、怎么兜？③ 存量 Webpack 大仓迁 Rspack 的成本项有哪些？ |
+| 浅（能说清概念） | 用一句话区分工具职责，不说错名词 | ① Webpack 从入口到产物落盘要经过哪几步？② Loader 与 Plugin 的职责边界在哪？③ Vite 开发态凭什么可以跳过打包？④ ESM 和 CJS 只是写法差异吗？ |
+| 中（能讲机制与代码） | 能写出配置、能解释每个参数在干什么 | ① 插件里什么时候拿 `compiler`、什么时候拿 `compilation`？② `usedExports` 与 `sideEffects` 分别在哪一层做删除？③ `contenthash` 配 `moduleIds: deterministic` 是怎么稳住缓存的？④ 活绑定与值拷贝在循环依赖下各是什么表现？⑤ Vite HMR 为什么与项目规模解耦？ |
+| 深（能讲取舍与线上） | 说得清代价、失效边界与事故现场 | ① Vite 生产构建并不比 Webpack 快，那「Vite 快」该怎么讲才不被追问穿？② 发版后旧 HTML 去请求已删除的 chunk 报错，链路是什么、怎么兜？③ 存量 Webpack 大仓迁 Rspack 的成本项有哪些？④ Sourcemap 为什么必须「上传后删除」？⑤ esbuild/SWC 替代 Babel 的边界在哪？ |
 
 ## Webpack 核心
 
@@ -185,6 +185,61 @@ optimization: {
   ]
 }
 ```
+
+---
+
+## 模块系统
+
+### Q4b: ESM 和 CommonJS 到底差在哪？⭐⭐ 🔥
+
+**答：** 不只是 `import` 和 `require` 的写法差异，是**两套语义**：
+
+| 维度 | CommonJS | ESM |
+|:--|:--|:--|
+| 加载时机 | **运行时**加载（执行到 require 才读文件） | **编译期**确定依赖图，执行前已完成链接 |
+| 导出内容 | `module.exports` 对象的**值拷贝**（基本类型） | 导出的**活绑定（live binding）**，只读引用 |
+| 顶层 this | `module.exports` | `undefined` |
+| 顶层 await | 不支持 | 支持（ES2022） |
+| 缓存 | 缓存 `module.exports` 对象 | 缓存模块实例，绑定共享 |
+| 动态性 | `require(变量)` 合法 | `import()` 动态，静态 import 必须顶层字面量 |
+
+**活绑定是最高频追问：**
+
+```javascript
+// counter.mjs
+export let count = 0;
+export function inc() { count++; }
+
+// main.mjs
+import { count, inc } from './counter.mjs';
+console.log(count); // 0
+inc();
+console.log(count); // 1 ← ESM 拿到的是「绑定」，源模块改了这边跟着变
+// count = 5;       // ❌ TypeError：导入的绑定只读
+
+// counter.cjs
+let count = 0;
+module.exports = { count, inc: () => count++ };
+// main.cjs
+const m = require('./counter.cjs');
+m.inc();
+console.log(m.count); // 0 ← CJS 导出时就拷贝了值，之后源模块改不到这里
+```
+
+**循环依赖的表现也不同：**
+
+```javascript
+// CJS：a 先执行，require b 时 b 又 require a，
+// 拿到的是 a「已执行部分」的 exports（可能是不完整对象）→ 不报错但值缺失
+// ESM：链接期就建好绑定，函数声明被提升可用；
+// 但访问「尚未初始化的 let/const」会抛 ReferenceError（TDZ）
+```
+
+**追问链：**
+
+- **「为什么 Node 里 `require` 一个 ESM 包会报错？」** 答：CJS 是同步加载模型，而 ESM 允许顶层 await（异步），同步 API 无法等待——所以 Node 22 之前 `require(esm)` 直接抛错，只能 `import()`。Node 22+ 开始支持 require 无顶层 await 的 ESM，但**有顶层 await 的仍然不行**，这是模型冲突不是实现偷懒。
+- **「`__dirname` 在 ESM 里为什么没了？」** 答：CJS 的 `__dirname/__filename/require` 都是模块包装函数注入的参数，ESM 没有这层包装。替代：`import.meta.dirname`（Node 20.11+）或 `fileURLToPath(import.meta.url)`。
+- **「打包器怎么处理两套混用？」** 答：靠**互操作层**——CJS 模块被包成「default 导出 = module.exports」的 ESM；这也是 `import x from 'cjs-pkg'` 能拿到整个 exports、而 `import { foo }` 有时失败的原因（具名导出要靠静态分析 cjs 源码猜，猜不中就只能 default）。Vite 预构建、Rollup 的 commonjs 插件干的就是这件事。
 
 ---
 
@@ -432,6 +487,38 @@ export default {
 - **「那大项目该怎么选？Rspack / Turbopack 是什么定位？」**
   答：先说结论——**Rspack（Rust 重写 Webpack）是「无痛迁移」路线**，配置与 Webpack 高度兼容（loader/plugin 生态大量复用），构建速度提升一个量级，适合存量 Webpack 大仓平滑替换；**Turbopack（Rust，Vercel）绑定 Next.js**，增量编译做到极致，但独立使用生态还在补齐。选型看约束：存量配置重、插件多 → Rspack；新项目 + Next.js → Turbopack / Vite；库开发 → Vite/tsup 足够。这类题的分值在「说清迁移成本」，不在背速度数字。
 
+### Q9b: Vite 的 HMR 和 Webpack 的 HMR 有什么不同？⭐⭐⭐
+
+**答：** 通知链路相似（文件变化 → WebSocket 推送 → 浏览器拉新模块），**替换机制完全不同**：
+
+```text
+Webpack HMR：模块被打包进 chunk → 更新以「模块 ID + 新工厂函数」下发
+             → runtime 替换模块缓存 → 沿 accept 边界冒泡
+Vite HMR：   模块本来就是浏览器里的独立 ESM → 直接 import 带时间戳的新 URL
+             → import.meta.hot.accept 回调里用新模块替换旧引用
+```
+
+```javascript
+// Vite HMR API（对比 Webpack 的 module.hot）
+if (import.meta.hot) {
+  import.meta.hot.accept('./render.js', (newModule) => {
+    newModule.render(); // 拿到的是新 ESM 模块对象
+  });
+  import.meta.hot.dispose(() => {
+    cleanup(); // 旧模块失效前清理副作用
+  });
+  import.meta.hot.invalidate(); // 主动放弃接受，让更新向上传播
+}
+```
+
+**三个关键差异（追问高发区）：**
+
+1. **更新速度与项目规模解耦**：Webpack 要重编译「受影响模块链」再打 patch，项目越大越慢；Vite 无论项目多大，**只编译被改的那一个文件**，HMR 耗时基本恒定——这是「Vite 大项目体验不衰减」的根因。
+2. **边界传播规则**：两者都是「没人 accept 就向上冒泡，冒到顶就整页刷新」。但 Vite 里 Vue/React 插件已自动写好组件级 accept（配合 Fast Refresh/vue-loader 的状态保留逻辑），业务代码很少手写；手写 `import.meta.hot` 主要出现在**非组件模块**（store、工具单例）需要自定义替换/清理时。
+3. **CSS 是天然 HMR**：Vite 里 CSS 也是 ESM 模块，改样式直接替换 `<style>`/link，不刷新页面、不丢状态；Webpack 需要 style-loader 配合，抽离 CSS 后 dev 会失效（见坑速查表）。
+
+**追问：「为什么 Vite 偶尔还是整页刷新？」** 答：三类——① 改的文件不在任何 accept 边界内（如纯工具函数被多处引用且无插件接管）；② 依赖预构建重跑（发现新依赖）；③ `vite.config` / `.env` 变化触发 server restart。**能区分「模块级更新失败」和「server 级重启」，说明真观察过终端日志。**
+
 ### Q10: Vite 的生产构建？⭐⭐
 
 ```javascript
@@ -560,6 +647,50 @@ new BundleAnalyzerPlugin() // 可视化分析
 }
 ```
 
+### Q12b: 发版后用户报 ChunkLoadError / Loading chunk failed，链路是什么？怎么兜？⭐⭐⭐ 🔥
+
+**答：** 这是**前端发版最高频的线上事故**，先把链路讲清：
+
+```text
+① 用户打开页面，加载了旧 index.html（引用旧 hash 的 chunk 清单）
+② 期间你发了新版：新 HTML 上线，旧 chunk 被清理/CDN 回源 404
+③ 用户在旧页面里点了懒加载路由 → 按旧清单请求旧 chunk → 404
+④ import() reject → ChunkLoadError → 路由白屏
+```
+
+**三层防线（缺一层都会被追问）：**
+
+```javascript
+// ① 加载失败重试 + 强制刷新（兜住「新旧交替窗口期」）
+function lazyWithRetry(importer, retries = 2) {
+  return () =>
+    importer().catch((err) => {
+      if (retries > 0) {
+        return new Promise((r) => setTimeout(r, 500)).then(() =>
+          lazyWithRetry(importer, retries - 1)()
+        );
+      }
+      // 重试仍失败：大概率是发版导致旧资源没了 → 带防死循环标记刷新
+      if (!sessionStorage.getItem('chunk-reloaded')) {
+        sessionStorage.setItem('chunk-reloaded', '1');
+        location.reload(); // 拿到新 HTML + 新清单
+      }
+      throw err;
+    });
+}
+const Page = React.lazy(lazyWithRetry(() => import('./Page')));
+
+// ② 版本探测：构建时注入版本号，轮询/路由切换时对比
+//    发现服务端版本更新 → 提示「有新版本，点击刷新」而不是突然白屏
+// ③ 发布侧：旧版产物保留至少一个发布周期（见工程化篇发布顺序）
+```
+
+**追问链：**
+
+- **「为什么不能 catch 到就无脑 reload？」** 答：如果 404 是 CDN 故障/网络问题而非发版，reload 后还是 404 → **无限刷新死循环**。所以必须带「本次会话已刷新过」的标记（sessionStorage），一次为限。
+- **「HTML 不是不缓存吗，怎么还会拿到旧的？」** 答：三个来源——浏览器内存里的**已打开页面**（最常见，HTML 缓存策略管不到它）、CDN 边缘节点残留、Service Worker 缓存。所以「HTML no-cache」只解决新打开的页面，**已打开页面的懒加载**必须靠重试/版本探测兜。
+- **「怎么在监控里把这类错误和普通 JS 错误分开？」** 答：按 `error.name === 'ChunkLoadError'` 或 message 匹配 `Loading chunk`/`Failed to fetch dynamically imported module`（Vite/Rollup 的报错文案不同）单独归类，告警阈值和「发版事件」关联——发版后 5 分钟内这类错误上涨是预期窗口，持续上涨才是事故。
+
 ---
 
 ## Babel
@@ -598,6 +729,62 @@ module.exports = {
 };
 ```
 
+### Q13b: esbuild / SWC 为什么比 Babel 快？能完全替代吗？⭐⭐ 🔥
+
+**答：** 快的来源是三层叠加，**不是单一原因**：
+
+1. **语言层**：Go（esbuild）/ Rust（SWC）编译型语言 vs Babel 的 JS 解释执行，且无 GC 停顿；
+2. **并行层**：原生多线程充分利用多核；Babel 单线程（thread-loader 只是进程级补丁）；
+3. **架构层**：esbuild 一次遍历完成 parse/transform/print，**不生成可遍历的 JS 对象 AST**（Babel 的 AST 是海量 JS 对象，创建+遍历+GC 是大头）；且不做 Babel 那套「插件逐个遍历 AST」的通用管线。
+
+**但「快」是有代价的，替代边界必须说清：**
+
+| 能力 | Babel | esbuild / SWC |
+|:--|:--|:--|
+| 语法降级 + JSX/TS 剥离 | ✅ | ✅（快 10-100x） |
+| **类型检查** | ❌（本来就不做） | ❌（都不做，tsc 单独跑） |
+| 任意自定义 AST 插件 | ✅ 生态最全 | ⚠️ esbuild 插件 API 受限；SWC 有插件但生态小 |
+| 老提案/装饰器 legacy 等边角语法 | ✅ | ⚠️ 部分不支持或语义有差 |
+| polyfill 按需注入（useBuiltIns: usage） | ✅ core-js 集成 | ❌ 需另配 |
+
+**工程结论（面试要落在这句）**：主流做法是**分层**——转译交给 esbuild/SWC（Vite dev、Next.js、tsup 都已默认），类型检查交给 `tsc --noEmit` 在 CI 单独跑，需要 Babel 独有插件的模块单独走 babel-loader。**「用 SWC 就不需要 tsc 了」是错误表述**——它们都不检查类型，类型门禁不能省。
+
+### Q13c: Sourcemap 的原理？生产环境该怎么配？⭐⭐⭐ 🔥
+
+**答：** Sourcemap 是一份 **JSON 映射文件**，记录「产物位置 → 源码位置」：`sources`（源文件列表）、`sourcesContent`（源码内容，可选）、`mappings`（**VLQ 编码**的位置映射：产物每一行每一列对应哪个源文件的哪行哪列）。浏览器/错误平台拿它把压缩后的栈还原成源码栈。
+
+**常见类型与取舍：**
+
+| devtool / 类型 | 产物 | 特点 |
+|:--|:--|:--|
+| `source-map` | 独立 .map + 末尾注释 | 完整映射，**注释会暴露 map 地址** |
+| `hidden-source-map` | 独立 .map，**无注释** | 产物不含指向，map 只给错误平台用 |
+| `inline-source-map` | map 内联进 bundle | 体积暴涨，仅调试用 |
+| `cheap-module-source-map` | 只到行不到列 | 更快更小，loader 转换前的源码 |
+| `eval-cheap-module-source-map` | eval 包裹 | dev 重建快，Vite/Webpack dev 常用 |
+
+**生产标准姿势（三步）：**
+
+```javascript
+// ① 构建：生成 map 但不暴露
+// webpack
+devtool: 'hidden-source-map'
+// vite
+build: { sourcemap: 'hidden' }
+
+// ② CI：把 .map 上传到 Sentry/自建错误平台，然后从发布产物里删除
+//    sentry-cli releases files <version> upload-sourcemaps dist/
+//    find dist -name '*.map' -delete   ← 部署包里不留 map
+
+// ③ 错误平台用 map 还原堆栈；普通用户拿不到源码
+```
+
+**追问链：**
+
+- **「为什么不能直接把 map 发到线上？」** 答：`.map` 里有 `sourcesContent` 时**等于公开全部源码**（含内部注释、接口路径、甚至误打包的密钥）。`hidden` 只解决「产物不指向 map」，**map 文件本身若还在 CDN 上，猜路径也能下载**——所以必须「上传后删除」，两步缺一不可。
+- **「不上传 map，线上报错还能排查吗？」** 答：能但很痛——只有压缩后的行列号，靠本地同版本构建产物手动对位。所以「发版必传 map」要写进 CI 流程，而不是靠人记得。
+- **「dev 和 prod 的 sourcemap 为什么策略不同？」** 答：dev 要**重建快**（eval/cheap 系，映射精度换速度）；prod 要**还原准 + 不泄露**（hidden 完整映射）。把 dev 配置带到 prod（inline/eval）是体积事故，把 prod 配置带到 dev（hidden 完整）是重建慢事故。
+
 ---
 
 ## 构建慢/包大怎么定位（面试常问「你怎么证明优化有效」）
@@ -623,6 +810,11 @@ module.exports = {
 | Vite 大依赖报 CJS 错误 | 未走预构建 | `optimizeDeps.include` 显式声明 |
 | HMR 改样式无效但改逻辑有效 | CSS 被 `MiniCssExtractPlugin` 抽离（dev 也开） | dev 用 `style-loader`，仅 prod 抽取 |
 | 构建内存 OOM | 大项目 sourcemap + 并行压缩 | 调 `--max-old-space-size`、拆分 chunk、关 dev sourcemap |
+| `require()` 一个 ESM 包抛错 | CJS 同步模型等不了顶层 await | 改 `import()`；Node 22+ 可 require 无 TLA 的 ESM |
+| `import { foo } from 'cjs包'` 拿不到 | CJS 具名导出靠静态分析猜 | 用 default 导入整个 exports，或换 ESM 包 |
+| 线上堆栈全是压缩行列号 | 没传 sourcemap 到错误平台 | CI 里 upload-sourcemaps 后再删 map |
+| 源码被公开下载 | .map 随产物上了 CDN | hidden + 上传后删除，两步缺一不可 |
+| catch 到 chunk 404 就 reload 死循环 | 非发版原因的 404 刷新也没用 | sessionStorage 标记，一次会话只刷一次 |
 
 ## 深水区追问（2026 补充）
 
@@ -642,18 +834,23 @@ module.exports = {
 
 答：npm 共享是**编译期**确定一份代码，MF 共享是**运行时**从共享作用域里挑一份已加载的模块。差异集中在三点：① 版本仲裁——`shared` 里声明 `singleton: true` 后，宿主与远程按 semver 选出「能满足所有消费者的最高版本」，选不出来就各用各的，于是同一页面加载两份 React，报 `Invalid hook call`；② 构建顺序解耦——remote 可以先发布、host 后接入，但 remote 未发布或契约变更时运行时报错，需要 `strictVersion` 之类的显式拒载策略；③ Context / 全局状态必须落在单例里，否则跨应用 `Provider` 不生效。所以「是否需要独立部署」才是 MF 的判断标准：monorepo 内多个包共享依赖，用 workspace 统一版本 + 构建缓存更简单；只有多团队独立发版时才值得引入 MF 的复杂度。
 
-## 自测清单（能答上 8 条算过关）
+## 自测清单（能答上 12 条算过关）
 
 1. Compiler 与 Compilation 的区别？插件里什么时候用哪个？
 2. Webpack 插件体系的底层是哪个库？三种 tap 的差异？
 3. Loader 从右到左执行的根本原因？
-4. ESM 为什么可静态分析、CJS 为什么不行？
-5. `usedExports` 与 `sideEffects` 各解决什么层级的问题？
-6. `sideEffects: false` 误标会导致什么线上事故？怎么修？
-7. Vue HMR 与 React Fast Refresh 的机制差异？为什么 React 改 hooks 顺序会丢状态？
-8. Vite 在生产构建上是否更快？它的「快」边界在哪？
-9. Vite 开发模式三个典型坑分别是什么？
-10. Rspack / Turbopack / Vite 的选型判断依据是什么？
+4. ESM 活绑定与 CJS 值拷贝的差异？循环依赖下各是什么表现？
+5. 为什么 `require(esm)` 长期被禁止？打包器怎么处理 CJS/ESM 混用？
+6. ESM 为什么可静态分析、CJS 为什么不行？
+7. `usedExports` 与 `sideEffects` 各解决什么层级的问题？
+8. `sideEffects: false` 误标会导致什么线上事故？怎么修？
+9. Vue HMR 与 React Fast Refresh 的机制差异？为什么 React 改 hooks 顺序会丢状态？
+10. Vite HMR 为什么与项目规模解耦？什么情况仍会整页刷新？
+11. Vite 在生产构建上是否更快？它的「快」边界在哪？
+12. esbuild/SWC 快的三层来源？为什么不能省掉 tsc？
+13. Sourcemap 生产三步姿势？为什么「上传后删除」缺一不可？
+14. ChunkLoadError 的完整链路？三层防线？为什么不能无脑 reload？
+15. Rspack / Turbopack / Vite 的选型判断依据是什么？
 
 ---
 
@@ -663,11 +860,15 @@ module.exports = {
 |:--|:--|
 | Loader | 文件转换器，从右到左执行 |
 | Plugin | 生命周期扩展，监听 Compiler hooks |
+| ESM vs CJS | 编译期链接 + 活绑定 vs 运行时加载 + 值拷贝 |
 | Tree Shaking | 基于 ESM 静态分析，移除未使用代码 |
 | splitChunks | 代码分割，提取公共代码和第三方库 |
-| HMR | WebSocket 通知 + 模块替换 |
+| HMR | WebSocket 通知 + 模块替换；Vite 按 ESM 单文件替换 |
 | Vite 快的原因 | 无需打包，原生 ESM + esbuild 预构建 |
+| esbuild/SWC | 原生语言 + 并行 + 轻 AST；类型检查仍靠 tsc |
 | contenthash | 内容 hash，利用浏览器缓存 |
+| Sourcemap | hidden + 上传错误平台 + 删产物，三步 |
+| ChunkLoadError | 重试 → 限次 reload → 版本探测 → 保留旧产物 |
 | 构建速度 | exclude、cache、多线程、resolve 优化 |
 
 > [!TIP]
