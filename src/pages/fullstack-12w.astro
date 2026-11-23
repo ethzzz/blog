@@ -1,0 +1,135 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug, url } from "@utils/url-utils";
+
+// 全栈进阶 12 周：路径层系列，正文与 node-roadmap 详文互为索引
+const allPosts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === "全栈进阶12周" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+
+// 按 slug 中的周编号排序
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = Number.parseInt(
+		a.slug.match(/fullstack-12w-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	const numB = Number.parseInt(
+		b.slug.match(/fullstack-12w-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	return numA - numB;
+});
+
+const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
+const weekPosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
+---
+
+<MainGridLayout title="全栈进阶 12 周合集">
+	<div class="onload-animation">
+		<!-- 页面标题 -->
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">全栈进阶 12 周</h1>
+			<p class="text-75 text-lg">前端工程师的路径层计划 · 共 {weekPosts.length} 周 · 每周一个可见交付物</p>
+		</div>
+
+		<!-- 与 Node 路线的关系说明 -->
+		<div class="card-base card-shadow p-5 mb-6">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white dark:text-black/70 font-bold text-xl">
+					12W
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">这不是又一份 Node 教程</h2>
+					<p class="text-75 text-sm">
+						技术细节在
+						<a href={url("/node-roadmap/")} class="link text-[var(--primary)]">Node.js 全栈开发</a>
+						那条路线里；本系列只解决「按什么顺序、每周交出什么、落后了先保哪几周」。
+						每周正文都跳转到对应详文，适合和主线并行推进。
+					</p>
+				</div>
+			</div>
+		</div>
+
+		<!-- 总览卡片 -->
+		{overviewPost && (
+			<a href={getPostUrlBySlug(overviewPost.slug)} 
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white dark:text-black/70">
+								总览
+							</span>
+							<span class="text-sm text-50">
+								{overviewPost.data.published.toLocaleDateString("zh-CN")}
+							</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">
+							{overviewPost.data.title}
+						</h2>
+						<p class="text-75 text-sm line-clamp-2">
+							{overviewPost.data.description}
+						</p>
+					</div>
+					<div class="ml-4 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M5 12h14M12 5l7 7-7 7"/>
+						</svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<!-- 周计划列表 -->
+		<div class="space-y-4">
+			{weekPosts.map((post) => (
+				<a href={getPostUrlBySlug(post.slug)} 
+				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+					<div class="flex items-start gap-4">
+						<!-- 周编号 -->
+						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-sm group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+							W{post.slug.match(/fullstack-12w-(\d+)/)?.[1] ?? "?"}
+						</div>
+
+						<div class="flex-1 min-w-0">
+							<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate mb-1">
+								{post.data.title.replace(/^W\d+\s*·\s*/, "")}
+							</h3>
+							<p class="text-75 text-sm mb-2 line-clamp-2">
+								{post.data.description}
+							</p>
+							<div class="flex items-center gap-3 text-xs text-50">
+								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+								{post.data.tags && post.data.tags.length > 0 && (
+									<span class="flex items-center gap-1">
+										{post.data.tags.slice(0, 3).map(tag => (
+											<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+												#{tag}
+											</span>
+										))}
+									</span>
+								)}
+							</div>
+						</div>
+
+						<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<path d="M5 12h14M12 5l7 7-7 7"/>
+							</svg>
+						</div>
+					</div>
+				</a>
+			))}
+		</div>
+
+		<!-- 底部说明 -->
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
+			<p class="font-medium mb-1">💡 执行建议</p>
+			<p>每周投入 10–15 小时，落后时优先保住 W2（NestJS 核心）、W5（鉴权与 RBAC）、W9（系统设计）、W12（部署与 CI/CD）四个里程碑；W1/W3/W6/W10 偏工程规范，已经熟悉就直接跳过。每篇末尾的「面试一句话」即该周的 senior 考点。</p>
+		</div>
+	</div>
+</MainGridLayout>

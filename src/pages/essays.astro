@@ -1,11 +1,21 @@
 ---
 import { getCollection } from "astro:content";
+import { ROADMAP_GROUPS } from "@constants/roadmap-modules";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { getPostUrlBySlug } from "@utils/url-utils";
 
-// 散篇内容聚合：教程 + 随笔（PROD 下排除草稿）
+// 有独立聚合页的系列 category，其余一律算散篇（新增 category 不会被漏掉）
+const seriesCategories = new Set([
+	...ROADMAP_GROUPS.flatMap((group) =>
+		group.modules.map((module) => module.category),
+	),
+	"前端面试宝典",
+	"notelab",
+]);
+
+// 散篇内容聚合（PROD 下排除草稿）
 const allPosts = await getCollection("posts", ({ data }) => {
-	const isLoose = data.category === "教程" || data.category === "随笔";
+	const isLoose = !data.category || !seriesCategories.has(data.category);
 	return isLoose && (import.meta.env.PROD ? data.draft !== true : true);
 });
 
@@ -13,10 +23,14 @@ const sortedPosts = allPosts.sort(
 	(a, b) => b.data.published.valueOf() - a.data.published.valueOf(),
 );
 
-const tutorialCount = sortedPosts.filter(
-	(p) => p.data.category === "教程",
-).length;
-const essayCount = sortedPosts.filter((p) => p.data.category === "随笔").length;
+const countByCategory = new Map<string, number>();
+for (const post of sortedPosts) {
+	const key = post.data.category || "未分类";
+	countByCategory.set(key, (countByCategory.get(key) ?? 0) + 1);
+}
+const summary = [...countByCategory]
+	.map(([name, count]) => `${count} 篇${name}`)
+	.join(" + ");
 ---
 
 <MainGridLayout title="随笔与教程">
@@ -25,7 +39,7 @@ const essayCount = sortedPosts.filter((p) => p.data.category === "随笔").lengt
 		<div class="mb-8">
 			<h1 class="text-3xl font-bold text-90 mb-2">随笔与教程</h1>
 			<p class="text-75 text-lg">
-				不成体系的零散沉淀 · {tutorialCount} 篇教程 + {essayCount} 篇随笔
+				不成体系的零散沉淀 · {summary}
 			</p>
 		</div>
 
@@ -38,7 +52,7 @@ const essayCount = sortedPosts.filter((p) => p.data.category === "随笔").lengt
 				<div class="flex-1">
 					<h2 class="text-lg font-bold text-90 mb-1">随笔与教程 - 路线之外的散篇</h2>
 					<p class="text-75 text-sm">
-						这里收的是还没有长成完整模块的内容：搭建/部署类教程、工具用法和偶尔的随手记。
+						这里收的是还没有长成完整模块的内容：搭建/部署类教程、工具用法、面试复盘和偶尔的随手记。
 						哪天某一类写多了，就会像其他模块一样升级成独立的学习路线。
 					</p>
 				</div>

@@ -92,6 +92,14 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 				chips: ["NestJS", "MySQL", "Redis"],
 			},
 			{
+				title: "全栈进阶 12 周",
+				abbr: "12W",
+				desc: "路径层计划：12 周把前端 + Node 基本盘推到全栈，每周一个可进作品集的交付物",
+				url: "/fullstack-12w/",
+				category: "全栈进阶12周",
+				chips: ["周计划", "NestJS", "交付物"],
+			},
+			{
 				title: "AI 应用开发",
 				abbr: "AI",
 				desc: "用前端工程能力把大模型做成真实产品：API / 流式 / RAG / Agent",
