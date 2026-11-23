@@ -1,0 +1,364 @@
+---
+title: '11 · Vue Router：导航守卫、动态权限路由与滚动恢复'
+published: 2026-11-22T19:00:00+08:00
+description: 'Vue Router 4 的导航模型：守卫执行顺序全景与 return/next 等价写法、导航失败类型、登录后用 addRoute 建动态权限路由的完整可运行套路与必须重定向一次的原因、刷新后路由丢失、scrollBehavior 与 keep-alive 的组合、history base 与 nginx 子路径、chunk 划分与预取。'
+tags: [Vue, "Vue Router", 导航守卫, 权限路由, scrollBehavior]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章解决中后台里最常见的三类"看起来是路由 bug"的问题：**登录后空白页、刷新后 404、返回列表页位置丢了。**
+> 真实场景：一个后台项目登录后跳 `/system/user` 白屏，控制台没报错，Network 里权限接口 200。
+> 原因只有一句话——**这次导航的路由匹配发生在 `addRoute` 之前**，`to.matched` 命中的是 catch-all 404，
+> 而 `addRoute` 不会让已经完成的匹配重跑。这个坑几乎每个做动态菜单的团队都要踩一次。
+> 问答形态见[前端面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)「Vue Router」一节（Q13 守卫顺序、Q13b history 与 nginx）；
+> 部署侧的子路径经验见 [工程化 · 构建与产物](/blog/posts/engineering-roadmap-02-bundling-principle/)。
+
+---
+
+## 一句话本质
+
+**Router 4 的一次导航是一个可取消、可重定向、可 `await` 的异步流程**，守卫的职责边界很清楚：
+**它能决定"这次导航要不要发生"，不能决定"组件内部怎么渲染"**。
+动态权限路由的难点不在 `addRoute` 本身，而在**匹配是一次性的**——理解这一点，登录白屏和无限重定向就都解释完了。
+
+---
+
+## 原理拆解
+
+### 1. 守卫执行顺序全景，与 `return` / `next` 的等价性
+
+官方完整流程（Router 4，按序，务必背第 2/3/7/8 这四步的相对顺序）：
+
+| # | 阶段 | 说明 |
+|---|---|---|
+| 1 | 导航触发 | `router.push` / `<RouterLink>` / 浏览器前进后退 |
+| 2 | **失活组件的 `beforeRouteLeave`** | 在**旧**页面组件里执行；此时它还没卸载，可以拦 |
+| 3 | **全局 `beforeEach`** | 按注册顺序，异步守卫会 pending |
+| 4 | 复用组件的 `beforeRouteUpdate` | 同组件不同参数（如 `/user/1` → `/user/2`） |
+| 5 | 路由配置里的 `beforeEnter` | 路由独享 |
+| 6 | **解析异步路由组件** | `component: () => import(...)` 在这里被 await |
+| 7 | 激活组件的 `beforeRouteEnter` | 组件还没实例化，拿不到 `this`（`next` 回调是 deprecated 写法） |
+| 8 | 全局 `beforeResolve` | 所有守卫和异步组件都完成后的最后检查 |
+| 9 | 导航确认 | — |
+| 10 | 全局 `afterEach` | **不能取消导航**，只能上报（埋点、进度条收尾、错误提示） |
+| 11 | DOM 更新 | — |
+| 12 | `beforeRouteEnter` 里传给 `next` 的回调执行 | 此时实例已创建 |
+
+组合式 API 里 `onBeforeRouteLeave` / `onBeforeRouteUpdate` 在页面组件的 setup 中注册，语义与选项式同名钩子一致。
+
+新版文档已经把**第三个参数 `next` 标为 deprecated**，推荐用返回值表达意图，两者严格等价：
+
+```ts
+router.beforeEach((to, from) => {
+  if (!auth.isLoggedIn) return { name: 'Login', query: { redirect: to.fullPath } };  // 重定向
+  if (!canAccess(to)) return false;      // 取消：URL 回退到 from
+  // 返回 undefined / true / 不返回 = 放行，进入下一个守卫
+});
+```
+
+等价的 `next` 写法：`next({ name: 'Login' })` / `next(false)` / `next()`。
+**混用是唯一要禁止的**：一个守卫里既有 `return` 又有 `next()`，逻辑上不会双触发，但可读性崩坏且极易漏掉 `next()` 导致导航永久挂起。
+
+导航被拦截后会发生什么（面试里的"深水区"追问点）：
+
+```ts
+import { isNavigationFailure, NavigationFailureType } from 'vue-router';
+
+const failure = await router.push('/admin');     // 导航返回 Promise
+if (failure) {
+  // 三种失败类型，没有第四种「navigationBlocked」这个 API —— 别被二手文章带偏
+  if (isNavigationFailure(failure, NavigationFailureType.aborted))    { /* 守卫返回了 false */ }
+  if (isNavigationFailure(failure, NavigationFailureType.cancelled))  { /* 上一次导航没完成又发起了新的 */ }
+  if (isNavigationFailure(failure, NavigationFailureType.duplicated)) { /* 已经在目标地址，默认不算错误 */ }
+}
+
+router.push('/x').catch((err) => { /* 守卫里抛出的 Error 会走到这里，也可用 router.onError 统一收 */ });
+```
+
+> [!IMPORTANT]
+> 一句话记住语义：**`return false` 是"停在原地"（aborted），`return '/login'` 是"改道"（重定向），抛错是"这次导航失败并进入 `router.onError`"。**
+> 三种意图不要在 `afterEach` 里猜，`failure` 对象里都写着。
+
+### 2. 动态权限路由：完整可运行套路 + 为什么必须重导一次
+
+中后台标准形态：静态路由（登录、404、错误页）+ 登录后按接口下发的菜单生成业务路由。
+
+```ts
+// router/routes.ts —— 只有这些是编译期就存在的
+export const staticRoutes: RouteRecordRaw[] = [
+  { path: '/login', name: 'Login', component: () => import('@/views/Login.vue') },
+  { path: '/404', name: 'NotFound', component: () => import('@/views/error/404.vue') },
+  // catch-all 放最后：Router 4 按路径打分排序匹配，不是按注册顺序，所以它天然优先级最低
+  { path: '/:catchAll(.*)*', redirect: { name: 'NotFound' } },
+];
+```
+
+```ts
+// stores/permission.ts —— setup store（10）
+export const usePermissionStore = defineStore('permission', () => {
+  const dynamicRoutes = ref<RouteRecordRaw[]>([]);
+  const loaded = ref(false);
+  const removers: Array<() => void> = [];                  // 记住每个 addRoute 的卸载函数
+
+  async function load(): Promise<boolean> {
+    if (loaded.value) return true;                         // 关键：已加载直接返回，防重复
+    const menus = await api.getRouters();                  // 后端下发的菜单树
+    dynamicRoutes.value = menusToRoutes(menus);            // 组件用 import.meta.glob 映射，见下方
+    loaded.value = true;
+    return true;
+  }
+  function install(router: Router) {
+    for (const r of dynamicRoutes.value) removers.push(router.addRoute(r));
+  }
+  function reset(router: Router) {                          // 登出必须清，否则换个低权限账号还能进老页面
+    removers.forEach((fn) => fn());
+    removers.length = 0;
+    dynamicRoutes.value = [];
+    loaded.value = false;
+  }
+  return { dynamicRoutes, loaded, load, install, reset };
+});
+```
+
+```ts
+// router/index.ts —— 守卫：把「已加载/未加载」显式建模
+router.beforeEach(async (to) => {
+  const auth = useAuthStore();
+  const perm = usePermissionStore();
+
+  if (to.meta.public) return true;                          // 登录页放行，否则死循环
+  if (!auth.token) return { name: 'Login', query: { redirect: to.fullPath } };
+
+  if (!perm.loaded) {                                       // 刷新后：store 是空的，动态路由不存在
+    await perm.load();
+    perm.install(router);
+    return { ...to, replace: true };                        // ← 必须重进一次，原因见下
+  }
+  if (to.meta.roles && !auth.hasAny(to.meta.roles)) return { name: 'NotFound' };
+  return true;
+});
+```
+
+**为什么 `return { ...to, replace: true }` 这一步不能省**（本章最值钱的一段）：
+
+1. 刷新时浏览器请求 `/system/user`，Router 用**当前路由表**做匹配。此刻动态路由还没 `addRoute`，
+   能匹配上的只有 catch-all，于是这次导航的 `to.matched` 已经是"404"了。
+2. `addRoute` 只影响**之后的导航**，不会回头重跑已经算好的 `to.matched`。守卫里你 `await load()` 完成后再 `return true`，
+   放行的仍然是那次"目标是 404"的导航 → **白屏或 404 页，且不报任何错**。
+3. 解决办法是**发起一次新的、指向同一地址的导航**：`{ ...to, replace: true }` 会带上原来的 `path`/`params`/`query`/`hash` 重新匹配
+   （这次能命中新增的路由），`replace` 保证不会在历史里留下一条"404"记录，用户按返回键不会退回不存在的中间态。
+
+同一目的的官方等价写法是 `router.replace(router.currentRoute.value.fullPath)`，或者在守卫里 `return to.fullPath`。
+三者选一即可，**但别在同一个守卫里既 `addRoute` 又 `return true`**。
+
+> [!WARNING]
+> "刷新后动态路由丢失"是**结构性的**：路由表在内存里，store 不持久化（持久化也解决不了组件引用无法序列化的问题）。
+> 所以正确姿势永远是"守卫里判断 `loaded` → 未加载就加载并重装"，而不是想办法把路由存进 `localStorage`。
+> 顺带把 `loaded` 与 `token` 的生命周期对齐：登出走 `perm.reset(router)`，否则换账号会残留上一个用户的可访问路由。
+
+组件映射用 Vite 的 glob，比手写 `component: 'system/user/index'` 的动态 import 稳：
+
+```ts
+const viewModules = import.meta.glob('@/views/**/*.vue');          // 懒加载，值就是函数
+function menusToRoutes(menus: MenuItem[]): RouteRecordRaw[] {
+  return menus.map((m) => ({
+    path: m.path,
+    name: m.name,                                                    // name 必须唯一，且与 keep-alive include 对齐（12）
+    component: viewModules[`/src/views/${m.component}.vue`],
+    meta: { title: m.title, roles: m.roles, keepAlive: m.isCache },
+    children: m.children ? menusToRoutes(m.children) : undefined,
+  }));
+}
+```
+
+`meta` 的类型要在模块声明里补齐，否则 `to.meta.roles` 是 `unknown`：
+
+```ts
+declare module 'vue-router' {
+  interface RouteMeta {
+    title?: string;
+    public?: boolean;
+    roles?: string[];
+    keepAlive?: boolean;
+  }
+}
+```
+
+> [!TIP]
+> 用 `import.meta.glob` 时，返回对象的 **key 是解析后的路径**（别名会被展开成 `/src/...`），不同 Vite 版本与
+> `base` 配置下形态可能不同。别硬拼字符串——先把 `Object.keys(viewModules).slice(0, 3)` 打一次日志再拼，
+> 拼错的表现为"路由加上了但组件是 `undefined`"，页面直接空白。
+
+### 3. `scrollBehavior` 与 keep-alive 的组合
+
+```ts
+scrollBehavior(to, from, savedPosition) {
+  if (to.meta.noScrollRestore) return { top: 0 };
+  if (savedPosition) return savedPosition;                    // 浏览器前进/后退：有记录就还原
+  if (to.hash) return { el: to.hash, offset: { top: 72 } };   // 锚点 + 吸顶高度补偿
+  if (to.matched.some((r) => r.meta.scrollToTop === false)) return;  // 同级切 tab 不滚
+  return { top: 0, behavior: 'smooth' };
+}
+```
+
+三个必须知道的限制：
+
+1. **只对 window 滚动生效**。中后台布局通常是"外壳固定、内层 `.app-main` 才是滚动容器"，
+   此时 `savedPosition` 拿不到、`{ top: 0 }` 也滚不动——必须自己记录/恢复容器 `scrollTop`（或用 `el` 选择器指向容器，
+   但 `el` 要求元素在文档中且此时已挂载）。
+2. **和 keep-alive 同时用时，位置其实不需要 Router 恢复**：组件被缓存，DOM 与滚动位置都还活着，
+   切回来自然在原位。真正的问题在**另一个方向**——缓存页重新激活时（08 的 `onActivated`）内容可能刚被异步刷新，
+   高度变了，滚动位置会飘。修法是在 `onActivated` 里 `await nextTick()` 之后再设 `scrollTop`，必要时等两轮 rAF。
+3. **`behavior: 'smooth'` 在恢复长列表时会被浏览器忽略或看起来没生效**（内容还没渲染完）。
+   这类"看着是配置问题其实是时序问题"的结论，先加一句 `await nextTick()` 再判。
+
+### 4. history 与 base、chunk 划分、预取
+
+```ts
+const router = createRouter({
+  history: createWebHistory(import.meta.env.BASE_URL),   // ← base 必须和 vite.config 的 base 一致
+  routes: staticRoutes,
+  scrollBehavior: () => ({ top: 0 }),
+});
+```
+
+子路径部署（本项目就是 `/blog/`）的三处必须一致，缺一处就 404 或资源加载失败：
+
+| 位置 | 配置 | 错了会怎样 |
+|---|---|---|
+| Vite | `base: '/blog/'` | 资源 404（JS/CSS 打不到） |
+| Router | `createWebHistory('/blog/')` | 页面能开但**刷新 404**、路由匹配不上 |
+| Nginx | `location /blog/ { try_files $uri $uri/ /blog/index.html; }` | 刷新 404（请求落到不存在的文件） |
+
+SSR 下用 `createMemoryHistory()`，并且在挂载前 `await router.isReady()`（守卫里的异步逻辑跑完才算首屏可水合）。
+
+懒加载与 chunk 划分（和 [Vite 工程实践](/blog/posts/engineering-roadmap-04-vite/) 衔接）：
+
+- **默认按路由切**：`component: () => import(...)` 天然是切点，别把所有页面 import 到一处再传给 `meta`。
+- **再按"模块组"聚一次**：同一个业务域（`system/*`、`monitor/*`）的页面共享一个布局/组件目录，靠 Vite 的
+  公共 chunk 规则自然会合并；手工用 `manualChunks` 强行合路由一般收益有限（示例数据：某 60 页后台按路由切完
+  首屏入口 chunk 从 1.2MB 降到 ~280KB，再手工合并只多降 20KB 却增加缓存失效面——这类结论要用你自己的
+  `rollup --analyze`/`vite-bundle-visualizer` 报告复核，别照抄）。
+- **必须处理"部署后旧 chunk 被删"**：用户在旧页面点新菜单 → `import()` 404 → 报 `Failed to fetch dynamically imported module`。
+  捕获与重试策略在 16，这里只放守卫侧的一行：
+
+```ts
+router.onError((err) => {
+  if (/dynamically imported module|Importing a module script failed/.test(String(err))) {
+    location.assign(router.currentRoute.value.fullPath);   // 整页重载拿新 index.html
+  }
+});
+```
+
+**预取**：Vue Router **没有内建 prefetch**（Nuxt 的 `<NuxtLink>` 才有）。可选的三条路：
+hover 时手动 import；`IntersectionObserver` 观察可见链接后预取；`<RouterLink>` 的 `custom` 插槽配合 `useLink`：
+
+```ts
+import { useLink } from 'vue-router';
+const { route, href, isActive, isExactActive, navigate } = useLink({ to: '/system/user', replace: false });
+// route 是解析后的路由对象，href 是最终 URL，isActive/isExactActive 是 ref，navigate 是可编程的跳转函数
+```
+
+`useLink` 的意义不是省代码，而是让**自定义菜单项组件**（Element Plus 的 `el-menu-item` 里塞链接这种）
+能复用 RouterLink 的 active 判定，避免自己写 `route.path.startsWith` 那种在嵌套路由下必然判错的逻辑。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue Router 4 | React Router（v6/v7 data router） |
+|---|---|---|
+| 路由定义 | 配置数组 + 嵌套 `children` | 路由对象/元素两种形态；v6.4+ 推荐 `createBrowserRouter` 对象式 |
+| 进入前拦截 | 全局/组件守卫链（`beforeEach` 等 12 步） | **没有等价守卫链**：改用 `loader` 里 `throw redirect('/login')`、组件内 `<Navigate>`，或包一层 `ProtectedRoute` |
+| 离开前确认（表单未保存） | `onBeforeRouteLeave` | 只能自己拦（`useBlocker`，且**只在 data router 下可用**） |
+| 离开后收尾（埋点/进度条） | `afterEach`（拿不到取消能力） | `afterEach` 事件订阅（v7 data router）/ `useEffect` cleanup |
+| 动态权限路由 | `router.addRoute` + 守卫重定向一次 | React Router 需**重新渲染 routes**（把路由表放进 state/context），因为它的 routes 是渲染产物不是实例方法 |
+| 滚动恢复 | `scrollBehavior` 显式函数 | data router 的 `future.unstable_...`/v7 `scrollRestoration`，可按路由关闭 |
+| 代码分割 | 路由级 `() => import()` + 外层 `Suspense`（12） | `React.lazy` + `Suspense`，v7 有 route `lazy` 属性 |
+| URL 状态 | `to.query` / `router.replace({ query })` | `useSearchParams`，语义等价，Vue 侧要注意"整体替换 query" |
+| 导航返回值 | `Promise<NavigationFailure \| void>` | `navigate()` 返回 `void`，失败靠 loader 抛错 + `useRouteError` |
+
+对 React 同学最需要提醒的一条：**Vue 的守卫是"命令式的中间件链"，React 的拦截是"渲染产物的一部分"。**
+所以 Vue 里加一条全局规则（鉴权、埋点、脏检查）就是一个 `beforeEach`，很爽；
+代价是链路隐式、顺序有 12 步、调试要靠 `router.beforeEach` 打断点，而 React 的 `loader` 直接写在路由定义里、可单测、但重复逻辑要靠 HOC 抽。
+
+---
+
+## 翻车现场
+
+### 现场 1：登录后跳目标页白屏，刷新一下就正常
+
+- **症状**：`login()` 成功 → `router.push(redirect)` → 空白；**手动刷新同一条 URL 却正常**。
+- **根因**：登录后的第一次导航发生在 `addRoute` 之前，匹配到 catch-all（白屏是因为 404 组件被写成了"空白 + 只在无数据时显示"）；
+  刷新时如果守卫顺序写成"先加载权限再匹配"，反而能命中，所以看起来"刷新就好"。
+- **修法**：第 2 节的两步走——`load()` → `install()` → `return { ...to, replace: true }`。
+  或者在登录成功里先 `await perm.load(); perm.install(router);` 再 `push`。**关键是"路由表必须先于导航完整"。**
+
+### 现场 2：无限重定向，页面在 `/login` 和自己的目标之间抖
+
+- **症状**：控制台 `Detected an infinite redirection in a navigation guard`；或者 Network 里权限接口被反复请求。
+- **根因**：三种常见写法漏洞——① 登录页没被排除（`to.meta.public` 缺失，守卫又把人踢回 login）；
+  ② `loaded` 判断写在 `load()` 之前但 `load()` 失败不回滚，导致每次都走"重装 + 重定向"分支；
+  ③ 401 响应拦截器里直接 `router.push('/login')`，和守卫的重定向叠加成环。
+- **修法**：守卫里给每个分支配**可判定的出口**（重定向前检查 `to.name !== 'Login'`）；
+  权限加载失败时 `loaded` 保持 `false` 但 `return { name: 'Error' }` 走错误页而不是原地重定向；
+  拦截器只在"确实会话失效"时跳转，且跳转前 `if (router.currentRoute.value.name !== 'Login')`。
+
+### 现场 3：返回列表页滚动位置丢失，且第一次返回还会闪一下顶部
+
+- **症状**：列表滚到第 30 行 → 进详情 → 返回，位置没了；且 keep-alive 已经开了仍然无效。
+- **根因**：滚动容器不是 window（布局是 `el-container` 内层滚动），`savedPosition` 帮不上；
+  同时返回触发了 `onActivated` 里的重新加载（08 的脏标记），列表高度先变 0 再变回来，位置被浏览器重置。
+- **修法**：在失活时把容器 `scrollTop` 记进 `sessionStorage`（或页面级 `provide` 的宿主状态，09），
+  `onActivated` 里**先等数据回来、再 `await nextTick()`、最后写回 scrollTop**；
+  数据未变时不要重新加载（失效策略见 12）；`scrollBehavior` 对这类容器统一返回 `{ top: 0 }` 之外的行为要关掉
+  （`meta.noScrollRestore`），避免和自定义恢复打架。
+
+---
+
+## 复习卡片
+
+- **Q：守卫的完整顺序？** A：leave（旧页面）→ 全局 beforeEach → update（复用组件）→ 路由独享 beforeEnter → 解析异步组件 → 新页面 beforeRouteEnter → beforeResolve → 确认 → afterEach → DOM 更新 → `next` 回调。
+- **Q：Router 4 里 `return false`、`return '/login'`、抛错分别是什么语义？** A：取消并回退 URL（aborted）／重定向（丢弃当前导航，新导航同 from）／取消并进入 `router.onError`。
+- **Q：为什么 `addRoute` 之后必须重定向一次？** A：匹配在导航开始时用当时的路由表完成，`addRoute` 不会重跑已完成的匹配；重进一次（`replace: true` 不留历史记录）才能命中新路由。
+- **Q：刷新后动态路由丢失怎么解？** A：路由表存内存、组件引用不可序列化，所以只能在守卫里判断 `loaded`，未加载就重新拉菜单、`addRoute`、再重定向。
+- **Q：`scrollBehavior` 什么时候不管用？** A：滚动容器不是 window 时；以及内容在 `onActivated` 里被异步刷新、高度变化之后。
+- **Q：子路径部署要改哪三处？** A：Vite 的 `base`、`createWebHistory` 的参数、Nginx 的 `try_files`（回退到 `子路径/index.html`）。
+
+---
+
+## 小结
+
+- 导航是异步流程：12 步顺序、可取消、可 `await`；`next` 已 deprecated，统一用 return 表达意图，禁止同守卫混用。
+- 动态权限路由的正确心智模型是**"路由表必须先于导航完整"**：`load → addRoute → 重进同一地址（replace）`，登出必须 `removeRoute`。
+- `loaded` 是一个必须显式建模的状态，刷新丢失是结构性的，别指望持久化。
+- 滚动恢复只对 window 有效；和 keep-alive 组合时位置通常不需要 Router 恢复，真正要解决的是"激活时数据刷新导致高度突变"。
+- 部署三处 base 一致；chunk 按路由切 + 必须兜 `onError` 的动态 import 失败；预取是自己加的糖（`useLink` 让 active 判定不重造轮子）。
+
+---
+
+## 练习
+
+1. 在任意项目里打印守卫顺序：全局 `beforeEach` / `beforeResolve` / `afterEach` + 旧页面 `onBeforeRouteLeave` + 新页面 `beforeRouteEnter`，
+   从一个带参路由跳到另一个同组件路由（`/user/1` → `/user/2`），把输出与第 1 节的表格逐条对齐，标出你没想到的那一步。
+2. 把守卫改成**纯 return 风格**：删掉所有 `next` 调用，并为三种失败类型各写一条 `console.debug`，
+   用 `router.push('/admin')` 手动触发 `aborted` / `duplicated` 各一次，观察 `await` 出来的 failure 对象结构。
+3. **可见交付物**：完整实现"登录后动态权限路由"：`staticRoutes`（含 catch-all）+ `permission` store（`load` / `install` / `reset`）
+   + 守卫（`loaded` 判断 + `return { ...to, replace: true }`）+ 登出清理。验收四条必须都能演示：
+   登录后直达目标页；**直接刷新**目标页 URL 能进；低权限账号访问受限页进 404/错误页；登出后换低权限账号不再能进之前的页面。
+
+---
+
+## 面试一句话
+
+> "Router 4 的一次导航是异步流程，顺序是：旧页面的 `beforeRouteLeave` → 全局 `beforeEach` → 复用组件的 `beforeRouteUpdate`
+> → 路由独享 `beforeEnter` → 解析异步组件 → 新页面的 `beforeRouteEnter` → `beforeResolve` → 确认后 `afterEach` → DOM 更新。
+> 新版文档已经把 `next` 标成废弃，用返回值等价表达：`return false` 取消、`return '/login'` 改道、抛错进 `router.onError`，
+> `await push` 拿到的是 `NavigationFailure`，只有 aborted、cancelled、duplicated 三种，**没有 `navigationBlocked` 这个 API**。
+> 动态权限路由最容易翻车的地方是匹配的一次性：刷新时 `/system/user` 用当时的路由表只能命中 catch-all，`addRoute` 不会重跑这次匹配，
+> 所以必须 `load` → `addRoute` → 以 `{ ...to, replace: true }` 重新发起同地址导航，`replace` 是为了不在历史里留下那条 404。
+> 刷新丢失是结构性的，路由表在内存、组件引用不可序列化，只能在守卫里显式建模 `loaded`，登出要 `removeRoute`。
+> 滚动那块我要提醒的是 `scrollBehavior` 只对 window 有效，中后台的容器滚动得自己记 `scrollTop`，
+> 而且和 keep-alive 组合时真正的故障是激活时重新拉数据导致高度突变，位置是被这次重排弄丢的。"

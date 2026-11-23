@@ -1,0 +1,350 @@
+---
+title: '02 · 模板编译：从 mustache 到 render 函数'
+published: 2026-11-22T10:00:00+08:00
+description: 'Vue 3 模板编译全流程：@vue/compiler-sfc 的 parse / transform / generate 三段、createVNode 与 patchFlag 位标记、静态提升与 handler 缓存、script setup 的内联模式、预编译与运行时编译的取舍及 CSP 影响，以及 Vue 为什么不需要全量子节点比较。'
+tags: [Vue, 模板编译, "@vue/compiler-sfc", patchFlag, 性能优化]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章解决两件在具体项目里很实在的事：**为什么这个节点的更新比那个贵**，以及**为什么模板能比手写 JSX 少做比较**。
+> 场景：后台列表页里一行有 12 个单元格，只有"状态"那一列会变。你给整行加了 `v-memo`，收益一般；后来把渲染函数改成只更新状态列，交互延迟立刻掉一半——差别就在编译产物有没有被标成"只有这一处会变"。
+> 问答形态见 [面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/) 的 Q6、Q7c（Block Tree / PatchFlags / 静态提升），这一章负责把那些答案的因果链补齐。
+
+---
+
+## 一句话本质
+
+Vue 的模板不是"语法糖"，是一门**编译期可分析的 DSL**：编译时能把"哪里会变"这件事直接写进产物，运行时只比较被标注过的部分。
+
+三个推论，贯穿全章：
+
+1. **模板能做到的优化，JSX 做不到**——JSX 是运行时表达式，编译器无法判断哪个属性是常量。
+2. 编译产物的核心信息不是 vnode 本身，而是 vnode 上的 **patchFlag**：一个位标记，告诉 diff "这个节点只有文本会变 / 只有 class 会变 / 需要全量比较"。
+3. 因此 Vue 的更新代价主要由**编译期决定**（写了什么结构），而不是由数据量决定。第 05 章的 `v-memo`、第 13 章的长列表优化，都是这条的下游。
+
+---
+
+## 原理拆解
+
+### 1. parse → transform → generate：编译发生在构建期
+
+一个 `.vue` 文件的处理链路（`@vue/compiler-sfc` 是入口，按块分派给 `@vue/compiler-dom`）：
+
+```text
+xxx.vue
+  └─ compiler-sfc.parse()        切成 <template> / <script setup> / <style> 三个块 + AST
+        │
+        ├─ <template> → compiler-core:
+        │     parse()            字符串 → 模板 AST（元素、指令、插值、文本节点）
+        │     transform()        改写 AST：指令语义化、静态判定、提升、生成 block
+        │     generate()         AST → JS 代码字符串（render / setup 内联函数）
+        │
+        └─ <script setup> → babel 解析 → 把模板编译结果内联进来
+
+产物：一个带 render 函数的普通 JS 模块，交给 Vite 打包
+```
+
+三段各自做什么：
+
+| 阶段 | 输入 → 输出 | 关键动作 |
+|---|---|---|
+| parse | 模板字符串 → 模板 AST | 词法/语法分析，指令与插值变成节点；HTML 实体、`<pre>` 空格保留规则在这一步 |
+| transform | AST → 带优化标注的 AST | 指令转换成 `createVNode` 调用、静态/动态判定（`isStatic`）、`hoistStatic` 提升、按 `v-if`/`v-for` 切 block、计算 patchFlag |
+| generate | AST → 代码字符串 | 产出 `_createElementVNode(...)` / `_createBlock(...)`，插入 `_push`/`_pop` 的 block 动态子数组 |
+
+要点：**这一步在 `npm run build` / dev 预变换时就完成了，浏览器里跑的没有模板字符串**。所以运行时版 Vue 才比编译器版小一截（压缩后差约 30 KB 量级，具体数字看构建与 tree-shaking，别背固定值），也才有 CSP 的说法。
+
+模板 AST 到渲染函数调用的映射，记这几条就够用：
+
+```text
+<div>           → _createElementVNode("div", props, children, patchFlag, dynamicProps)
+{{ msg }}       → 文本插值：_toDisplayString(msg)，所在节点标 patchFlag = TEXT
+:id="x"         → 动态 prop：进 props 对象，并给节点打上 PROPS / CLASS / STYLE
+v-if / v-else   → 三元表达式 + _createBlock，动态子节点收进 block.children 数组
+v-for           → _renderList(...) 包一层，产出 Fragment（带 KEYED / UNKEYED 标记）
+<Comp />        → _createVNode(Comp, props, children, patchFlag, dynamicProps)
+@click="fn"     → props.onClick = $event => fn($event)（或缓存后的 _cache[n]）
+```
+
+还有一层容易被忽略的输入：**transform 阶段拿得到 script 块的绑定信息**（`bindingMetadata`）。`<script setup>` 里每个顶层声明都会被登记成一种绑定类型，编译器据此决定模板里的标识符怎么引用：
+
+| 绑定类型 | 来源 | 模板里的引用方式（非内联模式） |
+|---|---|---|
+| `setup-ref` | `setup` 返回的 ref | `_ctx.xxx`，运行时按 ref 自动解包 |
+| `setup-reactive-const` | `setup` 返回的非 ref 常量 | `_ctx.xxx`，不做解包 |
+| `setup-const` | 内联模式下的纯常量 | 直接 `xxx`，不经过上下文 |
+| `literal-const` | 从别的模块 import 的常量 | 直接引用 |
+| `component` | 模板里当作组件用的标识符 | 解析为组件对象，跳过运行时全局查找 |
+| `props` / `data` / `options` | Options API | `_ctx.xxx` |
+
+这一层解释了两个"玄学"现象：为什么同一个标识符在内联模式产物里是裸变量、在分离模式里是 `_ctx.`；为什么 `<script setup>` 里 import 一个组件就能直接当标签用（编译期被登记成 `component`，不会退化成"查找全局组件"的字符串）。
+
+### 2. 编译产物长什么样：`createVNode` + patchFlag 位标记
+
+同一段模板，看编译前后：
+
+```vue
+<template>
+	<div class="cell">
+		<span class="label">状态</span>
+		<b :class="{ ok: row.enabled }">{{ row.status.text }}</b>
+		<i>静态图标</i>
+	</div>
+</template>
+```
+
+编译产物（简化，非逐字）：
+
+```js
+/* hoisted */ const _hoisted_1 = { class: 'cell' };
+/* hoisted */ const _hoisted_2 = { class: 'label' };
+/* hoisted */ const _hoisted_3 = _createVNode('i', null, '静态图标', -1 /* STATIC */);
+
+function render(_ctx) {
+	return _createVNode('div', _hoisted_1, [
+		_createVNode('span', _hoisted_2, '状态', -1 /* 无动态：可整体跳过 */),
+		_createVNode('b', {
+			class: { ok: _ctx.row.enabled },
+		}, _toDisplayString(_ctx.row.status.text), 3 /* TEXT | CLASS */),
+		_hoisted_3,
+	]);
+}
+```
+
+**patchFlag 是 vnode 上的第 5 个参数，按位或组合**（`TEXT | CLASS` 写成 `3`）。上面那行 `3` 就是运行时 diff 的全部依据：
+
+```text
+1   TEXT             只有文本插值会变           → 只 patch children 的文本
+2   CLASS            只有 class 会变            → 只比 class
+4   STYLE            只有 style 会变
+8   PROPS            有动态 props（非 class/style）→ 只比 dynamicProps 列出的那几个 key
+16  FULL_PROPS       props 的 key 集合本身动态（v-bind="obj" 展开）→ 退回全量比 props
+128 KEYED_FRAGMENT   v-for 有 key                → 建 key→index 映射后走子集匹配
+256 UNKEYED_FRAGMENT v-for 无 key                → 按位置依次比
+512 NEED_PATCH       ref / 动态事件之类，需完整 patch 一次
+-1 / -2 BAIL         编译器放弃优化（如 v-once、复杂 directive），该子树按老式全量 diff
+```
+
+不需要背全表，要记住的是**它解决的问题**：每次组件重渲染都会产出全新的一棵 vnode 树，diff 时如果每个节点都要遍历全部属性、全部子节点，代价就是"模板多大就有多贵"。有了 patchFlag，diff 在遇到被标记的节点时只走对应那一小段逻辑，遇到 `-1`/静态节点直接跳过。
+
+配套的第二层是 **Block Tree**：`v-if`、`v-for` 这些"子节点数量/种类会变"的位置会被切成独立的 block，block 自己维护一份**动态子节点扁平数组**（`_createBlock('div', key, [ /* 动态子节点 */ ])` 的第三个参数里那几个 `_createVNode`）。更新时不遍历整棵模板树，而是沿着这条动态数组走。这两层合起来才是"Vue 不做全量比较"的完整答案，缺了 Block Tree 只讲 patchFlag 是不及格的。
+
+带 `v-if` 的模板产物大概长这样（注意 `_openBlock()` 与 `_createBlock` 成对出现，children 位置放的就是这个 block 的动态子节点）：
+
+```js
+return _createBlock(_Fragment, null, [
+	_ctx.visible
+		? (_openBlock(),
+			_createBlock('div', { key: 0 }, [
+				_createVNode('p', null, _toDisplayString(_ctx.msg), 1 /* TEXT */),
+			]))
+		: _createCommentVNode('v-if', true),
+	_createVNode('span', null, '常量', -1 /* 静态，可跳过 */),
+]);
+```
+
+读产物时抓三个信号就够了：
+
+- 有没有 `_openBlock()` / `_createBlock`：有，说明这一层是动态块，走 block 的动态子数组；没有，说明整棵树是普通 children 数组，diff 时按 patchFlag 处理。
+- patchFlag 是几：`-1`/`-2` 是放弃优化，`1` 只比文本，`16` 是全量 props，`128`/`256` 决定列表走 keyed 还是按位置。
+- 有没有 `key: 0/1/2`：`v-if`/`v-else` 分支之间靠编译器自动补的整数 key 区分，不是写错。
+
+> [!TIP]
+> 想养成"写模板时能预判产物"的手感，做法很简单：改完一段模板就在 Playground 的 Output 面板扫一眼 patchFlag 列。三周之后你写 `v-for` 时会条件反射地先确认 key。
+
+### 3. 三项编译期优化：静态提升、hoistStatic、handler 缓存
+
+**静态提升（hoistStatic）**：判定为静态的节点/属性被提到 render 函数外面，只创建一次，之后每次渲染复用**同一个 vnode 对象**。vnode 引用不变 → diff 直接判定可跳过，连比较都省了。
+
+判定"静态"的口径（写模板时可以自查）：
+
+- 节点自身和整棵子树都没有插值、没有动态 `:` 绑定、没有指令（`v-if`/`v-for`/`v-html` 等）。
+- 属性值是字面量，或引用的是被登记成常量的绑定。
+- 事件监听器只有在被缓存（`cacheHandlers`）或本身就是常量时才允许提升，否则该节点算动态。
+- `<component :is>`、`v-slot` 内容、需要 patch 的 ref 都会把节点踢出静态集合。
+
+编译器选项 `hoistStatic` 默认为真；关掉它、或遇到上面任意一条时，节点退化成"每次渲染新建 vnode"。`<pre>` 里的空白保留规则、注释节点（默认不进产物，`comments: true` 才会）也在这套判定里。
+
+**属性对象提升**：`{ class: 'cell' }` 这种常量 props 也被提到外面，避免每次渲染新建对象——顺带避免了"props 每次都是新引用"导致的子组件更新。
+
+**事件 handler 缓存**（编译期选项 `cacheHandlers`）：把 `@click="doIt(id)"` 这类内联表达式改写成存入渲染缓存的形式：
+
+```js
+onClick: _cache[1] || (_cache[1] = (id) => _ctx.doIt(id));
+```
+
+收益要分场景看：
+
+- 挂在**原生元素**上、节点 patchFlag 只有 `TEXT` 时，事件 prop 本来就不参与比较，缓存收益接近 0。
+- 挂在**组件**上（`@change="(...)"`）时，每次新建的箭头函数是组件 props 的一部分，浅比较必然判不等 → 子组件白重渲染一次。这也是"给子组件传内联函数要不要 `useCallback`"在 Vue 里的答案：**多数时候编译器已经替你缓存了，真正该盯的是内联对象/数组**。
+- 3.4+ 对 attrs 透传路径做了性能改进，二次封装组件里 `v-bind="$attrs"` 的额外开销比早期版本低（见第 14 章）。
+
+还有一类编译期产物值得知道：`v-once` 会把子树标成"渲染一次后不再 patch"（BAIL），`v-memo` 则编译成显式的依赖数组判断（两者差异与适用场景在[第 05 章](/blog/posts/vue-roadmap-05-list-and-condition/)细讲，长列表的整体打法在[第 13 章](/blog/posts/vue-roadmap-13-performance/)）。
+
+### 4. 内联模式、`<script setup>` 与"要不要带编译器"
+
+**`<script setup>` 有两种编译形态**。先看内联模式的具体产物（左边是你写的，右边是编译器给的）：
+
+```vue
+<script setup>
+import { ref } from 'vue';
+const n = ref(0);
+function add() {
+	n.value++;
+}
+</script>
+
+<template>
+	<button @click="add">{{ n }}</button>
+	<span>{{ n * 2 }}</span>
+</template>
+```
+
+```js
+// 内联模式产物（简化）：render 就在 setup 内部，直接闭包引用 n / add，没有 _ctx
+export default {
+	__name: 'Counter',
+	setup(__props) {
+		const n = ref(0);
+		function add() {
+			n.value++;
+		}
+		return (_ctx, _cache) => [
+			_createElementVNode('button', { onClick: add }, _toDisplayString(n.value), 1 /* TEXT */),
+			_createElementVNode('span', null, _toDisplayString(n.value * 2), 1 /* TEXT */),
+		];
+	},
+};
+```
+
+分离模式则把 render 提到组件选项上，setup 的返回值被包成上下文对象，模板里全部经 `_ctx.n` 取。差别是：**内联少一层间接、少一份 bindings 对象**，这也是 `<script setup>` 组件在 dev 下产物更短、生产包略小的原因之一。
+
+两种形态的对照：
+
+| 模式 | 产物 | 触发条件 | 影响 |
+|---|---|---|---|
+| 内联（inline，默认在 SFC 编译中） | 模板直接编译进 `setup()` 返回的 render 闭包，可以裸引用局部变量 | SFC 且 `<script setup>` | 没有 `_ctx.xxx` 间接层，绑定更少、体积略小、可读产物更短 |
+| 分离（separate） | 模板编译成独立 `render(_ctx)`，setup 返回值经 `_sfc_main` 组装；`__returned__` 形式 | 非 `<script setup>`、显式关闭内联、模板里引用了 setup 外的东西需要运行期解析 | 变量要通过上下文对象取，devtools 能看到 bindings |
+
+内联模式的一个实际好处：**响应式引用的路径更直**，`ref` 的解包在编译期就确定，不会出现"运行时才找不到的绑定"。坏处是 devtools 里看到的 setup 结构没那么直观。
+
+**运行时编译 vs 预编译**（这是面试常问、也是 CSP 场景唯一的分歧点）：
+
+```js
+// 需要"带编译器的 Vue"才能工作
+const Comp = { template: `<div>{{ msg }}</div>` }; // 字符串模板在运行时才编译
+```
+
+```bash
+# 打包时按需选择入口文件（Vue 3.x 起统一 ESM，无 .min 时代那套 cjs 变体）
+vue/dist/vue.esm-browser.js           # 含编译器，能在浏览器里编译字符串模板
+vue/dist/vue.runtime.esm-browser.js   # 只有运行时，体积更小
+```
+
+- **默认走预编译**：`@vitejs/plugin-vue` 把 SFC 在构建期编译成 render 函数（见 [Vite 工程化篇](/blog/posts/engineering-roadmap-04-vite/)），运行时版足够。
+- **需要运行时编译的三类场景**：模板来自后端下发的字符串、低代码/搭建平台动态渲染、第三方库只给了 `template` 选项。做法是显式 alias 到带编译器的入口，或后端出模板时用 `@vue/compiler-dom` 预编译成 render 函数字符串再交给 `new Function`。
+- **CSP**：运行时编译依赖 `new Function`，在只允许 `script-src 'self'` 的环境里会被拦（要么加 `'unsafe-eval'`，要么放弃运行时编译）。这也是"企业内网严格 CSP 场景下，低代码渲染器要把模板编译放到服务端"的原因。
+- 报错特征很有辨识度：`Component is missing template or render function`（运行时版拿到字符串模板）；`vue.esm-browser.js` 引入后包体涨了约 30 KB 量级。
+
+> [!WARNING]
+> 判断"这个项目到底带不带编译器"别看 `package.json`，看实际解析到的入口：`vite build` 后在产物里搜 `new Function` 或 `compileToFunction`。搜得到才说明走了运行时编译，否则你完全可以把 alias 去掉换回 runtime-only。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 描述 UI 的方式 | 模板（编译期可静态分析）或 JSX（可选） | 只有 JSX，运行时表达式，编译期无法知道哪个属性是常量 |
+| 减少 diff 代价 | 编译器自动产出 patchFlag + Block Tree，写在模板里就生效 | 需要 `memo` / `useMemo` / `useCallback` 手工划边界，或上 React Compiler 做自动记忆化 |
+| 常量复用 | `hoistStatic` 提到 render 外，vnode 引用不变 | 组件外的常量同样复用，但 JSX 里的对象/函数默认每次新建 |
+| 内联事件函数 | `cacheHandlers` 在编译期缓存进 `_cache[n]` | 每次渲染新建闭包，需要 `useCallback` 才有稳定引用 |
+| 列表子节点比较 | Fragment 带 `KEYED` / `UNKEYED` 标记，走双端 + 最长递增子序列 | 按 index 逐个比较，key 用来建映射做移动 |
+| 编译发生在 | 构建期（模板 → render 函数），运行时可选是否带编译器 | 构建期（JSX → `createElement`），永远不带"UI 编译器" |
+| 忘记加 key 的代价 | 退化为 `UNKEYED_FRAGMENT`：按位置比，可能串 DOM 状态 | 位置配对，同样串状态，且有控制台警告 |
+
+对照的落点：**React 的优化是"程序员显式声明这段不用重算"，Vue 的优化是"编译器从结构里推断出这段不会变"**。所以从 React 转过来最容易误解的是"我在 Vue 里也要到处 memo"——模板能覆盖的场景不需要，模板覆盖不了的（大列表、昂贵计算、动态组件）才需要手动介入。
+
+---
+
+## 翻车现场
+
+**一、给组件传内联对象，patchFlag 帮不上忙。**
+
+```vue
+<EditDialog v-model:open="open" :config="{ title: '编辑用户', width: 720 }" />
+```
+
+- 症状：弹窗里输入什么都不算卡，但每次外层状态变化，`EditDialog` 内部都会重渲染一遍，`v-memo` 加了也没用。
+- 根因：`:config` 是对象字面量，每次渲染都是新引用。它是组件 props，编译产物只能标 `PROPS`（比较这几个 key），浅比较必然不等。class/style/文本这些标记救不了对象 props。
+- 修法：常量对象提到 `<script setup>` 外面（或 `markRaw` 后放进 `shallowRef`），依赖动态部分时拆成几个原始值 prop。**这条比"要不要加 memo"重要得多：先让引用稳定，再谈缓存。**
+
+**二、动态 class 写了三种形式，只有一种能被标成 CLASS。**
+
+```vue
+<div class="row" :class="{ active: isActive }">     <!-- patchFlag 含 CLASS，只比 class -->
+<div class="row" :class="computedClass">            <!-- 同上 -->
+<div class="row" v-bind="attrs">                   <!-- FULL_PROPS：props 整体全量比 -->
+```
+
+- 症状：二次封装的表格列组件里用了 `v-bind="attrs"` 透传，行数一多明显比直接用原生 `el-table-column` 慢。
+- 根因：`v-bind` 展开无法静态枚举 key 集合 → `FULL_PROPS`（16），退化成"每次遍历全部属性"。这是透传类组件的固有成本，不是 bug。
+- 修法：能枚举的显式写；把 `v-bind="attrs"` 限定在最少的节点上；3.4+ 的 attrs 透传路径已优化，升级比手写绕过更划算（第 14 章展开）。
+
+**三、把字符串模板交给 runtime-only 构建。**
+
+- 症状：本地 dev 一切正常，上线后搭建页白屏，控制台 `Component is missing template or render function`；或严格 CSP 站点报 `Refused to evaluate a string as JavaScript because 'unsafe-eval'`。
+- 根因：组件的模板来自后端 JSON 的 `template` 字段，运行时版 Vue 里没有编译器；Vite 默认解析到 `vue.runtime.esm-bundler.js`。
+- 修法：三选一——服务端出模板时用 `@vue/compiler-dom` 编译成 render 函数再下发；前端 alias 到 `vue/dist/vue.esm-bundler.js`（包体 +30 KB 量级，示例数据）；或放弃字符串模板，改用 JSON Schema 驱动的原生渲染组件。
+
+---
+
+## 复习卡片
+
+- **Q：模板编译分几步，各产出什么？** A：parse 把模板字符串变 AST，transform 改写 AST（指令语义化、静态判定、提升、切 block、算 patchFlag），generate 出 render 函数字符串。
+- **Q：patchFlag 解决的具体问题是什么？** A：每次渲染都会产出全新 vnode 树，patchFlag 让 diff 只看"编译器已知的会变部分"（TEXT/CLASS/PROPS 等），把全量属性比较降级为定点比较。
+- **Q：只有 patchFlag 够吗？** A：不够，还要 Block Tree——`v-if`/`v-for` 处切成 block 并维护动态子节点数组，子节点数量变化的位置才能不整棵遍历。
+- **Q：静态提升提的是什么？** A：静态节点与常量 props 对象被提到 render 函数外，复用同一 vnode 引用，diff 时直接跳过。
+- **Q：为什么 JSX 拿不到这些优化？** A：JSX 是运行时表达式，编译器无法判定 `<div className="row">` 里的 `className` 是不是常量；Vue 模板是编译期可分析的字符串。
+- **Q：什么时候真的需要带编译器的 Vue？** A：模板在运行时才出现（字符串模板、搭建平台下发）。代价是包体变大且需要 CSP 的 `unsafe-eval`。
+
+「模板写法 → 编译产物」对照（复习时就按这张表默写）：
+
+| 模板写法 | 编译产物要点 | patchFlag |
+|---|---|---|
+| `<i>静态图标</i>` | 提到 render 外，只创建一次 | 静态（可整体跳过） |
+| `{{ row.a.b }}` | `createVNode('span', null, _toDisplayString(...))` | `TEXT` |
+| `:class="{ok: x}"` / `:style="obj"` | class/style 单独走快速路径 | `CLASS` / `STYLE` |
+| `:id="x" :data-k="y"` | 只比较列出的 key | `PROPS` |
+| `v-bind="obj"` | 无法枚举 key，全量比 props | `FULL_PROPS` |
+| `v-for` + `:key` | `renderList` + Fragment，建 key 映射 | `KEYED_FRAGMENT` |
+| `v-for` 无 key | `renderList` + Fragment，按位置比 | `UNKEYED_FRAGMENT` |
+| `v-if` / `v-else` | `_createBlock(...)`，动态子节点收进数组 | block 结构 |
+| `v-once` | 编译期放弃优化，渲染一次后不 patch | `BAIL` |
+
+---
+
+## 小结
+
+- 编译发生在构建期：`compiler-sfc` 切块，`compiler-core` 的 parse / transform / generate 产出 render 函数；浏览器里通常不带编译器。
+- 产物的价值不在 vnode，而在**"哪里会变"的元信息**：patchFlag（位标记）+ Block Tree（动态子节点数组），两者合起来让 diff 从"全量比较"变成"定点比较"。
+- 静态提升让静态节点复用同一引用，属性对象提升避免每次新建；handler 缓存主要救组件 props，不救元素事件。
+- `<script setup>` 的默认编译形态是**内联**，好处是绑定路径短、无 `_ctx` 间接层；模板里引用局部变量的能力来自这个内联闭包。
+- 只有"运行时才知道模板长什么样"才需要带编译器的构建，代价是包体和 CSP；能预编译就预编译。
+- 与 React 的分工差异：React 靠人显式 memo，Vue 靠编译器推断；模板覆盖不到的地方（对象 props、大列表）才需要手动介入。
+
+---
+
+## 练习
+
+1. 打开 [Vue SFC Playground](https://play.vuejs.org)，把 Output 切到 JS，把第 01 章练习里那个表单模板贴进去，逐个节点在产物里找到它的 patchFlag 数字并写回注释。约 10 分钟。
+2. 造一段"故意退化"的模板：把一处 `:class` 改成 `v-bind` 展开、去掉一处 `:key`、给一个静态节点加上插值，观察产物从定点比较变成什么。写出这三种改动各自影响的 diff 路径。
+3. **可见交付物**：给项目里最重的一个列表单元格（比如 `views/system/user` 的行）做一次编译产物体检，产出一张前后对照表：节点数、`FULL_PROPS`/`UNKEYED_FRAGMENT` 出现次数、被提升的静态节点数，并把其中至少一处改成能命中定点比较的写法，用 Performance 面板记录"输入搜索关键字到列表更新"的前后耗时（记录方法见 [浏览器运行时性能](/blog/posts/browser-roadmap-09-runtime-performance/)）。
+
+---
+
+## 面试一句话
+
+> "Vue 3 的模板优化不是虚拟 DOM 更快，而是**把'哪里会变'提前到编译期算出来**：patchFlag 用位标记告诉 diff 只比文本、只比 class 还是只比列出的几个 props，Block Tree 把 `v-if`/`v-for` 这类子节点数量会变的切成独立块并维护动态子数组，静态节点直接提升到 render 外复用同一引用。所以模板能拿到 JSX 拿不到的收益——JSX 是运行时表达式，编译器没法判断哪个属性是常量；而 Vue 只要你不把动态对象塞进 props， diff 代价就基本和模板里'真正会变的点数'成正比。"

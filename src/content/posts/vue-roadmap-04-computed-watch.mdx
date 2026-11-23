@@ -1,0 +1,360 @@
+---
+title: '04 · 计算属性与侦听器：缓存、时机与副作用边界'
+published: 2026-11-22T12:00:00+08:00
+description: 'computed 的缓存命中条件与脏标记传播、可写 computed、watch 与 watchEffect 的取舍、flush 三个时机的选择、deep 的真实代价、immediate 的坑、onWatcherCleanup 解决的是竞态而非内存泄漏，以及哪些场景根本不该用侦听器。'
+tags: [Vue, computed, watch, watchEffect, 副作用, 竞态]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章的落点是一句能在面试和评审里直接用的判断：**"这个变化之后，你必须做一件有成本或不可逆的事吗？"必须做 → 侦听器；只是要一个值 → 计算属性。**
+> 场景：搜索框输入关键字，前端 300ms 防抖后请求接口。用户快速输入 `vue` → `vue3`，两条请求都在飞，**后到的那条是 `vue` 的旧结果**，列表被过期数据覆盖。这个 bug 十有八九不是"没防抖"，是"没有丢弃过期响应"。
+> 问答形态见 [面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/) 的 Q5b（watch / watchEffect 与 flush 时机）；响应式底层在[第 01 章](/blog/posts/vue-roadmap-01-reactivity-core/)；请求层的完整做法在[第 12 章](/blog/posts/vue-roadmap-12-async-data-cache/)。
+
+---
+
+## 一句话本质
+
+`computed` 是**读时结算的缓存**：它不安排任何副作用，只在"被读且依赖脏了"时算一次。
+`watch` 是**显式注册的副作用调度**：它在依赖变化后被安排执行，职责是"把变化转成动作"。
+
+两者的边界不是"要不要缓存"，而是三个问题：
+
+1. **产出是值还是动作？** 是值 → `computed`；是动作（请求、埋点、写 localStorage、操作 DOM）→ 侦听器。
+2. **谁付成本？** `computed` 只在被读时付；`watch` 每次变化都付，哪怕没人看结果。
+3. **要不要旧值？** 需要 `oldValue/newValue` 对比 → 侦听器；否则多半能用派生值表达。
+
+把这三问答错，就会得到项目里最常见的两种坏代码：为了"同步"写一堆互相触发的 `watch`，或者为每个派生值手写 `useMemo` 式的缓存变量。
+
+---
+
+## 原理拆解
+
+### 1. computed：缓存命中的条件与脏标记传播
+
+```ts
+const state = reactive({ first: 'Ada', last: 'Lovelace', age: 36 });
+
+const fullName = computed(() => {
+	console.log('getter 执行');
+	return `${state.first} ${state.last}`;
+});
+
+fullName.value; // 打印一次，_cache = 'Ada Lovelace'
+fullName.value; // 不打印：直接返回 _cache
+state.age = 37; // age 不在依赖里 → fullName 不会被标脏
+fullName.value; // 仍然不打印
+state.last = 'Byron'; // last 是依赖 → 下游被标脏
+fullName.value; // 打印一次，返回 'Ada Byron'
+```
+
+**缓存命中条件**（三条同时满足才命中）：
+
+1. 之前至少求值过一次（有 `_cache`）；
+2. 依赖没有被触发过（脏标记为假）；
+3. 依赖链上的上游 computed 重新求值后**结果确实变了**。
+
+第 3 条是关键，也是"读一次和读十次代价一样"这句话的准确版本：变化时的行为是**把脏标记沿依赖链往下传播**，而不是重算；真正的重算推迟到下一次读取，而且只算一次。所以：
+
+```text
+state.x 变  →  直接下游 computed 标脏（不算）
+            →  更下游只在"被读"时递归确认上游是否真的变了
+            →  值没变就不再往下传播，组件不会重渲染
+```
+
+前提别忘了：**"读一次和读十次一样便宜"只对同步 getter 成立**。getter 里放 `fetch`、放 `Math.random()`、放对非响应式对象的读取，缓存语义立刻失真（要么每次返回不同、要么永远不更新）。
+
+**可写 computed**：把"读"和"写"两种语义收进同一个名字，是表单组件的标准工具。
+
+```ts
+const props = defineProps<{ modelValue: string }>();
+const emit = defineEmits<{ 'update:modelValue': [v: string] }>();
+
+const text = computed({
+	get: () => props.modelValue,
+	set: (v) => emit('update:modelValue', v), // 写的时候不碰 props，只通知父组件
+});
+```
+
+3.4 起 `defineModel` 把这段样板替掉了，但**理解 `defineModel` 的返回值就是这样一个可写句柄**，比记语法有用。
+
+脏标记传播在链条上是这样跑的（三个 computed 串起来）：
+
+```ts
+const n = ref(1);
+const doubled = computed(() => {
+	console.log('doubled');
+	return n.value * 2;
+});
+const label = computed(() => {
+	console.log('label');
+	return `x${doubled.value}`;
+});
+const shown = computed(() => {
+	console.log('shown');
+	return label.value.length > 3 ? '长' : '短';
+});
+
+shown.value; // doubled / label / shown 各打印一次
+n.value = 2; // 只把三个都标脏，什么都不打印
+shown.value; // doubled、label 打印，shown 也打印：整条链重算一次
+n.value = 3;
+shown.value; // 三个又各打印一次，但 shown 的值仍是'短' → 依赖它的模板不会重新 patch
+```
+
+这条链给出两个可复用的结论：
+
+- **上游不重算，下游拿不到新值**：脏是"传播标记"，算是在读取时自上而下补做的，一次读取只算一次。
+- **值没变就不往下传**：`shown` 的结果不变时，依赖它的模板不会重新 patch。这就是"改了 state 但组件没重渲染"在 Vue 里的合法情形之一——别把它当 bug 查。
+
+三个高频误用：
+
+- **在 getter 里产生副作用**：请求、`emit`、改别的 state。getter 什么时候跑由"谁读它"决定，不可预测。
+- **依赖里混入非响应式来源**：`computed(() => api.lastResult.length)` 永远不会更新，因为 `api.lastResult` 不在依赖图里（第 01 章的失效场景三）。
+- **以为 computed 会"通知"谁**：它不会主动通知任何人，只是被读时给出最新值。想让变化触发动作，那是侦听器的职责。
+
+### 2. watch 与 watchEffect：来源、flush 时机与 deep 的代价
+
+```ts
+// 显式来源：能拿到新旧值，默认 lazy
+watch(
+	() => route.params.id,
+	(id, oldId) => {
+		/* id 是 string | undefined */
+	},
+	{ immediate: true },
+);
+
+// 隐式来源：回调里读了谁就依赖谁，第一次必须执行一次以建立依赖
+watchEffect(() => {
+	document.title = `${doc.title} - ${siteName.value}`;
+});
+
+// 多来源：数组形式，新旧值也是数组
+watch([keyword, page, sort], ([k, p, s], [ok, op, os]) => load(k, p, s));
+```
+
+判据：**需要旧值、需要懒执行、需要精确控制来源 → `watch`；只需要"跟着走" → `watchEffect`**。`watchEffect` 的隐式依赖在评审里是双刃剑：写起来短，但别人看不出它为什么跑。
+
+来源写法直接决定触发条件，排查时按这张表对号：
+
+| source 写法 | 什么时候触发 | 新旧值 |
+|---|---|---|
+| `watch(x, cb)`，`x` 是 `ref` 包原始值 | 值被替换时 | 正常给出 |
+| `watch(x, cb)`，`x` 是 `ref` 包对象 | 引用被替换时（内部字段改动不触发，除非 `deep`） | 新旧对象不同 |
+| `watch(state, cb)`，`state` 是 `reactive` | 隐式按 deep 处理，任意层级字段改动 | **新旧是同一个代理，恒等** |
+| `watch(() => state.a, cb)` | `a` 被替换时（对象不递归） | 正常给出，能拿到旧对象 |
+| `watch([a, b], cb)` | 任一变化 | 两个数组 |
+| `watchEffect(cb)` | 首次必跑一次，之后 cb 里读到的任一依赖变化 | 不提供旧值 |
+
+执行顺序记一条就够：同一 tick 内多个侦听器按**注册顺序**入队，`pre` 的回调在该组件重新渲染前跑完，`post` 等渲染提交后跑，`flush: 'sync'` 不参与排队。
+
+**flush 的三个时机**（`watch` 默认 `pre`，`watchEffect` 默认 `pre`，`watchSyncEffect` 等价 `sync`）：
+
+| 时机 | 执行点 | 典型用途 | 注意点 |
+|---|---|---|---|
+| `pre` | DOM 更新**之前**（作业队列里该组件渲染前） | 数据联动、请求、按新值改别的 state | 此时读 DOM 拿到的是**旧** DOM |
+| `post` | DOM 更新**之后** | 滚动定位、聚焦、图表重绘、读元素尺寸 | 依赖渲染完成，回调里再改响应式状态不会造成同批二次渲染 |
+| `sync` | 变化后立即同步执行 | 与第三方库同步、必须在同一 tick 内完成的桥接 | 每次赋值都跑，绕过了批处理，大表单里就是性能杀手 |
+
+`pre`/`post` 的选择直接决定一段代码对不对：
+
+```ts
+// ❌ 想在数据变化后把新行滚到底部：pre 时机读到的是旧 DOM
+watch(rows, () => el.value.scrollTop = el.value.scrollHeight);
+
+// ✅ 明确 post
+watch(rows, () => el.value.scrollTo({ top: el.value.scrollHeight }), { flush: 'post' });
+```
+
+**deep 的真实代价**：`deep: true` 要求 Vue 遍历整个对象树来建立订阅，并且每次触发时也要走一遍比对（值形态的新旧对比无法用引用相等完成）。代价与**节点数**成正比，与"你关心哪个字段"无关。
+
+```ts
+// 2000 行 × 20 字段的表格：整表 deep 侦听，示例数据下每次输入都要遍历数万个属性
+watch(form, onChange, { deep: true });
+
+// 换成字段级：只订阅真正关心的路径
+watch(() => form.user.name, onChange);
+watch([() => form.a, () => form.b], onChange);
+
+// 只要"引用换了"就够时，用浅层 + 整体替换
+const rows = shallowRef<Row[]>([]);
+watch(rows, onRowsChange); // 只在 rows.value 被替换时触发
+```
+
+**侦听 `reactive` 对象时 getter 包裹的必要性**——这是本章最容易考倒人的细节：
+
+```ts
+const state = reactive({ user: { name: 'a' }, count: 0 });
+
+watch(state, (nv, ov) => {
+	console.log(nv === ov); // true！传对象本身时，新旧值是同一个代理
+});
+
+watch(() => state.user, (nv, ov) => {
+	// 换引用时 nv !== ov，能拿到真正的新旧对象
+});
+```
+
+原因：`watch` 一个响应式对象时，隐式按 deep 处理，但传进去的 source 和触发时读到的都是**同一个代理引用**，所以 `oldValue === newValue`。想做"字段级 diff / 脏值统计 / 变更审计"，必须用 getter 返回那个字段，或者在回调里自己保存快照。
+
+**immediate 的坑**（三个都常见）：
+
+1. `immediate: true` 的回调在 setup 阶段同步跑一次，此时**模板还没渲染**，回调里读 `inputRef.value` 是 `null`、`el.value?.focus()` 静默失败。要 DOM 就配 `flush: 'post'` 或在 `onMounted` 里手动跑首次。
+2. 和 `onMounted` 里的初始化请求**重复**：进入页面既触发 immediate 又触发 mounted 请求，列表请求两次。选一个地方负责首次加载。
+3. immediate 回调里 `emit` 或写父组件状态，等于在子组件 setup 期间改父状态，容易撞出"父组件渲染时子组件已改了它"的告警。
+
+### 3. 副作用清理：`onWatcherCleanup` 解决的是竞态
+
+先把两件事分开：
+
+- **内存泄漏**：作用域销毁后监听器/定时器还活着。修法是 `effectScope.stop()`、组件卸载钩子里解绑（第 08 章）。
+- **竞态**：多次触发产生的结果**乱序落地**，后到的旧结果覆盖新结果。修法是**在下一次副作用开始前，取消/作废上一次**——这就是清理回调的全部意义。
+
+```ts
+import { ref, watch, onWatcherCleanup } from 'vue'; // onWatcherCleanup：Vue 3.5+
+
+const keyword = ref('');
+const rows = ref<Row[]>([]);
+const loading = ref(false);
+
+watch(keyword, async (kw, _old, onCleanup) => {
+	if (!kw) {
+		rows.value = [];
+		return;
+	}
+	const ctrl = new AbortController();
+	const timer = setTimeout(run, 300);
+
+	onCleanup(() => {
+		clearTimeout(timer); // 取消还没发出去的请求
+		ctrl.abort();        // 取消已经发出去的请求
+	});
+
+	async function run() {
+		loading.value = true;
+		try {
+			const res = await fetch(`/api/users?kw=${encodeURIComponent(kw)}`, { signal: ctrl.signal });
+			rows.value = (await res.json()).data;
+		} catch (e) {
+			// abort 不算错误：说明这次已经作废，什么都不做就是正确行为
+			if ((e as Error).name !== 'AbortError') report(e);
+		} finally {
+			loading.value = false;
+		}
+	}
+});
+```
+
+三个要点：
+
+1. **`onCleanup` 在"下一次回调开始前"被调用**，不是组件卸载时。这正好对应竞态的语义：新的请求要发了，旧的必须先作废。
+2. **`onWatcherCleanup`（3.5+）** 是同一个能力的函数式版本，可以在任意嵌套深度的同步调用栈里注册，不用把 `onCleanup` 参数一路往下传。3.5 之前的项目用回调第三参数 `onCleanup`，两者语义一致。
+3. **abort 不是万能的**：如果后端不支持取消，或你用不了 `AbortController`（某些封装层），退而求其次用**序号判定**丢弃过期响应。
+
+```ts
+let seq = 0;
+watch(keyword, async (kw) => {
+	const my = ++seq;
+	const data = await api.search(kw);
+	if (my !== seq) return; // 已经有更新的一次在跑，这次结果作废
+	rows.value = data;
+});
+```
+
+> [!IMPORTANT]
+> 判断"我该用 abort 还是序号"的标准很简单：**能否真正中断**。能 → `AbortController`（省带宽、省后端算力）；不能 → 序号/版本号丢弃（只保证界面正确）。面试里说清"两层都做"最稳：`AbortController` 管取消，序号管乱序。
+
+顺带一条边界：**不要在 `watch` 的回调里返回一个清理函数**。返回值的清理语义属于 `watchEffect` 与 `onWatcherCleanup`，`watch` 回调的返回值被忽略，这是代码评审里很容易漏掉的一行。
+
+### 4. 什么场景不该用 watch
+
+| 需求 | 正确工具 | 别这么写 |
+|---|---|---|
+| 由已有值派生新值 | `computed` | `watch` 里算好写进另一个 ref |
+| 用户输入/点击后的动作 | 事件处理函数 | `watch` 一个只被事件改的 ref |
+| 子组件要改父组件的值 | `defineModel` / `update:xxx` | 父子各写一个 `watch` 互相同步 |
+| 路由变化后要加载数据 | `watch(() => route.x)` 可以 | 但在守卫里 `push` 完再 `watch` 状态位 |
+| 全局共享状态联动 | store 的 getter / `storeToRefs` | 每个页面 `watch` store 字段回写本地 |
+| 组件挂载时的一次性动作 | `onMounted` / `onScopeDispose` | `watch(某 ref, ..., { immediate: true })` |
+| 表单校验 | 校验函数 + 规则（第 06 章） | 每个字段一个 `watch` 触发校验 |
+
+最后一条特别值得展开：**"输入即校验"用 `watch` 实现，是深层响应 + 校验器循环调用的组合灾难**。字段级 `watch(() => form.x)` 只在真正关心的字段上订阅，比整表 deep 便宜一到两个数量级；而"值合法性"本质是派生状态，用 `computed` 算 `errors` 更合理（校验函数在 getter 里是纯计算，不是副作用）。
+
+判据一句话：**`watch` 的合理数量，通常远少于写它的人预期的数量**。项目里如果超过五六个 `watch` 在互相回写，说明状态建模漏了。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 派生值缓存 | `computed`，自动依赖追踪 + 脏标记，不用写依赖数组 | `useMemo(fn, deps)`，依赖数组漏写就是 bug |
+| 变化后做副作用 | `watch` / `watchEffect`，只关心被列出的来源 | `useEffect`，组件每次渲染都可能重跑，要靠 deps 数组自救 |
+| 需要旧值 | `watch` 回调第二参直接给 | 自己用 `useRef` 存上一次值 |
+| 读 DOM 之后执行 | `flush: 'post'` | `useEffect`（绘制后）/ `useLayoutEffect`（绘制前） |
+| 副作用里改状态 | 允许，同批作业会被合并 | 允许但容易进渲染循环，需要依赖数组精确控制 |
+| 丢弃过期请求 | `onCleanup` / `onWatcherCleanup` + `AbortController` | effect 返回清理函数 + `AbortController` 或 `ignore` 标志 |
+| 防抖后再请求 | 回调里自己 `setTimeout` + `onCleanup` 清 timer | `useDebounce` 值 + deps，或 `useDeferredValue` |
+| "渲染阶段不能副作用" | 靠约定（`computed` getter 别写副作用） | React 强制更严：Render 阶段可能被重放（见 [React 数据获取](/blog/posts/react-roadmap-09-data-fetching/)） |
+
+对照的根差异：**React 的派生值天然存在于渲染函数里，所以"缓存"是加法语；Vue 的派生值是一个独立对象，"动作"才是加法语。**从 React 过来的人最容易写成 `watch` 驱动一切，把 Vue 用成手动挡。
+
+---
+
+## 翻车现场
+
+**一、搜索结果被过期响应覆盖。**
+
+- 症状：输入 `vue`，列表短暂显示 `vue` 的结果，然后跳回 `vu` 的匹配项；偶发，网络越差越容易复现（本地快、线上慢就是这个特征）。
+- 根因：只做了防抖没做作废。防抖只压缩"发出去"的次数，两条请求一旦同时在飞，落地顺序就取决于响应时间；`await` 之后直接赋值，等于让最慢的那次赢。
+- 修法：`AbortController` + `onCleanup`（作废请求）+ 序号判定（丢弃乱序结果）两层一起做，如上例。测复现方法：DevTools Network 里把带宽调成 Slow 3G，快速输入 4 个字符看结果是否稳定收敛到最后一次（[网络面板观察方法](/blog/posts/browser-roadmap-07-metrics/)）。
+
+**二、整表 deep 侦听，输入框每敲一个字卡一下。**
+
+- 症状：一个 60 字段的复杂表单，光标输入时有明显延迟；Performance 面板里 `run microtasks` 段出现大量 `traverse` 调用。
+- 根因：`watch(form, ..., { deep: true })` 每次变化都要遍历整棵对象收集新旧值，而表单字段里还塞了 `el-cascader` 的大数组选项；订阅数量与字段总数成正比，跟你关心的字段数无关。
+- 修法：拆成字段级 `watch`；选项数据改 `shallowRef` 并不参与侦听；校验结果用 `computed` 派生而不是 `watch` 回写。**收益量级**：字段级订阅把每次触发的遍历从"全部字段"降到"1 个字段"，示例数据下 60 字段表单从每键约 8ms 降到约 0.2ms（这类数字要用你自己的 Performance 记录，不要照抄）。
+
+**三、`immediate` 与 `onMounted` 双份请求。**
+
+- 症状：进入详情页 Network 里同一条 `GET /api/detail?id=x` 出现两次；有时后到的覆盖前到的，偶发字段错乱。
+- 根因：`watch(() => props.id, load, { immediate: true })` 负责首屏，同时又写了 `onMounted(load)`（或列表页跳转前预取了一次）。
+- 修法：**首屏加载只归一处负责**——要么 `immediate` 的 `watch`（适合 id 会变的路由页），要么 `onMounted`（适合 id 不变）。需要"先取到数据再渲染"用 `watch` + `flush: 'post'` 处理 DOM 依赖，而不是加第二个触发点。
+
+---
+
+## 复习卡片
+
+- **Q：computed 什么时候重算？** A：被读取时，若脏标记为真才重算；依赖变化只负责把脏标记往下传播，不触发计算。
+- **Q：为什么说"读一次和读十次代价一样"？** A：第一次求值后结果进缓存，之后直接命中；前提是 getter 是同步纯计算，没混入非响应式来源。
+- **Q：watch 和 watchEffect 怎么选？** A：要旧值、要懒执行、要精确指定来源用 `watch`；只是"跟着这些值走一遍"用 `watchEffect`，但要接受别人看不出依赖。
+- **Q：flush 三个时机各用在什么场景？** A：`pre`（默认，数据联动/请求，此时 DOM 还是旧的）、`post`（要读或操作更新后的 DOM）、`sync`（同 tick 内必须完成的第三方同步，慎用）。
+- **Q：`onWatcherCleanup` 解决的是内存泄漏吗？** A：不是，核心是竞态——在下一次副作用开始前作废上一次（取消请求、清 timer），避免后到的旧结果覆盖新结果；注册式写法 `onWatcherCleanup` 3.5+ 可用。
+- **Q：哪些情况不该用 watch？** A：派生值（用 computed）、事件驱动的动作（写在 handler 里）、父子双向同步（用 `defineModel`）、一次性初始化（用 `onMounted`）。
+
+---
+
+## 小结
+
+- `computed` = 惰性 + 脏标记 + 依赖收窄；变化时的成本是"标记"，重算推迟到读取。别在 getter 里放副作用或非响应式读取。
+- 可写 computed 是"读值 + 通知"的合一体，是 `defineModel` 的语义前身；面试里能把这条线讲通就够。
+- `watch` 的三个配置决定它对不对：来源形态（要不要 getter 包裹）、`flush` 时机（要不要 DOM）、`deep`（要不要为全部字段付订阅成本）。
+- 侦听 `reactive` 对象本身会拿到 `oldValue === newValue`，需要 diff 就必须 getter 或自存快照。
+- 清理回调的价值在**竞态**：`AbortController` 负责取消，序号负责丢弃乱序结果，两层都要。
+- `watch` 数量是代码质量的负指标；超过必要数量的互相回写，说明状态该重新建模。
+
+---
+
+## 练习
+
+1. 写一个 `fullName` 可写 computed 组件：外部 `v-model:full-name` 输入"张三 李四"，内部拆成 `first` / `last` 两个 ref 并允许子表单分别编辑，父组件只在真正编辑后收到一次更新。做完回答：为什么不能在 getter 里写 `first.value = ...`。
+2. 造一个"必须 `flush: 'post'` 才正确"的场景：列表新增一行后自动滚到底部。先写成 `pre` 观察它读到旧 DOM（`scrollHeight` 不变），再改 `post` 并在 `onMounted` 里处理首次进入，说明两者分工。
+3. **可见交付物**：完成搜索框三件套——`keyword` 输入 → 300ms 防抖 → 请求 → **过期响应丢弃**（`AbortController` + 序号双保险），并在 Slow 3G 下快速输入 `vue`/`vu`/`vue3` 各一次，截图 Network 面板证明只有一次的结果被采纳、其余被取消；把这段逻辑抽成 `useSearch(fetcher, delay)`，参数用 `MaybeRef` 约定、清理责任写在注释里（对应第 07 章的 composable 契约）。
+
+---
+
+## 面试一句话
+
+> "computed 和 watch 的分工不是缓存与否，而是**产出是值还是动作**：computed 是惰性求值加脏标记传播，依赖变化时只标脏、重算推迟到被读取，所以读一次和读十次一样便宜；watch 是显式的副作用调度，选型时要同时决定三件事——来源要不要用 getter 包裹（侦听 reactive 对象本身会拿到新旧值相等）、flush 是 pre 还是 post（要不要读更新后的 DOM）、要不要 deep（deep 的代价按整棵树的字段数付，不是按你关心的字段付）。而回调里的清理不是防内存泄漏，是防竞态：新一次副作用开始前必须作废上一次，`AbortController` 负责真取消、序号负责丢弃乱序到达的结果，两层一起做。"

@@ -1,0 +1,379 @@
+---
+title: '09 · provide / inject：跨层通信与边界'
+published: 2026-11-22T17:00:00+08:00
+description: 'provide 与 inject 的边界：InjectionKey 为什么必须是 Symbol 加类型、注入裸值为什么会失效、provide 时机与层级可见性、props 透传/provide-inject/Pinia 的选型判据，以及把可变方法一起 provide 形成的微型宿主契约与它的适用边界。'
+tags: [Vue, "provide inject", InjectionKey, 组件通信, 依赖注入]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章解决的是"**这个依赖该由谁提供**"，而不是"provide 怎么用"。
+> 真实场景：一个中后台的字段配置页，`ElForm` 里嵌了 5 层业务组件，最里面那个自定义字段要读表单的 `model` 和校验规则。
+> 团队当时有三种人各写了一种：有人逐层透传 props（改了 5 个文件），有人 `provide('form', form)` 用字符串 key
+> （两周后和组件库内部的 key 撞了，校验莫名失效），有人直接塞进 Pinia（结果两个标签页同时编辑同一张表单时互相覆盖）。
+> 这三种写法对应的正是本章的三个判据：**key 的命名空间、值的响应性、作用域的大小。**
+> 问答形态见[前端面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)「组件通信」一节（Q10），那里回答"有哪些方式"，这里回答"选哪种、什么时候会后悔"。
+
+---
+
+## 一句话本质
+
+**`provide` / `inject` 是"作用域内的依赖注入"：它把"谁拥有状态"和"谁消费状态"解耦，代价是组件不再自包含。**
+所以它只在该付这个代价的时候用——依赖由**宿主**建立、消费方**深度大于 2**、且这个依赖**允许被替换或屏蔽**。
+三条里少一条，就回到 props 或 store。
+
+---
+
+## 原理拆解
+
+### 1. `InjectionKey`：为什么必须 Symbol + 类型，不能用字符串
+
+先给能直接抄的写法，再解释为什么每个细节都是必要的。
+
+```ts
+// src/composables/useTheme.ts —— key 与类型放在同一个模块，是全仓唯一事实来源
+import type { InjectionKey, DeepReadonly, Ref } from 'vue';
+
+export interface ThemeContext {
+  name: DeepReadonly<Ref<'light' | 'dark'>>;
+  setTheme: (next: 'light' | 'dark') => void;   // 写操作只能通过方法
+  tokens: DeepReadonly<Ref<Record<string, string>>>;
+}
+
+export const ThemeKey: InjectionKey<ThemeContext> = Symbol('theme');
+// Symbol 的描述字符串只给调试用，不参与匹配 —— 两个 Symbol('theme') 也互不相等
+```
+
+```vue
+<script setup lang="ts">
+// 宿主
+import { provide, readonly, ref } from 'vue';
+import { ThemeKey, type ThemeContext } from '@/composables/useTheme';
+
+const name = ref<'light' | 'dark'>('light');
+const tokens = ref<Record<string, string>>({});
+function setTheme(next: 'light' | 'dark') { name.value = next; }
+
+provide(ThemeKey, { name: readonly(name) as ThemeContext['name'], tokens: readonly(tokens), setTheme });
+</script>
+```
+
+```vue
+<script setup lang="ts">
+// 任意深度的消费方（不需要父级一层层传）
+import { inject } from 'vue';
+import { ThemeKey } from '@/composables/useTheme';
+
+const theme = inject(ThemeKey);          // 类型是 ThemeContext | undefined
+if (!theme) throw new Error('[MyPicker] 必须在提供主题的宿主内使用');
+</script>
+
+<template>
+  <div :class="theme?.name">{{ theme?.name }}</div>   <!-- 这里不响应？见第 2 节 -->
+</template>
+```
+
+字符串 key 的三个具体故障，按"痛感"排序：
+
+| 问题 | 具体表现 | 为什么 Symbol 能解决 |
+|---|---|---|
+| 命名空间冲突 | `provide('theme', ...)` 和组件库/插件内部的 `'theme'`、`'form'`、`'config'` 撞名，后者拿到你的值，行为诡异且**没有任何报错** | Symbol 唯一，除非对方显式 import 你的 key，否则不可能撞上 |
+| 类型丢失 | `inject('theme')` 返回 `unknown`，只能 `as any` 或 `as` 强转，改了结构编译期发现不了 | `InjectionKey<T>` 把值类型编进 key，`inject(ThemeKey)` 直接是 `T \| undefined` |
+| 重构不可追 | 全局改字符串会有漏网；grep 还会命中普通文案 | 改名会直接报编译错误，且 `Find References` 有效 |
+
+这类"库类型 + 框架泛型"的写法属于框架集成题，配套的推导细节见
+[TypeScript 与框架集成](/blog/posts/typescript-roadmap-16-framework-integration/)——
+特别是 `InjectionKey` 在 `app.provide` 与组件 `provide` 上的两处重载差异，值得单独过一遍。
+
+用 Symbol 有**两个必须知道的坑**（都是真实会发生的）：
+
+1. **key 必须在提供者和注入者之间是同一个 Symbol 实例。** 所以 key 只能定义在**独立模块**里被双方 import，
+   不能就地声明。Vite HMR 改动 key 模块时会生成新 Symbol，导致"热更新后注入拿不到值，刷新就好"——
+   这不是 bug，但一定会被当 bug 查半天，解决办法是把 key 模块保持在稳定文件里、别在开发时反复改它。
+2. **Symbol 不可序列化、不可跨上下文**。iframe、Web Worker、`pinia-plugin-persistedstate` 之类要写进 localStorage 的地方，
+   绝不能把 key 当字符串用（它连 `JSON.stringify` 都过不去）。
+
+> [!WARNING]
+> `inject(ThemeKey, someDefault)` 里的 **默认值不要给 `null` 了事**——静默回退等于静默失去依赖。
+> 要么抛错（组件必须运行在宿主内），要么给一个真的能工作的默认对象（组件可独立使用）。这两个语义完全不同，必须显式选一个（见第 4 节）。
+
+### 2. 注入的必须是响应式引用，provide 裸值为什么"看起来能用其实失效"
+
+这是 `provide` 最高频的误解。机制只有一句：**`inject` 拿到的只是"提供者当时给出的那个值的引用"，
+Vue 不会在属性变化时重新通知谁——通知靠的是响应式系统的依赖收集，而收集只发生在"读取一个响应式源"的地方。**
+
+```ts
+// ❌ 失效三例
+provide('theme-name', themeName.value);        // 传的是字符串快照：宿主之后怎么改，子树永远读到初次的那个值
+provide(CountKey, count);                       // 传了 ref 对象本身，但消费方 const { n } = inject(CountKey)! 解构后失去响应式
+provide(FormKey, reactive({ ...formModel }));   // 展开拷贝：宿主改 formModel，注入的是另一份对象，毫不相关
+
+// ✅ 正确三例
+provide(ThemeKey, readonly(themeName));         // 注入 ref（只读包装），消费方读 .value 才走依赖收集
+provide(ThemeKey, themeCtx);                    // themeCtx 是一个 reactive 对象，消费方用 themeCtx.name（不整体解构）就响应
+provide(ThemeKey, computed(() => ({ ... })));   // 注入 computed ref，消费方读 .value
+```
+
+对应的失效现场（面试里说得出这个具体症状才算真懂）：
+
+```vue
+<!-- 消费方模板里直接写属性名，不会重新渲染 -->
+<script setup>
+const ctx = inject(ThemeKey);
+const { name } = ctx;          // ← 解构把响应式属性拷成了普通字符串
+</script>
+<template><div class="panel">{{ name }}</div></template>
+<!-- 主题切到 dark，这里仍是 light；但如果写 ctx.name 就正常 -->
+```
+
+结论固化成两条约定：
+
+- **注入值只能是 `Ref` / `ComputedRef` / `reactive` 对象**，且 `reactive` 对象必须**整体访问**（`ctx.name`）；
+  要在消费方解构，提供者就得先 `toRefs`（和 07 的返回值约定完全一致）。
+- **写权限通过方法收敛**：`provide` 一个 `{ state: readonly, setX, submit }`，比给一个"大家可以随便改"的 reactive 对象安全得多。
+
+时机与可见性：
+
+| 维度 | 规则 | 失败表现 |
+|---|---|---|
+| 提供时机 | setup 的**同步段**（或 `onServerPrefetch` 之前），或 `app.provide` 在挂载前 | `await` 之后再 `provide`：开发环境警告"在 setup 之外调用"，子组件 `inject` 拿到默认值 |
+| 可见范围 | 提供者组件的**整个子树**（不是全应用）；`app.provide` 才是全应用 | 兄弟组件之间互相 inject 不到——这是最常见的"为什么拿不到" |
+| 查找方向 | 沿组件树**向上找最近的提供者**，找到即停 | 嵌套两层各提供一个时，内层生效；弹窗/Teleport 到 body 的子树**照样能注入**（Vue 按组件树而非 DOM 树） |
+| 生命周期 | 提供者卸载，子树随之卸载，注入自然失效 | 反过来不成立：注入方卸载不影响提供方的值存活（07 讲过的模块级泄漏与此无关） |
+
+`app.provide` 适合"应用级、全局唯一、不随页面变化"的依赖（主题、i18n 实例、全局配置、埋点客户端）；
+组件 `provide` 适合"宿主作用域"的依赖（表单、向导、列表页）。两者的选择判据只有一个：**这个依赖的作用域是不是整个应用。**
+
+### 3. 选型：props 透传 / provide-inject / Pinia
+
+四个具体场景逐个判，判据写在后面。
+
+| 场景 | 选择 | 为什么不是另外两个 |
+|---|---|---|
+| **主题 / 语言 / 全局配置**（应用级、只读为主、极少变） | `app.provide` + `InjectionKey` | props：每一层都要透传，中间层根本不用，纯噪音；Pinia：主题不是业务状态，塞进 store 会牵出持久化/SSR/测试重置一堆成本 |
+| **表单宿主 → 深层自定义字段**（宿主生命周期内、需要字段反向注册） | 组件 `provide`（微型宿主契约，见第 4 节） | props：字段深度不定、数量不定，无法预枚举；Pinia：**两个标签页/两个弹窗同时编辑同一张表单就会互相覆盖**，因为 store 是应用级单例 |
+| **权限（用户角色、可访问菜单/按钮集合）** | Pinia（10），跨页面、要持久化、要水合 | provide：登录状态变化发生在应用根部，作用域勉强够，但权限要在路由守卫里读（守卫在组件树外，`inject` 拿不到）；这是决定性的一条 |
+| **列表页宿主 → 工具栏/表格/分页三件套共享筛选状态** | 组件 `provide`（列表页级），配合 12 的失效策略 | props：三个子组件都要读写同一份 query，双向透传会退化成事件总线；Pinia：筛选条件是**页面级**状态，放 store 就会跨页面残留 |
+
+由此抽出三条可判定的问句，按顺序问：
+
+1. **消费方深度是否 ≤ 2，且组件是公开复用的？** 是 → **props**（显式接口最好，移植性最高，别为省两行代码上注入）。
+2. **这个状态的作用域是否等于"某个宿主组件的一次存活期"？** 是 → **`provide`**；不是，且它需要在组件树外被访问（守卫、插件、另一个 store、持久化） → **Pinia**。
+3. **它是否可能被"同时出现两个"？** 两个表单、两个列表、两个向导——命中就必须 provide（或 store 工厂 + `useStore(scope)`），
+   绝不能用模块级单例顶替（07 的判据在这里同样成立）。
+
+> [!IMPORTANT]
+> 一条团队红线：**不许把 Pinia store 实例整个 `provide` 出去当通信手段。**
+> store 自己已经全局可达，再包一层注入只会让依赖关系从"显式参数"退化成"隐式全局"，
+> 同时丢掉 devtools 的追踪能力。`provide` 用于**非 store 的宿主依赖**，两者不重叠才有意义。
+
+判据 3（"是否可能同时出现两个"）值得一个具体的反例，因为它是**唯一能让 store 方案当场出错**的场景：
+
+```vue
+<!-- 用户实操：从订单列表同时打开两个编辑弹窗（中后台非常常见） -->
+<!-- ❌ 状态放 store：后打开的弹窗覆盖了前一个的 draft，两个弹窗共用同一条记录 -->
+<OrderEditDialog v-for="o in orders" :key="o.id" :order="o" />
+
+<!-- ✅ 状态放弹窗自己：每个实例 provide 一份，互不干扰 -->
+<script setup lang="ts">
+const draft = reactive({ ...props.order });            // 每次实例化都是新对象
+provide(OrderDraftKey, { draft, save: () => api.put(props.order.id, draft) });
+</script>
+```
+
+这类问题的通用形态是："store 里的 `currentOrder` / `activeForm` / `editingItem` 字段"。
+只要看见这种**单数命名 + 会被覆盖**的字段，就该反问一句：这个业务对象在屏幕上最多会出现几个？
+答案不是 1，就把状态挪回宿主（或把 store 改成按 id 索引的字典：`ordersById`，这属于 10 的拆分维度讨论）。
+
+### 4. 默认值、required 语义，与"微型宿主契约"
+
+`inject` 的签名有三个参数：`inject(key, defaultValue?, treatDefaultAsFactory?)`。
+
+```ts
+// 1) 给可用的默认值 → 组件可独立运行（推荐用于通用 UI 组件）
+const cfg = inject(TableKey, { size: 'default', border: false } as const);
+
+// 2) 默认值是函数时，它会被当作"要注入的值本身"，而不是工厂 —— 这是最容易踩的语义
+const fn = inject(HandlerKey, () => console.log('default'));   // 注入的是这个函数本身
+
+// 3) 第三个参数 true：把函数默认值当工厂执行（3.x 一直支持）
+const state = inject(StateKey, () => createFallbackState(), true);
+
+// 4) 没有官方 required，惯用做法是自己包一个「必填」版本，让错误在开发期立刻爆
+export function useRequired<T>(key: InjectionKey<T>, who: string): T {
+  const v = inject(key);
+  if (v === undefined) {
+    throw new Error(`[${who}] 缺少宿主：请在它外面 ${who} 需要它 provide 的上下文`);
+  }
+  return v;
+}
+```
+
+**"把可变方法一起 provide"形成的微型宿主契约**——组件库就是这么做的，值得单独讲清它**适用在哪、不适用在哪**。
+
+`ElForm` / `ElFormItem` 的形态（抽象后的等价实现）：
+
+```ts
+// 宿主提供的不只是数据，而是「数据 + 注册表 + 命令」
+interface FormContext {
+  model: Record<string, unknown>;              // reactive：字段直接读，保持响应
+  rules?: Record<string, unknown>;
+  addItem: (field: FormItemContext) => void;    // ← 子项把自己注册进宿主
+  removeItem: (prop: string) => void;
+  validate: (prop?: string) => Promise<boolean>;
+}
+
+// 子项：挂载时注册，卸载时注销（清理责任见 08）
+const form = inject(FormKey, undefined);
+onMounted(() => form?.addItem({ prop: props.prop, validate }));
+onScopeDispose(() => form?.removeItem(props.prop));
+```
+
+`tabs` / `tab-pane` 是同一个模式：宿主 provide `{ value, setValue, panes, registerPane, unregisterPane }`，
+pane 在挂载时把自己推进 `panes` 列表，宿主据此渲染 tab 头。
+
+**这套契约的适用边界**（三个条件同时成立才用）：
+
+| 条件 | 说明 | 反例 |
+|---|---|---|
+| 子项**数量与深度在编译期未知** | `v-for` 出来的字段、插槽里塞的任意层级组件 | 固定三个子组件 → 用 props + emits |
+| 子项需要**反向注册**（宿主得枚举它们） | 表单校验要遍历字段、tabs 要枚举面板、步骤条要算进度 | 只需读一个值 → 只 provide 值，别 provide 方法 |
+| 宿主需要**命令子项**或聚合子项结果 | `validate()` 收集所有字段的错误、`clearValidate()` | 一次性通知 → `emits` 就够 |
+
+不适用的边界也要说明白：**这是私有协议，不是公开 API。**
+一旦把 `FormContext` 暴露给业务方"顺手调用"，你就再也改不动它了——组件库的解法是**把 key 模块标记为内部**（不放进公开导出），
+业务侧需要同类能力时，自己定一套 key，而不是 import 库的。
+
+最后一个和 08 呼应的实务问题：**composable 里能不能 `inject`？** 能，但宿主受限——
+
+```ts
+// ✅ 组件的 setup 里、或在显式的作用域/注入上下文里
+const ctx = inject(ThemeKey);                 // 同步执行，正常
+
+// ❌ 纯工具函数里（没有任何实例上下文）
+export function readTheme() {
+  return inject(ThemeKey);                    // 开发环境警告 + 返回默认值，静默失效
+}
+```
+
+Vue 3.3+ 提供 `hasInjectionContext()`，它返回"现在能不能安全 `inject`"，专门给库作者做防御：
+
+```ts
+if (!hasInjectionContext()) {
+  throw new Error('[useTheme] 必须在提供主题的组件树内调用，或显式传入 ThemeContext');
+}
+```
+
+工程上更稳的做法是把两条路都留出来：**参数优先，注入兜底**——
+`useTheme(explicitCtx?)`，有参数就用参数（可脱离组件测试），没有再 `inject`（组件里省事）。
+这条约定直接来自 [Composable 设计](/blog/posts/vue-roadmap-07-composables/) 检查表的第 7 条"能不能脱离组件测"；
+而"作用域等于应用"那一档该怎么交给 store，见 [Pinia](/blog/posts/vue-roadmap-10-pinia/)。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 跨多层传依赖 | `provide` / `inject` + `InjectionKey` | Context（`createContext` + `Provider` + `useContext`） |
+| key 的类型安全性 | `InjectionKey<T>` 编译期绑定值类型 | 类型挂在 context 泛型上，等价能力；但 key 就是那个对象本身，没有 Symbol 概念 |
+| **提供方值变化时的重渲染范围** | 细粒度：只有真正读了那个响应式源的组件重渲染 | 粗粒度：`Provider` 的 value 引用一变，**所有** `useContext` 消费方都重渲染，除非拆 context / 用 selector 库 / memo |
+| 默认值语义 | `inject(key, default[, treatAsFactory])`，可以显式"必填即抛错" | `useContext` 拿到 `createContext(默认)`，默认值 `null` 静默失败是社区最常见的坑 |
+| 在组件树外读取 | `inject` **读不到**（守卫、纯函数里不行）→ 该用 store | 同样读不到（除非 `store` / ref 外置） |
+| 组件库的宿主契约 | provide/inject（Element Plus、Naive UI 全线使用） | Context + 自定义 Hook（Radix、MUI、Ant Design） |
+| 测试时的成本 | `mount(Comp, { global: { provide: { [Key]: stub } } })` | 包一层 `Context.Provider` wrapper |
+
+**最需要提前知道的一条差异是性能。** React 里"Context 太贵"是真实约束：value 每次变化会波及全部消费者，
+所以标准优化是拆成 `StateContext` + `DispatchContext`、或改用外部 store + selector
+（这套取舍在 [React 状态管理](/blog/posts/react-roadmap-08-state-management/) 里展开过，那边的结论同样适用于"Context 该不该装服务端状态"）。
+Vue 这边这个成本天然低——因为依赖收集发生在"读取属性"的那一刻，读 `ctx.name` 的组件只订阅 `name`。
+但别把它当成"随便用"的许可：`inject` 的代价在 React 里表现为性能，在 Vue 里表现为**可移植性与可测试性**：
+
+- **可移植性**：一个内部 `inject(RequiredKey)` 的组件，单独拿出来必须有人 provide 才能跑，等于它不再是自包含的。
+  一旦这类组件进了公共组件库，使用文档就必须写清"必须放在 X 宿主内"，否则接入方第一分钟就撞墙。
+- **可测试性**：每个单测都要构造替身上下文。宿主契约越复杂，测试脚手架越厚，而这些脚手架**不测业务只测接线**。
+  所以判据是：**给内部协作用的组件可以随便 inject；对外发布的通用组件优先 props/emits。**
+
+---
+
+## 翻车现场
+
+### 现场 1：字符串 key 撞上组件库，表单校验莫名失效
+
+- **症状**：自定义的 `BulkActions.vue` 里 `inject('form')` 拿到了 Element Plus 内部的表单上下文，
+  调用它的方法直接抛 `Cannot read properties of undefined`；同时外层 `ElForm` 的 `validate` 结果里多出无法解释的字段。
+- **根因**：组件库内部同样用 `provide`，字符串 key 没有命名空间。两个"form"互相吃到对方，且 Vue 不会报任何冲突。
+- **修法**：所有 key 换成从独立模块导出的 `InjectionKey`（`Symbol('biz.form')`），并把业务 key 与库 key 分目录存放。
+  顺带把"key 必须来自被 import 的模块"写进 lint 约束（自定义规则或 code review 清单）。
+
+### 现场 2：`await` 之后 provide，整棵子树拿到默认值后白屏
+
+- **症状**：页面主体是一个 `v-if="ctx"` 的空 div，控制台只有一条开发环境警告；生产环境连警告都没有。
+- **根因**：宿主的 setup 写成 `const data = await fetch(); provide(DataKey, data)`。`await` 之后实例上下文已丢失，
+  `provide` 挂不上（和 07 现场 3、08 第 4 节是同一个根因的三个表现面）。
+- **修法**：**同步提供，异步填充**：
+
+```ts
+const ctx = reactive({ rows: [], loading: true });
+provide(DataKey, ctx);                       // 同步段提供，永远成功
+const { rows } = await fetchList();          // 异步只改内容
+ctx.rows = rows; ctx.loading = false;
+```
+
+需要 `async setup` 时必须外层包 `Suspense`，且 `provide` 仍要在第一个 `await` 之前完成（12 展开这个约束）。
+
+### 现场 3：把注入当全局总线，组件变成"离开这个页面就跑不起来"
+
+- **症状**：一个本来很通用的 `FilterChips.vue` 被复用到另一个模块时列表是空的；单测里要 provide 四个 key 才能挂载；
+  新人接手后第一句话是"这组件依赖谁"，答案只能靠全局 grep `inject(`。
+- **根因**：宿主为了省事，把 `query`、`setQuery`、`resetQuery`、`fetchList`、`selection` 五个东西全 provide 出去，
+  组件内部自由 inject，接口在代码里**根本不存在**——这正是 07 批判 mixin 的"来源不可追"换了个形式复活。
+- **修法**：一次注入只解决一个协作关系；把"需要宿主"这件事变成显式的：组件用 `defineProps` 接必要数据，
+  **只有宿主契约（表单/tabs/向导这类）才走 inject**；通用组件把 inject 改成可选并提供可用默认值（第 4 节形态 1）。
+
+---
+
+## 复习卡片
+
+- **Q：为什么必须用 `InjectionKey` 而不是字符串？** A：字符串没有命名空间（会和组件库撞名且无报错）、不带类型、重构不可追；Symbol 唯一且能把值类型编进 key。
+- **Q：`provide` 裸值和 `provide` ref 的区别？** A：inject 只拿到"当时那个引用"，通知依赖响应式收集。裸值/展开拷贝=一次性快照；ref 或 reactive 对象整体访问才响应。
+- **Q：`provide` 能写在 `await` 之后吗？** A：不能。必须在 setup 同步段（或 `app.provide`）；异步数据要"同步提供、异步填充"。
+- **Q：inject 的默认值什么时候该抛错、什么时候该给可用值？** A：组件必须活在宿主内 → 默认值位置抛错（自建 `useRequired`）；组件要能独立使用 → 给一个真能工作的默认对象。
+- **Q：微型宿主契约的适用条件？** A：子项数量/深度编译期未知 + 子项要反向注册 + 宿主需枚举或命令子项，三条同时成立才用；它是私有协议，不外露。
+- **Q：Vue 的 inject 和 React 的 Context 最实际的差异？** A：Vue 的重渲染是细粒度的（读哪个属性订阅哪个），React 的 Context value 一变全体消费者重渲染，所以 React 要拆 Provider。
+
+---
+
+## 小结
+
+- `provide` / `inject` 的定位是"宿主作用域内的依赖注入"，三条判据齐备（宿主建立、深度 > 2、允许被替换）才值得用。
+- key 必须是**独立模块导出的 `InjectionKey`**；Symbol 实例要唯一，HMR 与序列化两处会咬人。
+- 注入值只能是 ref / computed / reactive，且约定"要么整体访问、要么 `toRefs` 后解构"；**写权限通过方法收敛**。
+- 选型顺序：props（深度 ≤ 2 且要可移植）→ provide（作用域等于宿主一次存活）→ Pinia（需要跨页面、持久化、组件树外访问）。
+- 滥用注入的真实成本不是性能，而是**隐式依赖**：组件不可移植、测试要搭接线、来源不可追——和 mixin 的病同一个。
+
+---
+
+## 练习
+
+1. 把项目里一组"逐层透传 3 层以上"的 props 改造成 `provide` / `inject`：先建 `InjectionKey` 模块，
+   再写 `useRequired(key, who)`，然后**记录改造前后的两处差异**——组件的公开 props 少了什么、单测多了几行脚手架。
+2. 复现并修复"现场 2"：故意把 `provide` 写在 `await` 之后，观察到开发环境警告文本（把它抄下来），
+   再用"同步提供、异步填充"改对，并说明为什么改成这样之后 `v-if` 白屏问题消失了。
+3. **可见交付物**：实现一套微型宿主契约 `useFieldHost` / `useField`（约 80 行）：
+   宿主 `provide` 一个含 `model`、`addItem`、`removeItem`、`validateField(prop)` 的上下文，字段组件 inject 后
+   挂载时注册、`onScopeDispose` 注销；做一个 demo 页，动态 `v-for` 增减 3 个字段，点"校验"时**只报错当前存在的字段**。
+   验收：增删字段后不需要刷新即可正确校验；把字段组件在没有任何宿主的页面里挂载时，抛出的是你写的明确错误而不是 `undefined`。
+
+---
+
+## 面试一句话
+
+> "我把 `provide` / `inject` 当成作用域内的依赖注入来用，判据是三条：依赖由宿主建立、消费深度大于两层、且允许被子树里的某一层屏蔽替换。
+> key 一定用独立模块导出的 `InjectionKey`——字符串 key 没有命名空间，会和 Element Plus 这类内部同样用注入的库撞名且**不报错**，而且带不了类型。
+> 第二个必须清楚的是响应性：inject 只是拿到当时的引用，通知靠依赖收集，所以裸值、`{ ...obj }` 展开都是快照，只有 ref 或整体访问的 reactive 才响应，
+> 写权限我一律通过方法提供而不是让别人直接改。第三个是边界：它和 Pinia 的分工看作用域——页面级、可能被同时实例化两次的状态用注入，
+> 需要持久化、跨页面、或在路由守卫里读的用 store；微型宿主契约（form/form-item、tabs/tab-pane 那种）只在
+> "子项数量不定 + 子项要反向注册 + 宿主需要枚举命令"三条同时成立时才写，而且是私有协议，不外露。
+> 和 React 比，Vue 这边注入的性能问题小得多，因为依赖收集细到属性；它的代价在可移植性和可测试性上，所以通用组件我优先 props/emits。"

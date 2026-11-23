@@ -1,0 +1,362 @@
+---
+title: '18 · Vue 3.5+ 与跨端：Nuxt、uni-app 差异'
+published: 2026-11-23T02:00:00+08:00
+description: 'Vue 3.4/3.5 里值得立刻上的五件事（defineModel、onWatcherCleanup、useId、useTemplateRef、响应式 props 解构）与知道就好的那批，编译器与 reactive 性能改进的实际影响排序，升级到 3.5 的真实风险点（依赖编译器宏改写的插件、类型链不同批），Nuxt 3 改了什么（自动导入的利与债、Nitro 服务端与混合渲染缓存、useState/useAsyncData 与状态层的对应）；uni-app Vue 3 跨端约束的系统化整理，以及该不该上 SSR 的判据。'
+tags: [Vue, Vue3.5, Nuxt, uni-app, 跨端, SSR]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这章解决两类决策：**版本要不要跟**（3.5 的新语法哪些值得现在改代码，哪些只是知道就好），以及**栈要不要换**（什么时候该上 Nuxt/SSR，跨端到 uni-app 时哪些约束是硬的）。
+> 真实场景：手上一个 Vue 3.4 的后台（前面 17 章那种形态），同时新增两个需求——一个面向搜索引擎的帮助中心（要 SEO 与首屏），一个微信小程序（已有 uni-app 版本在跑）。团队讨论卡在三个问题上：升 3.5 会不会炸、要不要开 Nuxt、小程序那边能不能沿用后台那套动态权限路由。
+> 问答对照见[面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)的「Vue2 和 Vue3 的区别」与「深水区追问」两节；跨端问答形态见[面试宝典 · 跨端篇](/blog/posts/interview-guide-06-cross-platform/)，React 侧同类问题（新版本 + SSR 该不该上）见 [React 19 与服务端那篇](/blog/posts/react-roadmap-18-react19-server/)。
+
+---
+
+## 一句话本质
+
+版本升级只有一条判据：**这个新 API 能不能删掉我现有的代码**。能删（`defineModel` 删掉手写 prop+事件对、`onWatcherCleanup` 删掉手工清理）就上，不能删（更多是内部实现与 SSR 语义变化）就先不动。跨端则完全不同：差异不在语法，而在**运行时给你什么**——Nuxt 给你 Node 侧的一份"另一个渲染"，uni-app 的小程序端连 DOM 和 window 都没有，很多在后台里天经地义的手段（`document.querySelector`、动态 `addRoute`）直接失效。
+
+---
+
+## 原理拆解
+
+### 1. 值得现在就用的五件事（判据是能删掉什么）
+
+**一、`defineModel`（3.4 起稳定，3.2 为实验特性）**——删掉 prop + `update:xxx` 事件那一整套样板。
+
+```vue
+<!-- 旧写法：5 行样板，还要处理类型与默认值 -->
+<script setup lang="ts">
+const props = defineProps<{ modelValue: boolean }>()
+const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
+const visible = computed({ get: () => props.modelValue, set: (v) => emit('update:modelValue', v) })
+</script>
+
+<!-- 新写法 -->
+<script setup lang="ts">
+const visible = defineModel<boolean>({ required: true })
+const size = defineModel<number>('size', { default: 20 })      // v-model:size
+</script>
+```
+
+它同时解决了第 14 章难点二里最容易出错的那件事：`v-model:visible` 与 `v-model` 两套语义混在封装层时手写容易漏。修饰符也能拿到：`defineModel<string, 'trim'>()`。
+
+**二、`onWatcherCleanup`（3.5 起）**——在 watcher 回调内部注册清理，替代以前把 `onCleanup` 当第二个参数写在形参表里。
+
+```ts
+watch(keyword, async (kw, old, onCleanup) => {
+  const ctrl = new AbortController()
+  onCleanup(() => ctrl.abort())              // 旧写法：依赖参数位置，async 回调里容易漏
+  fetchList(kw, { signal: ctrl.signal })
+})
+
+watch(keyword, async (kw) => {
+  const ctrl = new AbortController()
+  onWatcherCleanup(() => ctrl.abort())       // 新写法：任意位置调用，含嵌套函数内
+  await fetchList(kw, { signal: ctrl.signal })
+})
+```
+
+真实收益在第 12 章那条竞态验收上：`onCleanup` 参数在多层封装（把副作用抽成一个函数被 watcher 调用）里传不下去，`onWatcherCleanup` 是运行时注册的，跨函数层也能用。
+
+**三、`useId`（3.5 起）**——同构安全的唯一 id，主要用于无障碍关联（`label for`、`aria-describedby`）。
+
+```ts
+const id = useId()          // 形如 v-0
+// 模板：<label :for="id">用户名</label><el-input :id="id" />
+```
+
+在组件库里它替代了 `Math.random()` 拼 uid —— 后者一到 SSR 就出现服务端与客户端 id 不一致（hydratation 告警的头号来源之一，Nuxt 场景里必换）。
+
+**四、`useTemplateRef`（3.5 起）**——按字符串名拿模板 ref，替掉 `ref` 变量与模板属性名必须同名的隐式约定。
+
+```ts
+const tableEl = useTemplateRef<InstanceType<typeof ElTableV2>>('mainTable')
+// 模板：<el-table-v2 ref="mainTable" />
+```
+
+对封装层价值最大：父组件不再依赖子组件 setup 里那个变量名，重构时不会静默拿到 `null`。
+
+**五、响应式的 props 解构（3.5 稳定并默认开启）**——解构后依然保持响应式，默认值直接写在解构里，`withDefaults` 样板可以删掉。
+
+```ts
+const { title, count = 0, size = 'default', type = 'primary' } = defineProps<Props>()
+const doubled = computed(() => count * 2)      // 解构出的 count 仍是响应式的
+
+watch(() => count, ...)                        // 传源要包 getter，直接 watch(count, ...) 是编译错误
+```
+
+需要说清的边界有三条：**3.3 / 3.4 上它需要 `propsDestructure` 实验开关，3.5 起默认开启**，所以「要不要用」在 3.5+ 项目里已经不是问题，问题只在版本是否统一；它是 `<script setup>` 的编译期转换，`@vitejs/plugin-vue` 与 `vue-tsc` / `@vue/language-tools` 要跟 Vue 同批，错配时表现为「代码没错但视图不动」；最后是存量项目——`toRef(props, 'x')` 完全等价且不依赖编译器，**不必为它专门做一次升级**，新写的组件库统一用新写法即可。
+
+### 2. 编译器与 `reactive` 的性能改进，实际影响排序
+
+3.4 与 3.5 各动了一刀，位置不同：
+
+| 版本 | 改了什么 | 谁能感知到 | 你该怎么验 |
+|---|---|---|---|
+| 3.4 | 模板解析器重写（编译期）、列表 diff 用更优的最长递增子序列实现、class/style 与 attrs 合并提速 | 大型 SFC 的编译时间、大列表**重排**（不是重渲染）时的 patch 成本、`v-bind="obj"` 透传多 attrs 的封装层 | 看 `vite build` 的总时长；列表拖拽排序场景录 flamegraph |
+| 3.5 | 响应式内核重构：深层属性访问与 ref 解包的开销下降、依赖记录更省内存 | 深层对象读写密集的页面（大表单、树形数据、字典嵌套） | 自己压一份 5000 行 × 20 字段的数据对比 |
+
+量级口径：**官方给的是数倍级别的提升，但那是微基准**。我在业务页面里能稳定复现的是"构建时长下降"和"深层对象页面首次渲染略快"，而**这两项的收益都小于把手写 `v-for` 换成虚拟列表**（第 13 章）。所以我不会把"升到 3.5"当成性能方案报给业务方——它顺带做了就写进技术债清零，不该占一个需求排期。
+
+### 3. 知道就好的那批（不要为小版本写迁移故事）
+
+- 3.5 的 SSR/延迟 Teleport 与数据流相关调整：只有你上 Nuxt 且用了 Teleport 到 body 的场景才关心，纯 CSR 后台无感。
+- 响应式内核的内部实现（依赖图重构、代理与解包的细节）：影响的是库作者，业务代码感知不到接口变化。
+- `defineModel` 从实验到稳定的历史：现在直接当稳定 API 用，面试里能说清"3.2 实验、3.4 稳定"就够了，不要把它讲成一个迁移工程。
+- `onCleanup` 参数与 `onWatcherCleanup` 的并存：旧写法没被废弃，**不要为了统一而全量替换**（我见过这种 PR：改了 200 个文件，零行为变化，review 成本极高）。
+
+判据一句话：**小版本升级后，如果你写不出"因此删掉了 N 行代码"，这次升级就没有业务价值**——除了安全修复与依赖兼容这类必须做的情形。
+
+### 4. 升级到 3.5 的真实风险点
+
+风险不在你自己写的代码，在下面三处：
+
+1. **依赖编译器内部的框架/插件**。任何做 SFC 宏改写或 AST 处理的包都可能因编译器行为变化失效：`vue-macros` 系（含 `unplugin-vue-define-options` 这类给 `defineOptions` 打补丁的老包）、`@vitejs/plugin-vue-jsx`、各类自动导入与包装插件、以及把模板编译结果再加工的工具（做多语言提取、埋点注入、样式类名扫描的）。
+   **具体事故形态**（我在升级里真遇到过一类）：`defineOptions` 的补丁包与新编译器冲突，组件 `name` 丢失，于是 `keep-alive` 的 `include` 全部不命中，症状是"所有标签页缓存失效"——一个和"升级"看起来毫无关系的现象。
+2. **宏改写行为与类型链**。`vue`、`@vitejs/plugin-vue`、`vue-tsc`、`typescript` 必须同批升，否则会出现"运行时正常、类型报错"或反过来；泛型组件（`generic="T"`）与 `defineProps` 外部导入类型对编译器版本更敏感。
+3. **两份 Vue 运行时**。`vue` 必须是 `peerDependencies`（第 14 章那条），升级时最容易在 monorepo 里出现 app 是 3.5、内部 UI 包锁 3.4，症状是 `inject` 拿不到、Pinia 报 no active pinia、包体莫名变大。
+
+安全的升级动作（一次做完，不要拆开）：
+
+```bash
+# 同批升级运行时与工具链，避免出现两份 Vue 实例
+pnpm up vue@latest @vitejs/plugin-vue@latest vue-tsc@latest vue-router@latest pinia@latest
+pnpm -r exec vue-tsc --noEmit          # 类型层先过，比 build 早暴露宏问题
+pnpm build && pnpm vitest run
+# 再人工验四件：keep-alive 命中、动态路由装配、封装层透传、错误边界（第 16/17 章的清单）
+```
+
+灰度方式：内部后台直接全量（有回滚就行）；C 端页面按路由分批发，观察 chunk 类错误与单一 fingerprint 的突增。
+
+---
+
+## Nuxt 3 改了什么
+
+**一、自动导入：利与债要一起记。** `components/`、`composables/`、`utils/` 下的东西不用 import 就能用，`#imports` 提供 API，类型落在 `.nuxt/` 目录。
+
+| 利 | 债 |
+|---|---|
+| 少写上百行 import；新页面起手成本接近 0 | 读代码时"这个函数哪来的"变成默认疑问，新人第一周效率明显低 |
+| 组件按需注册，配合 `.nuxt` 类型对 IDE 友好 | 组件同名冲突时会被静默覆盖（`components/order/List.vue` 与 `components/goods/List.vue` 需要路径前缀策略） |
+| SSR 侧 tree-shaking 更自然（未用到的不打包） | lint/格式化与 TS 配置要包含 `.nuxt` 产物，CI 里必须先生成类型再 typecheck |
+
+我的取舍：**保留自动导入，但团队约定"跨模块的 composable 显式 import"**——把"约定优于配置"控制在目录边界内，越界就写显式引用。另外 `.nuxt` 必须进 `tsconfig` 的 include，且不要提交进 git。
+
+**二、Nitro 与服务端路由。** 构建产物由 Nitro 承载，`server/api/**` 文件即接口（`event.context`、`defineEventHandler`），一份产物可切 Node / 预发 / 静态 / 边缘。这带来的实际能力是：**"前端聚合层"**——把 5 个接口在 `server/api/page/[id].ts` 里合成 1 个，减少首屏串行请求，同时把密钥留在服务端（不再往 `VITE_` 变量里塞）。
+
+**三、`useAsyncData` / `useFetch` / `useState` 与前面几章的对应关系**（这张表是这节的重点）：
+
+| Vue 后台里的做法 | Nuxt 里的对应 | 迁移时的坑 |
+|---|---|---|
+| 组件里 `onMounted` 发请求（第 12 章） | `useAsyncData(key, handler)`：服务端取一次、结果随 payload 传给客户端 | `onMounted` 里的请求在 SSR 阶段不执行，服务端 HTML 里就是空的 |
+| 手写请求竞态处理（序号/AbortController） | `useFetch` 自带 key + 去重；相同 key 复用 | 不传 key 的 `useAsyncData` 每次调用都算一次，容易重复请求 |
+| Pinia 存跨页面状态（第 10 章） | `useState('name', () => init)` | **模块级 `const state = reactive({...})` 会让所有用户共享同一份内存**：SSR 下这是数据串号事故，必须每请求隔离 |
+| 布局与 `keep-alive` 缓存页签（第 8 章） | `<NuxtPage>` + `definePageMeta({ key })`；没有"多标签页"这套现成结构 | 后台的 TagsView 类交互在 Nuxt 里要自己实现，收益也不大 |
+| localStorage 存偏好 | `useCookie` / `useState`；`localStorage` 只在客户端可用 | SSR 阶段读 `localStorage` 直接抛错，需要 `<ClientOnly>` 或 `onMounted` 兜底 |
+
+**四、混合渲染与缓存策略**：`nuxt.config.ts` 的 `routeRules` 一个地方决定每个路径怎么出：
+
+```ts
+routeRules: {
+  '/': { prerender: true },                      // 帮助中心首页：构建期直出
+  '/help/**': { isr: 3600 },                     // 边缘缓存 1 小时，后台发布可主动失效
+  '/console/**': { ssr: false },                  // 内部后台：纯客户端，省掉 hydration 成本
+  '/api/**': { cors: true },
+}
+```
+
+选择逻辑（不是"SSR 一定快"）：
+
+- `ssr: false` 的页面首屏 HTML 是空壳，但**没有水合成本**，富交互后台常常反而更快；
+- `prerender` 适合内容几乎不变的页面（文档、落地页），零服务端负担；
+- `isr/swr` 类缓存适合"内容会变但可以容忍几分钟延迟"的详情页；
+- 全动态 + 强个性化 + 依赖登录态的页面，SSR 的代价（Node 实例、缓存穿透、hydration 错误）通常不值。
+
+**五、同构代码的纪律**（一句话记住）：**服务端那份"另一个渲染"里没有 window、document、localStorage，也没有你依赖的第三方 SDK**。任何浏览器 API 调用要么放进 `onMounted`，要么用 `<ClientOnly>` 包，要么写成 `import.meta.client` 分支。图表/地图类组件在 Nuxt 里基本都要走这条路径。
+
+## uni-app（Vue 3）跨端约束：系统化整理
+
+按"已知约束"来整理，不做科普。分六组，每组给出**触发症状**，这样出问题时能直接对号。
+
+**一、尺寸单位与样式。**
+
+| 项 | 规则 | 常见事故 |
+|---|---|---|
+| `rpx` | 750 设计稿基准，按屏宽换算；两端一致但小程序与 H5 的四舍五入略有差 | 小屏（320px）字号被压得过小；`1rpx` 边框在部分机型上消失（改用 `0.5px` 或 `border` 方案） |
+| `px` / `%` / `vw` | H5 与小程序对 `vh` 支持不稳（小程序里 100vh 不含导航栏） | 弹层高度算错、底部按钮被安全区吃掉 → 必须配 `env(safe-area-inset-bottom)` |
+| 选择器 | 不能用 `*` 通配；小程序端样式作用域受组件隔离影响，`:deep()` 只在部分端有效 | 全局样式改不动组件内部；换端后样式丢失 |
+| CSS 变量 | 支持但不完整，复杂 `calc` 嵌套在部分端表现不一致 | 主题切换在小程序上无效，需要编译期变量或多套样式文件 |
+| DOM 标签 | `view`/`text`/`image`/`scroll-view` 替代 `div`/`span`/`img`；长文本换行靠 `text` 而非 `span` | 从后台直接搬过来的模板里全是 `div`，H5 正常、小程序崩 |
+
+**二、条件编译**（跨端项目唯一"合法的分支语法"）：
+
+```vue
+<!-- #ifdef MP-WEIXIN -->
+<button open-type="share">分享</button>
+<!-- #endif -->
+
+<script setup lang="ts">
+// #ifdef H5
+const ua = navigator.userAgent
+// #endif
+// #ifndef APP-PLUS
+uni.setNavigationBarTitle({ title: '标题' })
+// #endif
+</script>
+
+<style>
+/* #ifdef MP-ALIPAY */
+.page { padding-bottom: 48rpx; }
+/* #endif */
+</style>
+```
+
+三条纪律：**条件编译块里不要写业务逻辑分叉**（只写平台 API 与标签差异，业务分支走适配层函数）；每个端特有分支都要在 CI 里至少构建一次那端；`#ifdef` 嵌套写超过两层就是设计问题，改抽 `platform.ts` 适配层。
+
+**三、运行时没有 DOM / window。**
+
+- 小程序逻辑层没有 `document`、没有 `window`（H5 才有），`querySelector`、`getBoundingClientRect` 全部换成 `uni.createSelectorQuery().in(...)`——传的是组件实例（`<script setup>` 里用 `getCurrentInstance()` 拿到的代理），不是 `this`；
+- 需要第三方 DOM 库（图表、富文本）时只有 H5 与 App 的 web-view 可用，小程序要换成官方组件或 canvas 版本；
+- **模板 ref 的边界**：小程序端通过自定义组件实例调方法是另一套机制（`selectComponent`），Vue 的 `$refs` + `defineExpose` 在小程序里不等价可用；加上 `<script setup>` 默认封闭，第 14 章那套"父调子方法"的写法在这里要改成 **事件 + props 单向通信**或抽共享 composable；
+- `nextTick` 可用，但 DOM 测量仍要走查询接口且是异步回调，别指望 `ref.value.offsetHeight`。
+
+**四、生命周期双体系并存。**
+
+```ts
+import { onLoad, onShow, onReachBottom, onPullDownRefresh, onPageScroll } from '@dcloudio/uni-app'
+import { onMounted } from 'vue'
+
+onLoad((query) => { /* 页面参数在这里，早于 mounted；分享/扫码进入都靠它 */ })
+onShow(() => { /* 从别的页返回时会再次触发，等价于 keep-alive 的 activated */ })
+onMounted(() => { /* 组件级：自定义组件里正常用 */ })
+```
+
+三条必须内化的规则：
+
+1. **页面数据初始化放 `onLoad`，不放 `setup` 顶层**——`setup` 里的同步代码拿不到路由参数；
+2. **"切回页面要刷新"靠 `onShow` 而不是 `onMounted`**（这跟第 8 章 `keep-alive` 下 `onActivated` 是同一个问题，两端答案不同）；
+3. `onReachBottom`/`onPullDownRefresh` 要在 `pages.json` 里声明开启，只写回调不生效（症状：上拉加载没反应，第一反应常去找接口问题）。
+
+**五、包体与分包。**
+
+- 微信小程序主包 2MB、总包有上限；资源超过就要 **分包**（`subPackages`）+ 把静态资源推到 CDN；
+- 分包带来的新问题：**主包不能引用分包的代码与组件**，**分包之间也不能互相引用**——所以公共组件必须留在主包，只服务于某个分包的组件要下沉进那个分包（否则它会算进主包体积，把主包挤爆）；跨分包的进入要靠 `preloadRule` 预下载；
+- 从后台带来的直觉错误：`router.addRoute` 这种动态能力在 `pages.json` 声明式路由下**不存在**，第 11/17 章那套动态权限路由要换成"全量页面声明 + 进入时权限校验拦截 + 服务端下发可见入口列表"（症状：照搬后台方案后，权限页在小程序里点进去是白屏）；
+- 首屏优化手段排序：分包（最有效）> 首屏图资源压缩与 CDN > 长列表分页/局部渲染 > 减少 setData 数据量（小程序端 setData 的序列化开销常比渲染本身更痛）。
+
+**六、状态与存储。** Pinia 在 uni-app Vue 3 可用，但没有浏览器会话概念：`localStorage` 换成 `uni.setStorageSync`；页面栈深到 10 层时状态清理责任更重（`onUnload` 里清），否则会攒出一批"返回后数据串页"的问题。
+
+---
+
+## 什么信号说明该上 Nuxt / SSR
+
+**该上（命中任两条就值得评估）**：
+
+- 内容需要被搜索引擎/社交平台抓取：SEO 收录、OG 卡片、分享预览必须有服务端 HTML；
+- 首屏指标是业务目标：外部落地页、文档站、活动页，LCP/FCP 直接影响转化；
+- URL 必须能直接打开：详情页从分享链接进入，不能先看到骨架；
+- 需要服务端聚合或多端共享数据层：省掉首屏串行请求，顺便把密钥收回服务端；
+- 团队有 Node 侧的部署与排障能力（这条常被忽略，但没有它，SSR 出问题时没人能查）。
+
+**不该上（命中任两条就先用 CSR）**：
+
+- 内部登录态后台：没有 SEO 需求，SSR 只增加 hydration 错误面与运维成本；
+- 强浏览器交互（画布、富文本、大量第三方 SDK）且这些 SDK 没做服务端兼容；
+- 团队没有 Node 服务运维能力，或没有边缘/CDN 缓存策略；
+- 页面内容与登录用户强相关、缓存命中率低（SSR 的收益本来来自可缓存的内容）；
+- 排期紧张：Nuxt 的成本不在写第一版，在**双环境调试**（同一段代码两个上下文跑）和 hydration bug 的长期维护。
+
+**中间方案**（我实际更常推荐的三条）：
+
+1. 只有少数页面要 SEO → 主站保持 CSR，用 `prerender`/`ssr:false` 的混合配置，或者单独拿一个轻量站承载 SEO 页；
+2. 只要首屏有内容、不需要完整可交互 → **服务端只出骨架 + meta（首屏 HTML 由模板生成），数据客户端补**；
+3. 文档类站点 → 构建期静态生成（Vite SSG 或专用文档框架），比运行时 SSR 便宜得多。
+
+评估时按这四步走，一天内能出结论，不需要先做技术验证工程：
+
+```text
+1. 列出"必须被爬虫/分享卡片读到"的字段（标题、正文首段、OG 图）→ 决定哪些页面需要直出
+2. 用 Lighthouse 在 4G 节流下跑一次 CSR 版，记下 FCP/LCP → 算出 SSR 能换来的收益
+3. 盘点这些页面上的浏览器依赖（图表、埋点、localStorage）→ 数量决定水合成本
+4. 明确谁来运维那个 Node/Nitro 实例 → 没人认领就不要上 SSR
+```
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue 生态 | React 生态 |
+|---|---|---|
+| 双向绑定样板消除 | `defineModel`（3.4 稳定） | 没有对应概念：受控组件天然要 `value` + `onChange` 两个 props |
+| 副作用清理 | `onWatcherCleanup`（3.5）/ watch 的 `onCleanup` 参数 | `useEffect` 返回清理函数（语言层约定，比 Vue 更统一） |
+| 同构唯一 id | `useId`（3.5） | `useId`（React 18 就有，命名撞车但语义一致） |
+| 新小版本里最该关注的风险 | 依赖 `@vue/compiler-sfc` 的宏改写插件（`defineOptions` 类补丁） | React Compiler 的编译产物差异与 `eslint-plugin-react-hooks` 规则版本 |
+| 全栈框架 | Nuxt 3 + Nitro（服务端路由与多平台部署目标） | Next.js（App Router + RSC，服务端组件是它独有的模型） |
+| 服务端取数 | `useAsyncData` / `useFetch` + payload 传输 | RSC 里直接 `async` 取数，或 `fetch` 缓存语义（心智模型不同：Vue 仍是"客户端应用 + 服务端预渲染"） |
+| 跨端 | uni-app / Taro(Vue) / 原生小程序 | Taro(React)、React Native（RN 是另一个 UI 体系，与小程序差异更大） |
+| 跨端时的样式单位 | uni-app `rpx`（750 基准） | Taro 也做 `rpx` 转换；RN 用无单位密度像素，没有媒体查询 |
+
+最大的一处结构差异：**Next 走的是"服务端组件为默认"的模型，Nuxt 3 仍是"同一套组件跑两个上下文"**。所以 Nuxt 的心智负担主要是"这段代码在服务端跑会不会碰到浏览器 API"，而 Next 的心智负担是"这个组件在哪个边界、数据怎么跨边界"。
+
+---
+
+## 翻车现场
+
+**一、升 3.5 后所有标签页缓存失效**
+
+- 症状：升级当天有人反馈"切页签每次都要重新加载"，接口量涨了一截，代码没动业务逻辑。
+- 根因：给 `defineOptions` 打补丁的老插件与新编译器宏改写冲突，组件 `name` 没注入，`keep-alive :include="['UserList']"` 全部不命中。
+- 修法：改用 Vue 3 原生 `defineOptions`（3.3 起稳定）并移除补丁插件；顺带把 `include` 改成用路由 `meta` 匹配，不再依赖组件名。
+- 复盘定的规矩：**依赖编译器宏的第三方包，升级前逐个确认是否已被官方 API 取代**，并把"keep-alive 命中"列入升级验收清单。
+
+**二、Nuxt 上线后 A 用户看到 B 用户的数据**
+
+- 症状：灰度第一天出现账号数据错乱，本地永远复现不了。
+- 根因：从后台搬过来的 `utils/session.ts` 里写了模块级 `const store = reactive({...})`，在 Node 里这份对象被**所有请求共享**。
+- 修法：改成 `useState('user-session', () => ({ ... }))`（每请求一份、随 payload 序列化），并把"禁止模块级可变单例"写进 ESLint 规则与 code review 清单。
+- 这条是 Nuxt 迁移最贵的一课：**CSR 下"模块级状态 = 全局状态"的直觉，在 SSR 下变成"跨用户状态"**。
+
+**三、小程序端点详情没反应，H5 与后台一切正常**
+
+- 症状：uni-app 项目里列表跳详情，小程序上白屏；调试发现列表页调用子组件的 `open()` 方法报错。
+- 根因：两处平台假设——一是 `<script setup>` + 模板 ref 调方法在小程序端不等价可用（要 `selectComponent`），二是照搬了后台的 `addRoute` 动态路由思路，而小程序路由由 `pages.json` 静态声明，目标页在未授权分包里根本没进包。
+- 修法：组件通信改成 `props` + `emit`（把"打开"变成一个状态而不是一个方法调用）；权限改为"页面全声明 + 进入时拦截"，并把低频分包页设为按需加载 + `preloadRule`。
+- 通用结论：**跨端事故九成不是语法问题，而是"运行时能力假设"**——DOM、window、路由动态性、组件实例四件事，每样都要问一句"小程序端有吗"。
+
+---
+
+## 复习卡片
+
+- **Q：3.5 里最值得现在用的三个 API？** A：`defineModel`（删样板）、`onWatcherCleanup`（跨函数层注册清理，解决竞态）、`useTemplateRef`/`useId`（重构安全与同构 id）。
+- **Q：响应式 props 解构怎么表述才准确？** A：3.5 稳定并默认开启（3.3/3.4 需要 `propsDestructure` 实验开关）；它是 `<script setup>` 的编译期转换，插件与 `vue-tsc` 要跟 Vue 同批升级；把解构变量直接当 `watch` 源是编译错误，要包 getter；存量项目用 `toRef(props, 'x')` 完全等价，不必为它专门升级。
+- **Q：升 3.5 最大的风险来自哪里？** A：依赖 `@vue/compiler-sfc` 做宏改写的插件（典型事故是 `defineOptions` 补丁失效导致 `keep-alive` include 不命中），以及 `vue`/`plugin-vue`/`vue-tsc` 不同批导致的类型与运行时错位。
+- **Q：Nuxt 里为什么不能用模块级 `reactive` 单例？** A：SSR 时 Node 进程被所有请求共享，会变成跨用户状态；必须用 `useState` 这类每请求隔离且能随 payload 序列化的容器。
+- **Q：uni-app 小程序端最硬的三条约束？** A：没有 DOM/window（查询要 `createSelectorQuery`）、路由由 `pages.json` 静态声明（不能 `addRoute`）、主包体积上限（要分包且分包页拿不到主包组件）。
+- **Q：什么信号说明该上 SSR？** A：需要被爬虫/分享卡片读取、首屏是业务指标、URL 必须直出、需要服务端聚合，且团队能运维 Node 服务——命中两条以上才评估。
+
+---
+
+## 小结
+
+- 判断新语法要不要用，只看"能不能删掉现有代码"；`defineModel`、`onWatcherCleanup`、props 解构都能（分别删掉 prop+事件对、跨层传 `onCleanup`、`withDefaults` 样板），而编译器与 reactive 的内部提速不值得单独做一次升级。
+- 3.4/3.5 的性能改进是真实的，但排序上**低于你自己的架构动作**（虚拟列表、shallowRef、拆包）；报给业务方时要按这个顺序。
+- 升级的风险集中在"编译器周边的第三方包"，不在业务代码；把 `keep-alive`、动态路由、封装透传、错误边界这四件列入升级验收。
+- Nuxt 改的是渲染上下文（一份代码两个环境），核心纪律是"每请求隔离"和"不碰浏览器 API"；`useState`/`useAsyncData` 分别对应第 10 章和第 12 章，但语义约束不同。
+- uni-app 的约束是运行时能力边界，样式单位只是最表层的；把"有没有 DOM、路由能不能动态、组件实例能不能调"这三条问清楚，能避开八成的跨端事故。
+
+---
+
+## 练习
+
+1. 把你项目里最典型的 3 个"手写 v-model 样板"组件改成 `defineModel`，并统计删掉的行数；再挑一个带 `keep-alive include` 的模块，在升级 `vue`/`plugin-vue`/`vue-tsc` 之后现场验证缓存是否仍命中（30 分钟内可完成）。
+2. 拿一个现有 Vue 3 后台页面做混合渲染配置：内容页设 `prerender`、详情列表页设 `isr`、内部页设 `ssr: false`；记录一次 hydration 报错或浏览器 API 访问错误，并写出修法（`<ClientOnly>`、`onMounted` 或 `import.meta.client`）。
+3. 交付物：一页《本项目升级与跨端准入》，含三部分——3.5 采纳/不采纳的 API 清单及理由（每条写"能删什么代码"）、升级验收四件套（keep-alive / 动态路由 / 封装透传 / 错误边界）的执行记录、uni-app 端能力禁用清单（DOM、`addRoute`、模板 ref 调方法、主包体积）与替代写法。
+
+---
+
+## 面试一句话
+
+> "我对 Vue 小版本的策略是：只采纳能删掉样板代码的 API——`defineModel` 消掉 prop 加事件对、`onWatcherCleanup` 解决跨层的副作用清理、`useTemplateRef` 和 `useId` 提升重构与同构安全性；props 解构我只在新代码里统一用，3.5 起它默认开启、能删掉 `withDefaults`，但存量项目 `toRef` 完全等价，不值得为它单独升级。升级真正的风险在编译器周边：依赖 `@vue/compiler-sfc` 做宏改写的插件会失效，我就遇过 `defineOptions` 补丁失效导致 `keep-alive` include 全部不命中。跨端上，Nuxt 改的是渲染上下文——模块级单例会变成跨用户状态，所以要用 `useState`；uni-app 改的是运行时能力边界——小程序没有 DOM/window、路由必须静态声明、主包有体积上限，判断该不该上 SSR 我只看 SEO、首屏指标、URL 直出和团队能不能运维 Node 服务这四条。"

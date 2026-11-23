@@ -1,0 +1,407 @@
+---
+title: '14 · 大型项目架构与组件库二次封装'
+published: 2026-11-22T22:00:00+08:00
+description: 'Vue 3 大型项目落地手册：目录与分层的单向依赖如何用 ESLint 拦住、组件三分类与 props 纪律、二次封装 Element Plus 的四个真实难点（inheritAttrs 落点、事件透传、slot 必须遍历 $slots、defineExpose 与实例类型）、类型化组件库导出、按域拆包与首屏产物预算、pnpm workspace 版本治理，以及最容易被漏掉的反向判断：什么时候不要封装。'
+tags: [Vue, 架构, 组件库, ElementPlus, Monorepo]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这章解决两个问题：**一个 3 万行的 Vue 项目靠什么规则而不靠自觉维持秩序**，以及**封装 Element Plus 到底会在哪四个地方翻车**。
+> 真实场景：四条业务线共用 60 多个"通用组件"，其中 20 个是对 Element Plus 的包装。升级 Element Plus 小版本当天，12 个页面的表单校验静默失效、弹窗样式错位——排查发现三个封装层没透传 `props`、两个把 `class` 落在了外层容器、一个把具名插槽吞了。
+> 问答对照见[面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)的「组件通信」一节；症状层面能对上总览第 5 节速查表里"二次封装的组件传属性全丢"这一行。
+
+---
+
+## 一句话本质
+
+架构不是目录好看，是**两条能被机器执行的规则**：依赖只能单向流动，封装只收敛"重复且已经稳定"的东西。写不出判定的架构文档，等于没有架构。
+
+---
+
+## 原理拆解
+
+### 1. 目录与分层：唯一需要被 CI 强执行的是依赖方向
+
+先给一份能直接抄的目录约定（中后台形态）：
+
+```text
+src/
+├── api/            接口函数：只有 request 封装 + 类型，不认识任何 UI
+├── types/          跨层共享的领域类型（DTO / 枚举 / 字典编码）
+├── store/          Pinia：只放"跨页面且需要活过路由切换"的状态
+├── composables/    可复用逻辑：允许调 api/、允许读 store，不允许 import components
+├── components/     通用 UI：props 只用 UI 词汇，不出现业务字段名
+│   └── business/   业务组件：props 用领域词汇，数据由外部传入
+├── features/       按业务域切分的模块（order / goods / report），域内可自带组件与 composable
+├── views/          页面容器：路由参数、编排、副作用
+├── router/         静态路由 + 动态路由装配 + 守卫
+└── utils/          纯函数：不许 import 任何上面几层
+```
+
+**依赖方向是单向的**，箭头只允许从左到右：
+
+```text
+types  <-  api  <-  composables  <-  views
+                 <-  store        <-  views
+types  <-  components（只依赖 types）
+```
+
+由此推出几条可执行、可写进 review 清单的硬规则：
+
+| 规则 | 判定方式 | 违反后的真实代价 |
+|---|---|---|
+| `components/**` 禁止 import `store/**` | ESLint 路径限制，PR 直接拦 | 通用组件被 store 结构绑死，换页面就得改组件；组件在测试里必须挂 Pinia |
+| `api/**` 禁止 import 任何 UI 层 | 同上 | 接口层弹 `ElMessage`，错误处理散成十份 |
+| `views/**` 之间禁止互相 import | 同上 | 页面变成隐式公共库，改一个炸另一个 |
+| `features/x` 不 import `features/y` 的内部文件 | 同上（跨域只走 `api` 或 `composables`） | 业务域耦合，三年后没人敢删目录 |
+| 组件 props 里禁止出现 `Record<string, any>` | ESLint 规则 + typecheck | 封装层把类型黑洞传给所有使用方 |
+
+落地用 `eslint-plugin-import` 的 `no-restricted-paths`（`boundaries` 插件更语义化，但配置更重）：
+
+```js
+// eslint.config.js 片段
+'import/no-restricted-paths': ['error', {
+  basePath: 'src/',
+  zones: [
+    { target: './components', from: './store', except: [] },
+    { target: './components', from: './views', except: [] },
+    { target: './api', from: './components', except: [] },
+    { target: './features', from: './features', except: [] },   // 业务域互不引用（except 相对 target，域内自引用仍允许）
+  ],
+}]
+```
+
+注意 `no-restricted-paths` 本身不支持"自定义违规文案"，报错信息里只有路径关系——所以违规的**解释**要写在文档和 PR 模板里，而不是指望 lint 输出教人。
+
+配一句实话：`no-restricted-paths` 只拦 import，拦不住"把 store 当全局变量用"的语义违规（比如在 utils 里 `useUserStore()`）。所以文档里要把**"谁可以调 store"**写成一条 review 项，光靠 lint 会给人虚假的安全感。
+
+### 2. 组件三分类与各自的 props 纪律
+
+分类不是命名游戏，它决定了**这个组件能被谁复用、在测试里怎么挂、能不能进组件库**。
+
+| 分类 | 数据来源 | props 词汇 | 允许副作用 | 测试方式 | 能否进公共组件库 |
+|---|---|---|---|---|---|
+| 通用 UI（`components/`） | 全部来自 props/slot | 只有 UI 概念（size、disabled、placeholder） | 无 | 纯 mount，不需要任何插件 | 能 |
+| 业务组件（`components/business`、`features/*/components`） | props 传入，可 inject | 领域概念（orderId、dictCode、status） | 只读，不发起写请求 | mount + inject stub | 谨慎：要先抽出契约 |
+| 页面容器（`views/`） | 路由参数 + store + 请求 | 几乎没有 props | 有 | 需要 Router + Pinia + MSW | 不能 |
+
+props 设计的四条纪律（第 03 章讲语法，这里讲工程约束）：
+
+1. **超过 6 个 props 就停下来**——通常是"这个组件该拆成两个"或"该收成一个有类型的 config 对象"，而不是加第 7 个；
+2. **布尔 props 不堆叠**：`is-edit / is-simple / is-mini` 三个布尔互相矛盾时没人能读，改成一个 `variant: 'edit' \| 'simple' \| 'mini'` 联合类型（判据写法参考 [TypeScript 联合类型那篇](/blog/posts/typescript-roadmap-08-union-and-type-guards/)）；
+3. **事件名要说清"改了什么"**：`change` 留给值变化，别用它同时表达"用户点了保存"；
+4. **禁止 `extraProps` / `override` 这种逃生舱 props**——一旦需要它，说明封装层在跟被封装组件抢控制权，这是下面"什么时候不要封装"的第一个信号。
+
+```vue
+<!-- components/business/OrderStatusSelect.vue -->
+<script setup lang="ts">
+import type { OrderStatus } from '@/types/order'
+
+const props = defineProps<{
+  modelValue: OrderStatus | null
+  readonly?: boolean
+}>()
+
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: OrderStatus | null): void
+  (e: 'change', v: OrderStatus | null): void
+}>()
+</script>
+```
+
+上面这种"调用签名"式的 `defineEmits` 类型写法是可以直接用的常规写法；3.3 起还支持更短的元组式声明 `defineEmits<{ change: [value: OrderStatus | null] }>()`，并对事件载荷做类型收窄（3.3 引入，用之前确认你们的 `vue-tsc` 版本）。
+
+---
+
+## 二次封装 Element Plus：四个真实难点
+
+这是本章的主体，也是面试里"你有没有真带过中后台"的判别题。
+
+### 难点一：`inheritAttrs` 与 attrs 的落点
+
+Vue 3 里非 props 的属性（含 `class` 与 `style`）会**自动落到包装组件的根元素**上。对 Element Plus 这种"根元素不是真正要样式的元素"的组件，就出现两个经典错位：
+
+- `class="mt-4"` 加在外层 `div` 上，但宽度/边框需要落在 `el-input`；
+- `placeholder`、`maxlength` 这些透传项能工作（它们本来就在 attrs 里），但 `clearable` 这类会影响子组件渲染模式的布尔值，如果包装层声明成了自己的 props 却没有转发给内层，就会"传了没反应"。
+
+标准写法：把根节点关掉，手动指定落点。
+
+```vue
+<script setup lang="ts">
+defineOptions({ inheritAttrs: false })
+
+const props = defineProps<{ modelValue: string; label: string }>()
+const emit = defineEmits<{ (e: 'update:modelValue', v: string): void }>()
+</script>
+
+<template>
+  <el-form-item :label="props.label">
+    <el-input
+      :model-value="props.modelValue"
+      @update:model-value="emit('update:modelValue', String($event))"
+      v-bind="$attrs"
+    />
+  </el-form-item>
+</template>
+```
+
+配套纪律：**封装层要在文档里写死"attrs 落在哪个元素"**，否则使用方只能靠试。3.4 起 attrs 透传做了性能优化（不用重复创建 attrs 对象），但**语义没变**，别指望升级解决落点问题。
+
+### 难点二：事件透传——为什么 `v-bind="$attrs"` 有时捕不到 emit
+
+机制（这段要能背）：
+
+- 父组件写 `@change="fn"`，传到包装层时它是 attrs 里的 `onChange`；
+- **包装层如果在 `emits` 里声明了 `change`，Vue 就认为"你会自己触发它"，于是把 `onChange` 从 `$attrs` 里摘掉**——这时 `v-bind="$attrs"` 转不动它，事件静默丢失；
+- 包装层没声明 `emits`，`onChange` 留在 `$attrs` 里，`v-bind="$attrs"` 就能直接透到内层组件上。
+
+所以规则很明确：**声明了就必须转发，没声明才可以靠 attrs 带过去**。真实项目里推荐显式转发，因为大多数时候你要在中间改参数或补埋点：
+
+```vue
+<script setup lang="ts">
+const props = defineProps<{ modelValue: OrderStatus | null }>()
+
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: OrderStatus | null): void
+  (e: 'change', v: OrderStatus | null, prev: OrderStatus | null): void
+}>()
+
+function onInnerChange(next: OrderStatus | null) {
+  emit('update:modelValue', next)
+  emit('change', next, props.modelValue)   // Element Plus 只给一个参数，第二个是我加的
+}
+</script>
+```
+
+三个高频坑：
+
+1. **`v-model` 必须成对转发**：`modelValue` prop + `update:modelValue` 事件，漏一个就是"能显示不能保存"。麻烦在于 Element Plus 各组件的双向绑定名并不统一：`el-input`、`el-select`、`el-dialog` 走 `v-model`（`modelValue`），`el-pagination` 走 `v-model:current-page` 与 `v-model:page-size` 两个具名绑定，而 Vue 2 时代那批 `:visible.sync` 的老写法在一些内部工具包里还有残留——同一个封装层里混两套语义最容易写错。用 `defineModel`（3.4 起稳定）可以把这层样板全部省掉，见第 06 章；
+2. **事件参数个数不一致**：包装层声明 `(e: 'change', v: T, prev: T)`，内层只 emit 一个值，`prev` 是 `undefined`——类型上看不出来，要靠断言；
+3. **`selection-change` / `current-change` 这类 Element Plus 表格事件**：它们携带的是行数组，虚拟化列表（第 13 章）之后不可见行没挂载，选中态必须以 `row-key` 存在数据源里，否则事件一透传就丢。
+
+### 难点三：slot 透传为什么必须写 `v-for`
+
+`$attrs` 只管属性，**插槽完全不在 attrs 里**——插槽是"传给子组件的渲染函数集合"，挂在 `$slots` 上，key 是插槽名。所以只写默认插槽的封装层会把具名插槽静默吞掉：
+
+```vue
+<!-- ❌ 只转发 default：使用方写的 #append / #extra 全部消失，且没有报错 -->
+<template>
+  <el-input v-bind="$attrs"><template #default><slot /></template></el-input>
+</template>
+
+<!-- ✅ 遍历 $slots，动态插槽名转发全部 -->
+<template>
+  <el-input v-bind="$attrs">
+    <template v-for="(_, name) in $slots" #[name]="slotProps">
+      <slot :name="name" v-bind="slotProps || {}" />
+    </template>
+  </el-input>
+</template>
+```
+
+机制原因，拆成三点：
+
+1. 模板里的 `#append` 是**静态插槽名**，编译期就固定；`#[name]` 是**动态插槽名**，运行时按 `$slots` 的 key 逐个建立，所以遍历是"我不知道使用方会传哪些名字"的唯一解；
+2. `v-for="(_, name) in $slots"` 里第一个参数是插槽内容（我们不关心，用 `_` 占位），第二个才是 key；这个 `$slots` 是渲染时读取的，**没被使用的插槽不会出现**，遍历时机的正确性依赖它在 render 里被访问；
+3. **作用域插槽的参数必须回传**：`el-table-column` 的 `#default="{ row }"`、`el-form-item` 的 `#error` 都带参数。如果你写 `<template #default><slot /></template>`，作用域参数就断了，表现是"插槽渲染出来了但 row 是 undefined"。`v-bind="slotProps"` 就是为这一步服务的。
+
+代价也要说：这么写的封装组件**没法让 TS 推断插槽名与参数**（插槽类型 Vue 至今不友好），所以要在文档里手写"支持 default / append / #extra（参数 `{ row }`）"这一行。
+
+### 难点四：`expose` 与模板 ref 的类型
+
+`<script setup>` 默认是封闭的：父组件拿到实例也调不到内部方法。表单类封装一定要 `defineExpose`，而暴露出去的接口必须有类型，否则使用方写 `formRef.value.validate()` 全靠猜。
+
+```ts
+// components/business/ProForm/types.ts
+export interface ProFormExpose {
+  validate: () => Promise<boolean>
+  resetFields: () => void
+  scrollToField: (prop: string) => void
+}
+```
+
+```vue
+<script setup lang="ts">
+import type { ProFormExpose } from './types'
+
+const formRef = ref<InstanceType<typeof ElForm>>()
+
+defineExpose<ProFormExpose>({
+  validate: () => formRef.value!.validate(),
+  resetFields: () => formRef.value?.resetFields(),
+  scrollToField: (prop: string) => formRef.value?.scrollToField(prop),
+})
+</script>
+```
+
+使用方两种拿实例类型的写法：
+
+```ts
+import ProForm from '@/components/business/ProForm/index.vue'
+import type { ProFormExpose } from '@/components/business/ProForm/types'
+
+const formRef = ref<InstanceType<typeof ProForm> | null>(null)      // 走组件类型推导
+const formRef2 = ref<ProFormExpose | null>(null)                    // 走显式暴露接口（更稳）
+```
+
+三个必须知道的细节：
+
+- 推荐**同时**给 `defineExpose<T>()` 显式类型和一份对外 `types.ts`：`InstanceType<typeof Comp>` 在不同 vue-tsc 版本下的可用性表现不完全一致，显式接口不受构建链影响；
+- `defineExpose` 暴露的 ref 会被自动解包，外部拿到的是值而不是 ref 对象——这点和 `reactive` 暴露不同（第 01 章的 unwrap 规则在这里复用）；
+- 模板 ref 的字符串写法（`ref="form"` + `useTemplateRef('form')`，3.5 起）对封装层更友好，能避免"模板里 ref 名与 setup 变量名不同步"这类低级事故。
+
+---
+
+## 类型化组件库：让别人不会用错
+
+"别人不会用错"这句话来自总览第 1 节尺子 3，落到组件库上有四个具体动作：
+
+1. **props 类型与组件一起导出**：`export interface ProTableProps` 放在 `types.ts`，`defineProps<ProTableProps>()` 引用它。Vue 3.3 起 `defineProps` 支持外部导入的类型（有限定：类型必须是可静态解析的），别再退化成运行时对象写法；
+2. **泛型组件（3.3 起）**：表格、选择器这类"数据类型由外部决定"的组件用 `<script setup lang="ts" generic="T extends Record<string, unknown>">`，让 `:columns` 的 `dataKey` 与 `T` 的 key 对齐；
+3. **暴露接口单独一份 `types.ts`**（上一节的 `ProFormExpose`），并把它们从包入口 `index.ts` 导出；
+4. **约定即文档**：组件目录里放 `README.md`（attrs 落点、转发的事件、支持的作用域插槽与参数）——这四条恰好对应上面四个难点，缺一条就会有人踩。
+
+深层类型细节（`ExtractPropTypes`、`ComponentInstance` 之类）建议直接看 [TypeScript 与框架集成那篇](/blog/posts/typescript-roadmap-16-framework-integration/)，组件库日常用不到那么深。
+
+## 按路由 / 按域拆包与首屏产物预算
+
+后台项目产物控制的杠杆点只有一个：**页面 chunk 必须按路由切，公共 chunk 必须按变化频率切**。
+
+```js
+// vite.config.ts 片段：按 features 目录做域拆分
+build: {
+  rollupOptions: {
+    output: {
+      manualChunks(id) {
+        if (id.includes('node_modules')) {
+          if (id.includes('element-plus')) return 'ui'
+          if (id.includes('echarts')) return 'chart'
+          return 'vendor'
+        }
+        const m = id.match(/src\/features\/([^/]+)/)
+        if (m) return `feat-${m[1]}`
+        return undefined
+      },
+    },
+  },
+}
+```
+
+配套纪律：
+
+- **首屏预算要先写成数字**才能被守住。示例预算（不是通用标准，按你自己业务定）：首屏 JS gzip 控制在 300KB 以内、CSS 60KB 以内，登录页不加载任何业务域 chunk。测量与拆解方法在第 13 章的构建侧一节，原理见[工程化 Vite 篇](/blog/posts/engineering-roadmap-04-vite/)与[打包原理篇](/blog/posts/engineering-roadmap-02-bundling-principle/)；
+- 拆完**必须验证"共享代码没被复制两份"**：`echarts` 出现在两个 `feat-*` chunk 里比不拆更糟，这时候 `manualChunks` 的显式分组才是解药；
+- 按域拆包还有一个非性能收益：`feat-order` 挂了只影响订单页，配合第 16 章的 chunk 加载失败捕获，故障半径可以从"整站白屏"缩到"一个页面"。
+
+## pnpm workspace 里的组件库版本治理
+
+内部 UI 包一旦进 workspace，会同时遇到四个治理问题：
+
+| 问题 | 现象 | 处理 |
+|---|---|---|
+| `vue` 被写成 dependencies | 宿主和组件库各一份 Vue 运行时：`inject` 拿不到、Pinia 报 no active pinia、包体莫名变大 | 组件包里 `vue` 必须是 `peerDependencies`；Element Plus 同理 |
+| 内部包发布形态 | 发 `.vue` 源码时宿主 Vite 要把它当业务代码编译（symlink 包默认不进预构建，冷启动变慢）；发产物时要额外带类型与样式 | 内部包推荐源码直连（`exports` 指到 `src`），并保证三件事：`vue` 走 peer、`resolve.dedupe: ['vue']` 防双实例、`server.fs.allow` 放开仓库根；对外发布才出 dist |
+| 版本对齐 | 三个 app 用 `ui-kit@0.3.1`、`0.4.0`、`^0.2`，同一改动要验三遍 | 用 pnpm `catalog:` 在 `pnpm-workspace.yaml` 统一版本区间，升级只改一处（详见[工程化 Monorepo 篇](/blog/posts/engineering-roadmap-11-monorepo/)） |
+| 变更可见性 | 组件库改了 slot 名，宿主页面静默坏掉 | changeset 生成 CHANGELOG + 组件库改动必须带一条"破坏性检查项"的 PR 模板；配合第 15 章的测试才敢升 |
+
+一句实战经验：**内部组件库的语义版本不要假装成熟**。`0.x` 阶段每次改动都主版本跳（`0.3` → `0.4`），配合 `catalog:` 一次性切，比维护一堆 `^0.3.0` 加一堆兼容层便宜得多。
+
+---
+
+## 什么时候不要封装（资深面试最想看的一条）
+
+封装的判断是**反向**的：默认不封装，除非满足条件。我的决定顺序如下。
+
+**该封装**（三条同时满足）：
+
+1. 出现 3 处以上**结构完全一致**的使用（不是"看起来差不多"）；
+2. 这个结构在接下来半年**不会继续变**（业务已定型）；
+3. 封装后能同时写出**类型 + attrs 落点 + 事件表 + slot 表**四项文档。
+
+**不该封装**（任一条成立即停手）：
+
+- 只有 1–2 处使用，或者"以后大概会用到"；
+- 重复的只是三行模板：那说明该抽的是 composable 或样式类，不是组件；
+- 需求仍在变，业务规则每周都在加例外分支（封装会把变化固化成 if）；
+- 需要新增 `extraProps`、`raw`、`render` 这类逃生舱才能覆盖使用场景；
+- 类型写不出来，只能 `Record<string, any>` 传进去；
+- 你要封装的是"校验逻辑 + 请求 + UI"三件事——那应该拆成第 07 章的 composable + 一个薄 UI 组件。
+
+> [!IMPORTANT]
+> 最贵的一种封装：包了 Element Plus 之后，团队遇到所有表格问题都先去改封装层。封装层于是变成所有人共享的单点故障，一次改动打穿四条业务线。**判据很简单：如果你要动封装层才能修一个页面的 bug，那这个封装本来就是错的。**
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue 3 | React |
+|---|---|---|
+| 维持分层依赖方向 | `eslint-plugin-import` 路径限制（两边通用），但 SFC 让"一个组件一个文件"，目录即边界 | 同样靠 lint 规则；组件常拆成 `Comp.tsx` + `Comp.css` + `useComp.ts`，文件边界更碎 |
+| 属性透传 | `v-bind="$attrs"`，未声明的属性（含 `class`/`style`）默认自动落到根元素 | `{...props}` 手动展开；没有任何"自动落根节点"的行为，class 需要自己拼 |
+| 事件透传 | 声明了 `emits` 就必须显式转发，否则子层收不到 | handler 是普通 prop，spread 即可；不需要声明，也没有"被摘掉"的机制 |
+| 插槽转发 | 必须 `v-for` 遍历 `$slots`，作用域参数要 `v-bind` 回传 | `children` / render props 是普通值，传下去就行，无需特殊语法 |
+| 暴露实例方法 | `defineExpose` + 外部 `InstanceType<typeof X>` 或显式接口 | `forwardRef` + `useImperativeHandle`，默认只能暴露你挂上去的那个对象 |
+| 泛型组件 | `generic="T"`（3.3 起） | 函数组件天然能带泛型参数，写法更直接 |
+| 组件库源码消费 | 内部包可直接发 `.vue` 源码，由宿主编译 | 内部包通常也要经过构建，源码直连需要配 ts 路径与编译 |
+
+一处**没有差异**的地方也要写清楚：目录分层、按域拆包、版本治理这三件事在两个栈里是同一套工程问题，规则可以完全复用；差异只出现在"透传机制"这一层，而它恰好是 Vue 封装最容易出事的地方。
+
+---
+
+## 翻车现场
+
+**一、封装后 `class` 和校验一起失效**
+
+- 症状：使用方写 `<ProInput class="w-64" @blur="check" />`，宽度没生效，`blur` 时机上校验偶发拿不到值；控制台无报错。
+- 根因：包装层根节点是 `div`，`class="w-64"` 落在 `div` 上而 `el-input` 宽度由内部元素决定；同时 `blur` 事件在内层 `input` 与外层 `div` 上的时机不同（`div` 上拿到的是冒泡后的事件，`relatedTarget` 语义变了）。
+- 修法：`inheritAttrs: false` + 显式 `v-bind="$attrs"` 到 `el-input`，并在组件 README 里写"attrs 与事件落在内层 input"。这条改动要配套一次全量替换（用 grep 找所有 `<ProInput`），否则新老用法混存更难查。
+
+**二、`v-model:visible` 传进弹窗封装层后"关不掉"**
+
+- 症状：点关闭按钮，弹窗没反应，父组件的 `visible` 一直是 `true`；再点一次才偶尔生效。
+- 根因：封装层声明了 `emits: ['update:visible']`，于是 `onUpdate:visible` 从 `$attrs` 被摘走，而内部又忘了 emit；同时内层 `el-dialog` 的 `v-model` 绑的是包装层自己的一个 `ref`，两个状态各走各的。
+- 修法：只保留一份状态源——用 `defineModel<boolean>('visible')`（3.4 起）接住，不再手写 prop + 事件对，`expose` 出一个 `open()/close()` 供列表页调用。
+- 通用教训：**声明 emits 却不转发**，是"封装后属性全丢"这一类症状里最隐蔽的一种，因为 Vue 不做任何警告。
+
+**三、表格列封装把作用域插槽吞了**
+
+- 症状：`<ProTableColumn>` 里 `<template #default="{ row }">` 的 `row` 是 `undefined`，页面直接白（读 `row.status` 报错）。
+- 根因：转发时写了 `<template #default><slot /></template>`，没有把内层 `el-table-column` 给的插槽参数传出去。
+- 修法：统一改成 `v-for="(_, name) in $slots" #[name]="p"` + `<slot :name="name" v-bind="p || {}" />`；同时在封装组件的单测里断言"作用域参数能拿到"（第 15 章有对应写法）。
+
+---
+
+## 复习卡片
+
+- **Q：分层靠什么维持？** A：靠能被机器执行的规则——单向依赖用 ESLint 路径限制在 PR 拦，props 词汇表与 attrs 落点写进组件 README 当契约。
+- **Q：为什么 `v-bind="$attrs"` 有时带不过事件？** A：包装层在 `emits` 里声明了该事件，Vue 就把对应监听从 `$attrs` 摘走，必须显式转发。
+- **Q：slot 转发为什么要 `v-for="(_, name) in $slots"`？** A：插槽不在 attrs 里且名字在编译期未知，只有遍历 `$slots` 才能建立动态插槽名；作用域参数还要 `v-bind` 回传。
+- **Q：封装层怎么暴露方法并带上类型？** A：`defineExpose<接口>()` + 一份独立 `types.ts`，使用方可以选 `InstanceType<typeof Comp>` 或直接用那个接口类型。
+- **Q：什么信号说明这次封装是错的？** A：需要新增 `extraProps` 这类逃生舱、类型只能写 `any`、或者修一个页面的 bug 要动封装层。
+- **Q：内部组件库最容易被忽略的依赖约定是什么？** A：`vue` 和 UI 库必须放 `peerDependencies`，否则出现两份运行时，`inject`/Pinia 会以无法解释的方式失败。
+
+---
+
+## 小结
+
+- 架构的可执行部分是"依赖方向 + 词汇表"，其他都是文档；`components` 不 import `store` 这类规则必须进 lint，否则三个月后一定会被破。
+- 组件三分类决定了它的可测试性与可复用范围，props 词汇是分类的判据（UI 概念 vs 领域概念）。
+- 二次封装的四个难点各有固定修法：attrs 显式落点、声明即转发、slot 遍历 `$slots`、`defineExpose` 配显式接口类型。
+- 产物与版本治理是"能不能长期维护"的关键：按路由切 chunk、按变化频率切公共 chunk、`catalog:` 统一内部包版本、`peerDependencies` 锁运行时。
+- 最后一条最值钱：**默认不封装**。封装层的 bug 是乘法的 bug。
+
+---
+
+## 练习
+
+1. 给你手上项目加一条 `import/no-restricted-paths` 规则，禁止 `src/components/**` import `src/store/**`，跑一遍 lint，把违规点按"改成 props 传入 / 改成 composable / 页面容器直接读 store"三类分别修掉，并统计各类数量（30 分钟内可完成大部分）。
+2. 挑一个你写过的 Element Plus 封装组件，补齐四件事：`inheritAttrs` 落点说明、显式事件转发表、`v-for` 遍历 `$slots` 的转发、`defineExpose` 的显式接口类型；然后用它替换两处使用点，写下类型是否真的推断正确。
+3. 交付物：一页《组件封装准入规则》，包含"该封装"三条判据、"不该封装"六条反向判据、一张现有组件的处置表（保留 / 下沉为 composable / 删除 / 拆成两层），处置表不少于 10 个组件，每个附一句理由。
+
+---
+
+## 面试一句话
+
+> "我在大型 Vue 项目里只强制两件事：依赖方向单向（`components` 不能读 `store`，用 ESLint 在 PR 拦）和封装准入（三处以上、结构一致、需求已定型才封）。二次封装 Element Plus 我会明确处理 attrs 落点、emits 声明即转发、slot 必须遍历 `$slots`、`defineExpose` 配显式类型这四件事。如果一个问题需要改封装层才能修，那说明这个封装一开始就不该做。"

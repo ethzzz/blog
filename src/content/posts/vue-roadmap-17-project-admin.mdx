@@ -1,0 +1,577 @@
+---
+title: '17 · 毕业项目：Vue 3 + Element Plus 后台（对照 RuoYi-Vue3）'
+published: 2026-11-23T01:00:00+08:00
+description: '把前 16 章串成一个能演示、能讲设计的后台：三阶段交付（登录与动态权限路由、字典与 CRUD 表格与批量操作、性能与错误兜底与测试发布）、每阶段可运行的关键代码骨架（含 addRoute 与守卫重放的正确写法）、22 条逐条可判定的验收清单、常见事故与回滚策略，以及这段项目面试里怎么讲 10 分钟的 STAR 提纲。'
+tags: [Vue, 项目实战, ElementPlus, 动态路由, 权限, Pinia]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章的产出不是一个教程，而是一份**能被验收的交付**：一个中后台（登录 + 动态权限路由 + 字典 + CRUD + 批量操作 + 性能与错误兜底 + 测试与发布），并且每个决定都能追溯到前面某一章。
+> 场景锚定在最真实的形态上：对照 [RuoYi-Vue3 前端架构篇](/blog/posts/ruoyi-roadmap-13-vue-frontend/) 的结构（后端下发菜单、`v-hasPermi` 指令、字典、代码生成器出的 CRUD 骨架），但**自己实现四件基础设施**，而不是直接拿现成框架跑起来。菜单与角色在后端侧的模型见 [RuoYi 角色与菜单篇](/blog/posts/ruoyi-roadmap-06-role-menu/)，本章不重复后端部分。
+> 面试问答形态见[面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)的「Vue Router」与「状态管理」两节；总览第 5 节的症状速查表里的每一行，都能在下面的 22 条清单里找到对应验收项。
+
+---
+
+## 一句话本质
+
+这个项目的技术含量不在"页面数量"，在三件事：**身份与路由的装配顺序**（决定刷新会不会 404）、**权限的两层落点**（路由级与按钮级各自在哪实现、后端如何兜住越权）、**可运维性**（有指标的优化、能还原的栈、能回滚的发布）。做到了这三件，它就是一个"会架构、能救火、有数字"的作品；缺任何一件，它就是一堆 Element Plus 页面。
+
+---
+
+## 原理拆解
+
+### 1. 三阶段的依赖顺序不可交换
+
+```text
+阶段一  身份与骨架     登录 / token / 动态路由装配 / 布局与标签页 / 权限指令
+   ↓       决定"页面能不能进来"，返工代价最高，必须先定
+阶段二  业务闭环       字典 / CRUD 表格 / 表单校验分层 / 批量与跨页选择 / 导出
+   ↓       决定"需求能不能持续交付"，是前 6 章的练兵场
+阶段三  可运维         性能基线与优化 / 错误边界与 chunk 恢复 / 测试门禁 / 构建与回滚
+           决定"能不能上线、能不能讲"，也是面试里最稀缺的部分
+```
+
+顺序不可交换的具体理由：
+
+- 先做业务页面，动态路由改造时要把每个页面的注册方式重写一遍（我见过两次这样的返工，成本都在一周以上）；
+- 没有阶段一的权限指令，阶段二的按钮权限就变成"每个页面自己 `v-if`"，之后没法统一审计；
+- 性能与错误兜底必须在业务形态稳定后做，否则优化对象会变（但**剖析与埋点要在阶段二就开始**，不然阶段三无基线）。
+
+### 2. 每阶段"完成"的判定
+
+| 阶段 | 交付物 | 判定证据（不是"我觉得好了"） | 最常见的返工 |
+|---|---|---|---|
+| 一 | 登录 + 动态路由 + 布局 + 双层权限 | 用两个不同角色账号跑通：菜单不同、按钮显隐不同、直接敲无权限 URL 进 403、刷新任意深层路由不 404 | 通配 404 路由注册早于 `addRoute`，导致所有动态路由永远匹配到 404 |
+| 二 | 2 个完整业务模块（用户 + 一条业务域） | 每个模块能查/增/改/删/批量/导出，字典驱动状态字段，校验失败与接口失败都有可见反馈 | 选中态存 DOM（翻页即丢）、把字典值写死在页面里 |
+| 三 | 指标文档 + 兜底体系 + CI 门禁 + 发布流程 | 有优化前后数字与测法；断网/删 chunk 两个故障场景能自愈；PR 上违规 import 会被拦 | 只做了 `errorHandler` 就以为兜住了（不做局部边界，仍是整页白屏） |
+
+### 3. 目录与模块划分
+
+沿用第 14 章的分层与依赖方向，这里落到具体文件：
+
+```text
+src/
+├── api/
+│   ├── request.ts             axios 实例 + token + 错误码 + 401 防抖
+│   ├── system/user.ts         list / add / update / remove / resetPwd
+│   └── biz/order.ts
+├── types/
+│   ├── api.d.ts               后端 DTO（分页包装、错误码）
+│   └── models.ts              领域模型与枚举、字典编码
+├── store/
+│   ├── index.ts               createPinia + 持久化插件注册
+│   └── modules/
+│       ├── user.ts            token / profile / permissions（setup store）
+│       ├── permission.ts      动态路由装配：generateRoutes / loadComponent
+│       ├── dict.ts            字典缓存：useDict 的数据源
+│       └── app.ts             侧栏折叠、主题、标签页
+├── router/
+│   ├── index.ts               静态路由（登录、404、403、首页）
+│   ├── guard.ts               鉴权守卫 + 装配重放 + 标题
+│   └── asyncRoutes.ts         前端兜底的静态部分（本地开发可脱离后端）
+├── directive/
+│   └── hasPermi.ts            按钮级权限：无权限时移除 DOM
+├── composables/
+│   ├── useDict.ts             字典读取 + 缺失时异步拉取
+│   ├── useTable.ts            查询 / 分页 / 排序 / loading / 错误态 + 请求竞态处理
+│   ├── useSelection.ts        跨页选择（以 row-key 为准）
+│   └── useExport.ts           blob 下载 + 错误体识别
+├── components/
+│   ├── AppBoundary.vue        局部错误边界（第 16 章）
+│   ├── ProTable/              el-table-v2 封装：attrs/事件/slot/expose 四件套
+│   └── business/              业务组件（只接领域词汇的 props）
+├── layout/
+│   ├── index.vue              侧栏 + 顶栏 + 主内容
+│   └── components/TagsView.vue
+├── views/
+│   ├── login/index.vue
+│   ├── system/user/index.vue  标准 CRUD 模板
+│   ├── biz/order/index.vue
+│   └── error/403.vue / 404.vue
+├── plugins/
+│   └── errorGlobal.ts         window 层错误钩子 + 上报初始化
+└── utils/
+    ├── permission.ts          checkPermi / checkRole / hasRoutePermission
+    ├── auth.ts                token 读写（cookie 或 localStorage，一处封装）
+    └── report.ts              错误上报 + 面包屑
+```
+
+依赖方向仍然只有两条硬规则：`components/**` 不 import `store/**`；`api/**` 不 import UI 层。这两条会在阶段三被 lint 拦下来（尺子 4）。
+
+---
+
+## 技术选型对照
+
+| 维度 | 本方案：Vue 3 + Pinia + Router 4 + Element Plus | React + Zustand + Next | 直接采用 RuoYi-Vue3 |
+|---|---|---|---|
+| 从零到能演示 | 2–3 周（骨架代码本章给全） | 3–4 周（要自己拼表格、权限、请求层） | 2–3 天（菜单、字典、代码生成器都有） |
+| 后端配合成本 | 需要 `getInfo` + `getRouters` 两个接口 | 同上，或全在前端配路由表 | 零：与 RuoYi 后端天然对齐 |
+| 权限模型表达力 | 后端下发菜单 + 前端指令双保险，边界清晰 | 通常前端路由表 + `accessApi`/中间件，SSR 下更自然 | 同款双保险（本方案的参照物） |
+| 首屏与包体 | 路由级 chunk + `manualChunks`，可控但要自己做（第 13 章） | Next 的路由分割更自动，但后台项目常因 RSC 复杂度得不偿失 | 默认打包较全，体积偏大，裁剪需读源码 |
+| 二开自由度 | 高：所有基础设施都在自己手里，能讲清每行为什么这样写 | 高，但要额外处理 Element Plus 与 SSR 的兼容 | 低到中：要迁就它的约定（Shiro 权限字符、菜单表结构、多环境配置） |
+| 面试叙事价值 | 最高：能答"刷新为什么 404""按钮权限在哪层生效""chunk 失效怎么恢复" | 高，但 Vue 岗位问不到这些细节 | 低：容易被追问"这部分是框架自带的吧" |
+| 服务端渲染/SEO | 不适用（后台不需要，若需要见第 18 章 Nuxt） | Next 天然支持，管理后台里常是多余复杂度 | 不支持，需换技术栈 |
+| 长期维护 | 取决于分层规范与测试门禁（第 14、15 章） | 取决于同类的规范落地 | 升级跟上游，改自己代码要处理合并冲突 |
+
+结论按场景给：
+
+- **给 Vue 岗位准备作品集** → 本方案。理由是最后一行：基础设施自己写过一遍，才撑得住第二轮追问。
+- **公司要 3 个月内上线一套内部系统** → 直接用 RuoYi-Vue3（或同类脚手架），别自己造。这时候自研是负资产。
+- **团队主栈是 React 或需要 SEO/服务端** → React + Next，别混栈做后台。
+- **已经有一套 Vue 2 老后台** → 不要全量重写，按 RuoYi-Vue3 的结构把新模块写成 Vue 3，用微前端或 iframe 做过渡；等模块边界清晰后再逐域替换（这类渐进迁移的取舍属于工程化路线里微前端与构建配置的范畴，此处不展开）。
+
+---
+
+## 阶段一：登录 + 动态权限路由 + 布局
+
+**请求层**（`api/request.ts` 的关键三段，其余照常规）：
+
+```ts
+const service = axios.create({ baseURL: import.meta.env.VITE_APP_BASE_API, timeout: 15_000 })
+
+service.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+let reloginPrompted = false
+
+service.interceptors.response.use(
+  (res) => {
+    const { code = 200, msg, data } = res.data ?? {}
+    if (code === 200) return data
+    if (code === 401) handleUnauthorized()
+    else ElMessage.error(msg || '请求失败')
+    return Promise.reject(new Error(msg || `code ${code}`))
+  },
+  (error) => {
+    if (error.response?.status === 401) handleUnauthorized()
+    else if (!axios.isCancel(error)) ElMessage.error(error.message || '网络异常')
+    return Promise.reject(error)
+  },
+)
+
+// 并发 5 个 401 只弹一次：单点标志位 + 清理后跳转
+function handleUnauthorized() {
+  if (reloginPrompted) return
+  reloginPrompted = true
+  ElMessageBox.confirm('登录状态已过期，请重新登录', '提示', { confirmButtonText: '重新登录' })
+    .then(async () => {
+      await useUserStore().logout()
+      location.href = `/login?redirect=${encodeURIComponent(location.pathname + location.search)}`
+    })
+    .finally(() => { reloginPrompted = false })
+}
+```
+
+**用户 store**（setup store，权限字符与角色都放这里）：
+
+```ts
+export const useUserStore = defineStore('user', () => {
+  const token = ref(getToken())
+  const profile = ref<UserProfile | null>(null)
+  const permissions = ref<string[]>([])
+  const roles = ref<string[]>([])
+
+  async function login(payload: LoginPayload) {
+    const data = await apiLogin(payload)
+    token.value = data.access_token
+    setToken(data.access_token)
+  }
+
+  async function getInfo() {
+    const data = await apiGetInfo()
+    profile.value = { userName: data.userName, nickName: data.nickName, avatar: data.avatar }
+    permissions.value = data.permissions ?? []
+    roles.value = data.roles ?? []
+  }
+
+  async function resetAll() {
+    removeToken()
+    token.value = ''
+    profile.value = null
+    permissions.value = []
+    roles.value = []
+    usePermissionStore().reset()              // 必须一起清，否则下次登录拿到旧路由
+    useDictStore().clear()
+  }
+
+  return { token, profile, permissions, roles, login, getInfo, logout, resetAll }
+})
+```
+
+**权限 store：把后端菜单树转成路由**（`component` 字符串 → 动态 import）：
+
+```ts
+const modules = import.meta.glob('@/views/**/index.vue')
+
+function loadComponent(name: string) {
+  if (name === 'Layout') return () => import('@/layout/index.vue')
+  if (name === 'ParentView') return () => import('@/layout/components/ParentView.vue')
+  const loader = modules[`/src/views/${name}/index.vue`]
+  if (!loader) {
+    // 后端把组件路径配错了：不要让整个路由装配失败，只让这一个菜单坏
+    reportError(new RouteComponentError(name), { phase: 'route-assembly', component: name })
+    return () => import('@/views/error/500.vue')
+  }
+  return loader as () => Promise<unknown>
+}
+
+export const usePermissionStore = defineStore('permission', () => {
+  const menuTree = shallowRef<MenuItem[]>([])
+  const loaded = ref(false)
+
+  async function generateRoutes() {
+    const routers = await apiGetRouters()
+    menuTree.value = routers
+    return routers.map(toRouteRecord)
+  }
+
+  function toRouteRecord(item: MenuItem): RouteRecordRaw {
+    return {
+      path: item.path,
+      name: item.routeName ?? item.path,
+      component: loadComponent(item.component),
+      redirect: item.redirect,
+      meta: { title: item.meta.title, icon: item.meta.icon, perms: item.perms, keepAlive: item.meta.noCache !== 1 },
+      children: item.children?.map(toRouteRecord),
+    } as RouteRecordRaw
+  }
+
+  function reset() { menuTree.value = []; loaded.value = false }
+
+  return { menuTree, loaded, generateRoutes, reset }
+})
+```
+
+用 `import.meta.glob` 而不是模板字符串动态 import，是因为 `import('@/views/' + name + '/index.vue')` 在 Vite 里要靠静态分析确定范围：模板字符串能工作但会把整个目录切成大量 chunk 并失去类型；`glob` 的显式映射**同时避免了"路径拼错时报错信息完全看不出原因"**（这是 RuoYi 前端那张表里"页面空白"一行的根因）。
+
+**守卫：本章必须完整可运行的一段**（`router/guard.ts`）：
+
+```ts
+import type { Router, RouteLocationNormalized } from 'vue-router'
+
+const WHITE_LIST = ['/login', '/404', '/403']
+
+export function setupGuard(router: Router) {
+  router.beforeEach(async (to: RouteLocationNormalized) => {
+    const userStore = useUserStore()
+    const permissionStore = usePermissionStore()
+
+    if (!userStore.token) {
+      return WHITE_LIST.includes(to.path) ? true : { path: '/login', query: { redirect: to.fullPath } }
+    }
+
+    if (to.path === '/login') return { path: '/' }
+
+    if (permissionStore.loaded) {
+      return hasRoutePermission(to, userStore.permissions) ? true : { path: '/403' }
+    }
+
+    try {
+      if (!userStore.profile) await userStore.getInfo()
+      const routes = await permissionStore.generateRoutes()
+      routes.forEach((record) => router.addRoute(record))
+
+      // 通配兜底必须最后注册，否则它会先吃掉所有动态路由
+      if (!router.hasRoute('notFound')) {
+        router.addRoute({ path: '/:pathMatch(.*)*', name: 'notFound', redirect: '/404' })
+      }
+
+      permissionStore.loaded = true
+      return { ...to, replace: true }             // 重放导航：让刚注册的路由参与本次匹配
+    } catch (err) {
+      reportError(err, { phase: 'route-bootstrap' })
+      await userStore.resetAll()
+      return { path: '/login', query: { redirect: to.fullPath } }
+    }
+  })
+
+  router.afterEach((to) => {
+    document.title = to.meta.title ? `${to.meta.title} · 管理台` : '管理台'
+  })
+}
+```
+
+这段有四个"写错就出事故"的点，逐条对号：
+
+1. **Vue Router 4 用返回值控制导航**：`true`/`undefined` 放行、路由对象重定向、`false` 取消。老代码里的 `next({...to, replace: true})` 在 4 里仍可用，但同一个守卫里 `next()` 与 return 混用会触发"next 被调用多次"警告——统一用 return。
+2. **`{ ...to, replace: true }` 不能省**：`addRoute` 之后当前导航的路由匹配结果已经算好了（是 404 或未匹配），不重放就会停在空页面。这是"刷新后 404/白屏"最主流的修法。
+3. **通配 404 必须在动态路由之后注册**：`addRoute` 是插到匹配表末尾的，先注册的通配路由会一直命中，症状是"菜单点了都没反应"。
+4. **失败分支必须清 token 并重置 permission**：否则半装配状态留在内存里，重登之后路由缺一半。
+
+配套还差两处装配代码（容易漏）：
+
+```ts
+// main.ts：等首跳完成再挂载，避免首帧渲染时动态路由未装好导致 Layout 空白
+router.isReady().then(() => app.mount('#app'))
+```
+
+```ts
+// directive/hasPermi.ts：按钮级权限，无权限直接从 DOM 移除
+export const hasPermi: Directive = {
+  mounted(el: HTMLElement, binding: DirectiveCommand) {
+    const required = normalize(binding)                  // 字符串或数组
+    if (required.length && !checkPermi(required)) {
+      el.parentNode?.removeChild(el)
+    }
+  },
+}
+```
+
+`removeChild` 的写法要记住一条限制：指令移除元素后**不会因权限变化自动恢复**，所以权限在会话内变更时必须重新登录或整块重渲染（用第 16 章的边界 `key` 手法）。另外这条指令只是体验，越权必须由后端拒（接口返回 403）——这是清单里必须验的一条。
+
+## 阶段二：字典 + CRUD + 校验 + 批量
+
+**字典**（`composables/useDict.ts`，缓存 + 缺失补拉 + 退出清理）：
+
+```ts
+export function useDict(...types: string[]) {
+  const store = useDictStore()
+  const result = reactive<Record<string, DictItem[]>>({})
+
+  types.forEach((type) => {
+    result[type] = store.itemsOf(type)        // 命中缓存直接返回；未命中触发一次异步拉取并写入缓存
+  })
+
+  return result
+}
+```
+
+三条验收要点：**页面里不许出现 `'0': '正常'` 这类硬编码**；字典被后台修改后要有"刷新缓存"入口（否则症状就是"改了后台页面还是旧值"）；退出登录必须清缓存（换个账号看别人的字典标签是常见的越权信息泄露）。
+
+**CRUD 的编排层**（`composables/useTable.ts`，管状态与竞态，不管 UI）：
+
+```ts
+export function useTable<T>(fetcher: (q: Query) => Promise<PageResult<T>>, init: Partial<Query> = {}) {
+  const query = reactive<Query>({ pageNum: 1, pageSize: 20, ...init })
+  const rows = shallowRef<T[]>([])                      // 第 13 章：大列表不深代理
+  const total = ref(0)
+  const loading = ref(false)
+  const error = shallowRef<Error | null>(null)
+  let seq = 0
+
+  async function load() {
+    const my = ++seq
+    loading.value = true
+    error.value = null
+    try {
+      const res = await fetcher({ ...query })
+      if (my !== seq) return                            // 第 12 章：丢弃过期响应
+      rows.value = res.rows
+      total.value = res.total
+    } catch (err) {
+      if (my !== seq) return
+      error.value = err as Error                        // 失败保留旧数据，界面走空态 + 重试
+    } finally {
+      if (my === seq) loading.value = false
+    }
+  }
+
+  const debouncedLoad = useDebounceFn(load, 250)        // 搜索框走防抖，分页器走即时
+  return { query, rows, total, loading, error, load, debouncedLoad, reload: load }
+}
+```
+
+**校验分层**（第 06 章的工程版）：`rules` 只管字段级（必填、长度、正则）；跨字段（结束时间晚于开始时间）用 `validator` 且必须写 `trigger: 'blur'`；业务唯一性与状态机校验放提交前拦截，失败要落到具体字段——做法是把后端返回的错误映射到 `serverErrors`，再传给对应 `el-form-item` 的 `error` 属性。提交时才跑全表 `validate()`，字段级变更只跑 `validateField`（第 13 章的性能口径在这里落地）。
+
+**批量与跨页选择**：选中态存 `useSelection`（以 `row-key` 为单位的 `ref<Set<string>>`，整体替换而非原地 `add`），表格翻页/筛选后仍保留；提交前做三件事——数量上限检查、后端预校验（哪些可删）、失败明细回显。**"批量删除返回 200 但只删了 3 条"是这类系统的固定事故**，所以清单里要求后端返回逐条结果、前端必须显示失败原因。
+
+**导出**（`useExport.ts`）：请求声明 `responseType: 'blob'` 之后必须先嗅探内容——后端出错时常常仍返回 200 加一段 JSON 错误体，于是你拿到的是一个"伪装成文件的 JSON"，直接落盘就是一个打不开的 xlsx：
+
+```ts
+async function download(params: ExportQuery, filename: string) {
+  const blob = await request<Blob>({ url: '/biz/order/export', method: 'post', data: params, responseType: 'blob' })
+  if (blob.type.includes('application/json')) {                 // 错误体伪装成文件
+    const text = await blob.text()
+    ElMessage.error(JSON.parse(text).msg || '导出失败')
+    return
+  }
+  saveBlob(blob, filename)
+}
+```
+
+## 阶段三：性能、错误兜底、测试与发布
+
+**性能**：先取基线，再改代码。三件事必须在阶段二结束时就位——长任务探针、`version.json`、路由级 chunk；否则阶段三只能"感觉变快了"。
+
+```ts
+// plugins/perf.ts：预发/灰度环境采样上报，生产按 1% 采样
+if (import.meta.env.VITE_COLLECT_PERF) {
+  new PerformanceObserver((list) => {
+    for (const e of list.getEntries()) if (e.duration > 50) report('longtask', e.duration, e.attribution)
+  }).observe({ entryTypes: ['longtask'] })
+}
+```
+
+优化动作清单（每项的机制与量级口径在第 13 章）：列表数据源 `shallowRef`、搜索防抖、500 行以上换虚拟表格、静态大块拆组件吃 patchFlag 红利、`manualChunks` 分离 vendor/ui/chart、`import.meta.glob` 保证按域拆包不重复。
+
+**错误兜底**：三层 + 一层恢复，直接用第 16 章的成品：
+
+```text
+app.config.errorHandler      →  上报（不吞异常、不做 UI）
+AppBoundary（布局层 + 页面层） →  局部降级 + key 重建
+window.onerror / unhandledrejection → 异步盲区上报 + chunk 失败识别
+router.onError + beforeResolve     →  chunk 重试 / 版本探测 / 带路径刷新（sessionStorage 护栏）
+```
+
+发布侧加一个 `version.json` 生成插件，让探测有依据：
+
+```ts
+// vite.config.ts
+{
+  name: 'gen-version',
+  closeBundle() {
+    const dir = resolve('dist')
+    writeFileSync(resolve(dir, 'version.json'), JSON.stringify({ buildId: BUILD_ID, at: new Date().toISOString() }))
+    writeFileSync(resolve(dir, 'index.html'), readFileSync(resolve(dir, 'index.html'), 'utf8'))
+  },
+}
+```
+
+**测试与门禁**（第 15 章的分层阈值直接落地）：守卫与装配（`generateRoutes`、`hasRoutePermission`）、`useTable` 的竞态与错误分支、`useDict` 的缓存与失效、`checkPermi` 边界、封装层的透传契约，各写单测；E2E 三条（登录、一条 CRUD 主链路、权限路由）；CI 里 `typecheck + lint + vitest run --coverage`，`import/no-restricted-paths` 拦分层违规。
+
+**发布与回滚**：
+
+```bash
+# 构建：注入版本号，产物带 buildId
+VITE_APP_BUILD_ID=$(date +%Y%m%d%H%M) pnpm build
+
+# nginx：入口不缓存，资源长缓存，history 兜底
+location = /index.html { add_header Cache-Control "no-cache"; }
+location = /version.json { add_header Cache-Control "no-cache"; }
+location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
+location / { try_files $uri $uri/ /index.html; }
+```
+
+发布策略：**产物目录按 buildId 建，`current` 软链切换**，保留上一版 30 分钟。这一条同时解决两类事故——旧 chunk 被删（软链回不去但文件还在）与代码级回归（软链一秒切回）。
+
+| 事故级别 | 判定 | 动作 | 时间目标 |
+|---|---|---|---|
+| P0 全站白屏 / 登录不可用 | 上报量陡增 + 影响全量用户 | 软链回滚上一版，再查 | 5 分钟内 |
+| P1 单页面崩溃 | 局部边界生效、单一 fingerprint | 热修或加防护后发小版本 | 30 分钟内 |
+| P2 chunk 失效类 | 只影响未刷新的老会话 | 走版本探测自愈 + 保留旧产物 | 无需人工 |
+| P3 文案/样式 | 无功能影响 | 进下一个常规发布 | 不紧急 |
+
+---
+
+## 22 条验收清单
+
+逐条可判定：每条都带"怎么验"。勾不满不要对外说"做完了"。
+
+**阶段一（身份与骨架）**
+
+- [ ] **AC-01** 无 token 访问 `/system/user` 被重定向到 `/login?redirect=/system/user`，登录后回到原路径。验证：手动跑一遍 + 守卫单测断言返回的路由对象。
+- [ ] **AC-02** 刷新任意深层子路由不 404（开发态由守卫重放解决，生产态由 nginx `try_files` 解决）。验证：构建后起静态服务，刷新三级菜单页。
+- [ ] **AC-03** 动态路由由后端 `getRouters` 下发装配，通配 404 在 `addRoute` **之后**注册。验证：故意把通配路由提前，确认症状是"点了菜单没反应"，再改回来。
+- [ ] **AC-04** 无权限 URL 直接输入进 `/403`，而不是白屏。验证：用低权账号敲高权路径。
+- [ ] **AC-05** 并发 5 个请求同时 401，只弹一次重新登录且 token 被清干净。验证：MSW/E2E 造 5 个并发 401。
+- [ ] **AC-06** `v-hasPermi` 对无权限账号**从 DOM 移除**按钮（不是 `display:none`），且同接口后端返回 403。验证：`wrapper.find('button').exists()` 为 false + 直接调接口。
+- [ ] **AC-07** 标签页 `keep-alive` 命中与淘汰可观察：切回页面数据是新的（`onActivated` 触发），缓存超上限后被淘汰。验证：连续开 8 个页签回到第 1 个，看是否重新请求（对应速查表"页面切回来数据是旧的"）。
+
+**阶段二（业务闭环）**
+
+- [ ] **AC-08** 字典全部走 `useDict`，页面里零硬编码枚举；后台改字典后有"刷新缓存"入口并立即生效。验证：全局搜 `'正常'`；验证速查表"字典不更新"一行。
+- [ ] **AC-09** 退出登录清空 dict/permission/user 三个 store 与本地 token。验证：换账号登录后看不到上一个账号的菜单与字典标签。
+- [ ] **AC-10** 列表具备 loading / empty / error 三态，接口失败时保留旧数据并显示重试。验证：断网点重试恢复。
+- [ ] **AC-11** 连续切换筛选时**最终展示的是最后一次请求结果**（序号或 AbortController）。验证：慢网络下连点 3 个筛选（对应速查表"watch 里请求被后到的旧响应覆盖"）。
+- [ ] **AC-12** 表单校验分层落地：字段级 `rules`、跨字段 `validator` + `trigger: 'blur'`、业务唯一性走提交前拦截并回显到具体字段。验证：制造一次后端重名错误，看提示是否落在字段上。
+- [ ] **AC-13** 批量操作跨页保持选中（以 `row-key` 存数据源），并给出失败明细；承载它的 `useSelection` 要把三件事写成约定：返回值类型、入参是否接 `MaybeRef`、谁负责 reset。验证：翻三页选 5 条删除，其中 1 条后端拒绝，界面能指出是哪条；文档里那三处约定能对上代码（**尺子 3**）。
+- [ ] **AC-14** 导出对"错误伪装成文件"有识别，不会产生打不开的 xlsx。验证：让导出接口返回错误码。
+- [ ] **AC-15** 所有 store 消费点通过 `storeToRefs` 取 state/getters；能现场复现并解释"改了不更新"的三种路径（解构 `reactive`、`shallowRef` 改内部属性、直接替换引用方式错误）。验证：口头 + 演示（**尺子 1**、速查表"store 解构后 getters 失效"）。
+- [ ] **AC-16** 二次封装组件（`ProTable` 至少）四件齐备：attrs 落点、事件显式转发、`v-for` 遍历 `$slots`、`defineExpose` 显式类型，且各有一条单测。验证：在封装层外用 `class` 与具名作用域插槽，能生效（速查表"二次封装的组件传属性全丢"）。
+
+**阶段三（可运维）**
+
+- [ ] **AC-17** 大列表页有优化前后的**数字**（输入到画面稳定的耗时、长任务次数），并标清测法与机器/数据量；未测的写明"示例数据"。验证：文档里有一张前后对比表（**尺子 4 的"有数字"部分**）。
+- [ ] **AC-18** 能对任一页面说出更新范围：静态部分被提升、动态部分带 patchFlag，组件拆分的收益可解释。验证：看编译产物或现场讲（**尺子 2**）。
+- [ ] **AC-19** 首屏产物预算达标并有证据：登录页不含业务 chunk、vendor/ui 分离、无重复依赖；`version.json` 与 `VITE_APP_BUILD_ID` 一致。同时确认没有依赖 dev-only 行为（`app.config.performance` 在生产无效、`v-memo` 与手写 `key` 的使用有证据）。验证：产物分析报告 + `curl /version.json` + 用生产构建复测一次交互指标（对应速查表"生产包比开发环境还慢"）。
+- [ ] **AC-20** 三层错误捕获就位并可现场验证：局部边界让崩溃只坏一块；`errorHandler` 与 `window` 层各有一条上报到达；sourcemap 为 hidden 且能现场还原一条线上栈。验证：故意抛 3 类错误（setup、render、`setTimeout`）各一次；再做一次**计时演练**——从"白屏告警"开始，按第 16 章的 checklist 在 30 分钟内说出属于哪一层、证据是什么（**尺子 5**）。
+- [ ] **AC-21** chunk 失效自愈链路完整：识别（多浏览器文案）→ 重试 → 版本探测 → 带目标路径刷新 → `sessionStorage` 防死循环。验证：删掉某个路由 chunk 后触发一次，并去掉护栏复现死循环。
+- [ ] **AC-22** 质量门禁可执行：CI 上 `typecheck + lint + vitest --coverage（分层阈值）+ 三条 E2E` 全绿，且 `components` import `store` 会被拦；配套一份 10 分钟 STAR 讲述稿与一页架构文档。验证：提一个故意违规的 PR 看是否被拦（**尺子 4**：分层与规范能被 CI 拦住）。
+
+> [!IMPORTANT]
+> 清单里的 AC-15、AC-18、AC-13、AC-22、AC-20 这五条直接对应总览第 1 节的五把尺子（依次为：改了不更新、能预编译模板、composable 三约定、分层落地并被拦、30 分钟定位）。勾不上这五条，就意味着这条路线的 L3 还没过——不要靠"页面数量多"来给自己交付。
+
+---
+
+## 翻车现场
+
+**一、上线后所有人点某个菜单没反应，菜单能展开、页面空白**
+
+- 症状：新角色登录后，部分菜单点击无变化，控制台干净。
+- 根因：通配 404 路由在动态路由之前注册（阶段一第 4 点），永远命中它并被重定向到 404，而 404 页被写成了"无提示的空白布局"。
+- 修法：把通配路由挪到 `addRoute` 循环之后并加 `hasRoute` 防重复注册；同时 404 页必须有可见文案——**"静默失败"是这类问题拖一整天的原因**。
+
+**二、"字典改了没生效"演变成一次数据一致性疑云**
+
+- 症状：运营在后台改了字典项，前端页面标签仍是旧值；有人怀疑接口缓存，去查了后端。
+- 根因：`useDict` 把字典缓存在 store + `localStorage`，只有登录时拉一次，没有失效入口。
+- 修法：字典缓存加 `updatedAt` 与"刷新缓存"按钮；`localStorage` 版本号和后端字典版本号对齐，不一致则丢弃本地缓存。
+- 复盘定下的规矩：**任何本地缓存都必须有失效路径**，写不出失效路径的缓存就不要缓存在本地。
+
+**三、发布后 20 分钟白屏告警，最后确认是两个问题叠在一起**
+
+- 症状：一部分用户报"页面加载失败"提示，一部分报"整页空白刷新也没用"。
+- 根因：旧 chunk 被删（第一类）+ 一个新版接口字段改名导致列表渲染抛错（第二类），且当时只有 `errorHandler` 没有局部边界，所以第二类是整页白。
+- 修法：保留上一版产物 30 分钟 + 版本探测自愈；接口字段变更走"后端兼容两版 + 前端可选链 + 缺字段时降级列"三步；补 `AppBoundary` 分层。
+- 复盘定下的规矩：**每次发布必须同时观察"chunk 类错误占比"和"单一 TypeError 的 fingerprint 突增"**，这两类混在一起时用影响面与错误类型分布区分最快（第 16 章的 30 分钟 checklist 第 3、8 分钟那两步）。
+
+---
+
+## 这段项目怎么在面试里讲 10 分钟
+
+按 STAR 讲，但**把 60% 时间放在 A 的第三段（可运维）**，因为那是区分"做过后台"和"上过线"的地方。
+
+| 段 | 时长 | 说什么 | 一句锚定句 |
+|---|---|---|---|
+| S 背景 | 60 秒 | 四条业务线的内部中后台，日均活跃 200 左右，对接 RuoYi 风格后端（菜单/权限字符/字典由后端下发） | "不是营销站，是权限模型复杂、迭代频繁的内部系统。" |
+| T 目标 | 90 秒 | 我负责前端架构与交付质量：把发布事故降到可自愈、把首屏与交互做到有数字、把分层规范做到能被 CI 拦 | "三个目标都有可判定的验收，不是'做得更好'。" |
+| A1 身份与路由 | 2 分钟 | 守卫里的装配顺序、`addRoute` 后重放、通配路由时机、401 防抖、`keep-alive` 与 `onActivated` | "刷新不 404 这件事，我拆成守卫和生产 nginx 两层来讲。" |
+| A2 业务闭环 | 2 分钟 | 字典与缓存失效、`useTable` 的竞态与三态、校验分层、批量跨页选择、导出错误体识别 | "批量删除返回 200 但只删 3 条，这类事我是怎么处理失败明细的。" |
+| A3 可运维 | 3 分钟 | 性能：基线 + 手段 + 数字；错误：三层捕获 + chunk 自愈 + sourcemap；质量：分层 lint + 覆盖率阈值 + 3 条 E2E；发布：软链 + 保留上一版 | "线上一次白屏，我 30 分钟内定位到是旧 chunk 还是渲染错误。" |
+| R 结果 | 60 秒 | 只说能被追问的数字：交互延迟从多少到多少、发布事故数量变化、回归拦截数（没有真实数字就说"这块我用示例口径，实际数值要按你的环境测"） | "数字我用同一台机器同一份数据测的，测法是长任务 + 输入到画面稳定。" |
+
+三个必被追问的点，提前备好一句话答案：
+
+1. **"为什么不直接用 RuoYi-Vue3？"** → "同样需求下我会直接用。自己实现是为了掌握四件基础设施的决策点——尤其路由装配顺序和权限两层落点，用现成框架时这两处出问题你改不动。"
+2. **"你这个项目里最难的一个 bug？"** → 讲"通配路由吃掉动态路由"或"chunk 失效与渲染错误叠加"，按症状→证据→根因→修法→定下的规矩五段讲，最后一定要有"规矩"。
+3. **"性能数字怎么来的？"** → 说清测法（长任务阈值 50ms、输入到画面稳定、`app.config.performance` 只在 dev 有效）与机器/数据量，并主动说明哪些是示例量级——**主动承认口径边界比报一个大数字更加分**。
+
+---
+
+## 复习卡片
+
+- **Q：动态路由装配后为什么要 `return { ...to, replace: true }`？** A：本次导航的路由匹配已在 `addRoute` 之前算完，不重放就会停在未匹配/404 状态，表现为刷新后白屏。
+- **Q：通配 404 为什么要最后注册？** A：`addRoute` 按注册顺序参与匹配，先注册的通配路由会一直命中，导致所有动态路由打不开。
+- **Q：前端权限和后端权限的分工？** A：路由级由后端下发菜单决定可见范围，按钮级用指令移除 DOM 只是体验，越权必须由后端接口拒绝。
+- **Q：`keep-alive` 下页面数据为什么是旧的？** A：`onMounted` 不再执行，要在 `onActivated` 里重新取数；缓存超上限后被淘汰则恢复完整生命周期。
+- **Q：阶段三为什么必须在业务稳定后做？** A：性能与错误兜底的优化对象会随业务形态变化，但剖析埋点与版本探测必须提前就位，否则拿不到基线。
+- **Q：这个项目的可交付证据是什么？** A：22 条验收清单（每条带验证方法）+ 一份指标文档 + 一条被 CI 拦住的违规 import 记录。
+
+---
+
+## 小结
+
+- 三阶段的划分依据是**返工代价**：路由与权限最先定，业务其次，可运维最后但埋点最早。
+- 守卫与 `addRoute` 的那 20 行是这类后台的技术核心，四个雷（返回值语义、导航重放、通配时机、失败清理）踩任何一个都会变成线上事故。
+- 权限是两层：后端下发路由决定"能不能进"，指令决定"能不能点"，接口 403 决定"到底安不安全"。
+- 22 条清单里五条直接对应总览的尺子；勾不满就别对外说完成——**清单的价值是把"我觉得好了"变成可判定语句**。
+- 面试里最值钱的不是页面数量，而是"哪个决定是我做的、哪个事故是我修的、哪个数字是我测的"。
+
+---
+
+## 练习
+
+1. 用最小后端（两个接口：`getInfo`、`getRouters`，返回写死的两棵菜单树）跑通阶段一，然后用两个角色账号验证 AC-01 到 AC-07 七条，把失败的那条的现象与修法写成 10 行以内的笔记（30 分钟内可完成）。
+2. 故意制造三类崩溃各一次（`setup` 抛错、渲染里读 `undefined`、`setTimeout` 里抛错），记录：用户分别看到什么、控制台与上报里分别有什么、被哪一层接住；再按第 16 章补齐缺失的层，重跑一遍。
+3. 交付物：完整跑完 `## 22 条验收清单`，并把结果落成一份文档——每条写明"通过/未通过 + 验证方式 + 证据（截图、日志片段或测试文件名）"；同时产出 10 分钟 STAR 讲述稿一份，其中 A3 段必须有至少三个可被追问的数字及其测法。
+
+---
+
+## 面试一句话
+
+> "我做过一个 Vue 3 + Element Plus 的中后台，参照 RuoYi 的结构但四件基础设施是自己写的：请求层（token、错误码、401 防抖）、后端下发动态路由（`getRouters` → `addRoute` → 重放导航，通配路由必须最后注册）、双层权限（路由级管可见、指令管按钮、接口 403 才是安全边界）、字典与 CRUD 的 composable 层。第二阶段之后我把重点放在可运维：列表交互延迟有前后数字和测法、三层错误捕获加 chunk 版本探测自愈、分层用 ESLint 在 PR 拦、E2E 只留登录、一条 CRUD 主链路和权限路由三条。它给我的底气不是页面多，是任何一处线上白屏我能在 30 分钟内说出是渲染错误、权限装配问题还是旧 chunk 被删。"

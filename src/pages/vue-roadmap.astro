@@ -1,0 +1,154 @@
+---
+import { getCollection } from "astro:content";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+// 获取所有 Vue 学习路线文章
+const allPosts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === "Vue学习路线" &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+
+// 按 slug 中的阶段编号排序
+const sortedPosts = allPosts.sort((a, b) => {
+	const numA = Number.parseInt(
+		a.slug.match(/vue-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	const numB = Number.parseInt(
+		b.slug.match(/vue-roadmap-(\d+)/)?.[1] ?? "0",
+		10,
+	);
+	return numA - numB;
+});
+
+// 分离总览和阶段文章
+const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
+const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
+---
+
+<MainGridLayout title="Vue 3 从组合式到工程化">
+	<div class="onload-animation">
+		<!-- 页面标题 -->
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">Vue 3 从组合式到工程化</h1>
+			<p class="text-75 text-lg">从响应式机制到能带团队交付的中后台 · 共 {sortedPosts.length} 篇</p>
+		</div>
+
+		<!-- 项目信息卡片 -->
+		<div class="card-base card-shadow p-5 mb-6 bg-gradient-to-r from-[var(--btn-regular-bg)] to-transparent">
+			<div class="flex items-start gap-4">
+				<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--primary)] flex items-center justify-center text-white dark:text-black/70 font-bold text-xl">
+					Vue
+				</div>
+				<div class="flex-1">
+					<h2 class="text-lg font-bold text-90 mb-1">Vue 3 - 渐进式框架的完整工程栈</h2>
+					<p class="text-75 text-sm mb-2">编译期 patchFlag + 运行时 Proxy 响应式 + 组合式 API：与 React 路线互为对照，每章都给两侧写法差异</p>
+					<div class="flex flex-wrap gap-2 text-xs">
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">响应式</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Composable</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Pinia</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">动态权限路由</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Element Plus</span>
+						<span class="px-2 py-1 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">Nuxt / uni-app</span>
+					</div>
+				</div>
+				<a href="https://vuejs.org/" target="_blank" rel="noopener"
+				   class="flex-shrink-0 text-[var(--primary)] hover:opacity-75 transition-opacity">
+					<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+						<path d="M2 3h3.5L12 14l6.5-11H22L12 24 2 3z"/>
+					</svg>
+				</a>
+			</div>
+		</div>
+
+		<!-- 总览卡片 -->
+		{overviewPost && (
+			<a href={getPostUrlBySlug(overviewPost.slug)}
+			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
+				<div class="flex items-start justify-between">
+					<div class="flex-1">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--primary)] text-white dark:text-black/70">
+								总览
+							</span>
+							<span class="text-sm text-50">
+								{overviewPost.data.published.toLocaleDateString("zh-CN")}
+							</span>
+						</div>
+						<h2 class="text-xl font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-2">
+							{overviewPost.data.title}
+						</h2>
+						<p class="text-75 text-sm line-clamp-2">
+							{overviewPost.data.description}
+						</p>
+					</div>
+					<div class="ml-4 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+					</div>
+				</div>
+			</a>
+		)}
+
+		<!-- 阶段文章列表 -->
+		<div class="space-y-4">
+			{stagePosts.map((post, index) => (
+				<a href={getPostUrlBySlug(post.slug)}
+				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+					<div class="flex items-start gap-4">
+						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+							{index + 1}
+						</div>
+						<div class="flex-1 min-w-0">
+							<div class="flex items-center gap-2 mb-1">
+								<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
+									{post.data.title}
+								</h3>
+							</div>
+							<p class="text-75 text-sm mb-2 line-clamp-2">
+								{post.data.description}
+							</p>
+							<div class="flex items-center gap-3 text-xs text-50">
+								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+								{post.data.tags && post.data.tags.length > 0 && (
+									<span class="flex items-center gap-1">
+										{post.data.tags.slice(0, 3).map(tag => (<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">#{tag}</span>))}
+									</span>
+								)}
+							</div>
+						</div>
+						<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+						</div>
+					</div>
+				</a>
+			))}
+		</div>
+
+		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
+			<p class="font-medium mb-1">💡 学习建议</p>
+			<p>按三层读，不要顺读：<strong>L1（01–06）</strong> 讲机制——01 的响应式断点、02 的 patchFlag、04 的清理时机是后面所有"为什么"的地基；<strong>L2（07–12）</strong> 是本系列的增值中心——07 的 composable 契约、10 的状态归属、11 的动态权限路由，直接对应中后台日常；<strong>L3（13–16）</strong> 讲交付——13 先学看数字再谈优化，16 决定线上会不会白屏。已经会 React 的话，每章的对照表比正文更值得先扫一遍；17 是毕业项目，建议留一整块时间做完。</p>
+		</div>
+
+		<div class="mt-4 flex flex-wrap gap-4 text-sm">
+			<a href="https://vuejs.org/guide/introduction.html" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+				Vue 官方指南
+			</a>
+			<a href="https://vuejs.org/api/" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+				API 参考
+			</a>
+			<a href="https://pinia.vuejs.org/" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+				Pinia 文档
+			</a>
+			<a href="https://router.vuejs.org/" target="_blank" rel="noopener" class="link text-[var(--primary)] flex items-center gap-1">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+				Vue Router 文档
+			</a>
+		</div>
+	</div>
+</MainGridLayout>

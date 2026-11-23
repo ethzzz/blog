@@ -1,0 +1,356 @@
+---
+title: '10 · Pinia：store 拆分、持久化与 SSR 水合'
+published: 2026-11-22T18:00:00+08:00
+description: 'Pinia 实战：相对 Vuex 4 真正减少的东西、option store 与 setup store 怎么选、storeToRefs 解构陷阱与 $patch 批量更新、按领域还是按页面拆分、哪些状态根本不该进 store、持久化与 SSR 每请求实例和水合，以及跨 store 循环依赖的解法。'
+tags: [Vue, Pinia, 状态管理, storeToRefs, SSR, "$patch"]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章解决"**什么状态有资格进 store**"以及"**进了 store 之后怎么不被自己写的代码坑**"。
+> 真实场景：一个后台项目的 `store/app.js` 长到 1400 行，谁都不敢删，因为没人知道哪个字段还在用；
+> 某天有人把 `state` 解构出来用，页面局部不再更新了；同时上线 SSR 后出现"A 用户看到 B 用户的菜单"。
+> 三个问题分别对应本章三节：**边界（拆分维度）、解构陷阱、每请求实例与水合。**
+> 问答形态见[前端面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)「状态管理」一节（Q11：Vuex 和 Pinia 的区别）；
+> 想看真实工程里的 store 组织，参考 [RuoYi-Vue3 前端拆解](/blog/posts/ruoyi-roadmap-13-vue-frontend/)。
+
+---
+
+## 一句话本质
+
+**store 是"跨页面存活 + 需要在组件树外被访问"的状态的唯一合法位置**，其余状态留在局部或宿主（09）。
+Pinia 相对 Vuex 的收益不是"少写几百行"，而是两件事：**类型是从声明推导出来的**（不再靠 `as` 硬编），
+**store 是一个可组合单元**（`defineStore` 返回的就是 setup 函数，天然能复用组合式逻辑、能被显式传入实例）。
+
+---
+
+## 原理拆解
+
+### 1. 相对 Vuex 4 实际减少的东西，与两种 store 形态
+
+| Vuex 4 的负担 | Pinia 的处置 | 真实收益（不是"更简洁"这种话） |
+|---|---|---|
+| `mutation` + `action` 双层 | 只有 `state` / `getters` / `actions`，同步异步都在 action | 少一层无意义的二分；异步错误处理不再分裂在两处 |
+| 字符串型 `type` 与 `commit('user/SET_NAME')` | 直接调方法 | 改名有编译期反馈，重构工具能追；命名空间字符串消失 |
+| `modules` + `namespace: true` + `registerModule` 样板 | 平铺多个 `defineStore`，跨 store 显式调用 | 模块边界变成**文件边界**，按需加载与 tree-shaking 更直接 |
+| 全局单例 `store` + `this.$store` | `useXxxStore()` 在任何作用域取得；组件外可传实例 | 可测（每个用例一个新 pinia）、可 SSR（每请求一个实例） |
+| 类型要靠手写 `ModuleTree` 泛型 | `state()` 返回值推导，`getters` 显式标返回类型即可 | TS 项目里最大的一条，见 03/16 的类型讨论 |
+| `mapState/mapActions/...` 全家桶 | 有 `mapStores` 但基本用不上，直接解构 action | 减少了"为了少写两行而引入的一层间接" |
+
+**option store vs setup store**，选择不是口味问题，而是能力交换：
+
+```ts
+// option store —— 结构最"文档化"，devtools 展示最完整
+export const useUserStore = defineStore('user', {
+  state: () => ({ info: null as UserInfo | null, roles: [] as string[], loading: false }),
+  getters: {
+    isAdmin: (s): boolean => s.roles.includes('admin'),       // 返回类型必须显式，否则推导会变 any
+    permissions: (s) => s.info?.permissions ?? [],
+  },
+  actions: {
+    async fetchInfo() {
+      this.loading = true;
+      try { this.info = await api.getProfile(); } finally { this.loading = false; }
+    },
+  },
+});
+
+// setup store —— 就是一个 setup 函数，能直接复用 07 写的 composable
+export const usePermissionStore = defineStore('permission', () => {
+  const routes = ref<RouteRecordRaw[]>([]);          // ref/reactive 即 state
+  const loaded = ref(false);
+  const asyncRoutes = computed(() => filterByRole(routes.value, useUserStore().roles));
+
+  async function load(): Promise<boolean> {          // 显式返回类型，跨 store 调用时类型才稳
+    const data = await api.getRouters();
+    routes.value = transform(data);
+    loaded.value = true;
+    return loaded.value;
+  }
+  return { routes, loaded, asyncRoutes, load };       // 必须把所有对外成员 return 出来
+});
+```
+
+| 维度 | option store | setup store |
+|---|---|---|
+| 复用组合式逻辑 | 差（`this` 语义，不能直接调 composable） | **强**：内部可以直接 `useDict()`、`usePolling()`（07/08） |
+| 推导与类型控制 | 靠 `state()` 推导，getters 需标返回类型 | 完全由你写的 ref 泛型决定，更可控 |
+| 私有成员 | 无法隐藏（都在选项里） | **没 return 的就是私有**，这条很有用 |
+| `$reset()` | 内置 | **没有**（要自己写 `reset()` 或用 `store.$state = factory()`） |
+| devtools 体验 | 完整 | 相对弱：action 归属与状态编辑的展示不如 option 直观 |
+| 团队一致性 | 新人上手快、结构统一 | 老手写得爽、新手容易漏 return |
+
+我的判据：**状态少、动作直白的领域 store（user / app / settings）用 option store；
+store 内部要复用 composable、要藏私有实现、要做复杂派生（permission、dict、workflow）用 setup store。**
+两种混用完全合法，一个项目里也建议混用——但**同一个 store 不要混**，读起来最累。
+
+### 2. 解构陷阱、批量更新与订阅
+
+这是 Pinia 最高频的运行时 bug，规则只有一条：**store 实例本身是响应式对象，解构会把它变成普通值快照。**
+
+```ts
+const store = useUserStore();
+
+store.roles.push('admin');            // ✅ 响应
+const roles = store.roles;            // ❌ 拿到的是数组引用；整体替换 store.roles = [...] 时 roles 指向旧的
+const { loading } = store;            // ❌ 基本类型直接固化为初值，永远不变
+const { fetchInfo } = store;          // ✅ actions 可以解构（函数无状态，this 由 Pinia 绑定）
+const { roles, info } = storeToRefs(store);   // ✅ state/getters 的正确解构方式
+```
+
+配套 API 的边界（面试写代码时最容易写错的三处）：
+
+```ts
+// 1) $patch：批量更新，只触发一次订阅/一次渲染，比逐字段赋值省掉中间态
+store.$patch({ loading: true, roles: ['admin'] });
+store.$patch((s) => {                                   // 函数式：适合结构变更
+  s.filters.status = '';
+  s.filters.pageNum = 1;
+});
+
+// 2) 整体替换 / 重置
+store.$state = { ...store.$state, roles: [] };           // option store 也可用 store.$reset()
+Object.assign(store, defaultState());                   // 常见误用：$state 才是"整体替换"的正道
+
+// 3) 订阅：外部同步（埋点、持久化、跨标签页）
+const stop = store.$subscribe((mutation, state) => {
+  if (mutation.type === 'patchObject') persist(state);   // mutation.type: 'direct' | 'patchObject' | 'patchFunction'
+}, { detached: false });
+stop();                                                   // 一定要停，见 08 的作用域讨论
+
+// 4) action 拦截：全局 loading / 错误上报的统一入口（回调收到的是一个上下文对象）
+const stopOnAction = orderStore.$onAction(({ name, args, after, onError }) => {
+  startProgress(name, args);
+  after(() => finishProgress());                 // action 成功完成
+  onError((err) => { reportError(err); return true; });   // 是否吞掉错误由返回值决定，语义以你装的版本文档为准
+});
+stopOnAction();                                   // 第二个参数 detached 控制「订阅者卸载后是否继续」
+```
+
+`$subscribe` 与 `watch` 的差别要讲清：前者只在 **state 变化**时触发（且能拿到 `mutation.type` 与调用它的 action），
+后者可以观察任何派生表达式；**`$subscribe` 不会在 getter 变化时触发**，这是"为什么我的 watch 有反应订阅没反应"的标准答案。
+
+> [!WARNING]
+> `storeToRefs` 只搬 state 和 getters，**不搬 actions**。所以 `const { roles, fetchInfo } = storeToRefs(store)`
+> 里的 `fetchInfo` 是 `undefined`。写法定型：`const { roles, info } = storeToRefs(store); const { fetchInfo } = store;`
+
+### 3. 拆分维度，与"哪些状态根本不该进 store"
+
+拆分的两个维度，不要同时用：
+
+| 维度 | 组织方式 | 适合 | 风险 |
+|---|---|---|---|
+| **按领域**（推荐默认） | `store/user`、`store/permission`、`store/dict`、`store/cart` | 中后台、有稳定业务概念的系统 | 页面私有状态会往这里堆，逐渐变成 1400 行的 `app.js` |
+| **按页面/特性** | `store/order-list`、`features/audit/store` | 页面彼此独立、生命周期短的后台 | 同一份数据被两个页面各存一份，出现"两处不一致" |
+
+实操组合：**领域 store 做全局真相，页面级状态不进 store**（走宿主 `provide`，09）。
+如果页面级状态确实需要"跨路由存活"（列表页返回不丢筛选条件），优先考虑放进 **URL**（可分享、可刷新、天然隔离）而不是 store——
+这条在中后台里能消灭一半的"store 膨胀"（11 里 `query` 持久化的做法）。
+
+**服务端状态不该进 store**，这是和 [React 数据请求与缓存](/blog/posts/react-roadmap-09-data-fetching/) 完全互认的一条结论，
+两边只是实现手段不同：
+
+```text
+状态分类（Vue 项目同样适用）
+├── URL 状态        筛选条件、页码、tab、排序          →  route.query（11）
+├── 服务端状态      列表、详情、字典                   →  缓存层（12）+ 组件局部，别复制进 store
+├── 客户端全局      用户、权限、主题、租户、菜单        →  Pinia（持久化/SSR 水合都只针对这一类）
+└── 局部状态        弹窗开合、表单草稿、hover           →  ref / reactive（09/03）
+```
+
+把服务端状态复制进 store 的三个具体代价：① 你手写了缓存失效（12 的活）；② 组件读的是副本，
+和真实数据之间永远有一层同步代码；③ 每个列表都要 `setList` + `loading` + `error` 三份样板。
+正确的做法是 store 只留**必须跨页面存活的客户端状态**，列表数据交给请求层与组件局部
+（`useAsync` 或 TanStack Query 的 vue 适配器，见 12）。
+
+跨 store 依赖与**循环引入**的解法（`store/a` import `store/b`、`b` 又 import `a` 时，运行期会拿到 `undefined` 或 "no active pinia"）：
+
+```ts
+// ❌ 模块顶层就取实例：定义顺序被 import 决定，循环时必炸
+const user = useUserStore();
+export const useOrderStore = defineStore('order', () => { /* 用 user */ });
+
+// ✅ 解法 1（默认）：在 action / getter 内部惰性调用，实例化发生在运行时
+export const useOrderStore = defineStore('order', () => {
+  async function submit() {
+    const user = useUserStore();          // 调用时 pinia 已激活
+    return api.submit({ operator: user.info?.id });
+  }
+  return { submit };
+});
+
+// ✅ 解法 2：把双方都要用的逻辑抽成 composable（07），store 只是薄壳
+// ✅ 解法 3：A 需要通知 B 时，反向依赖改成事件/回调：A 只返回结果，调用方决定要不要更新 B
+```
+
+一句话纪律：**store 之间可以调用，但不许在模块求值阶段调用；依赖方向必须是"上层领域 → 下层领域"，不许成环。**
+
+### 4. 持久化、SSR 每请求实例与水合、测试
+
+持久化两种写法：
+
+```ts
+// 方案 A：插件 pinia-plugin-persistedstate（注意它的大版本间配置字段名不同：v3 用 paths、v4 改用 pick，
+// 以你安装的版本文档为准，别照抄旧文章）
+export const useUserStore = defineStore('user', {
+  state: () => ({ info: null, roles: [], token: '' }),
+  persist: {
+    key: 'app.user',
+    storage: localStorage,
+    pick: ['token', 'roles'],              // 白名单：只存能重建会话的东西
+  },
+});
+
+// 方案 B：手动 persist（更可控，且能防脏数据）
+const KEY = 'app.user';
+function hydrate(store: ReturnType<typeof useUserStore>) {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as { v: number; data: typeof store.$state };
+    if (parsed.v !== SCHEMA_VERSION) return;          // 版本不匹配 → 丢弃，别猜
+    store.$patch(parsed.data);
+  } catch { localStorage.removeItem(KEY); }            // 解析失败必须清掉，否则会反复抛
+}
+```
+
+持久化的四个失效场景，每一个都会在生产出现：
+
+| 场景 | 症状 | 处置 |
+|---|---|---|
+| 存了不可序列化/巨大对象 | `QuotaExceededError`；刷新慢；`localStorage` 里 2MB 列表缓存 | **白名单**（只存 token / 主题 / 租户），列表与服务端状态一律不存 |
+| 循环引用 / 特殊类型 | `JSON.stringify` 抛 `Converting circular structure`；`Date` 变字符串、`Map`/`Set` 变 `{}` | 用 `serializer` 自定义，或这类字段不进 persist |
+| Schema 漂移 | 改字段名后老用户读到 `{ roles: undefined }`，页面白屏或权限为空 | 存版本号 + 迁移函数；不匹配就丢弃而不是 `$patch` 脏值 |
+| SSR | 服务端没有 `window`，插件读取即报错；水合后客户端值和服务端不一致 → 内容闪一下 | 只在客户端 hydrate；服务端用状态注入（下面第 2 段） |
+
+**SSR 的硬规则：`createPinia()` 必须每请求一个新实例。** 把 pinia 实例提到模块作用域 = 整个进程共享一份状态，
+于是用户 A 的数据被用户 B 读到（07 讲过模块单例的 SSR 判据，这里是最常见的落地事故）：
+
+```ts
+// entry-server / createApp 工厂：每次调用都新建
+export async function createApp() {
+  const app = createApp(App);
+  const pinia = createPinia();      // ← 每请求一次
+  const router = createRouter({ history: createMemoryHistory() });
+  app.use(pinia).use(router);
+  await router.isReady();
+  return { app, pinia, router };
+}
+
+// 服务端渲染完成后把状态序列化进 HTML
+const state = JSON.stringify(pinia.state.value);     // { user: {...}, permission: {...} }
+// 客户端：创建 pinia 后、挂载前灌回去
+pinia.state.value = JSON.parse(window.__INITIAL_STATE__);
+```
+
+水合的两个必须知道的后果：① **`onServerPrefetch` 里灌进 store 的数据，客户端挂载后可能再请求一次**
+（组件的 `onMounted` 在服务端不执行，08），要不要跳过第二次请求是显式策略（12 讲失效与二次请求）；
+② `pinia.state.value` 是**按 store id** 组织的，两个 store 撞 id 会互相覆盖——`defineStore` 的第一个参数当成命名空间管理。
+
+测试：
+
+```ts
+import { setActivePinia, createPinia } from 'pinia';
+import { beforeEach } from 'vitest';
+
+beforeEach(() => { setActivePinia(createPinia()); });    // 没有它：「getActivePinia was called with no active Pinia」
+
+// 组件测试里更省事：createTestingPinia（@pinia/testing）自动 stub 所有 action
+// 断言按行为写，不测内部字段（15）
+```
+
+---
+
+## 与 React 的对照
+
+这一章的价值集中在选型表上——面试里"你们为什么用 Pinia"通常被翻译成"和 Zustand/Redux/Context 比怎么样"。
+
+| 需求 | Vue + Pinia | React 对应方案 |
+|---|---|---|
+| 定义一个全局 store | `defineStore`（模块级，`useXxxStore()` 取用） | Zustand `create`（模块级单例）/ Redux Toolkit `createSlice` + Provider |
+| **细粒度订阅** | 不需要 selector：读哪个 ref/属性就订阅哪个（响应式收集） | **必须** selector（`useStore(s => s.x)`）或 `useSelector`，否则整体重渲染 |
+| 派生状态 | `getters` / 外部 `computed` | `useMemo` 派生 或 selector 派生（需注意引用稳定） |
+| 批量更新 | `$patch` | Zustand 多次 `setState` 会被合并/自动批处理（18 起并发更新）；RTK 一个 action 一次 |
+| 组件树外访问 | `useXxxStore()`（激活的 pinia 存在即可，也可显式传实例） | Zustand 直接 `store.getState()`（天然支持，且这是它相对 Context 的最大卖点） |
+| SSR 请求隔离 | `createPinia()` 每请求一个 + `pinia.state.value` 水合 | 模块单例 store（Zustand/Jotai 默认写法）**会跨请求泄漏**，需每请求新建 store 并放进 RequestProvider；RTK 每请求 configureStore |
+| 状态持久化 | 插件（白名单 + 序列化器） | 同样靠 `persist` 中间件（Zustand 内置），语义一致 |
+| 测试隔离 | `setActivePinia(createPinia())` / `createTestingPinia` | 每个用例新建 store 或用 Provider 注入实例 |
+| 学习曲线/样板 | 低；无 mutation | Zustand 最低但约定靠自己；RTK 最多样板但约束最强 |
+
+React 同学转过来最容易误判的一点：**Pinia 里没有"选择器"这个概念不是缺陷，是响应式白送的能力。**
+所以 Vue 侧的性能问题一般不出在"store 用得太粗"，而出在：① 把大对象整个 `reactive` 化（13 的 `shallowRef` 议题）；
+② getter 里做重计算却不缓存依赖路径；③ 组件里 `store.$subscribe` 忘了停。
+
+---
+
+## 翻车现场
+
+### 现场 1：解构后视图不更新，且"有时好用"
+
+- **症状**：某个页面权限按钮一直显示，另一个页面同样代码却正常；改 `roles` 后 `isAdmin` 不动。
+- **根因**：`const { roles, loading } = store`。`loading` 是布尔，被固化成初值；`roles` 是数组引用，
+  当 action 里用 `this.roles = 新数组` 整体替换时，页面拿的还是旧数组——所以"push 生效、替换失效"，看起来时好时坏。
+- **修法**：`storeToRefs` + actions 分开解构；同时定下 store 的写入风格（要么统一 `$patch`，要么统一整体替换），别混。
+
+### 现场 2：SSR 下菜单串台，本地永远复现不了
+
+- **症状**：线上偶发"普通用户看到管理员菜单"，一次刷新就好；本地 dev（客户端渲染）怎么都测不出来。
+- **根因**：`createPinia()` 写在模块顶层被复用（或框架配置里 pinia 实例是全局单例），
+  `permission` store 的 `routes` 存在进程内存里，请求之间互相覆盖。
+- **修法**：`createApp` 工厂里每请求新建；权限路由这类"登录后派生物"要么随请求重建，
+  要么显式标记为客户端专属（`if (!import.meta.env.SSR)`）；水合只灌客户端全局那一类状态。
+  动态路由怎么在守卫里重建而不重复请求，见 11。
+
+### 现场 3：跨 store 循环依赖，测试比生产先炸
+
+- **症状**：运行时报 "getActivePinia was called with no active Pinia" 或 `Cannot read properties of undefined (reading 'roles')`；
+  单测里更稳定地复现（因为 import 顺序不同）。
+- **根因**：`order` store 在**模块顶层**调 `useUserStore()`，而 `user` store 又 import 了 `order`，形成环，
+  求值时 `useUserStore` 还是 `undefined`。
+- **修法**：调用点下移到 action/getter 内部（惰性）；把共享逻辑抽到 composable；
+  依赖方向做成 DAG 并写进 code review 清单（第 3 节的纪律）。测试侧统一 `setActivePinia(createPinia())` 只是必要条件，不解决环。
+
+---
+
+## 复习卡片
+
+- **Q：Pinia 相比 Vuex 4 实际减少了什么？** A：mutation 与字符串 type、模块注册样板、命名空间与手写类型；核心收益是类型推导和 store 可组合/可按请求实例化。
+- **Q：option store 和 setup store 怎么选？** A：要复用 composable、藏私有成员、做复杂派生用 setup；要 `$reset`、devtools 完整展示、新人上手用 option。判据是能力交换，不是口味。
+- **Q：store 解构为什么会失效？怎么解？** A：state/getters 解构成值快照（`ref`/`reactive` 语义，01）；用 `storeToRefs`，actions 可以直接解构。
+- **Q：哪些状态不该进 store？** A：URL 状态（进 query）、服务端状态（进请求缓存层）、局部 UI 状态（进 ref）。store 只留跨页面存活的客户端全局状态。
+- **Q：SSR 里 pinia 的正确姿势？** A：`createApp` 工厂内每请求 `createPinia()`，服务端把 `pinia.state.value` 序列化进 HTML，客户端挂载前灌回；`defineStore` 的 id 当命名空间管，撞 id 会互相覆盖。
+- **Q：跨 store 循环依赖怎么解？** A：把 `useOtherStore()` 挪进 action/getter 惰性调用，共享逻辑抽 composable，依赖方向不许成环。
+
+---
+
+## 小结
+
+- store 的准入门槛写死：**跨页面存活 + 组件树外要访问 + 客户端全局**，三条缺一就换地方放。
+- 形态选择是能力交换：setup store 换组合式复用与私有成员，option store 换 `$reset` 与 devtools 完整度。
+- 解构陷阱是唯一的"必须背"API 规则：`storeToRefs` 管 state/getters，actions 直接解构，`$patch` 做批量更新。
+- 服务端状态交给缓存层（12 与 react 侧同一结论），持久化只走白名单 + 版本号，SSR 每请求一个实例并显式水合。
+- store 之间可以有调用关系，但不能有环；测试用 `setActivePinia(createPinia())` 起手，断言写行为不写内部字段（15）。
+
+---
+
+## 练习
+
+1. 找一个 500 行以上的 store（没有就自己造一个巨型 `app.js`），按第 3 节的四类状态做一次**书面拆分方案**：
+   每个字段标注去向（URL / 缓存层 / Pinia / 局部），并列出删除它会影响哪些组件。方案控制在 20 行以内，贴给同事评审一次。
+2. 把 `roles` / `loading` 的两处解构写法改成 `storeToRefs` 版，并写一个单测复现原 bug：
+   先 `const { loading } = store`，再 `store.$patch({ loading: true })`，断言 `loading` 仍是 `false` ——**用这个失败测试当反例文档**。
+3. **可见交付物**：给 `useUserStore` 加"带版本号的持久化"：存 `{ v: 1, data }`，加 `migrate(from, data)` 骨架，
+   白名单只留 `token` / `theme`；写 3 个单测覆盖"版本不匹配丢弃"、"JSON 解析失败清 key"、"SSR 环境不读 `localStorage`"。
+   再用一个 `import.meta.env.SSR` 分支演示客户端跳过首次请求（配合 08 的 `onMounted` 不执行）并说明为什么。
+
+---
+
+## 面试一句话
+
+> "我判断状态进不进 store 只看三条：跨页面存活、需要在组件树外访问、属于客户端全局。
+> 列表和详情这类服务端状态不进 store，否则等于自己重写一遍缓存失效，这块和 React 侧的结论是一样的，只是 Vue 用 TanStack Query 的 vue 适配器或自建 composable 来做。
+> 形态上 option store 和 setup store 是能力交换：setup 能复用 composable、能藏私有成员，代价是没有内置 `$reset`、devtools 展示弱一些。
+> API 层面唯一的硬规则是解构：state 和 getters 必须 `storeToRefs`，actions 才能直接解构，批量更新用 `$patch` 而不是逐字段赋值，避免中间态触发多次订阅。
+> SSR 上最狠的一条是 `createPinia()` 必须每请求新建——放到模块作用域就是进程级共享，会直接导致用户之间数据串台；
+> 渲染完把 `pinia.state.value` 序列化进 HTML、客户端挂载前灌回去，同时要有意识地处理 `onMounted` 在服务端不执行导致的二次请求。"

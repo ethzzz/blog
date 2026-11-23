@@ -1,0 +1,399 @@
+---
+title: '07 · Composable 设计：从 mixin 到组合式函数'
+published: 2026-11-22T15:00:00+08:00
+description: 'Composable 设计：mixin 的命名冲突、来源不可追、隐式依赖 this 三个故障如何被组合式函数消掉；返回值 refs 还是 reactive、MaybeRefOrGetter 参数约定、模块单例与 provide 注入单例的取舍，以及一份能贴进 Code Review 清单的设计检查表。'
+tags: [Vue, 组合式函数, composable, 逻辑复用, MaybeRef]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章解决的不是「怎么写一个 `useXxx`」，而是「怎么写一个**别人用不错、三年后还敢改**的 `useXxx`」。
+> 真实场景：一个中后台项目里有 11 个页面共用 `useTable`，某次给它的返回值加了一个 `reactive` 对象，
+> 两周后三个页面的列表筛选条件互相污染，还有一个页面的分页彻底失灵。查到最后不是响应式的 bug，
+> 是**返回值约定没定**：有人在组件里解构了它，有人把整个对象传给了另一个 composable。
+> 被问到「你们的 composable 怎么设计的」，去看[前端面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)的「组件通信」与「状态管理」两节，那是对话形态的答案；这里给的是设计依据。
+
+---
+
+## 一句话本质
+
+**Composable 是团队的 API 契约，不是语法糖。** mixin 之所以被淘汰，不是因为"旧"，而是因为它的接口是**隐式**的：
+调用方看不出某个 `this.xxx` 来自哪个 mixin，也看不出它会覆盖谁。组合式函数把复用单元从"属性名空间"换成"函数签名"，
+于是输入、输出、清理责任三件事全部变成可评审的代码——**这也是它唯一的增值点**，写法本身反而没那么重要。
+
+---
+
+## 原理拆解
+
+### 1. mixin 的三个真实故障，以及组合式函数怎么逐个消掉
+
+先精确复述故障，否则"mixin 不好"只是一句口号。
+
+```js
+// mixins/dict.js —— Vue 2 时代最常见的一类 mixin
+export default {
+  data() {
+    return { dictLoading: false, dictMap: {} };
+  },
+  created() {
+    this.loadDict('sys_yes_no');        // ① 隐式依赖 this
+  },
+  methods: {
+    formatDict(v) {                     // ② 命名冲突源
+      return this.dictMap[v] ?? v;
+    },
+  },
+};
+```
+
+| 故障 | 具体表现 | 为什么在 mixin 里无解 | 组合式的解法 |
+|---|---|---|---|
+| ① 隐式依赖 `this` | 单独把 `formatDict` 拷出来就报错，无法脱离组件测试 | 方法的执行上下文由合并过程决定，不是由声明决定 | 依赖通过**函数参数**传入，`useDict(type)` 的入参就是全部依赖 |
+| ② 命名冲突与静默覆盖 | 组件里的 `formatDict` 覆盖了 mixin 的；两个 mixin 同名 `data` 字段，后者赢 | 合并策略写在源码里，靠约定避免，混得越深越不可控 | 每次调用返回独立的局部变量，重名由调用方 `const { format: fmtDict } = useDict()` 改名解决 |
+| ③ 来源不可追 | 模板里一个 `submitting` 要全仓 grep 才知道来自哪个 mixin | 属性是通过 `Object.assign` 语义挂到实例上的，没有声明处 | 显式 `const { submitting } = useSubmit()`，来源就是这一行 |
+
+第三条最贵。真实成本是这样的：一个 3 万行的 Vue 2 项目里 `mixins/` 有 27 个文件，其中 6 个 mixin 又互相引用了别的 mixin（最深 3 层），
+新人改一个 `data` 字段的初始值要顺着链找半天，找不到就只能"全改一遍然后回归"。**这就是"三年后还能维护"的反面**——
+它不是性能问题，是**可读性问题被放大成组织问题**。
+
+组合式版本，注意每一行的输入输出都是显式的：
+
+```ts
+// composables/useDict.ts
+import { computed, readonly, ref, type ComputedRef, type Ref } from 'vue';
+
+const cache = new Map<string, Record<string, string>>();   // 模块级缓存，见第 4 节的讨论
+
+export function useDict(type: string): {
+  items: ComputedRef<{ label: string; value: string }[]>;
+  loading: Readonly<Ref<boolean>>;
+  label: (v: unknown) => string;
+  reload: () => Promise<void>;
+} {
+  const raw = ref<Record<string, string>>(cache.get(type) ?? {});
+  const loading = ref(false);
+
+  const items = computed(() =>
+    Object.entries(raw.value).map(([value, label]) => ({ value, label })),
+  );
+
+  async function load() {
+    loading.value = true;
+    try {
+      const res = await fetch(`/api/system/dict/data/type/${type}`);
+      const rows = await res.json();
+      const map = Object.fromEntries(rows.map((r: any) => [r.dictValue, r.dictLabel]));
+      cache.set(type, map);
+      raw.value = map;                     // 整体替换：raw 是 ref，替换 .value 不丢响应式
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  if (!cache.has(type)) void load();
+
+  return {
+    items,
+    loading: readonly(loading),            // 只读：调用方改不动，接口即约束
+    label: (v) => raw.value[String(v)] ?? String(v ?? ''),
+    reload: load,
+  };
+}
+```
+
+`readonly(loading)` 这一步看起来多余，实际是 mixin 教训的直接产物：**接口能力要显式声明**。
+mixin 里的 `dictLoading` 任何组件都能改；这里改不了，改错了就是编译期错误。
+
+### 2. 返回值约定：优先返回 refs，返回 reactive 就必须 `toRefs`
+
+这是本章唯一必须记住的一条硬规则。原因在响应式原理层（01 讲过），这里给结论和判据：
+
+```vue
+<script setup lang="ts">
+// ❌ 返回 reactive 对象：组件里一解构就丢响应式
+import { reactive } from 'vue';
+function useMouseReactive() {
+  const state = reactive({ x: 0, y: 0 });
+  window.addEventListener('mousemove', (e) => { state.x = e.clientX; state.y = e.clientY; });
+  return state;
+}
+const { x, y } = useMouseReactive();   // x / y 是普通 number 的快照，永远停在 0
+</script>
+
+<template>
+  <div>{{ x }}, {{ y }}</div>          <!-- 永远显示 0, 0 -->
+</template>
+```
+
+```vue
+<script setup lang="ts">
+// ✅ 返回 refs：解构天然安全，模板里自动拆包
+import { onScopeDispose, ref } from 'vue';
+function useMouse() {
+  const x = ref(0);
+  const y = ref(0);
+  const onMove = (e: MouseEvent) => { x.value = e.clientX; y.value = e.clientY; };
+  window.addEventListener('mousemove', onMove);
+  onScopeDispose(() => window.removeEventListener('mousemove', onMove));  // 08 详解
+  return { x, y };
+}
+const { x, y } = useMouse();           // 仍是两个 ref，模板里自动 .value
+</script>
+```
+
+为什么返回 refs 更安全，一句话：**`reactive` 的响应式挂在 Proxy 对象上，解构等于把属性值拷出来，Proxy 被丢掉；
+`ref` 的响应式挂在盒子自己身上，怎么传都还在。**
+
+那什么时候确实该返回 `reactive`？两种，且这两种都要用 `toRefs` 收尾：
+
+1. **需要"一个对象整体传下去"**：例如表单 composable 返回 `form`，页面把它 `v-bind` 给一组子组件，或塞进 `provide`。
+   返回散装 refs 会让调用方自己拼对象，拼错就是隐性 bug。
+2. **需要 `v-model` 一个对象**：`<ElForm :model="form">` 要的是普通对象，不是 `{ a: Ref, b: Ref }`。
+
+```ts
+// composables/useUserForm.ts —— 内部用 reactive，出口用 toRefs 兜住
+import { reactive, toRefs, computed } from 'vue';
+
+export function useUserForm(init = { name: '', role: '' }) {
+  const form = reactive({ ...init });                    // 需要整体能力：reset 要原地重置
+  const isValid = computed(() => form.name.trim().length > 1);
+
+  function reset() {
+    Object.assign(form, init);                           // 换 refs 写法就得逐字段赋值
+  }
+
+  // 出口：form 保持是响应式对象（供 :model 用），字段同时以 refs 形式暴露（供解构用）
+  return { form, ...toRefs(form), isValid, reset };
+}
+```
+
+```ts
+const { form, name, role, isValid, reset } = useUserForm();
+// form  -> reactive 对象，可以直接给 <ElForm :model="form">
+// name  -> Ref<string>，解构后依然响应式（toRefs 的功劳）
+```
+
+> [!WARNING]
+> `...toRefs(form)` 之后，如果 composable 内部又用 `form = reactive(...)` 整体替换（而不是 `Object.assign`），
+> 之前 `toRefs` 出来的 refs 会指向旧对象，视图静默不更新。**返回 reactive 就必须禁止内部整体替换**，把这条写进检查表。
+
+### 3. 参数与命名约定：`MaybeRefOrGetter` + `toValue`（3.3+）
+
+Composable 的入参要允许两种东西：**固定值**和**会变的值**。写死 `Ref` 会强迫调用方到处 `ref()`；写死裸值则传 ref 时静默失效。
+3.3 起的官方答案是 `MaybeRefOrGetter<T>`（= `T | Ref<T> | (() => T)`）配 `toValue()`（3.3+）：
+
+```ts
+import { effectScope, toValue, watchEffect, type MaybeRefOrGetter } from 'vue';
+
+// ✅ 三种调用方式都合法
+export function useDebouncedRef<T>(source: MaybeRefOrGetter<T>, delay = 300): Ref<T> {
+  const out = ref(toValue(source)) as Ref<T>;   // 初值也走 toValue，三种入参统一处理
+  let timer: ReturnType<typeof setTimeout>;
+
+  const scope = effectScope();
+  scope.run(() => {
+    watchEffect((onInvalidate) => {
+      const v = toValue(source);         // 裸值 / ref / getter 统一取值
+      clearTimeout(timer);
+      timer = setTimeout(() => { out.value = v; }, delay);
+      onInvalidate(() => clearTimeout(timer));
+    });
+  });
+  onScopeDispose(() => scope.stop());
+
+  return out;
+}
+
+// 调用方三种写法
+const a = useDebouncedRef('kw');                       // 裸值
+const b = useDebouncedRef(searchKeyword);              // ref
+const c = useDebouncedRef(() => store.filters.name);   // getter，最灵活
+```
+
+规则可以简化成一条**能被 lint 检查**的约定：*入参一律用 `MaybeRefOrGetter` + `toValue`；只有在 composable 内部需要"多次读写同一个值"时才要求传 `Ref`，并在类型上直接写 `Ref<T>`*。
+例如 `usePagination(data: Ref<Item[]>)` 这类要往数组里 push 的，就必须是 `Ref`，不要给 `MaybeRef` 的假自由度。
+
+命名与目录约定（写成团队的硬规则，别靠自觉）：
+
+| 项 | 约定 | 反例 |
+|---|---|---|
+| 文件名/函数名 | `use` 前缀，一个文件一个主 composable，文件与主函数同名 | `utils/table.ts` 导出 `getTableStuff` |
+| 目录 | `src/composables/`（跨业务复用）与 `src/features/<域>/composables.ts`（业务内），后者不导出到前者之外 | 所有都堆在 `src/utils` |
+| 返回值 | 对象 + 具名字段；只有对称的两个值（`[value, setValue]`）才用元组 | 返回 `[loading, error, data, retry]` 让调用方按顺序猜 |
+| 布尔字段 | 语义前缀 `is/has/can`，只读导出 | `loading` 可写 |
+| 副作用 | 谁创建谁清理，且清理在 `onScopeDispose` 里 | 组件卸载后还在监听 `resize` |
+| 文档 | 文件头 5 行：用途、参数、返回、清理责任、不适用场景 | 只有 demo |
+
+最后一条"不适用场景"很关键。`useTable` 的文档里写一句"超过 2000 行的表格请改用虚拟滚动（13），本 composable 不做分片渲染"，
+比代码评审时说十次都有用。
+
+### 4. 三种共享方式：新实例 / 模块单例 / `provide` 注入，以及测试代价
+
+同一个 composable，"每调用一次是新状态"还是"全局共享一份状态"，是**设计决定**，不是实现细节。
+React 侧把这两件事分得更开（自定义 Hook 共享逻辑、Context/store 共享状态，见
+[React 状态管理](/blog/posts/react-roadmap-08-state-management/)），Vue 这边因为"函数只跑一次 + ref 可以放模块作用域"，
+一不小心就把逻辑写成了全局状态——所以下面这张代价表值得贴在工位上。
+
+```ts
+// A. 每次新实例（默认）：useMouse、useDebouncedRef、useDialog —— 无共享语义
+// B. 模块级单例：把 ref 提到模块作用域
+const currentTheme = ref<'light' | 'dark'>('light');   // 整个 JS 上下文共享
+export function useTheme() {
+  return { currentTheme, toggle: () => { currentTheme.value = currentTheme.value === 'light' ? 'dark' : 'light'; } };
+}
+// C. provide 注入单例：状态挂在组件树上，谁挂载谁负责
+const ThemeKey: InjectionKey<ReturnType<typeof createThemeState>> = Symbol('theme');
+```
+
+三者的代价差异主要体现在测试和多实例上：
+
+| 方式 | 适用 | 测试代价 | 多实例 / SSR 风险 |
+|---|---|---|---|
+| 每次新实例 | 与单个组件生命周期绑定的逻辑 | 最低：`mount(Comp)` 即可，无全局状态要清 | 无 |
+| 模块级单例 | 真正的应用级、进程级不变状态（主题、语言、设备信息） | **高**：状态跨用例存活，必须手写 `beforeEach` 重置，或导出 `_reset()` 测试钩子（污染 API） | **SSR 致命**：Node 进程内所有请求共享同一份模块作用域，用户 A 的数据会被用户 B 读到 |
+| provide 注入单例 | 作用域内共享：一个页面/一个表单/一个弹窗内部多个子组件协作 | 中：测试时多写一层 `global.provide`，但每个用例都是干净的 | 无：作用域随组件卸载释放，SSR 每请求新建组件树，天然隔离 |
+
+判据（这条是本章要背的）：**只要"共享状态"的作用域可能小于应用，或者进程可能同时服务多个用户，就用 `provide`，不要用模块级 ref。**
+展开成四条可判定的条件，命中任意一条就选 provide：
+
+1. **多实例**：同一页面可能出现两个独立表格/两个表单/两个向导（模块单例会让它们共用一份状态）。
+2. **SSR / 请求级隔离**：Nuxt 或服务端渲染下，模块作用域的存活期是**进程**而不是**请求**。
+3. **需要按分支提供不同值**：同一个组件树里，A 子树要 `readonly` 版本、B 子树要带写操作的版本。
+4. **测试要求隔离**：单测里要能同时跑两个实例互不干扰。
+
+反过来，`provide` 的代价也要明说：组件不再自包含，必须在宿主里提供，移植性下降（09 展开）。
+
+> [!IMPORTANT]
+> **设计检查表**（把它贴进 MR 模板，逐条打勾）
+> 1. 返回值是不是 refs？如果暴露了 reactive 对象，是否同时给了 `toRefs`，并且内部禁止整体替换？
+> 2. 入参是否用 `MaybeRefOrGetter` + `toValue`（3.3+）？需要写回的是否直接要求 `Ref`？
+> 3. 共享语义是哪一种（新实例 / 模块单例 / provide）？写进文件头注释了吗？
+> 4. 谁创建副作用、谁清理？清理是否挂在 `onScopeDispose` 上而不是靠调用方记得调 `destroy()`？
+> 5. 是否存在"在 `await` 之后再注册生命周期钩子"的路径？（这条必然失效，见翻车现场 3）
+> 6. 类型是否显式返回（不靠推导）？契约变更要能被 `git diff` 看出来。
+> 7. 能不能脱离组件测？如果不能，说明它隐式依赖了 `inject` 或全局对象，要么补 `provide`，要么拆开。
+
+---
+
+## 与 React 的对照
+
+这一段是本价值最高的地方：**很多 React 工程师写 composable 会不自觉带上 Hook 的肌肉记忆，写出既没收益又有 bug 的代码。**
+如果你手上还有 React 项目在读，[React 自定义 Hook 与闭包陷阱](/blog/posts/react-roadmap-07-custom-hooks/) 是这一节的镜像：
+它讲的那些"依赖数组收敛""stale closure"，在这里几乎都会变成"不需要"，但**有两个例外**会在下面点出来。
+
+| 需求 | Vue | React |
+|---|---|---|
+| 抽一段可复用逻辑 | composable（普通函数，setup 里调用一次） | 自定义 Hook（每次渲染都重新执行） |
+| 复用逻辑的**状态** | 默认同样隔离（每次调用各自 new 一份 ref）；要共享用模块作用域或 `provide` | 默认隔离；要共享用 Context 或外部 store |
+| 声明依赖 | **不需要依赖数组** | 必须写对 `useEffect` 依赖数组 |
+| 在 `if` 里调用 | 生命周期钩子必须在 setup 同步调用；但 `computed`/`watch` 可以条件创建 | 任何 Hook 都不能条件调用（顺序规则） |
+| 闭包过期（stale closure） | 几乎不存在：读的是 `x.value`，永远最新 | 常见：需要函数式更新或 `useRef` 兜住最新值 |
+| 清理时机 | `onScopeDispose` / watcher 的 `onCleanup`，**跟着作用域走，不跟着渲染走** | effect 的返回函数，跟着"依赖变化 + 卸载"走 |
+
+**为什么 Vue 不需要依赖数组**：Vue 的依赖是在**读取那一刻**由响应式系统的 getter 收集的。
+`watchEffect(() => console.log(a.value, b.value))` 执行一次，就把 `a`、`b` 记下来了；后来新增读取 `c.value` 的分支也会在下一次执行时被收集。
+React 的 `useEffect` 每次渲染只是重新执行函数、拿到的是**值快照**，运行期没有任何东西知道这个闭包读了哪些变量，
+所以只能由你把这些变量名交出来。差别不是"API 设计口味"，而是**依赖信息在运行时的位置**：Vue 在数据上，React 在函数上。
+想彻底理解"值快照"这件事，看 [JS 闭包](/blog/posts/js-roadmap-05-closure/) 那一章——Vue 之所以能躲开，
+是因为它的"值"永远是 `ref.value` 这个 getter，闭包捕获的是盒子而不是盒子里的数。
+
+**为什么 composable 不受渲染时机约束**：Vue 组件的更新由响应式依赖驱动，函数组件不会被反复调用，
+setup 逻辑（含 composable 主体）在实例创建时**只跑一次**。所以：
+
+```ts
+// 在 React 里是违规写法，在 Vue 里完全没问题
+const { items, loading } = useList(kind.value === 'all' ? useAllItems() : useMineItems());
+```
+
+但要清楚代价：setup 只跑一次意味着**条件里的 `kind.value` 变化不会重跑这段逻辑**，
+两个分支各自创建的 watcher 也都会一直活着。这不是 lint 会拦你的错误，而是**语义陷阱**——
+React 用"每次都重跑"逼你把依赖写全，Vue 用"只跑一次"省掉了依赖数组，但把"变化后怎么办"留给了你自己。
+要跟随变化就得写 `watch` 或 `computed`，别指望 if 分支会重新执行。
+
+还有一处必须提醒 Vue 2 老用户：composable 里的 `onMounted` **不等价于** Options API 的 `mounted`，
+它注册到当前实例上；一旦越过 `await`，实例上下文就丢了（见翻车现场 3 与 08）。
+
+---
+
+## 翻车现场
+
+### 现场 1：`useDict` 用模块级单例，SSR 下用户看到别人的数据
+
+- **症状**：本地开发一切正常，上了 Nuxt 服务端渲染后偶发"字典下拉框是空的"或"显示的是另一个租户的选项"，且复现要连着刷两次。
+- **根因**：`cache` 和 `raw` 提到模块作用域。Node 进程只加载一次这个模块，缓存的生命周期是**进程**，
+  但业务语义要求它是**请求**。多租户下 A 请求写进去的 `raw`，B 请求直接读到。
+- **修法**：把状态收进 `createDictState()` 工厂，在根组件/布局里 `provide`，`useDict` 内部 `inject`；
+  进程级安全的东西（如已编译的常量表）才留在模块作用域。**判据**：状态里只要可能装"某个用户的数据"，就不许放模块作用域。
+
+### 现场 2：`useTable` 返回 reactive，列表筛选条件互相污染
+
+- **症状**：A 页面选了状态筛选，B 页面打开也带着这个筛选；更怪的是某个页面"改了参数但表格不请求"。
+- **根因**：两件事叠在一起。① 为了"方便整体传参"把 `reactive` 对象原样返回，页面里 `const { query } = useTable()` 解构后
+  `query` 丢响应式，写它不触发 watch → 不请求；② 有工程师"修好了"，改法是把 `query` 提到模块作用域当单例 → 全站共享 → 交叉污染。
+- **修法**：出口固定成 `{ query: toRefs(state).query, ... }`（或干脆返回 `Ref` 数组/对象字段），并在检查表第 1、3 条上把住；
+  真正需要跨页保留的（比如"列表页回到第几页"）放到 URL 或 store（10），不要靠模块作用域。
+
+### 现场 3：`await` 之后注册生命周期钩子，静默失效
+
+- **症状**：`useChart` 里 `onMounted` 想初始化 ECharts 实例，控制台出现
+  "onMounted is called when there is no active component instance to be associated with"，图表在某些页面不渲染，且不报错。
+- **根因**：`onMounted` 之类的钩子依赖"当前实例"这个隐式上下文。
+  一旦 composable 主体在 `await` 之后才执行到注册语句，微任务里实例上下文已经被清掉，钩子注册不上。
+- **修法**：结构改成"**同步注册，异步执行**"：
+
+```ts
+export function useChart(el: MaybeRefOrGetter<HTMLElement | undefined>) {
+  let chart: echarts.ECharts | undefined;
+  onMounted(() => {                 // 这一行必须在任何 await 之前
+    chart = echarts.init(toValue(el)!);
+    void loadData().then((rows) => chart?.setOption(buildOption(rows)));
+  });
+  onScopeDispose(() => chart?.dispose());   // 第三方实例也要清理
+}
+```
+
+如果确实要写"异步初始化"，把 `await` 放进钩子**回调内部**，而不是钩子注册之前。
+
+---
+
+## 复习卡片
+
+- **Q：mixin 的三个致命问题分别是什么，组合式各用什么消掉？** A：隐式依赖 `this` → 显式参数；命名冲突与静默覆盖 → 局部变量 + 调用方改名；来源不可追 → 一行调用即声明处。
+- **Q：为什么返回值优先用 refs？** A：`reactive` 的响应式在 Proxy 对象上，解构就丢；`ref` 的响应式在盒子本身，怎么传都在。
+- **Q：什么时候可以返回 reactive？** A：需要整体传递或给 `:model` 用时；且必须同时 `toRefs` 暴露字段，内部禁止整体替换该对象。
+- **Q：入参想让调用方能传 ref 也能传裸值，怎么写？** A：类型 `MaybeRefOrGetter<T>`，内部用 `toValue()` 取值（3.3+）。
+- **Q：什么时候必须用 `provide` 而不是模块级单例？** A：作用域可能小于应用（多实例）、或进程可能同时服务多个用户（SSR/多租户）、或测试需要隔离——任一命中就 provide。
+- **Q：composable 为什么不需要依赖数组，React Hook 为什么需要？** A：Vue 的依赖在读取时由 getter 收集（信息在数据上），React 每次渲染只是值快照（信息只能由你写出来）。
+
+---
+
+## 小结
+
+- 组合式函数解决的是**接口显式化**：输入进参数、输出进返回值、清理进 `onScopeDispose`，三件事都必须能在 `git diff` 里看见。
+- 返回值默认 refs；暴露 reactive 对象就同时给 `toRefs`，并禁止内部整体替换。
+- 入参用 `MaybeRefOrGetter` + `toValue`（3.3+）；要写回的就明确要求 `Ref`，别给假自由度。
+- 共享语义是设计决定：新实例是默认，模块单例只给应用级不变状态，**SSR/多实例/测试隔离三条判据命中就上 `provide`**。
+- 从 React 过来的人要主动卸掉两个包袱：不用找依赖数组，但也别指望逻辑会重跑；条件调用不违规，但变化不响应。
+
+---
+
+## 练习
+
+1. 把本文 `useDict` 改成 **provide 注入版**：新增 `createDictState()` 工厂 + `DictKey: InjectionKey`，在布局组件里 `provide`，
+   `useDict` 内部 `inject` 并在拿不到时抛明确错误。验收：两个页面各自改缓存不互相影响（可用 `console.count` 或单测证明）。
+2. 给 `useMouse`（返回 refs 版）和"返回 reactive 版"各写一个单测：在测试里 `const { x } = useMouse()` 后
+   手动派发一次 `mousemove`，断言 `x.value` 变化；另一个断言失败并打印实际值。**产出**：一条能贴进团队规范的结论。
+3. **可见交付物**：写一个 `useRemoteSearch`（参数 `MaybeRefOrGetter<string>` + `delay`，返回 `{ results, isSearching, error, retry }`），
+   配一份 8 行的 API 契约注释（用途/参数/返回/清理/不适用场景），再补 2 条单测（防抖只发一次、卸载后不再发请求）。
+   把它当成你团队的第一个"有契约的 composable"，让同事不看实现只用文档调用一次，记录他踩到的一切。
+
+---
+
+## 面试一句话
+
+> "组合式函数不是 API 用法问题，是接口设计问题。mixin 的病根是隐式：依赖 `this`、命名会撞、来源追不到，
+> 所以组合式必须把三件事显式化——入参用 `MaybeRefOrGetter` 加 `toValue`，返回值优先给 refs（要给 reactive 就同时 `toRefs` 并禁止整体替换），
+> 副作用清理挂 `onScopeDispose`。共享语义上我的判据很硬：只要状态作用域可能小于应用，或者服务端进程会同时服务多个请求，
+> 就不用模块级单例而用 `provide`，因为它随组件树释放、SSR 天然隔离。和 React 比，Vue 不写依赖数组是因为依赖记在数据上而不是函数上——
+> 代价是 setup 只跑一次，条件分支不会重执行，变化得靠 `watch` 或 `computed` 自己接。"

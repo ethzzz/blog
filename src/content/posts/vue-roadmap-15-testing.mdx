@@ -1,0 +1,420 @@
+---
+title: '15 · 测试：Vitest、Test Utils 与 Playwright'
+published: 2026-11-22T23:00:00+08:00
+description: 'Vue 3 测试工程落地：用「重构后还绿吗」判定测行为而非测实现，讲清 @vue/test-utils 的 mount/shallowMount 选型与 await nextTick/flushPromises 的机制原因、global.plugins 挂 Pinia 与 Router、vi.mock 与 MSW 的分工、composable 脱离组件测试的两种写法、store 最小 fixture、组件库与指令的测试代价、Playwright 只覆盖三条主链路的策略，以及覆盖率门槛该卡在哪一层与哪些层不值得测。'
+tags: [Vue, 测试, Vitest, TestUtils, Playwright]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这章解决的不是"怎么写一个测试"，而是**一个中后台团队该测哪三层、怎么让测试不变成负债**。
+> 真实场景：订单模块要改公共的 `ProTable`，没人敢发版。团队试过补测试——三个月后攒下 400 个快照，每天因为无关改动红一片，最后整目录被删掉。我接手时定的第一件事不是"提高覆盖率"，是**把测试数量砍到 60 个，让它们只对用户可见的行为负责**。
+> 异步与更新时机那部分的问答形态见[面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)的「深水区追问」（`nextTick` 实现原理那条）；同层需求在 React 栈的做法见 [React 路线测试篇](/blog/posts/react-roadmap-15-testing/)。
+
+---
+
+## 一句话本质
+
+测试买的是"改完敢发"的信心，不是覆盖率数字。判据只有一条：**把内部实现改名、把 state 挪去 store、把 computed 拆成函数——好的测试全绿；用户看到的按钮消失、事件不触发、文案变错——好的测试立刻红。**
+
+Vue 特有的麻烦在于它的更新是异步排队的，所以一大半"测试为什么失败"其实是**等待时机**问题，不是断言问题。
+
+---
+
+## 原理拆解
+
+### 1. 测行为不测实现：三条可执行的判据
+
+| 断言对象 | 该测 | 不该测 |
+|---|---|---|
+| 用户可见结果 | 渲染出的文本、按钮 disabled、表格行数、错误提示文案 | 内部 `ref` 的名字与结构 |
+| 交互契约 | emit 的事件名与参数、`v-model` 的双向更新、路由跳转结果 | 组件里第几个 `div`（`nth-child` 选择器） |
+| 外部依赖调用 | "调了哪个接口、带什么参数"（因为它是契约） | 用了几次 `axios.create`、内部工具函数顺序 |
+
+三条判据在 review 时直接用：
+
+1. **改名判据**：给某个内部变量重命名，测试红了吗？红了就是测实现（例外：那个变量本身就是暴露接口）。
+2. **可朗读判据**：一句断言念出来是不是用户能理解的话。"点击保存后应发出 `saved` 事件并携带 id"合格；"`wrapper.vm.loading` 应为 false"不合格。
+3. **迁移判据**：把这个组件的数据源从 `ref` 换成 Pinia store，测试应该不用改。要改就说明断言穿透了实现。
+
+> [!WARNING]
+> 快照测试是"测实现"的头号来源：它默认把整棵 DOM 结构序列化，改个 class 名就红。快照只适合两类东西——组件库的**关键片段**（比如 `el-form-item` 的错误渲染结构）和纯展示且极稳定的小组件。整页快照一律禁止。
+
+### 2. `@vue/test-utils`：选型与"必须 await"的机制
+
+**选型判据**：
+
+| 场景 | 用什么 | 原因 |
+|---|---|---|
+| 被测单元本身（业务组件、封装层） | `mount` | 需要真实渲染链，`shallowMount` 会把要验证的行为一起 stub 掉 |
+| 页面容器（依赖一堆子组件与异步请求） | `mount` + `global.stubs` 指定几个重组件 | 只 stub 你确定不参与本次断言的部分 |
+| 只想验证"父给子传对了 props/事件" | `shallowMount` | 子组件被 stub，`wrapper.findComponent(Child).props()` 直接可断言 |
+| 通用 UI 组件（自己写的按钮、输入框） | `mount` | 没有子组件可 stub，`shallowMount` 等于 `mount` |
+
+**为什么 `await nextTick` / `flushPromises` 必须写**（机制，不是"经验要求"）：
+
+- Vue 改数据后**不会同步更新 DOM**：变更被推入调度队列，在当前微任务末尾统一 flush。所以 `form.name = 'x'` 之后立刻读 DOM，读到的是旧节点。
+- `await nextTick()` 等的是"这一轮 flush 完成"，即队列被清空的那个微任务边界。
+- 组件里如果有 `await api.list()`，还需要等**你mock 的 Promise 链**走完：一次 `nextTick` 不够（Promise 链跨多个微任务），所以要 `flushPromises()` 把微任务队列排空，再 `nextTick()` 让 DOM 更新落地。
+- VTU 的交互方法（`setValue`、`trigger`、`click`）返回的 Promise 本身已经等了一个 `nextTick`，所以 `await wrapper.find('input').setValue('a')` 这一句就够——但**接口请求之后仍需 `await flushPromises()`**。
+
+```ts
+// 常见等待三件套，按需组合
+await wrapper.find('input[name="code"]').setValue('A123')   // 内含一次 nextTick
+await wrapper.find('button.save').trigger('click')
+await flushPromises()                                      // 排空 mock 返回的 Promise 链
+await nextTick()                                           // 让 Promise 之后的 DOM 更新落地
+
+expect(wrapper.text()).toContain('保存成功')
+```
+
+```ts
+// tests/utils.ts：不引第三方时的 flushPromises
+export const flushPromises = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+```
+
+注意 `setTimeout(0)` 会跨过整个微任务队列，因此它比 `nextTick` "等得更久"；如果代码里用了 `setTimeout` 做防抖，就要配合 `vi.useFakeTimers()` + `vi.advanceTimersByTime(200)`，而不是多 await 几次。
+
+**props 与 emits 的断言写法**：
+
+```ts
+const wrapper = mount(OrderStatusSelect, {
+  props: { modelValue: 'PAID' },
+  global: { plugins: [pinia] },
+})
+
+await wrapper.findComponent(ElSelect).vm.$emit('change', 'CLOSED')
+
+const updates = wrapper.emitted('update:modelValue')
+expect(updates?.at(-1)).toEqual(['CLOSED'])       // 断言事件与参数，而不是内部状态
+
+await wrapper.setProps({ modelValue: null })
+expect(wrapper.find('.status-empty').exists()).toBe(true)
+```
+
+`wrapper.emitted()` 是行为断言的正当出口：事件名与参数就是组件的对外契约。反过来 `wrapper.vm.someRef` 在 `<script setup>` 里根本拿不到（默认封闭），这恰好帮你挡掉了错误的写法——真需要访问实例方法时，是组件该 `defineExpose`，见第 14 章。
+
+### 3. 依赖注入：`global.plugins`、`provide`、`vi.mock` 与 MSW 的分工
+
+```ts
+const pinia = createPinia()
+const router = createRouter({
+  history: createMemoryHistory(),          // 测试里永远用 memory history
+  routes: [{ path: '/order/:id', component: { template: '<div />' } }],
+})
+
+const wrapper = mount(OrderDetail, {
+  props: { id: '1' },
+  global: {
+    plugins: [pinia, router],
+    mocks: { $t: (k: string) => k },       // 只在 i18n 来不及装时用，长期方案是装插件
+    provide: { [panelKey as any]: { collapsed: ref(false) } },
+    stubs: { HeavyChart: true },
+  },
+})
+```
+
+四个要点：
+
+- **Pinia 必须每次新建**：`createPinia()` 放在 `beforeEach` 里，或 store 测试里 `setActivePinia(createPinia())`，否则两个测试文件会共享同一份 state，出现"单独跑绿、一起跑红"。
+- **Router 不要 mock**：`createMemoryHistory` 起一个真实例便宜且可靠；只有当你只关心"跳没跳"时，才 `vi.mock('vue-router')` 断言 `push` 的入参。
+- **`vi.mock` 用于"替换一个模块"**（把 `@/api/order` 整个换成 `vi.fn()`），适合只想验组件与接口的契约；**MSW 用于"替换网络层"**（保留真实 axios 拦截器、错误码处理），适合验请求层本身和跨组件的接口行为。
+- 判据：**测组件用 `vi.mock(api)`，测请求层/拦截器用 MSW**。反过来会浪费一半时间。
+
+```ts
+// tests/server.ts（MSW v2）
+import { http, HttpResponse } from 'msw'
+
+export const handlers = [
+  http.get('/api/order/list', ({ request }) => {
+    const q = new URL(request.url).searchParams
+    if (q.get('status') === 'BAD') return HttpResponse.json({ code: 500, msg: 'boom' })
+    return HttpResponse.json({ code: 200, data: { rows: ORDERS, total: ORDERS.length } })
+  }),
+]
+```
+
+```ts
+// tests/setup.ts
+import { setupServer } from 'msw/node'
+
+export const server = setupServer(...handlers)
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }))
+afterEach(() => server.resetHandlers())
+afterAll(() => server.close())
+```
+
+`onUnhandledRequest: 'error'` 是这套配置里最值钱的一行：新代码请求了一个你没在 fixture 里写的接口时，测试立刻报错，而不是静默走到真实网络。
+
+Element Plus 在 jsdom 下还会缺两个浏览器 API，测试 setup 里要补：
+
+```ts
+globalThis.ResizeObserver = class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: (query: string) => ({ matches: false, media: query, addListener: () => {}, removeListener: () => {}, addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false }),
+})
+```
+
+不补这两条，`el-table` 与响应式弹层会在测试里以"组件没渲染"的形式失败，很容易误判成业务 bug。
+
+---
+
+## composable 怎么脱离组件测
+
+两种做法，选哪种取决于这个 composable 用了什么。
+
+**一、宿主组件法（默认选它）**：适用于内部用了生命周期钩子（`onMounted`、`onScopeDispose`、`onActivated`）或依赖 `inject` 的场景。
+
+```ts
+// tests/helpers/withSetup.ts
+function withSetup<T>(composable: () => T) {
+  let result!: T
+  const Host = defineComponent({
+    setup() {
+      result = composable()
+      return () => null
+    },
+  })
+  const wrapper = mount(Host, { global: { plugins: [createPinia()] } })
+  return { result, wrapper }
+}
+
+// 用法：能测到 activated / 卸载清理
+const { result, wrapper } = withSetup(() => useAutoRefresh(fetcher, 30_000))
+await wrapper.vm.$nextTick()
+vi.advanceTimersByTime(30_000)
+expect(result.count.value).toBe(1)
+wrapper.unmount()
+expect(result.timer.value).toBeNull()          // 证明 onScopeDispose 真的清理干净
+```
+
+**二、`effectScope` 法**：适用于纯逻辑（只用到 `ref`/`computed`/`watch`，不涉及生命周期、不涉及 `inject`）。好处是不引 DOM，快；代价是**测不到生命周期，也测不到依赖注入**。
+
+```ts
+const scope = effectScope()
+let api!: ReturnType<typeof usePagination>
+scope.run(() => { api = usePagination(baseRef) })
+expect(api.pageCount.value).toBe(3)
+api.goTo(2)
+expect(baseRef.value).toEqual({ page: 2, size: 10 })
+scope.stop()                                    // 清理责任在调用方
+```
+
+判据一句话：**凡是被第 08 章归入"必须挂生命周期"的 composable，一律走宿主组件法**。用 `effectScope` 测它们会得到"测试绿但线上没注册回调"的假安全。
+
+## store 测试的最小 fixture
+
+store 是这条线里最容易测好的一层，因为它没有渲染。最小配置就三行：
+
+```ts
+beforeEach(() => {
+  setActivePinia(createPinia())
+  vi.mocked(orderApi.list).mockReset()
+})
+
+it('拉取列表后写入 rows 与 total，失败时置 error 且保留旧数据', async () => {
+  vi.mocked(orderApi.list).mockResolvedValue({ rows: [row1], total: 1 })
+  const store = useOrderStore()
+
+  await store.load({ status: 'PAID' })
+  expect(store.rows).toHaveLength(1)
+  expect(orderApi.list).toHaveBeenCalledWith({ status: 'PAID' })
+
+  vi.mocked(orderApi.list).mockRejectedValue(new Error('network'))
+  await store.load({ status: 'PAID' })
+  expect(store.error).toBe('network')
+  expect(store.rows).toHaveLength(1)             // 失败不该清空已有数据
+})
+```
+
+纪律：
+
+- **不要 mock store**。mock 掉 store 的组件测试等于把被测对象的行为替换成你的猜测；要控制数据就 `$patch` 预置 state，或用 fixture 文件。
+- **持久化（`localStorage`）在测试里显式注入**：store 内部不要直接读 `localStorage`，而是走一个可替换的 storage 函数，否则测试之间互相污染。
+- 一个 store 的测试用例数应该集中在**action 的分支**（成功、失败、并发、权限），不是 getter 的每个字段。纯映射的 getter 不值得单测。
+
+## 组件库与指令的测试代价
+
+这两类是"测试成本明显高于收益"的区域，要有意识：
+
+| 对象 | 该测什么 | 不该测什么 | 我的经验成本 |
+|---|---|---|---|
+| 通用 UI 组件 | 对外契约：props 生效、事件参数、slot 是否渲染 | Element Plus 内部 DOM 结构 | 低，值得 |
+| 二次封装层 | **透传契约**：attrs 落点、事件转发、作用域插槽参数能拿到 | 被封装组件自己的功能（那是官方库该测的） | 中，必须做，否则第 14 章四类事故全靠人肉 |
+| 业务组件 | 用户流程：查询、校验提示、保存后事件 | 每次快照 | 中 |
+| 自定义指令 | `mounted` 后 DOM 结果（移除/禁用/样式） | 指令内部实现 | 高，只做被复用 3 次以上的 |
+| 页面容器 | 路由守卫、权限分支、加载失败态 | 完整页面渲染（交给 E2E） | 高，别当单测写 |
+
+指令测试的典型写法，注意"断言 DOM 结果"而不是"断言指令被调用过"：
+
+```ts
+const Host = defineComponent({
+  directives: { hasPermi },
+  template: '<button v-hasPermi="[\'order:add\']">新增</button>',
+})
+setUserPerms([])
+const wrapper = mount(Host)
+expect(wrapper.find('button').exists()).toBe(false)   // 无权限时被移除
+```
+
+## Playwright E2E：只覆盖三条主链路
+
+E2E 的价值在于**验证胶水**（守卫、token、请求拦截、权限路由、构建产物），不在于覆盖功能矩阵。我只留三条，多了维护不住：
+
+1. **登录 → 落地页 → 刷新不丢路由**（含 token 过期与并发 401 只弹一次）；
+2. **一条 CRUD 主链路**：查询 → 新增（含校验失败分支）→ 编辑 → 批量操作 → 删除；
+3. **权限路由**：用低权账号访问高权 URL，应看不到菜单、按钮，且直接导航时被守卫拦下。
+
+```ts
+// e2e/auth.setup.ts：登录一次，全站复用 storageState
+test('as admin', async ({ page }) => {
+  await page.goto('/login')
+  await page.getByLabel('用户名').fill(process.env.E2E_ADMIN as string)
+  await page.getByLabel('密码').fill(process.env.E2E_PASS as string)
+  await page.getByRole('button', { name: '登录' }).click()
+  await expect(page).toHaveURL(/\/order$/)
+  await page.context().storageState({ path: '.auth/admin.json' })
+})
+```
+
+```ts
+test('普通账号看不到批量删除入口且无法进入角色页', async ({ page }) => {
+  await page.goto('/system/role')
+  await expect(page.getByRole('heading', { name: '无权限' })).toBeVisible()
+  await page.goto('/order')
+  await expect(page.getByRole('button', { name: '批量删除' })).toHaveCount(0)
+})
+```
+
+三条降低 flaky 的硬规矩：
+
+- **定位只用 `getByRole` / `getByLabel` / `getByText`**，不用 CSS 类与 `nth-child`（第 14 章改一次 class，E2E 全红就是这原因）；
+- **不用 `waitForTimeout`**，用自动等待的断言（`toHaveCount`、`toBeVisible`）；等接口用 `waitForResponse`；
+- **测试数据要么走 MSW 式的 `page.route` 拦截固定返回，要么用带时间戳前缀的独立数据 + 测试后清理**，绝不能多个用例抢同一条记录。
+
+E2E 的账号与数据管理是最容易被低估的成本：起一套"只读基线数据 + 每次跑生成独立前缀"的机制，比写用例花时间。
+
+## 覆盖率该卡在哪一层
+
+分层设门槛，不要给全局一个数：
+
+```ts
+// vitest.config.ts
+test: {
+  environment: 'jsdom',
+  setupFiles: ['./tests/setup.ts'],
+  coverage: {
+    provider: 'v8',
+    reporter: ['text', 'lcov'],
+    thresholds: {
+      'src/composables/**': { lines: 80, branches: 75 },
+      'src/store/**': { lines: 80, branches: 70 },
+      'src/utils/**': { lines: 85 },
+      'src/components/**': { lines: 60 },
+      lines: 60,
+    },
+  },
+}
+```
+
+CI 里的排布（详见[工程化质量门禁篇](/blog/posts/engineering-roadmap-12-testing-gates/)）：
+
+```text
+PR（每次）：typecheck + eslint + vitest run --coverage        （目标 90 秒内）
+合并 main：+ E2E 三条链路（headed 关、chromium 单项目、失败留 trace）
+发布前：+ 冒烟 E2E 指向预发环境（真实后端）
+```
+
+门槛的**唯一作用是防止下滑**，不是推动上升。所以设成"当前值再低 2%"起步，一个月内不要动它；一旦把它变成考核指标，团队就会去写无价值快照——我们真的发生过一次。
+
+## 哪些层不值得测（避免团队写无用测试）
+
+- **纯展示的静态页面**：布局用视觉抽查，不用单测；
+- **一行映射的 getter / 简单格式化函数**：除非它带规则（金额分位、时区、脱敏），否则不测；
+- **第三方库自身行为**：测 Element Plus 的表格能不能排序是浪费时间，只测你传给它的配置；
+- **路由表的每一条静态路由**：只测守卫与动态路由装配；
+- **构建配置**：靠产物验证（第 16 章会用到），不写测试；
+- **"为了覆盖率补的测试"**：宁可在 `thresholds` 里承认这个数字低，也不要用假测试凑。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue 3 | React |
+|---|---|---|
+| 组件测试库 | `@vue/test-utils`（有真实实例，可 `emitted()` 断言事件） | React Testing Library（几乎只有 DOM 查询） |
+| "断言事件被触发" | `wrapper.emitted('change')` 直接拿参数 | 要 `userEvent` 点完再断言外部回调（`vi.fn`） |
+| 异步等待 | 必须显式 `nextTick` / `flushPromises`（更新排微任务） | `await userEvent.click()` 自带等待；等待用 `findBy*` / `waitFor` |
+| 访问内部状态 | `<script setup>` 默认封闭，拿不到（这反而逼你测行为） | `useState` 值天然不可见，同样只能靠 DOM 断言 |
+| 自定义 hook / composable | 宿主组件法或 `effectScope.run` | 用 `@testing-library/react` 的 `renderHook`（一行搞定，比 Vue 方便） |
+| 网络 mock | MSW 通用；组件层常用 `vi.mock('@/api/x')` | MSW 是事实标准，React Query 生态更依赖它 |
+| 状态管理测试 | `setActivePinia(createPinia())` 每文件重置 | 每次 `render` 重建 store 或 `resetStore`，思路一致 |
+| E2E | Playwright，同一套；权限路由与守卫是必测点 | Playwright，同一套；差异只在 next 的路由中间件层 |
+
+最大的差异是第四行：**Vue 的 `<script setup>` 封闭性帮你挡住了"测实现"的诱惑**，React 里因为 `renderHook`、context 暴露等原因更容易写出耦合实现的测试。
+
+---
+
+## 翻车现场
+
+**一、CI 偶尔红、本地永远绿**
+
+- 症状：`OrderList` 的测试在 CI 上偶发失败，断的是"表格行数应为 3"，本地跑 50 次都对。
+- 根因：MSW handler 里返回的数据来自一个共享数组，另一个测试文件在它上面 `push` 过；jsdom 环境是每文件独立的，但 CI 并发高时 mock 的 `listOrders` 模块级状态被跨用例复用。
+- 修法：fixture 一律 `structuredClone` 后返回；`afterEach` 里 `server.resetHandlers()` + `vi.clearAllMocks()`；把"共享可变数组"从测试工具里删掉。
+- 补充一条纪律：**测试文件之间不许有隐式顺序依赖**，本地用 `vitest run --sequence.shuffle` 打开随机顺序，能提前抓出这类问题。
+
+**二、快照测试拖垮整个团队**
+
+- 症状：400 多个快照，每天十几个 PR 里出现"更新快照"的 diff，review 时没人看，CI 时间翻倍。
+- 根因：图省事给所有页面加了 `toMatchSnapshot`，快照序列化了 Element Plus 的内部 DOM。
+- 修法：只保留 6 个组件级快照（封装层的错误态与空态），其余全删并换成行为断言；PR 模板加一条"本 PR 的快照变更是否含 class 名变化"的勾选项。
+- 结论：快照的价值在"结构漂移检测"，不在"渲染正确性验证"，范围必须收窄。
+
+**三、`wrapper.vm.xxx` 满天飞，重构一次全红**
+
+- 症状：把 `useDict` 内部的 `map` 改成 `object`，30 个测试红。
+- 根因：早期用了 Options API 写法（`vm` 可直接访问），迁到 `script setup` 后团队改用 `wrapper.findComponent(Child).vm.$props` 一层层往里挖。
+- 修法：封装层暴露必要的测试出口（`defineExpose`，见第 14 章），其余一律走 DOM 与 `emitted`；把这三类断言列进 review checklist 的禁用项。
+
+---
+
+## 复习卡片
+
+- **Q：怎么判定一个测试是测行为还是测实现？** A：改内部变量名它会红就是测实现；断言念出来是用户能理解的话（点了什么、看到了什么、发出了什么事件）就是测行为。
+- **Q：为什么改完数据要 `await nextTick()`？** A：Vue 把变更排进调度队列并在微任务末尾统一 flush，DOM 更新不是同步发生的；`nextTick` 等的正是这次 flush 完成。
+- **Q：什么时候用 `flushPromises`？** A：被测代码里有真实或被 mock 的 Promise 链（接口请求）时，一次 `nextTick` 不够，要先排空微任务队列再等一次 tick。
+- **Q：`vi.mock` 和 MSW 各管什么？** A：`vi.mock` 替换模块，适合测组件与接口层的契约；MSW 替换网络层，保留 axios 拦截器与错误码逻辑，适合测请求层。
+- **Q：composable 怎么脱离组件测？** A：用了生命周期或 `inject` 的必须 mount 宿主组件；纯逻辑可以用 `effectScope.run` + `scope.stop()` 验证清理。
+- **Q：E2E 该覆盖什么？** A：登录 + 一条 CRUD 主链路 + 权限路由三条，因为它验证的是守卫、token、拦截器这些单元测试够不到的胶水层。
+
+---
+
+## 小结
+
+- 测试的第一性问题不是"怎么写"，是"这条断言在实现变了以后该不该红"。
+- Vue 测试的技术门槛集中在三处：**异步更新时机**（nextTick/flushPromises）、**依赖装配**（Pinia 每文件新建、Router 用 memory history）、**浏览器 API 缺失**（ResizeObserver/matchMedia polyfill）。
+- 分工要清楚：单测管契约与分支，组件级管交互，E2E 只留三条主链路管胶水。
+- 覆盖率门槛只用于防下滑，分层设置；把数字当 KPI 的那一刻，无价值测试就开始了。
+- 最后回到总览尺子 4：**这套测试规则要能被 CI 拦住**，否则三个月后又是 400 个快照。
+
+---
+
+## 练习
+
+1. 挑一个你写过的组件，用"改名判据"审一遍现有测试：列出所有"改内部变量名就会红"的断言，把它们改写成 DOM 文本或 `emitted` 断言（30 分钟内可完成）。
+2. 给一个 composable 分别用宿主组件法和 `effectScope` 法各写一次测试，然后故意去掉它内部的 `onScopeDispose`，看哪种写法能抓到泄漏，并写下结论。
+3. 交付物：`vitest.config.ts` 的分层 `thresholds` + 一份 `tests/README.md`，包含"必须测的四层、禁止测的三类、禁用断言清单（`vm` 穿透、`nth-child`、整页快照）"三条硬规则，并在 CI 里加一个只跑单测的门禁 job（附实际跑通的输出截图或日志片段）。
+
+---
+
+## 面试一句话
+
+> "我写 Vue 测试的原则是只对用户可见的东西下断言：渲染出的文本、按钮状态、emit 的事件与参数、跳转结果，内部状态一律不碰——`<script setup>` 的封闭性在这里反而是优点。技术上重点处理三件事：`nextTick` 与 `flushPromises` 的等待时机、Pinia 每个文件重建、MSW 固定网络返回。E2E 我只留登录、一条 CRUD 主链路和权限路由三条，因为 E2E 的价值是验证守卫和请求封装这层胶水。覆盖率门槛分层设、只用于防下滑，一旦当 KPI 就会收获一堆无价值快照。"

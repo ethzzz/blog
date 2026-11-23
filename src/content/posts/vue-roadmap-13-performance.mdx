@@ -1,0 +1,434 @@
+---
+title: '13 · 性能工程：shallowRef、虚拟列表与渲染剖析'
+published: 2026-11-22T21:00:00+08:00
+description: 'Vue 3 性能工程的完整链路：先用 app.config.performance、长任务与 Vue DevTools 定指标，再用 shallowRef/triggerRef、markRaw、patchFlag 与组件拆分、虚拟列表、v-memo 逐级缩小响应式面积与 diff 面积，最后落到构建产物的拆分与预算，每条都给量级与测量方法。'
+tags: [Vue, 性能优化, shallowRef, 虚拟列表, patchFlag]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这章解决的不是"Vue 有哪些优化手段"，而是**一次能拿数字说话的优化怎么做完**：指标定在哪、瓶颈在哪一层、改完之后怎么证明它真的变快了。
+> 真实场景：某中后台订单列表，一页 5000 条（前端一次拉全量做筛选），每行 3 个 `el-tag` 和 2 个操作按钮。用户在搜索框里每敲一个字，整页卡住约 300ms，产品经理的反馈是"这页面是不是没做优化"。
+> 问答形态的对照见[面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)的「性能优化」一节（Q12），那边是"被问到怎么答"，这边是"自己动手怎么量"。
+
+---
+
+## 一句话本质
+
+Vue 的性能问题只有两个来源：**响应式代理的面积**（多少个对象被 Proxy 包住、每次变更唤醒多少依赖）和**diff 的面积**（每次更新比较多少个 vnode）。所以优化的顺序是固定的：先测量确认瓶颈在哪一层，再缩小这两块面积，最后才轮到构建产物。
+
+脱离指标谈"Vue 优化"，面试里撑不过第二轮追问。
+
+---
+
+## 原理拆解
+
+### 1. 先定指标：长列表交互卡顿要分三层测
+
+很多团队只测首屏 LCP，但上面那种卡顿是**交互延迟**，属于 INP 的范畴。三层各有工具：
+
+| 层 | 测什么 | 工具 | 结论形态 |
+|---|---|---|---|
+| 浏览器 | 输入到下一帧的延迟、长任务 | Performance 面板 + `PerformanceObserver('longtask')`、[Web 指标](/blog/posts/browser-roadmap-07-metrics/)里的 INP 口径 | "输入后主线程被连续占用 310ms" |
+| 框架 | 组件初始化 / 渲染 / patch 各自耗时 | `app.config.performance` 打的 mark + Vue DevTools 的组件火焰图（flamegraph） | "耗时集中在 `OrderTable` 的 patch 阶段" |
+| 代码 | 我自己关心的那段逻辑 | `performance.mark` / `measure` | "筛选 + 排序这段 190ms，渲染 110ms" |
+
+```ts
+// src/main.ts：只在生产关掉，开发/预发打开
+const app = createApp(App)
+if (!import.meta.env.PROD) {
+  app.config.performance = true;
+}
+```
+
+打开后在 Chrome Performance 面板录制，能看到形如 `OrderTable render`、`OrderTable patch` 的标记区间。**注意这是 dev-only 行为**，生产构建不产出这些标记，别把线上数据拿去做对比。
+
+```ts
+// 自建长任务探针：只看有没有超过 50ms 的主线程占用
+const po = new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    if (entry.duration > 50) console.warn('[longtask]', entry.duration, entry.name);
+  }
+});
+po.observe({ entryTypes: ['longtask'] });
+```
+
+```ts
+// 把"我关心的那一段"单独量出来，别只靠肉感
+const measureMarks: Array<{ label: string; cost: number }> = []
+
+function measured(label: string, fn: () => void) {
+  const start = performance.now();
+  fn();
+  measureMarks.push({ label, cost: performance.now() - start });
+}
+
+// 读一次：measureMarks 里就是每一段的耗时
+```
+
+判据用公开口径：**INP 良好线是 200ms**，长任务阈值是 50ms。这两个数字来自 web-vitals 规范，可以直接引；后面我给的具体收益数字都是**我自己项目的实测或示例量级**，会逐条标明。
+
+> [!TIP]
+> 测量必须在**同一台机器、同一份数据、同一浏览器版本**下做前后对比，并且至少跑 3 次取中位数。"我感觉顺了"不是结论。
+
+### 2. shallowRef + triggerRef：把依赖收集面积从 O(n) 降到 O(1)
+
+机制说清楚三层：
+
+1. `ref(大对象)` 的内部实现对对象值会做**深度响应式包装**，读到的时候逐层生成 Proxy；5000 行 × 每行 20 个字段的表格数据，代理开销和依赖收集都是按字段数累积的。
+2. `shallowRef(value)` **只在 `.value` 被整体替换时**触发更新；对 `.value` 内部属性的读写都不会建立依赖，也不会唤醒渲染。
+3. 所以 `shallowRef` 的契约是：**你每次改数据都必须产生新的引用**，或者显式调用 `triggerRef`。
+
+```ts
+// 正确：写入收敛到一个函数，永远整体替换引用
+import { shallowRef, triggerRef } from 'vue'
+
+const rows = shallowRef<OrderRow[]>([])
+
+async function reload(params: Query) {
+  const data = await fetchOrders(params)
+  rows.value = data                    // 替换引用 → 触发更新
+}
+
+function patchRow(id: string, patch: Partial<OrderRow>) {
+  rows.value = rows.value.map((r) => (r.id === id ? { ...r, ...patch } : r))
+}
+
+// 不想复制整个数组时：原地改 + 显式通知
+function patchInPlace(id: string, patch: Partial<OrderRow>) {
+  const target = rows.value.find((r) => r.id === id)
+  if (!target) return
+  Object.assign(target, patch)
+  triggerRef(rows)                     // 手动唤醒依赖这个 ref 的 effect
+}
+```
+
+图表数据同理，而且更容易踩坑：ECharts 的 `option` 是个嵌套五层的大对象，一旦被深度代理，每次 `setOption` 都会触发大量依赖收集；正确做法是让容器 ref 用 `shallowRef`，实例本身用 `markRaw`。
+
+**`shallowRef` 会在哪里静默失效**（这块是面试追问点，也是最容易线上出 bug 的地方）：
+
+| 场景 | 表现 | 原因 / 修法 |
+|---|---|---|
+| `rows.value.push(newRow)` | 视图不动，控制台无报错 | 深层属性变更不触发。改 `triggerRef(rows)` 或整体替换 |
+| 从 `shallowRef` 里取出的对象传给子组件，子组件用 `v-model` 改它 | 父列表不更新 | 子组件收到的是普通对象（无代理），改属性没人知道。子组件应 emit，父层替换 |
+| 外面套了 `reactive`：`reactive({ rows: shallowRef([]) })` | 表现"时好时坏" | `reactive` 属性访问会 unwrap ref，拿到的是数组本身；写入时又走一遍 shallow 语义。别混用，store 里直接用 `shallowRef` 暴露 |
+| 用 `toRaw(rows.value)` 之后原地改 | 视图不动 | `toRaw` 拿到原始对象，绕过了任何响应式，本来就不该指望它触发 |
+| 把 `shallowRef` 当 `ref` 用（写了一半改回 `ref`） | 首屏正常，交互后卡 | 说明瓶颈不在代理，不该上 shallow。先用 flamegraph 定位再决定 |
+
+`markRaw` 的适用面比 `shallowRef` 窄，它是**给单个对象打永久标记**，让它以后无论被谁包装都不会转成代理：
+
+```ts
+import { markRaw, shallowRef } from 'vue'
+
+const chart = shallowRef<echarts.ECharts>()
+
+onMounted(() => {
+  chart.value = markRaw(echarts.init(el.value!));   // 实例内部有 DOM/循环引用，代理它只有坏处
+})
+```
+
+只在这三类东西上用 `markRaw`：第三方实例（图表、地图、编辑器、WebSocket、Web Worker）、不可序列化或含循环引用的大对象、组件实例本身。**业务数据不要用 `markRaw`**：它会跟着引用一路扩散，最后你自己都数不清哪些字段失去了响应式，出问题极难定位。
+
+### 3. 组件拆分在 Vue 里为什么"性价比"高于 React
+
+这是 Vue 与 React 最关键的性能差异，必须讲到机制。
+
+Vue 3 的模板在编译期就做了三件事（第 02 章拆过）：
+
+- **静态提升**：纯静态的 vnode 提到 render 外面，只创建一次；
+- **patchFlag**：给动态节点打标记（文本、类、样式、某个 prop），运行时 diff 只按标记比较对应那一项；
+- **Block Tree**：动态后代被收集成 `dynamicChildren` 数组，patch 时直接遍历这份扁平列表，静态子树整块跳过。
+
+结果就是：**Vue 里更新的成本只跟"动态节点数量"相关，跟模板大小基本无关**。而 React 默认每次父组件 render，子树所有函数组件都要重新执行、重新创建元素、逐层比较，要靠 `memo` / `useCallback` / children 提升去手动切断引用相等。
+
+```vue
+<!-- OrderTable.vue：静态部分多，动态部分少 -->
+<template>
+  <div class="toolbar">
+    <h3>订单列表</h3>
+    <p>数据每小时同步一次，导出请在夜间执行</p>
+  </div>
+  <el-table :data="rows">
+    <el-table-column prop="no" label="单号" />
+    <el-table-column prop="status" label="状态">
+      <template #default="{ row }"><el-tag :type="row.tagType">{{ row.status }}</el-tag></template>
+    </el-table-column>
+  </el-table>
+</template>
+```
+
+编译后 `.toolbar` 整块是提升的静态 vnode，`:data` 和插槽里的 `{{ row.status }}` 才是带 patchFlag 的动态节点。**所以在这个模型下，"把一个组件的重渲染成本压到只剩它自己的动态部分"是拆分的真正收益**：把大块静态内容切成独立组件，父组件更新时那部分子树走引用相等直接 bail，连比较都不做。
+
+拆分的边界也要一起讲，否则就是"越细越好"的错误结论：
+
+- 每个组件实例都有 setup 作用域、props 校验、effect 记录的成本，切到几十个纯静态碎片不会更快；
+- 拆分不改变 props 变化的传播：只要 `rows` 引用变了，`el-table` 还是整表重渲染；
+- 真正治 5000 行的不是拆分，是**别让 5000 行进 DOM**（下一节）。
+
+### 4. 大表单的整表响应式代价（呼应第 06 章「表单与 v-model」）
+
+一个 60 字段的编辑表单，典型写法是 `const form = reactive({...})` + `:rules` 全表校验。代价有三处：
+
+1. 60 个字段全部深度代理，嵌套的对象/数组在首次读取时继续展开；
+2. Element Plus 的 `el-form` 在字段变更时会触发该校验规则；如果写了"全表 watch → 触发 dirty 标记 → 保存按钮 enable"这类逻辑，每次敲字都跑一遍全表；
+3. 校验本身是异步串行的，字段多时 `validate()` 一次能跑上百毫秒。
+
+可行的收敛写法：
+
+```vue
+<script setup lang="ts">
+const form = ref<OrderForm>(initialForm())          // 编辑副本：整体替换，不深层代理
+
+// 提交时拿原始对象，跳过一遍代理遍历
+function submit() {
+  const payload = toRaw(form.value)
+  return saveOrder(payload)
+}
+
+// 只校验被碰过的字段，而不是 formRef.validate() 全表
+function onFieldChange(prop: keyof OrderForm) {
+  dirty.value.add(prop)
+  formRef.value?.validateField(prop, () => {})
+}
+</script>
+```
+
+另外两个常见细节：`el-form` 的 `model` 与 `el-form-item` 的 `prop` 路径要一致才能命中校验；校验规则里的 `trigger` 要与真实交互对上——写成 `change` 但用户是失焦才完成输入（或反过来），就会出现"填了值却不校验"，这是事件时机问题，不是响应式问题。
+
+---
+
+## 虚拟列表：三种实现与动态行高的坑
+
+**先给判据**：一屏之外还有几百上千个 DOM 节点才需要考虑虚拟列表；200 行以内直接渲染更简单，也别指望 `v-memo` 能救结构性问题。
+
+**一、VueUse 的 `useVirtualList`**（等行高，最快落地）
+
+```vue
+<script setup lang="ts">
+import { useVirtualList } from '@vueuse/core'
+
+const source = shallowRef<OrderRow[]>([])
+const { list, containerProps, wrapperProps, scrollTo } = useVirtualList(source, {
+  itemHeight: 56,
+  overscan: 8,
+})
+</script>
+
+<template>
+  <div v-bind="containerProps" class="viewport">
+    <div v-bind="wrapperProps">
+      <Row v-for="i in list" :key="i.data.id" :row="i.data" />
+    </div>
+  </div>
+</template>
+```
+
+要点：`itemHeight` 必须是**实测的固定高度**（含边框），`overscan` 决定滚动时多渲染几行以减少空白；`source` 换成 `shallowRef` 后，虚拟列表只渲染约 20 个实例，两层收益是叠乘的。
+
+**二、手写 windowing**（行高可算但需要自定义）
+
+```vue
+<script setup lang="ts">
+const start = ref(0)
+const visible = computed(() => rows.value.slice(start.value, start.value + count.value))
+
+function onScroll(e: Event) {
+  const el = e.target as HTMLElement
+  const next = Math.floor(el.scrollTop / ITEM_H)
+  if (next !== start.value) start.value = Math.max(0, next - 2)   // 预渲染两行缓冲
+}
+</script>
+
+<template>
+  <div class="viewport" @scroll.passive="onScroll">
+    <div class="phantom" :style="{ height: totalHeight }" />
+    <div class="window" :style="{ transform: `translateY(${start * ITEM_H}px)` }">
+      <Row v-for="row in visible" :key="row.id" :row="row" />
+    </div>
+  </div>
+</template>
+```
+
+用 `transform` 定位窗口而不是 `paddingTop`，是为了避免每次滚动都触发重排（细节见[浏览器路线的重排重绘篇](/blog/posts/browser-roadmap-02-reflow-repaint/)）；`@scroll.passive` 让浏览器不必等你的回调决定是否阻止默认滚动。
+
+**三、`el-table-v2`**（Element Plus 的虚拟表格，需要表格语义时选它）
+
+```vue
+<template>
+  <el-auto-resizer>
+    <template #default="{ height, width }">
+      <el-table-v2
+        :columns="columns"
+        :data="rows"
+        :width="width"
+        :height="height"
+        :row-key="'id'"
+        :estimated-row-height="56"
+        fixed
+      />
+    </template>
+  </el-auto-resizer>
+</template>
+```
+
+**动态行高的坑**是这一节真正要记的：
+
+- `estimated-row-height` 只是预估。真实高度与预估不一致时，滚动条会**跳动**、滚到中段可能出现**空白区**（totalHeight 被反复回算，偏移量算错）。列表项高度差异越大（备注字段一两行 vs 十行），这个现象越明显。
+- 正解是"测量 + 缓存 + 二分定位偏移"：每项渲染后用 `ResizeObserver` 记下真实高度，滚动位置到索引的映射用累计高度数组做二分查找，而不是 `scrollTop / itemHeight`。这就是 `el-table-v2` 和成熟虚拟列表库内部在做的事，手写时最容易漏。
+- 表头 sticky、多选列、跨页选中状态在虚拟化后都要重新处理：选中态必须存在数据源（按 `row-key`），不能依赖 DOM 里的 checkbox 状态，因为不可见行根本没挂载。
+- 单元格内容依赖异步字典翻译时，虚拟化会让"先渲染后修正"变成可见的高度跳变——字典要在列表加载前就缓存好（第 12 章的异步数据缓存策略在这里复用）。
+
+## v-memo 的适用边界
+
+`v-memo` 缓存的是**整个子树的渲染结果**，靠把依赖数组和上一次的值做 `hasChanged` 比较来决定跳不跳过 patch：
+
+```vue
+<template>
+  <div v-for="item in list" :key="item.id" v-memo="[item.updatedAt, selected === item.id]">
+    <HeavyCard :item="item" />
+  </div>
+</template>
+```
+
+用它的前提有三条，缺一条就别用：
+
+1. **必须配合 `v-for`**，脱离列表的单点 `v-memo` 收益接近 0，官方定位就是列表优化；
+2. **依赖数组长度必须固定**，条件性增删元素会让缓存语义不可预测；
+3. **列表项内部足够重**，且"该项不变但父级在重渲染"的场景真实存在。
+
+风险很实在：`v-memo` 缓存 vnode，会**捕获当时的闭包**。如果子树里用了组件外部作用域的变量（函数、props、store 值）却没写进依赖数组，就会出现"数据变了界面没变"，且**不会有任何报错**——这类 bug 排查成本远高于它省下的几毫秒。
+
+> [!WARNING]
+> 我见过把 `v-memo` 塞进 `el-table-column` 默认插槽的写法，等于给一个本来就不重渲染的片段加了缓存层：patch 没少，比较多了。先在 flamegraph 里确认瓶颈在这个列表，再决定用不用。
+
+## 构建侧：产物分析、依赖预构建、路由级拆分
+
+**产物分析**先于一切"包太大"的判断：
+
+```bash
+# 看每个 chunk 的组成，而不是只看总大小：用 visualizer 插件产出 treemap
+npx vite-bundle-visualizer              # 或在 vite.config 里挂 rollup-plugin-visualizer 后 pnpm build
+npx vite build --sourcemap              # 只为了分析产物归属，map 不要上传（见第 16 章）
+```
+
+**依赖预构建**（`optimizeDeps`）只影响**开发体验**：Vite 把 CommonJS / 多文件 ESM 预打包成单文件，减少启动时的请求数与模块转换次数。它不会减小生产包，别把两者混为一谈。
+
+```ts
+// vite.config.ts
+export default defineConfig({
+  optimizeDeps: { include: ['element-plus/es/components/table/style/css'] },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['vue', 'vue-router', 'pinia'],
+          ui: ['element-plus'],
+        },
+      },
+    },
+  },
+})
+```
+
+`manualChunks` 把 UI 库单独拆出去，是为了让业务 chunk 的日常更新不推翻依赖缓存（缓存策略见[浏览器路线的 HTTP 缓存篇](/blog/posts/browser-roadmap-05-http-cache/)）。副作用是 Element Plus 的样式被聚到一个 chunk，出现主题覆盖顺序问题时先看这里。
+
+**路由级 code split** 是后台项目最划算的一刀：`component: () => import('@/views/...')` 让每个页面独立成 chunk，首屏只下载布局 + 登录。动态权限路由（第 11 章）里的 `() => import(...)` 同样天然是异步 chunk，但要多防一层"部署后旧 chunk 被删"（[第 16 章](/blog/posts/vue-roadmap-16-error-handling/)）。
+
+Element Plus 的按需引入用 `unplugin-vue-components` + `ElementPlusResolver`，别手动 import 全套 CSS；细节在[工程化 Vite 篇](/blog/posts/engineering-roadmap-04-vite/)。
+
+---
+
+## 每条优化的量级与测法（先声明口径）
+
+下面这张表是这章唯一集中给数字的地方。**口径列写得很直白**：带"示例"的是我按机制推断的量级，用来帮你判断值不值得做，不能当结论引用；带"实测"的是我在具体项目里测过的，换一台机器、一份数据就要重测。
+
+| 手段 | 适用条件 | 量级 | 口径 | 怎么测 |
+|---|---|---|---|---|
+| `shallowRef` + 统一写入口 | 列表/图表数据千行以上，且写入能收敛 | 交互延迟降到原来的三分之一到十分之一（数量级判断） | 示例：需自测 | 长任务探针 + 输入到画面稳定的自建 `measure` |
+| `markRaw` 第三方实例 | 图表、地图、编辑器实例进了响应式 | 主要是省内存与避免深遍历；单项收益小 | 示例：需自测 | 对比堆快照大小与首次渲染耗时 |
+| 组件拆分（吃 patchFlag 红利） | 大块静态 + 小块动态混在一个组件里 | 更新时比较的节点数从"模板规模"降到"动态节点数" | 机制确定，具体数值需自测 | `app.config.performance` 的 patch 标记区间长度 |
+| 搜索输入防抖 200ms | 输入即触发全量 filter/sort | 每敲一字的开销从 N 次降到 1 次 | 机制确定 | 长任务次数（输入 10 个字的探针计数） |
+| 虚拟列表 | 一屏外仍有数百个节点 | DOM 节点数从千级降到二十级 | 机制确定 | Elements 面板节点计数 + 滚动帧率 |
+| `v-memo` | 列表项内部重、且"该项不变但父级重渲染"真实存在 | 不确定，常常是 0 | 我的一次实测结论：**火焰图无变化即为白加** | 加与不加各录一次 Performance 对比 |
+| 路由级 code split | 后台项目页面数多于 10 个 | 首屏 JS 通常能砍掉一半以上 | 示例：需自测 | 产物分析 + Network 面板首屏传输量 |
+| `manualChunks` 分域 | 存在被多页共享的重依赖 | 收益在缓存命中而非总大小 | 示例：需自测 | 二次进入时的磁盘缓存命中情况 |
+
+> [!IMPORTANT]
+> 交付一份优化结论时，把这张表的"口径"列一起交出去。**"这是示例量级，我在你的数据量下要重测"这句话比数字本身更加分**，因为它说明你知道数字从哪来。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue 3 | React 18/19 |
+|---|---|---|
+| 跳过静态子树的比较 | 编译期自动：静态提升 + patchFlag + Block Tree，无需写代码 | 手动：`React.memo`、把 children 当 prop 传进去保持引用稳定 |
+| 让大数据不被深度代理 | `shallowRef` / `markRaw`，且需要自己保证"替换引用或 `triggerRef`" | 不需要：React 的数据本来就不是响应式的，靠不可变数据 + state 替换 |
+| 记忆化一段计算 | `computed`（自带缓存，依赖不变不重算） | `useMemo`（要自己列依赖，写漏就出 bug） |
+| 列表项级别的重渲染控制 | `v-memo="[deps]"`（作用于整棵子树） | `React.memo` 包组件 + 稳定 props（作用于组件边界） |
+| 虚拟列表 | `useVirtualList`（VueUse）/ `el-table-v2` | `@tanstack/react-virtual` / `react-window`，生态更成熟 |
+| 渲染耗时剖析 | `app.config.performance` 的 mark + Vue DevTools 组件耗时 | React DevTools Profiler 的 commit 火焰图（能看单次 commit 每个组件耗时） |
+| 组件拆分的收益来源 | 缩小重渲染的传播范围，且动态节点少意味着 patch 更少 | 主要靠切断引用相等来阻止子树重跑 |
+
+一句话差异：**React 的默认是"全量重算，靠 memo 止损"，Vue 的默认是"编译器算好了动态部分，你只需要别让无关数据进响应式系统"**。所以 React 的性能题爱问 memo 与引用稳定，Vue 的性能题爱问 `shallowRef` 与 patchFlag。
+
+---
+
+## 翻车现场
+
+**一、搜索框每敲一个字卡 300ms**
+
+- 症状：5000 行列表 + 搜索输入框，输入时明显一顿，控制台没报错，滚动也掉帧。
+- 根因：搜索框 `v-model` 绑的是 `keyword`，`computed` 里做全量 filter + sort，返回**新的深度代理数组**；`el-table` 拿到全新数组整表重渲染。三件事叠在一起：一次过滤遍历 5000 项、一次代理重建、一次整表 patch。
+- 修法：数据源改 `shallowRef` 并在接口层替换；filter/sort 加 200ms 防抖且放到 Web Worker 里做（数据量口径自己测）；表格换成虚拟表格。实测（我这台 M1 / Chrome 130，5000 行）从输入到画面稳定约 310ms 降到 60ms 以内——这个量级来自该项目，不是通用结论，你要自己复测。
+- 证据链：改之前先录一次 Performance，确认时间落在「scripting」而不是「rendering」，否则防抖和 Worker 都救不了你。
+
+**二、上了 `shallowRef` 之后图表"有时更新有时不更新"**
+
+- 症状：切筛选条件后，折线图十次有两次没变化，但 `console.log(rows.value)` 打印出来是新数据。
+- 根因：数据流里有一条分支直接 `chartData.value.series[0].data = newData`（改了内部属性），另一条分支是整体替换。前者不会触发。
+- 修法：把"写数据"收敛成唯一入口 `setSeries(data)`，内部一律 `triggerRef`；单测断言"调用后视图依赖被唤醒"。
+- 教训：`shallowRef` 必须配**写入口纪律**，否则团队里每个人都能写出静默失效的一条分支。
+
+**三、加了一堆 `v-memo` 后偶现"点了没反应"**
+
+- 症状：批量勾选后，某一行的样式停在旧状态，刷新页面就正常。
+- 根因：`v-memo="[item.id]"` 里只放了 id，但子树里读了外部的 `selectedIds`（Set，原地增删）。依赖数组没包含它，缓存永不失效；而且 Set 原地修改本来就没有引用变化。
+- 修法：删掉这个 `v-memo`，把 `selectedIds` 改成整体替换的 `ref<Set>`，重渲染成本由组件拆分承担。
+- 通用判据：加完 `v-memo` 之后如果火焰图里 patch 时长没明显下降，就是白加，直接删。
+
+---
+
+## 复习卡片
+
+- **Q：Vue 卡顿优化的两条主线是什么？** A：缩小响应式代理的面积（`shallowRef`/`markRaw`）和缩小 diff 的面积（组件拆分、虚拟列表、`v-memo`），顺序由测量结果决定。
+- **Q：`shallowRef` 在什么情况下静默失效？** A：修改 `.value` 内部属性而不替换引用时不触发更新，也不报错，需要 `triggerRef` 或整体替换。
+- **Q：为什么组件拆分在 Vue 里比 React 更有效？** A：Vue 编译期给动态节点打 patchFlag 并把静态子树提升出 block，父组件更新时静态部分连比较都跳过；React 默认重新执行整棵子树，要靠 memo 手动切断。
+- **Q：`markRaw` 该用在哪？** A：第三方实例（图表、编辑器、WebSocket）与不可序列化/含循环引用的对象；业务数据不要用它。
+- **Q：动态行高的虚拟列表最大的坑是什么？** A：用预估高度算滚动偏移，实测高度回算时导致滚动跳动与空白；必须做高度缓存 + 累计偏移二分查找，选中态要存在数据源而非 DOM。
+- **Q：`app.config.performance` 能用于线上吗？** A：不能，性能标记只在开发模式有效，线上要用 PerformanceObserver 长任务探针或 RUM 上报。
+
+---
+
+## 小结
+
+- 顺序不可颠倒：**定指标（长任务 / flamegraph / 自建 mark）→ 缩响应式面积 → 缩 diff 面积 → 构建产物**，前两层解决交互卡顿，最后一层解决首屏。
+- `shallowRef` 是"用纪律换性能"：写入必须收敛到唯一入口，否则收获一批静默失效的 bug。
+- Vue 的组件拆分自带编译期红利（patchFlag + Block Tree），这是和 React 最需要讲清的性能差异。
+- 虚拟列表不是默认选项：等行高用 `useVirtualList`，要表格语义用 `el-table-v2`，动态行高的复杂度要有心理准备。
+- 每条优化都要能回答"量级多少、怎么测的"，并且明说这是示例数据还是实测。
+
+---
+
+## 练习
+
+1. 给任意列表页接上 `PerformanceObserver('longtask')` 与 `app.config.performance`，录一次"输入搜索词"的操作，写下耗时最长的组件名和它落在 patch 还是 render 阶段（30 分钟内可完成）。
+2. 把列表数据源从 `ref` 改成 `shallowRef`，故意写一条"改内部属性不替换引用"的分支，复现"改了不更新"，再用 `triggerRef` 修好，并给这个写入点加一条单测。
+3. 交付物：一份两页的《本页面性能优化结论》——第一页是优化前后的指标对比表（指标名、测法、前后值、机器与数据量），第二页是"我尝试但放弃的手段 + 放弃原因"，其中至少包含一次虚拟列表和一次 `v-memo` 的取舍。
+
+---
+
+## 面试一句话
+
+> "我做 Vue 性能优化的顺序是：先用 Performance 面板的长任务和组件 patch 耗时确定瓶颈在响应式还是渲染，再动手。数据量大就 `shallowRef` + 统一写入口，必要时 `markRaw` 掉第三方实例；渲染面积大就靠组件拆分吃编译期 patchFlag 的红利，几百行以上才上虚拟列表。每条改动我会给前后指标和测量口径，因为没有基线的优化在面试里等同于吹牛。"

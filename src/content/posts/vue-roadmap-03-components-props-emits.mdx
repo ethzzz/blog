@@ -1,0 +1,382 @@
+---
+title: '03 · 组件与 Props / Emits：单向数据流的两种写法'
+published: 2026-11-22T11:00:00+08:00
+description: 'Vue 3 组件契约：defineProps 类型声明式与值声明式的取舍、withDefaults 的边界、为什么不能给 props 赋值、从 modelValue + update:modelValue 到 defineModel 的演进、defineEmits 类型收窄与 .sync 的历史、attrs 透传与 inheritAttrs、3.5 响应式 props 解构，以及插槽与 v-slot 传参。'
+tags: [Vue, 组件通信, defineProps, defineEmits, defineModel, TypeScript]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章管的是**组件的对外契约**：一个组件能被怎么用，取决于它声明了什么 props、什么事件、什么插槽。契约写得含糊，两年后就是"没人敢改这个组件"。
+> 场景：中后台里一个 `DictSelect` 被 20 个页面复用，某天有人发现"传了 `:options` 却不显示"——因为组件内部把 `options` 改名成了 `items`，而 props 用的是运行时声明，TypeScript 完全不报错。这一章就是给这类问题建立防线。
+> 问答形态见 [面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/) 的 Q10（组件通信方式），类型侧的机制见 [TypeScript 与框架集成](/blog/posts/typescript-roadmap-16-framework-integration/)。
+
+---
+
+## 一句话本质
+
+props 是**父组件持有的只读快照**，emits 是**子组件唯一的上行通道**；Vue 给这两条通道都提供了"类型声明"和"运行时声明"两种写法，但它们的保障层次不同，不能互相替代。
+
+三条判据，后面所有章节都能挂回这里：
+
+1. **子组件不许改 props**：能改的是"由子组件持有的那份状态"，改完通过事件同步回去。
+2. **类型声明管开发期，运行时声明管生产期**：编译后的类型是零成本的，也是零存在的。
+3. **契约要能被编译器检查**：`defineProps` / `defineEmits` / `defineSlots` 三个宏的意义，不只是少写 `setup()` 样板，而是让"外部传错东西"这件事在 `vue-tsc` 阶段就失败。
+
+---
+
+## 原理拆解
+
+### 1. defineProps 的两种声明方式：类型式与值式
+
+**类型声明式**（推荐给 TS 项目）：
+
+```ts
+interface Props {
+	userId: string;
+	readonly?: boolean;
+	options?: DictItem[];
+	mode?: 'single' | 'multiple';
+}
+
+const props = withDefaults(defineProps<Props>(), {
+	readonly: false,
+	mode: 'single',
+	options: () => [], // 对象/数组默认值必须用工厂函数返回
+});
+```
+
+**值声明式**（运行时声明）：
+
+```ts
+const props = defineProps({
+	userId: { type: String, required: true },
+	mode: { type: String, default: 'single', validator: (v) => ['single', 'multiple'].includes(v) },
+	options: { type: Array as PropType<DictItem[]>, default: () => [] },
+});
+```
+
+编译器会把类型声明**尽量翻译成运行时声明**，所以类型式也能拿到默认值、必填警告。但翻译能力有边界，这一条直接决定"props 校验能不能替代 TS 类型"（见本节末尾）：
+
+| 你在类型里写的 | 编译出来的运行时约束 |
+|---|---|
+| `string` / `number` / `boolean` / `Function` / 数组字面量类型 | 对应的 `type` 构造器，能做类型不匹配警告 |
+| `userId: string`（无 `?`） | `required: true` |
+| 内联对象类型 `{ a: string }` | `type: Object`，内部字段不校验 |
+| 字面量联合 `'a' \| 'b'` | 退化成 `type: null`（不做校验），想要枚举校验得用值式 `validator` |
+| 交叉类型、`Pick`、条件类型等复杂推导 | `type: null`，同上 |
+| interface 从别的文件 import（3.3+） | 可以解析，前提是 `import type` 这种纯类型导入；值导入参与类型推导会解析失败 |
+
+**版本边界要标清楚**：3.3 之前只能写在同一个文件里的字面量类型；3.3+ 支持跨文件的类型导入、接口、`Pick` 这类挑选与交叉组合；3.5 继续扩大可解析面。工程口径建议：**统一 `import type`，不要把类型挂在值导入上**，这样两种版本都不会翻车。
+
+取舍判据（不是"哪个更现代"）：
+
+```text
+需要 validator / 需要给 JS 使用者看文档 / 需要 Type 与运行时严格一致 → 值声明式
+纯 TS 项目、props 结构简单、想让 vue-tsc 挡住误用           → 类型声明式
+组件对外发布（组件库）                                  → 类型声明式 + 关键枚举用值式补 validator
+```
+
+翻译能力有边界，先看一段"类型式 → 运行时"的实际映射（编译产物简化）：
+
+```ts
+// 你写的（类型式）
+interface Props {
+	userId: string;
+	count?: number;
+	mode?: 'single' | 'multiple';
+	meta?: { label: string };
+	items?: DictItem[]; // DictItem 是 import type 进来的接口
+}
+
+// 编译器给出的运行时形状
+props: {
+	userId: { type: String, required: true },
+	count: { type: Number, required: false },
+	mode: { type: null, required: false },        // 字面量联合 → 不校验
+	meta: { type: Object, required: false },      // 内部字段不校验
+	items: { type: Array, required: false },      // 元素类型丢失
+}
+```
+
+**props 校验不能替代 TS 类型，反向也不成立**。理由：类型编译后消失，生产环境里传进来的是后端 JSON，字段缺失或类型漂移只有运行时校验能报出来；而运行时校验只到"是不是对象/字符串"这一层，字段级约束（`mode` 只能是这两个值、`id` 必填且非空串）要靠 `validator` 自己写，写不动就不如交给类型。落地做法是：**类型负责开发期，值式 + `validator` 负责组件边界，接口数据进来时再加一层 schema 校验**（第 06 章的表单分层里用得上）。
+
+### 2. 为什么不能给 props 赋值，以及 `defineModel` 的由来
+
+先补一条命名规则，它是大量"prop 传不进去"的根因：**声明用 camelCase，模板里两种都能写**。
+
+```vue
+<!-- 声明：defineProps<{ userId: string; maxWidth?: number }>() -->
+<UserCard user-id="u1" :max-width="320" />   <!-- ✅ kebab-case，DOM 模板（in-DOM）必须这样 -->
+<UserCard :userId="'u1'" />                   <!-- ✅ camelCase，SFC 里可用；但组件库文档建议统一 kebab -->
+<UserCard userid="u1" />                      <!-- ❌ 全小写会被当成 "userid"，匹配不到 userId -->
+```
+
+原因：HTML 属性不区分大小写，Vue 在解析时把 kebab 归一到 camel；`userid` 归一后是 `userid`，与 `userId` 不是同一个 key。
+
+再看只读的边界：
+
+```ts
+props.title = 'new'; // 开发环境警告：Set operation on key "title" failed: target is readonly
+```
+
+原因不是"Vue 想管着你"，而是三条工程事实：
+
+1. **props 是父组件状态的投影**。子组件改了，父组件下次渲染又盖回来，形成"看起来改了又没改"的薛定谔状态。
+2. **props 对象是浅响应的**（内部是 `shallowReactive`）：Vue 靠"父组件传新引用"触发更新，子组件对 props 的字段写入不会通知父组件，也不会通知兄弟。
+3. **单向数据流是可追溯性的前提**：一个 UI 变化的原因只能是"上面某个 state 变了"，允许子组件写 props 就毁掉了这条推理链。
+
+需要"子组件里可编辑"时，Vue 给的通道是事件。手写两遍是必要的认知打底：
+
+```vue
+<!-- 父 -->
+<EditInput v-model:title="article.title" />
+
+<!-- 子：Vue 2 时代的 .sync 等价写法，也是 3.x 里 defineModel 之前的标准写法 -->
+<script setup>
+const props = defineProps<{ title: string }>();
+const emit = defineEmits<{ 'update:title': [value: string] }>();
+
+const draft = computed({
+	get: () => props.title,
+	set: (v) => emit('update:title', v),
+});
+</script>
+
+<template>
+	<input :value="draft" @input="draft = $event.target.value" />
+	<!-- v-model:title 编译后就是 :title + @update:title -->
+</template>
+```
+
+`defineModel`（3.4 起稳定，3.2/3.3 是实验性）把这套"一个 prop + 一个 `update:xxx` 事件"的模板代码收成一个双向绑定句柄：
+
+```ts
+const title = defineModel<string>('title', { required: true });
+// 等价于：props.title + emit('update:title')，且 title.value 可读写
+```
+
+三个必须知道的选项（细节在第 06 章）：
+
+- `{ local: true }`：把值拷进组件内部，只有真正变更时才回传父组件——用来避免"父组件每次传新对象都打断子组件输入"。
+- 默认名 `modelValue`：不传参数即 `v-model`；传 `'title'` 即 `v-model:title`。
+- 可以声明多个，但每个都要有名字；无名的只能有一个。
+
+`.sync` 的历史就一句话：Vue 2 的 `:x.sync` 是"约定式双向绑定"语法糖（等价 `@update:x`），Vue 3 用 **带参数的 `v-model`** 取代了整个 `.sync`，因此 3.x 里 `.sync` 修饰符不存在（写在模板上会被当成不认识的修饰符）。
+
+多绑定的完整形状（第 06 章会在表单组件里用它）：
+
+```vue
+<!-- 父：同一个组件上三个独立的双向通道 -->
+<RangeFilter v-model:start="q.start" v-model:end="q.end" v-model:keyword="q.keyword" />
+
+<!-- 子 -->
+<script setup lang="ts">
+const start = defineModel<Date>('start', { required: true });
+const end = defineModel<Date>('end');
+const keyword = defineModel<string>('keyword', { default: '' });
+
+// 无名的 modelValue 与具名的可以共存，但无名的只能有一个
+const selected = defineModel<string[]>();
+</script>
+```
+
+`defineModel` 返回的是一个 ref，因此它能直接进 `computed` / `watch`，也能 `v-model="start"` 传给下层组件——这是它比手写 `props + emit` 最实用的地方：**双向绑定变成了可传递的值**。
+
+> [!IMPORTANT]
+> `defineModel` 在 3.4 才稳定。3.3 及更早属于实验特性，需要在 `vueCompilerOptions` 里显式打开对应开关，且部分行为与稳定版不一致。**跨项目复用组件前先确认最低 Vue 版本**，这比语法本身重要。
+
+### 3. defineEmits：类型收窄与事件契约
+
+```ts
+// 3.3+ 的元组式写法：键是事件名、值是参数元组；老写法（调用签名 `(e: 'change', id: string): void`）仍然支持
+const emit = defineEmits<{
+	change: [id: string, mode: 'single' | 'multiple'];
+	confirm: [];
+	'update:modelValue': [value: string[]];
+}>();
+
+emit('change', 'u1'); // ❌ 编译期报错：缺第二个参数
+emit('submit'); // ❌ 编译期报错：事件未在契约里
+```
+
+- **值声明式**同样可用：`defineEmits(['change', 'confirm'])`，运行时只用于判断事件是否要落到 `$attrs`（声明过的事件不会透传）。
+- **事件命名**：`update:xxx` 是被语法识别的约定（配合 `v-model:xxx` / `defineModel`），其它事件建议动宾结构、kebab-case 写模板、camelCase 声明均可，Vue 会做归一化。
+- **不要在 emit 里做业务分支**：事件只负责"通知发生了什么"，参数带上足够上下文；把校验、状态迁移放父组件或 composable 里，否则组件复用时分支会失控。
+
+### 4. attrs 透传、解构边界与插槽
+
+**attrs 的准确定义**：父组件传入的、**没有在该组件 props 里声明**的所有东西，包括 `class`、`style`、`onXxx` 事件监听器（未声明为 emit 的部分）和任意属性。它是个普通对象，不是响应式代理（`$attrs` 的引用每次父组件更新时替换）。
+
+```vue
+<!-- BaseField.vue：把不认识的属性原样交给内部原生控件 -->
+<script setup>
+defineOptions({ inheritAttrs: false });
+</script>
+
+<template>
+	<label class="base-field">
+		<span>{{ label }}</span>
+		<input v-bind="$attrs" class="base-field__input" />
+	</label>
+</template>
+```
+
+- 默认 `inheritAttrs: true` 时，attrs 会自动挂到**模板的根元素**上。根是 Fragment（多根）时不会自动挂，Vue 会给出警告——这是多根组件最常见的坑。
+- 显式 `v-bind="$attrs"` 落点可控，代价是编译产物上该节点走 `FULL_PROPS`（见第 02 章），组件库封装要权衡。3.4+ 对 attrs 透传路径做了性能改进，早期那种"透传两层就明显变慢"的情况缓和了不少。
+- 事件监听器也在 attrs 里（`onClick`、`onFocus`），所以二次封装时**不要重复声明 emit**，否则事件被吃掉不再透传。详见第 14 章。
+
+**3.5 稳定并默认开启的响应式 props 解构**：以前 `const { title } = defineProps(...)` 会丢响应式（第 01 章的失效场景一）。3.5 起编译器把对解构变量的每次访问改写回 `props.xxx`，因此解构默认值与重命名都可用：
+
+```ts
+// 3.5 起稳定并默认启用（3.3 / 3.4 需要 propsDestructure 实验开关）
+const { title = '未命名', mode: displayMode = 'single' } = defineProps<{ title?: string; mode?: 'single' | 'multiple' }>();
+
+watch(() => title, (v) => console.log(v)); // 传给 watch / composable 时要包成 getter
+useDynamicTitle(() => title);
+```
+
+工程口径三条，都是会被追问的点：
+
+1. **编译器只在「访问」处改写，不追引用传递**。所以 `watch(title, ...)`（直接把解构变量当源）拿到的是求值一次的普通值——3.5 的类型链会把它报成编译错误，官方写法是包一层 getter：`watch(() => title, ...)`。同理传给 composable 要用 `() => title` 或由 composable 内部 `toValue()` 归一化。
+2. **这是 `<script setup>` 的编译期转换**，依赖 `@vitejs/plugin-vue` + `vue-tsc` / `@vue/language-tools` 与 Vue 版本同批升级；版本错配时表现为「代码看着没错、视图不动」，比运行时报错更难查。
+3. **存量 3.3 / 3.4 项目不必为它升级**：`toRef(props, 'title')` 是完全等价的老写法，迁移期两种并存也不冲突。
+
+**插槽**：默认插槽、具名插槽、作用域插槽，一个组件三种出口。
+
+```vue
+<script setup lang="ts">
+defineSlots<{
+	default?: (props: { row: UserRow; index: number }) => any; // 3.3+ 类型化插槽
+	toolbar?: (props: { disabled: boolean }) => any;
+}>();
+</script>
+
+<template>
+	<div class="table-card">
+		<header><slot name="toolbar" :disabled="!canEdit" /></header>
+		<table>
+			<tr v-for="(row, i) in rows" :key="row.id">
+				<td><slot :row="row" :index="i">{{ row.name }}</slot></td>
+			</tr>
+		</table>
+	</div>
+</template>
+```
+
+- `v-slot` 只能写在 `<template>` 上（默认插槽的简写除外），作用域插槽的参数就是插槽 props 对象。
+- 插槽内容**在父组件的作用域里编译**：插槽里读的是父组件的变量，触发的是父组件的渲染；这就是"插槽内容不会因为子组件重渲染而丢失自己的响应式"的原因。
+- 有插槽的组件在 diff 时多一层成本：`v-slot` 的内容每次渲染都产出新 vnode，动态插槽还会让节点带 `DYNAMIC_SLOTS` 标记。列表每行都塞复杂插槽，性能问题多半出在这里。
+
+**第四个出口：实例本体的对外面**。`<script setup>` 默认是封闭的——父组件拿到 ref 也访问不到内部变量，这是设计而非限制。要暴露就显式声明：
+
+```vue
+<script setup>
+const formRef = ref();
+async function validate() {
+	return formRef.value?.validate();
+}
+defineExpose({ validate, scrollToError: () => {} }); // 契约：父组件只能调这两个
+</script>
+```
+
+```vue
+<script setup lang="ts">
+import { useTemplateRef } from 'vue'; // 3.5 引入；更早用"同名 ref 变量"的写法
+const dialog = useTemplateRef('dialog');
+const form = useTemplateRef('form');
+
+async function submit() {
+	await form.value?.validate();
+	dialog.value?.close();
+}
+</script>
+
+<template>
+	<ElDialog ref="dialog" />
+	<ProForm ref="form" />
+</template>
+```
+
+判据：**能用 props + emits + 插槽解决的，不要用 `defineExpose`**。暴露方法等于把组件变成 imperative API，父组件的时序依赖随之出现（"到底挂载了没有"），这也是 Element Plus 之类组件库必须暴露 `validate`/`clearValidate` 的无奈之处——表单校验天然是命令式的（第 06 章展开）。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 声明入参 | `defineProps`（类型式或值式），编译期即契约 | 函数参数解构 + `interface Props`，契约只是类型注释 |
+| 默认值 | `withDefaults` 或值式 `default`（支持工厂函数） | 参数解构默认值 / `defaultProps`（函数组件已废弃） |
+| 运行时校验 | 值式 `type` + `validator`，生产可见；类型式只能推出有限校验 | PropTypes（社区基本弃用，生产构建常剥掉） |
+| 子传父 | `defineEmits` 声明事件，父组件用 `@event` 监听 | 父组件把回调函数当 prop 传下去，无契约声明 |
+| 双向绑定 | `v-model:xxx` / `defineModel`，一个 prop + 一个事件被语法识别 | 受控：`value` + `onChange`，框架层没有专门语法 |
+| 未知属性透传 | `$attrs` 自动含 `class`/`style`/`onXxx`，`inheritAttrs` 可控 | 手工 `{...rest}` 展开到根元素，无自动落点 |
+| 内容分发 | 具名/作用域插槽，编译在父作用域 | `children` / render props，同样闭包在父作用域 |
+| 命令式操作子组件 | `defineExpose` 显式开接口 + 模板 ref（3.5 起 `useTemplateRef`） | `useImperativeHandle` + `forwardRef`，默认不暴露任何方法 |
+| 子组件"改"父状态 | 不允许改 props，走 emit；`defineModel` 提供合法句柄 | 不允许改 props，走回调；本质一致 |
+
+一句话：**Vue 把 React 靠约定维持的东西（props 契约、事件契约、透传规则、双向绑定）写成了编译期可见的语言特性**。代价是你会遇到"两种声明方式产物不同"这类新问题，收益是这些契约能被工具检查。
+
+---
+
+## 翻车现场
+
+**一、子组件里 `props.list.sort()`，父组件表格顺序跟着变。**
+
+```ts
+const sorted = computed(() => props.rows.sort((a, b) => a.createTime - b.createTime));
+```
+
+- 症状：列表页排序"生效"了，但用户下次筛选时顺序错乱，导出接口拿到的顺序和界面不一致；有人反映"数据像被人改过"。
+- 根因：`readonly` 只挡赋值（`props.rows = ...`），不挡原地变异。`props.rows` 和父组件的数组是**同一个引用**，`sort` 就地重排了父状态。这在 Vue 里能跑，是因为 props 是浅响应：原地改数组仍会触发依赖（数组索引/`length` 被订阅）。
+- 修法：`computed(() => [...props.rows].sort(...))`；需要"用户点的排序列/方向"这类状态时，把它提到父组件（或 composable）通过事件同步，**绝不在展示组件里改源数据**。
+
+**二、用字面量联合类型声明 props，传错值生产环境一点警告都没有。**
+
+- 症状：`mode` 只支持 `'single' | 'multiple'`，同事写了 `'multi'`，界面静默走默认分支，测试环境也没报错，线上排查半天。
+- 根因：编译器无法把字面量联合变成运行时约束，产物里 `mode` 的 `type` 是 `null`，等于不校验；类型层在编译后不存在。
+- 修法：关键枚举用值式声明加 `validator`，或用 `toRef`/普通 `computed` 做一次归一化 `const m = computed(() => VALID.includes(props.mode) ? props.mode : 'single')`；同时在接口层加 schema 校验，让"非法值"在进入组件前就暴露。
+
+**三、二次封装组件把事件吃掉了。**
+
+- 症状：`<ProTable @row-click="handle" />` 里的 `handle` 从不触发，直接换成 `el-table` 就正常。
+- 根因：封装层用 `defineEmits(['row-click'])` 声明了该事件，于是它从 `$attrs` 里被摘走，而封装层又没有 `emit('row-click')`；再加上内部写了 `inheritAttrs: false` 却没把 `v-bind="$attrs"` 挂到真实表格上，监听器彻底没落点。
+- 修法：**封装层只声明自己真正要拦截的事件**，其余让 `$attrs` 透传到目标组件；根为多元素时必须显式指定落点。组件库这一层的规则见[第 14 章](/blog/posts/vue-roadmap-14-architecture-library/)。
+
+---
+
+## 复习卡片
+
+- **Q：类型声明式和值声明式怎么选？** A：纯 TS 项目用类型式让 `vue-tsc` 挡误用；需要 `validator`、需要枚举级运行时校验、或组件对外发布时补值式声明。
+- **Q：props 校验能替代 TS 类型吗？** A：不能，方向也不对称。类型编译后消失，管不到生产数据；运行时校验只到构造器级别，字段约束要靠 `validator` 或接口层 schema。
+- **Q：为什么子组件不能改 props？** A：props 是父状态的只读投影且浅响应，改了父组件下次渲染会盖回来，并且破坏"变化只来自上游"的可追溯性；要改就走 emit 或 `defineModel`。
+- **Q：`defineModel` 相当于什么？** A：一个具名的 `props.xxx` + `update:xxx` 事件对，外加 `{ local: true }` 可选的内部拷贝语义；3.4 起稳定。
+- **Q：`$attrs` 里有什么？** A：所有未声明为 props 的传入项，含 `class`/`style` 和未声明 emit 的 `onXxx` 监听器；根为 Fragment 时不会自动挂载。
+- **Q：3.5 的 props 解构和以前有何不同？** A：编译器把解构变量的访问改写回 `props.xxx`，因此不再丢响应式、默认值直接写在解构里；3.5 起稳定且默认开启（3.3/3.4 要 `propsDestructure` 开关），但它是编译期转换——把解构变量直接当 `watch` 源会报错，要包 getter，存量项目用 `toRef` 等价。
+
+---
+
+## 小结
+
+- 组件契约三件套：`defineProps` / `defineEmits` / `defineSlots`。它们的价值不是少写样板，而是让"外部误用"变成编译期错误。
+- 两种 props 声明方式是**保障层次**不同：类型式给开发期，值式给生产期；编译器只会把简单类型翻译成运行时约束，字面量联合和复杂推导会退化成不校验。
+- props 只读是机制不是口号：浅响应 + 引用来自父组件，因此禁止赋值也防不住原地变异，展示组件要自己复制。
+- `update:xxx` 约定 → `v-model:xxx` → `defineModel`，是同一条双向绑定路径的三次收敛；`.sync` 是 Vue 2 的历史包袱，3.x 不存在。
+- `$attrs` 是组件库二次封装的命脉：落点、是否继承、哪些事件该声明，要写成团队规则而不是每次现场判断。
+- 插槽在父作用域编译，作用域插槽是"子组件把数据借给父组件渲染"，代价是每次渲染都产出新 vnode。
+
+---
+
+## 练习
+
+1. 把同一个 `DictSelect` 分别用类型声明式和值声明式各写一遍，`vue-tsc` 通过后到 Playground 看两种产物里 `props` 的运行时形状差异，并验证"传错 `mode`"在两种写法下各自会不会报警。约 12 分钟。
+2. 手写 `modelValue` + `update:modelValue` 版与 `defineModel` 版各一个，比较代码量；再给 `defineModel` 加上 `{ local: true }`，实测"父组件每次传新对象时输入是否被打断"的差别。
+3. **可见交付物**：完成 `DictSelect.vue`——类型式 props（`code`、`multiple`、`disabled`）、`defineEmits` 契约（`change` / `update:modelValue`）、一个 `option-extra` 作用域插槽、`inheritAttrs: false` + `v-bind="$attrs"` 落到 `el-select`，并为 `multiple` 的非法值补一条运行时 `validator`；配 3 条断言：外部误用被 `vue-tsc` 拦下、`$attrs` 能透传 `placeholder`、`change` 事件参数类型正确。
+
+---
+
+## 面试一句话
+
+> "Vue 3 的组件契约是编译期可见的：`defineProps` 两种声明方式对应两层保障——类型式给 `vue-tsc` 挡误用，但它只会被编译成构造器级别的运行时校验，字面量联合这类复杂类型直接退化成不校验，所以校验和类型不能互相替代；props 只读不是风格问题，它是浅响应对象、引用来自父组件，改它既会被下次渲染覆盖，也毁掉了'变化只来自上游'这条推理链，要改就走 `update:xxx` 约定，也就是 `v-model:xxx` 和 3.4 稳定下来的 `defineModel`；再往外一层是 `$attrs` 透传，它连未声明的事件监听器一起带上，所以组件库封装时'声明哪些 emit'本身就是行为约定。"

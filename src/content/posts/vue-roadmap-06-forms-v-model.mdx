@@ -1,0 +1,357 @@
+---
+title: '06 · 表单与 v-model：修饰符、defineModel 与校验分层'
+published: 2026-11-22T14:00:00+08:00
+description: 'v-model 的展开式（modelValue + update:modelValue）与 v-model:xxx 多绑定、lazy/trim/number 修饰符的实现位置、IME 组合输入为什么 Vue 内置处理而 React 要自己写、自定义选择器组件的完整 v-model 契约（含 defineModel 的 local 选项与自定义事件名）、表单校验的三层分工与状态归属判断，以及大表单卡顿的两种根因。'
+tags: [Vue, v-model, defineModel, 表单校验, Element Plus, IME]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章管的是**"输入"这条路径上的每一环**：字符怎么进到状态、状态怎么回到控件、校验放在哪一层、大表单为什么不跟手。
+> 场景：新增用户弹窗里"手机号"字段，中文输入法连续打字会吞字；改用 `el-input` 的 `v-model` 后不吞了；但把同一个字段换成自定义选择器组件后又出现"输入被打断"。三种表现、两个根因，都在这一章。
+> 问答形态见 [面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/) 的 Q10（组件通信里的 `v-model` 那一节）；React 侧的受控写法与校验分层见 [事件与表单](/blog/posts/react-roadmap-04-events-forms/) 和 [表单工程化](/blog/posts/react-roadmap-10-forms-engineering/)；后台项目里的真实表单形态见 [RuoYi 的 Vue 前端](/blog/posts/ruoyi-roadmap-13-vue-frontend/)。
+
+---
+
+## 一句话本质
+
+`v-model` 不是双向绑定的魔法，是**一个 prop 加一个事件的语法糖，再加一组运行时指令**：值往下走 `modelValue`，改动往上走 `update:modelValue`，中间那段"怎么读 DOM、什么时候同步"由运行时的 `vModel*` 指令负责。
+
+由此得到四个判断：
+
+1. **修饰符决定"什么时候写回"**（`lazy` / `trim` / `number`），不决定校验，也不决定渲染。
+2. **IME 由内置指令处理**，这是 Vue 相对 React 少写一层代码的真实来源之一。
+3. **组件的 `v-model` 契约必须自己定义清楚**（绑定名、事件名、是否 local），Element Plus 的 `modelValue` 只是社区约定。
+4. **校验分层**：schema 管数据合法性，组件 rules 管界面提示，提交前统一拦截管业务流程；三者不要互相冒充。
+
+---
+
+## 原理拆解
+
+### 1. `v-model` 的展开式：一个 prop、一个事件、一组运行时指令
+
+用在**原生元素**上，`v-model` 会被编译成"绑定当前值 + 监听对应事件 + 通过指令读写 DOM"：
+
+```vue
+<input v-model="text" />
+<input v-model.number="age" type="number" />
+<textarea v-model="remark"></textarea>
+<select v-model="cityId">…</select>
+```
+
+```js
+// 编译产物（内联模式，简化）：值不在 props 里，而是第三个参数位置的指令
+_withDirectives(_createElementVNode('input', {
+	'onUpdate:modelValue': $event => ((text) = $event),
+}, null, 512 /* NEED_PATCH */), [[_vModelText, text]]);
+```
+
+关键点有两个：**原生元素上没有 `modelValue` prop**，值走的是指令的第二元素；以及这个元素被打了 `NEED_PATCH`（512），因为指令需要参与 patch——这正是第 02 章里"带 ref 或动态事件的节点会退回完整 patch"的同一族情况。`v-model` 在元素上编译出 `onUpdate:modelValue` 这个"看起来像组件事件"的键，实际是被 `vModelText` 内部当作回调调用，这是很多人把两种 `v-model` 混为一谈的原因。
+
+用在**自定义组件**上，才是完整的 prop + 事件对（第 03 章）：
+
+```vue
+<DictSelect v-model="form.status" :code="'user_status'" />
+<!-- 等价于 -->
+<DictSelect :model-value="form.status" @update:model-value="form.status = $event" :code="'user_status'" />
+```
+
+带参数就是多通道，每个参数一个独立的名字与事件：
+
+```vue
+<RangeFilter v-model:start="q.start" v-model:end="q.end" v-model:keyword="q.keyword" />
+```
+
+```ts
+// 子组件里三种写法等价，能力递增
+const props = defineProps<{ start: Date }>();
+const emit = defineEmits<{ 'update:start': [v: Date] }>();
+
+const start = defineModel<Date>('start', { required: true }); // 3.4+：一个句柄同时给读和写
+
+// 自定义事件名 / prop 名（第 3 节细讲为什么不建议）
+const value = defineModel<string>({ type: String }); // 默认 modelValue + update:modelValue
+```
+
+三条容易踩的语义：
+
+- **`v-model` 只能绑"可写的表达式"**：`v-model="obj.a + 1"`、`v-model="computedReadonly"` 都不会工作（后者会警告"写只读 computed"）。要绑派生值就用可写 computed。
+- **`v-model` 与 `:value`/`@input` 不要同时写**在同一个元素上，事件顺序不可控，`v-model` 会被覆盖成"看起来随机生效"。
+- **动态参数 `v-model[dynamicName]` 合法但难读**，组件库之外不要用。
+
+**`.exact`、`.native` 之类的历史**：`.native` 在 3.x 已移除（事件统一走 attrs/emit 判定），迁移代码里看到 `@click.native` 要直接改成 `@click`。
+
+### 2. 修饰符 `lazy` / `trim` / `number` 的实现位置，以及 IME
+
+结论先给：**这三个修饰符不是编译期改写表达式，而是作为编译期传给运行时指令的参数**。编译器把修饰符对象带进指令调用（`vModelText` 内部按 `lazy` / `trim` / `number` 分支处理事件与转换），所以：
+
+| 修饰符 | 生效层 | 具体行为 | 副作用 |
+|---|---|---|---|
+| `lazy` | 运行时指令 | 把监听事件从 `input` 换成 `change` | 失去"边输边搜"，但省掉大量输入事件 |
+| `trim` | 运行时指令 | 同步回状态前 `trim()`；输入过程中若被裁掉空格，会把 DOM 值写回 | 粘贴尾部空格会被立刻去掉；空格开头输入体验略怪 |
+| `number` | 运行时指令 | `looseToNumber`：能转成数字就转，转不了保留原字符串 | 输入 `1.` 会被写成 `1`，小数点打不出来 |
+
+`number` 这条是最常见的实际故障：
+
+```vue
+<!-- ❌ 想输 3.14：输入 '3.' 时状态变成 3，视图回填 '3'，小数点永远打不出来 -->
+<input v-model.number="price" />
+
+<!-- ✅ 文本输入 + 派生数值：状态存字符串，计算属性给数字 -->
+<input v-model="priceText" />
+
+<script setup lang="ts">
+const priceText = ref('3');
+const price = computed(() => {
+	const n = Number(priceText.value);
+	return Number.isFinite(n) ? n : undefined;
+});
+</script>
+```
+
+**IME 组合输入**是 `v-model` 相对 React 受控写法最实在的优势。`vModelText` 指令在元素上同时挂了三个监听：
+
+```text
+compositionstart → composing = true（此后 input 事件不再写回状态）
+compositionupdate→ 只更新 DOM 显示，不动状态
+compositionend  → composing = false，并把这一轮合成好的完整文本一次性写回
+```
+
+所以中文/日文连续输入时，状态只在合成结束（候选词确认）后变更一次；输入过程中 Vue 会抑制写回，并且在需要时把 DOM 值校正回来。
+
+React 没有这一层：`onChange` 本质监听 `input` 事件，Safari 等浏览器在合成期间也会触发，于是**受控 `value` 会在拼音阶段被写回，导致候选串被截断、字打不出来**。社区方案是 `onCompositionStart/End` 自己挡一层，或者干脆非受控 + `defaultValue`（见 [React 事件与表单](/blog/posts/react-roadmap-04-events-forms/)）。
+
+工程上要记住的是**这条差异会外溢到组件封装层**：Element Plus 的 `el-input` 内部也是走原生 `input` + Vue 的合成处理，所以套一层组件不影响；但如果你自己写了一个"监听 `@input` 再 emit"的输入组件，就把这层保护弄丢了——要用 `v-model` 语义而不是手写 `@input`。
+
+还有两条关于修饰符的边界，评审里反复用到：
+
+- **内置的只有 `lazy` / `trim` / `number` 三个**（元素上）。没有 `.debounce`：Vue 1 时代有过，Vue 2 起移除，3.x 也没有恢复。想要"延迟写回状态"，要么在组件内用内部 ref + 定时器（正好是 `local` 的语义），要么在请求层做防抖（第 04 章），**不要指望模板修饰符替你省掉副作用管理**。
+- **组件侧的修饰符要自己实现**：值声明式的 props 里能收到 `modelModifiers`（带参数时是 `xxxModifiers`）这个对象，形如 `{ trim: true }`。自定义输入组件如果既不交给 `v-model` 语义、又不读这个对象，用户写的 `.trim` 就是**静默失效**——这类"看起来支持其实不支持"的坑比报错更难查。组件文档里要写清支持哪些修饰符。
+
+### 3. 自定义组件的 `v-model` 契约：一个完整选择器
+
+契约要写清四件事：**绑定名、事件名、值形态、是否本地化**。下面是一个支持单选/多选、远程字典、可清除的选择器：
+
+```vue
+<!-- DictSelect.vue -->
+<script setup lang="ts">
+import { computed, watch } from 'vue';
+
+const props = withDefaults(
+	defineProps<{
+		code: string; // 字典编码
+		multiple?: boolean;
+		clearable?: boolean;
+		disabled?: boolean;
+	}>(),
+	{ multiple: false, clearable: true, disabled: false },
+);
+
+// 默认通道：v-model → modelValue + update:modelValue
+const model = defineModel<string | string[]>({
+	// local: 先在组件内部落一份，值真正变化时才回传父组件
+	local: true,
+});
+
+// 第二个通道：v-model:label，用来同步显示文本（父组件常需要它做导出/校验提示）
+const label = defineModel<string>('label', { default: '' });
+
+const dict = useDict(props.code); // composable：shallowRef 存的选项表（第 01、10 章）
+
+const value = computed({
+	get: () => model.value as string | string[],
+	set: (v) => {
+		model.value = v;
+		label.value = props.multiple
+			? (v as string[]).map((x) => dict.label(x)).join('、')
+			: dict.label(String(v ?? ''));
+	},
+});
+
+// 外部把值重置为 undefined 时，归一化成多选/单选的"空"形态，避免控件拿到脏值
+watch(
+	() => props.multiple,
+	(multi) => {
+		if (multi && !Array.isArray(model.value)) value.value = [];
+		if (!multi && Array.isArray(model.value)) value.value = '';
+	},
+);
+</script>
+
+<template>
+	<el-select
+		v-model="value"
+		:multiple="props.multiple"
+		:clearable="props.clearable"
+		:disabled="props.disabled"
+		:reserve-keyword="false"
+	>
+		<el-option v-for="opt in dict.options" :key="opt.value" :label="opt.label" :value="opt.value" />
+	</el-select>
+</template>
+```
+
+```vue
+<!-- 父组件用法：两个通道 + 一个事件 -->
+<DictSelect
+	v-model="form.status"
+	v-model:label="form.statusText"
+	code="user_status"
+	@change="onStatusChange"
+/>
+```
+
+四个决策点：
+
+1. **`local: true` 什么时候必须加**：父组件绑定的值来自异步来源（接口回写、store 覆盖、每次渲染新建的对象），或者你需要"先在本组件改完再一次性回传"。不加 `local` 时，`defineModel` 是 props 的直接镜像，父组件一回写新引用就打断当前编辑（见本节末的翻车现场）。代价是 `local` 之后父组件的变更需要组件自己同步，语义变复杂——**能不 local 就别 local**。
+2. **自定义事件名/prop 名**：`defineModel('startDate')` 就是 `v-model:startDate`。老项目里想兼容 `value`/`inputValue` 这类历史 prop 名，**建议改名而不是再补一个自定义事件**：一个组件上两套双向通道是长期维护成本。Vue 2 的 `.sync` 与 `modelValue` 混用是迁移期最常见的 bug 源。
+3. **值形态要唯一**：单选给 `string`，多选给 `string[]`，空值统一 `''` / `[]`。混用 `null` 与 `undefined` 会让 `el-select` 在"是否显示 placeholder"上表现不一致。
+4. **要事件就同时给上下文**：`@change` 之外再给一个 `emit('clear')`；把联动逻辑留在父组件，不要在选择器里偷偷改别的字段。
+
+`defineModel` 的返回值是 ref，因此可以往下透传给第三层组件（`v-model="model"`），也可以进 `computed` —— 这是第 03 章"双向绑定变成了可传递的值"的落点。
+
+### 4. 校验分层与状态归属
+
+**三层各管什么，谁都不该越界**：
+
+```text
+L1 数据层（schema）     接口回来的数据、提交前的 payload 是否合法
+                       工具：zod / 自写 validate()，产出错误列表 → 阻断提交
+L2 控件层（组件 rules） 字段级即时提示：required / 长度 / 正则 / 异步唯一性
+                       工具：Element Plus 的 rules + el-form-item 的 prop
+L3 流程层（提交拦截）   跨字段/跨步骤约束：时间区间先后、必填分组、权限、脏数据确认
+                       工具：提交前统一 validate + 汇总错误定位到第一个出错字段
+```
+
+```ts
+// L3：提交前的统一拦截，而不是每个按钮各写一遍
+async function submit() {
+	const ok = await formRef.value?.validate().catch(() => false); // 组件校验
+	const errs = schema.safeParse(payload); // 数据校验
+	if (!ok || !errs.success) {
+		if (!ok) scrollToFirstError();
+		else toastErrors(errs.error.issues);
+		return;
+	}
+	// 只有两层都过才发请求
+	await api.save(payload);
+}
+```
+
+**校验状态放组件内还是 store**——按"生命周期 + 作用域"两问判定：
+
+| 状态 | 归属 | 理由 |
+|---|---|---|
+| 字段当前值、是否被触碰（touched）、单字段错误文案 | 表单组件内（或表单 composable） | 随弹窗关闭销毁，跨页面复用无意义 |
+| 草稿恢复（用户填了一半关掉再打开） | localStorage / 后端草稿表 | 需要跨会话，属于持久层不是应用状态 |
+| 步骤表单的完成度、跨页签共享的编辑内容 | store | 多组件同时关心，且需要统一提交 |
+| 字典、权限、表单元数据（字段配置） | store（Pinia） | 全局共享，一次加载多次消费 |
+| 服务端校验错误映射 | store 或表单实例，二选一但**必须只有一个** | 两处都放会出现"改了字段但错误没消失" |
+
+判据：**校验状态是"这个表单这一次填写"的私有状态**。放进全局 store 的后果很具体——同一类型的两个弹窗（批量编辑、单条编辑）共享一份 `errors`，A 弹窗的报错显示在 B 弹窗上；或者用户第二次打开弹窗看到上一次的残留错误。要做跨页保持，就把 store 的 key 按"表单实例 id"分片，而不是共用一个 `errors` 对象。
+
+**异步校验的触发时机是另一个高频返工点**。手机号唯一性、用户名重复这类要发请求的规则，如果 `trigger` 配成 `input`，每敲一个字发一次请求；配成 `blur` 又会出现"用户不点提交永远不校验"。可靠的做法是三层各就各位：
+
+```ts
+const rules = {
+	phone: [
+		{ required: true, message: '请输入手机号', trigger: 'blur' },
+		{ pattern: /^1\d{10}$/, message: '格式不正确', trigger: 'blur' },
+		{
+			asyncValidator: async (_rule, value, callback) => {
+				if (!value || value.length !== 11) return callback(); // 长度不够不发请求
+				const ok = await api.checkUnique({ field: 'phone', value });
+				callback(ok ? undefined : new Error('该手机号已被占用'));
+			},
+			trigger: 'blur', // 失焦触发，配合下面的提交前统一拦截兜底
+		},
+	],
+};
+```
+
+要点三条：异步规则只在 `blur` 或提交时跑；请求本身要防抖 + 丢弃过期响应（复用第 04 章 `useSearch` 的清理策略，组件卸载时由 `onWatcherCleanup` 兜住）；`el-form` 的 `validate()` 在提交时会跑全部规则，所以"blur 才校验"不会漏。
+
+**大表单卡顿的两种根因**（第 13 章会展开完整方法，这里只给结论）：
+
+| 根因 | 症状 | 判定信号 | 修法 |
+|---|---|---|---|
+| 整表响应式 + 整表订阅 | 每个键入都掉帧，字段越多越卡 | Performance 里 `traverse` 与 getter 调用数量随字段数增长 | 字段级 `computed`/`watch`；选项、上传文件列表改 `shallowRef`；校验结果派生而非回写 |
+| 渲染范围过大 | 输入不卡，但一改状态整屏重画 | 组件 render 次数远高于预期；子树节点很多 | 拆分组件（每个 `el-form-item` 一组）、`v-memo` 局部块、异步字段折叠时不渲染 |
+
+第一条是响应式层的问题（第 01、04 章），第二条是渲染层的问题（第 02、05 章）。**先分清是哪一类，再谈优化**——把"整表响应式"当成"渲染慢"去拆组件，是这类需求最常见的无效工作量。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 受控输入 | `v-model="text"`，一行 | `value={text}` + `onChange`，且要自己保证不可变更新 |
+| 中文输入法 | 内置 `vModelText` 挡合成期，无需处理 | 合成期会触发 `onChange`，需 `onCompositionStart/End` 或改用非受控 |
+| 输入转换（数字 / 去空格 / 延迟写回） | 内置修饰符只有 `number` / `trim` / `lazy`，运行时指令实现；延迟要自己做 | 全部自己写 handler（`parseFloat` + `trim` + 防抖 hook） |
+| 双向绑定跨组件 | `defineModel`（含 `local` 语义），prop + 事件被语法识别 | 只能传 `value` + `onChange` 两个 props，无框架层约定 |
+| 表单库生态 | Element Plus / Naive 自带 rules；复杂表单常配 `vee-validate` | `react-hook-form` + zod 是事实标准 |
+| 校验状态归属 | 组件内 `ref` / composable，天然局部 | `formState` 或 `useForm` 实例，作用域要自己管 |
+| 提交前统一拦截 | `formRef.validate()`（命令式 API，需 `defineExpose`） | `handleSubmit(onValid)`（库把命令式包成声明式） |
+| 大列表/大表单性能 | 字段级订阅 + `shallowRef` + `v-memo` | `memo` + 引用稳定 + 虚拟化 |
+
+差异的根：**React 只有"受控"一种模型，所有表单能力都要在库层重建；Vue 把最小可用的双向绑定放进了语言层**，所以简单表单不需要库，复杂表单才需要（这时反而要小心 Vue 生态的表单库与组件库校验机制重叠）。
+
+---
+
+## 翻车现场
+
+**一、`v-model.number` 让价格字段打不出小数点。**
+
+- 症状：输入 `3.14`，界面显示 `314` 或停在 `3`；用户反馈"输不了小数"，接口收到的数却是 `314`。
+- 根因：`number` 修饰符每次同步都尝试转数字，`'3.'` 被转成 `3` 并回填 DOM，小数点这一步被吞掉。
+- 修法：状态存字符串、派生数字（如上例）；金额类字段直接用 `el-input-number` 或 `el-amount` 风格的专用控件，让控件负责格式，`v-model` 只负责值。
+
+**二、自定义选择器"吞字/选中被回退"，因为父组件一直在回写新引用。**
+
+- 症状：搜索型选择器里输入两个字后，第一个字被覆盖；或刚选中的项被弹回上一个值。
+- 根因：`defineModel` 没有 `local`，值完全镜像父组件 props；父组件那边绑的是每次渲染新建的对象字段（第 02 章的 `:config` 同款问题）或一个 `watch` 又在回写（第 04 章的循环同步）。
+- 修法：给组件加 `local: true` 让内部值先落地、变化后再回传；同时修父组件，把引用稳定下来。**两个都要做**——只加 `local` 会掩盖父组件的结构性问题，还会带来"外部改了但界面不更新"的新问题（`local` 模式下组件仍需响应 props 变更，Vue 会处理，但你的 `watch` 逻辑要考虑这一层）。
+
+**三、校验状态放全局 store，两个弹窗互相串报错。**
+
+- 症状：先打开"编辑用户"触发一堆必填错误，关掉后再打开"新增用户"，界面立刻红一片；批量编辑和单条编辑同时打开时，A 的错误显示在 B 上。
+- 根因：`errors` 是 store 上的单例对象，表单实例没有作用域；关闭弹窗只隐藏了组件，没有重置状态。
+- 修法：错误状态回到组件/composable 内部（随实例销毁自然清理）；确需跨页保持的用"表单 id 分片 + 打开时显式 reset"；弹窗复用同一个组件实例时，用 `:key="recordId"` 强制重建比手写 reset 更可靠（第 05 章）。
+
+---
+
+## 复习卡片
+
+- **Q：`v-model` 在元素上和组件上是一回事吗？** A：不是。元素上是"指令 + `onUpdate:modelValue` 回调"，值读写由 `vModelText` 等运行时指令负责；组件上才是 `modelValue` prop + `update:modelValue` 事件的约定对。
+- **Q：`lazy` / `trim` / `number` 在哪一层生效？** A：编译期把修饰符作为参数交给运行时指令，运行时决定监听哪个事件、是否 `trim`、是否 `looseToNumber`；不是编译期改写表达式。
+- **Q：为什么 Vue 不用处理中文输入法？** A：`vModelText` 监听 `compositionstart/update/end`，合成期间不写回状态，结束时一次性提交；React 的 `onChange` 在合成期也触发，需要自己挡。
+- **Q：`defineModel` 的 `local` 什么时候用？** A：父组件绑定值来自异步回写或每次新建引用、导致输入被打断时。代价是双向同步变复杂，能不 local 就别 local。
+- **Q：表单校验为什么必须分三层？** A：schema 管数据合法性（生产可见）、组件 rules 管即时提示、提交前统一拦截管跨字段流程；混做会出现"界面绿了但数据非法"或"校验逻辑散在 20 个按钮里"。
+- **Q：大表单卡顿的两种根因分别是什么？** A：整表响应式 + 整表订阅（每次键入遍历全部字段，改字段级订阅与 `shallowRef`）；渲染范围过大（一改状态整屏重画，改组件边界与 `v-memo`）。判定信号看 Performance 里 `traverse` 次数与组件 render 次数。
+
+---
+
+## 小结
+
+- `v-model` 的展开式是"prop + 事件 + 运行时指令"三层；分清元素版与组件版，也就分清了"值怎么写回 DOM"和"值怎么写回父状态"。
+- 修饰符是运行时行为不是编译期语法糖：内置只有 `number`（会把 `3.` 吞成 `3`）、`trim`（裁空格）、`lazy`（`input` 换成 `change`）三个；没有 `.debounce`，延迟写回要在状态层或请求层自己做。
+- IME 由内置指令处理，是 Vue 表单体验的默认收益；自己写 `@input` + `emit` 的输入组件会把这层保护丢掉。
+- 自定义组件的 `v-model` 是契约设计题：绑定名、事件名、值形态、`local` 四要素要写进组件文档；一个 prop 名配两套通道是长期债。
+- 校验三层分工 + "校验状态属于这一次填写"的归属判断，能同时解决"红一片的复用弹窗"和"提交前才发现数据非法"。
+- 大表单先分根因再优化：响应式订阅成本还是渲染范围成本，两者的修法完全不同（第 13 章给出完整测量流程）。
+
+---
+
+## 练习
+
+1. 用 `v-model.number`、`v-model.lazy`、`v-model.trim` 各写一个字段，在 Vue Devtools 里观察状态更新时机与值的类型变化，写出三者分别"在什么时候写回、写成什么"。约 10 分钟。
+2. 把本章 `DictSelect` 去掉 `local: true`，再在父组件里加一个"每次渲染新建 `form` 对象"的写法，复现输入被回退；然后分别用「加回 local」和「稳定父组件引用」两种修法验证，说明为什么建议两者都做。
+3. **可见交付物**：完成一个 `UserEditForm.vue`——字段含姓名（长度校验）、手机号（正则 + 输入法连续输入不吞字）、状态（用上面的 `DictSelect`，双通道 `v-model` + `v-model:label`）、生效时间区间（跨字段校验：结束必须晚于开始）；实现三层校验（zod/自写 schema + `el-form` rules + 提交前统一拦截并滚动到第一个错误），校验状态全部留在组件内；配 3 条断言：中文输入法连续输入 5 字后状态值正确、跨字段错误能阻断提交、关闭再打开弹窗无残留错误。
+
+---
+
+## 面试一句话
+
+> "`v-model` 我会拆成三层说：在原生元素上它是编译期给出的运行时指令 `vModelText` 加一个 `onUpdate:modelValue` 回调，值读写、`lazy`/`trim`/`number` 的转换都在运行时指令里做，所以 `number` 会把 `'3.'` 吞成 `3`；在组件上它是 `modelValue` prop 加 `update:modelValue` 事件的约定，带参数就是多通道，3.4 稳定下来的 `defineModel` 把这一对合成一个可传递、可 `local` 的句柄。中文输入法不用自己处理是因为指令监听了 `compositionstart/update/end`，合成期不写回状态，而 React 的 `onChange` 在合成期照样触发，必须自己用 composition 事件挡一层。表单工程上我按三层分：schema 管数据合法性、组件 rules 管即时提示、提交前统一拦截管跨字段流程，校验状态属于'这一次填写'，所以留在组件或表单 composable 里而不是全局 store；大表单卡顿要先分清是整表响应式订阅的成本还是渲染范围的成本，改法完全不同。"

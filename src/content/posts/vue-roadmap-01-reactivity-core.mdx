@@ -1,0 +1,403 @@
+---
+title: '01 · 响应式系统：Proxy、ref 与依赖收集'
+published: 2026-11-22T09:00:00+08:00
+description: 'Vue 3 响应式原理：Proxy 相比 Object.defineProperty 解决了什么、track 与 trigger 的分工、ref 为什么需要 .value、reactive 的三大失效场景与 toRefs 修法、深层响应的代价与 shallowRef 的分工，以及 computed 的惰性求值与脏标记。'
+tags: [Vue, 响应式, "Proxy", ref, reactive, computed]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章只回答一个问题：**为什么有的值改了界面会动，有的不会**。
+> 真实场景是你在中后台项目里写了一个用户编辑弹窗，把 `reactive` 表单对象解构后传给子组件，子组件里点"保存"后父表格纹丝不动，刷新页面数据却是新的——数据在，视图不在。这类问题在 [面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/) 的 Q4、Q5 是对话形态，这里讲的是它背后的机制。
+> 判定标准只有一个：**能指出模板里每一个响应式断点是在哪一层断的**。
+
+---
+
+## 一句话本质
+
+Vue 3 的响应式 = **用 Proxy 拦截"对对象做了什么操作"，用 effect 记录"这次读取发生在谁身上"，在写入时把记录过的 effect 唤醒**。
+
+它不是"数据变了自动刷新页面"，而是一套精确的订阅关系：
+
+- 只有**被读过**的属性才被追踪；
+- 只有**记录在案的订阅者**才被通知；
+- 通知之后不是直接改 DOM，而是把副作用（组件的 render effect、`watch` 回调、`computed` 重算）安排到微任务里。
+
+由此推出后面所有章节的因果：**没被读 → 没订阅 → 改了不通知**；**换了引用 → 订阅的是旧对象 → 新对象没人认识**。
+
+---
+
+## 原理拆解
+
+### 1. Proxy 拦截的是"操作"，不是"属性"
+
+Vue 2 的 `Object.defineProperty` 只能在**已知属性名**上装 getter/setter。这决定了它的能力边界：初始化时看不到属性，就永远看不到它的变化。
+
+| 操作 | defineProperty (Vue 2) | Proxy (Vue 3) |
+|---|---|---|
+| 读取/修改已存在的属性 | 支持 | 支持（`get` / `set` 陷阱） |
+| 新增属性 | 不支持，需 `Vue.set` | 支持（`set` 陷阱能感知 key 不存在） |
+| 删除属性 | 不支持 | 支持（`deleteProperty` + `ownKeys`） |
+| `in` 运算符 / `Reflect.has` | 不支持 | 支持（`has` 陷阱） |
+| 数组按下标赋值、`length` 变化 | 需重写 7 个变异方法 | 天然支持，直接 `arr[2] = x` 即可 |
+| `Map` / `Set` 的 `get`/`set`/`has` | 完全不支持 | 用另一套 handler 拦截方法调用 |
+
+Vue 用了 5 个陷阱，覆盖面就到齐了：
+
+| 陷阱 | 对应操作 | Vue 里的用途 |
+|---|---|---|
+| `get` | 读属性、`arr[i]`、`arr.length` | `track` 依赖收集 + 返回值时按需套嵌套代理 |
+| `set` | 写属性、数组下标赋值 | 判断新增还是更新，`trigger` 唤醒 |
+| `has` | `'a' in obj`、`for...in` | 追踪 key 是否存在（新增要能感知） |
+| `deleteProperty` | `delete obj.a` | 唤醒 `has` 与 `ownKeys` 的订阅者 |
+| `ownKeys` | `Object.keys`、展开运算符、`for...in` | 追踪"键集合"变化 |
+
+关键差异不是"能不能"，而是**拦截粒度**：`defineProperty` 拦截的是"某个属性的读写"，`Proxy` 拦截的是"对这个对象做了哪种操作"。后者才能覆盖新增、删除和集合类型。
+
+```js
+// Vue 3 里这些都不需要特殊 API
+const state = reactive({ a: 1, list: [1, 2], dict: new Map() });
+state.b = 2;            // 新增属性：触发 set 陷阱 + ownKeys 追踪
+state.list[5] = 9;      // 数组越界写入：仍然触发
+delete state.a;         // 删除：触发 deleteProperty，'a' in state 也会被追踪
+state.dict.set('k', 1); // Map：走 collectionHandlers，而不是普通对象 handler
+```
+
+代价是**Proxy 无法穿透**：它只能拦截"通过代理对象的访问"。一旦拿到原始对象，或者拿到一个被复制出来的新对象，追踪就断了。这正是后面所有失效场景的根源。陷阱（trap）本身的机制属于元编程范畴，见 [Proxy 与 Reflect](/blog/posts/js-roadmap-13-metaprogramming/)。
+
+另外要澄清两个常见误解：
+
+- **Proxy 不是性能瓶颈**：深层对象是在**读取时才创建**嵌套代理（懒代理），没访问到的属性不生成 Proxy。
+- **代理与原始对象不相等**：`reactive(raw) !== raw`，把它传给严格比较的第三方库（表单库、图表库、`structuredClone`）时要当心。
+
+### 2. track / trigger：依赖收集发生在读取的那一刻
+
+三个角色：
+
+- **Dep**：一个属性对应的订阅者集合。
+- **activeSub**：当前正在运行的那个副作用（组件的 render effect、`watch` 回调、`computed` 的 getter）。源码里的全局变量就叫 `activeSub`（早期版本叫 `activeEffect`）。
+- **track / trigger**：读取时 `track` 把 `activeSub` 记进这个属性的 Dep；写入时 `trigger` 遍历 Dep 把订阅者安排出去。
+
+```text
+组件渲染            读取 state.count   →  track: Dep(count) 里记下 render effect
+用户点击            count + 1          →  trigger: 取出 Dep 里的订阅者，入队
+下一个微任务         render effect 重跑 →  产出新 vnode → patch DOM
+```
+
+由此得到三条能直接用来排查的推论：
+
+1. **渲染没用到 = 没订阅**。`v-if="false"` 的分支里读 `state.x`，改 `state.x` 不会触发这个组件更新。
+2. **迭代器/遍历的订阅范围比想象大**。`for...in`、`Object.keys`、`in` 会订阅 `ownKeys`，任何新增删除都会唤醒；`v-for` 遍历数组会订阅索引和 `length`。
+3. **副作用必须"正在运行"才收集得到**。所以 `track` 的时机是"执行期"，把读取搬到异步回调里，那次读取就不属于任何订阅者。
+
+```js
+import { reactive } from 'vue';
+
+const state = reactive({ n: 0 });
+
+setTimeout(() => console.log(state.n), 0); // 这次读取没有被任何 effect 收集
+```
+
+**effectScope 是这套订阅关系的容器**（3.0+）：`watch`、`computed`、组件的 render effect 都挂在当前 scope 上，scope 停止则全部依赖断开。手写 composable 时用它统一清理，见第 08 章。
+
+把上面四步手写一遍，机制就没有秘密了（约 30 行，面试白板题的原型）：
+
+```js
+let activeSub = null;
+let batched = false;
+const queue = new Set();
+
+function reactive(target) {
+	const deps = new Map(); // key -> Set<effect>
+
+	function track(key) {
+		if (!activeSub) return;
+		if (!deps.has(key)) deps.set(key, new Set());
+		deps.get(key).add(activeSub);
+	}
+	function trigger(key) {
+		for (const eff of deps.get(key) || []) eff.enqueue();
+	}
+
+	return new Proxy(target, {
+		get(t, key) {
+			track(key);
+			const v = Reflect.get(t, key);
+			return typeof v === 'object' && v ? reactive(v) : v; // 懒代理：读时才包
+		},
+		set(t, key, val) {
+			const isNew = !(key in t);
+			t[key] = val;
+			if (isNew) trigger('ownKeys');
+			trigger(key);
+			return true;
+		},
+		deleteProperty(t, key) {
+			const had = key in t;
+			delete t[key];
+			if (had) trigger(key), trigger('ownKeys');
+			return true;
+		},
+	});
+}
+
+function effect(fn) {
+	const eff = {
+		_dirty: true,
+		run() {
+			const prev = activeSub;
+			activeSub = eff;
+			try {
+				return fn();
+			} finally {
+				activeSub = prev;
+			}
+		},
+		enqueue() {
+			queue.add(eff);
+			if (!batched) {
+				batched = true;
+				queueMicrotask(flush);
+			}
+		},
+	};
+	eff.run();
+	return eff;
+}
+
+function flush() {
+	for (const eff of queue) eff.run();
+	queue.clear();
+	batched = false;
+}
+```
+
+对照真实实现，还有三处差异值得知道，因为它们决定了实际行为：
+
+- **子集/父集关系**：真实 Vue 里一个 Dep 可以有"上游依赖"（`key in obj` 这种整体订阅），触发时会向上冒泡，所以 `Object.keys` 的订阅者能被任意新增唤醒。
+- **版本号**：`computed` 不靠"标记某位为真"而是比对依赖的 `_version` 来判断是否真的变了，这解决了"依赖被写入但值没变"的空重算。写同一个值两次不会重渲染，也是靠值比较而不是靠 effect 计数。
+- **调度器**：组件的 render effect 走的是"排到作业队列 + 按组件优先级排序"的调度，不是上面这种扁平 `Set`；这就是父组件先于子组件更新、同一 tick 内多次赋值只渲染一次的原因。
+
+### 3. ref：为什么必须有 `.value`，模板又为什么可以不带
+
+Proxy 只能包对象。`number`、`string`、`boolean`、`null` 这些值类型没法拦截，于是 Vue 用一个对象把它们套起来：
+
+```ts
+function ref<T>(value: T): Ref<T> {
+	// 内部结构等价于：{ value: 若为对象则 reactive(value, { shallow: !deep }) }
+	return { __v_isRef: true, _value: value };
+}
+```
+
+- **`.value` 是给 JS 看的**：读 `count.value` 才会触发 `get` 陷阱，`count` 本身只是个盒子，不会变。
+- **模板里自动解包**：编译器把 `setup` 顶层返回的 ref 绑定 unwrap 掉，所以 `{{ count }}` 直接写。这是**编译器行为**，不是魔法。
+- **解包是有边界的**：ref 嵌在 `reactive` 对象里（`state.count`）会自动解包；ref 放进**普通数组或普通对象**里不解包，`list[0]` 仍是 ref，必须 `.value`。`v-for` 拿到的项同理。
+
+解包边界用一段模板记最省事：
+
+```vue
+<script setup>
+import { ref, reactive } from 'vue';
+const count = ref(0);
+const state = reactive({ n: 0 });
+const list = ref([ref(1), ref(2)]);
+const plain = { inner: ref('x') };
+const objRef = ref({ deep: 1 });
+</script>
+
+<template>
+	<!-- ✅ 顶层 ref：编译器自动解包 -->
+	<p>{{ count }}</p>
+	<!-- ✅ reactive 属性 / ref 对象内部的 ref：也自动解包 -->
+	<p>{{ state.n }} {{ objRef.deep }}</p>
+	<!-- ❌ 普通对象里的 ref：不解包，写 {{ plain.inner }} 会打印 RefImpl 的字符串 -->
+	<p>{{ plain.inner.value }}</p>
+	<!-- ❌ 数组下标取出的 ref：同样要显式 .value -->
+	<p>{{ list[0].value }}</p>
+	<!-- ✅ v-for 遍历 ref 数组时，元素本身若为 ref 仍需 .value -->
+	<p v-for="(item, i) in list" :key="i">{{ item.value }}</p>
+</template>
+```
+
+顺带一条常被追问的边界：`v-for` 的别名如果直接是被 `reactive` 包的项，改它内部字段是可以的；但如果 `list` 是 `shallowRef`，`list.value[0].name = 'x'` 不会触发任何更新——代理只包到了数组本身，没包到元素。
+
+配套 API 的边界要拎清：
+
+| API | 作用 | 什么时候用 |
+|---|---|---|
+| `isRef(x)` | 判断是不是 ref | 写通用 composable 的参数归一化 |
+| `unref(x)` | 是 ref 就取 `.value`，否则原样返回 | 参数只允许"值或 ref"一种输入时 |
+| `toValue(x)`（3.3+） | 支持 getter：函数也会调用一次 | 参数想同时接受 ref / getter / 原值 |
+| `toRef(obj, key)` | 造一个指向对象属性的 ref，双向同步 | 只暴露一个字段给子组件 |
+| `toRefs(obj)` | 每个字段都转成 `toRef` | 解构 `reactive` 且不丢响应式 |
+| `shallowRef(x)` | 只有 `.value` 被替换才触发 | 大对象、第三方实例、频繁整体替换 |
+
+`ref` 和 `shallowRef` 的差别在**对内层对象是否递归响应**，而不是"有没有 `.value`"：两者都必须换 `.value` 才触发；差别在于 `state.value.a.b = 1` 这种深层写入，`ref` 触发，`shallowRef` 不触发。
+
+```js
+const rows = shallowRef(bigListFromApi.value); // 大表格：只认整体替换
+rows.value = [...rows.value];                  // 触发（新引用）
+triggerRef(rows);                              // 手动触发（原地 mutate 时用）
+rows.value[0].name = 'x';                      // 不触发
+```
+
+`shallowRef` 的定位：**当你确信"变化 = 换一整个值"**。列表分页、图表实例、worker 传回的快照，都符合这个模型。反过来，如果变化散落在字段级别，`shallowRef` 只会逼你到处 `triggerRef`，那就该回 `reactive` 或拆成多个 `ref`。
+
+### 4. reactive 的三大失效、深层代价与 computed 的脏标记
+
+**失效场景一：解构。** 解构走的是属性读取，得到的是一次求值后的**普通值**，从此与代理对象再无关系。
+
+```js
+const state = reactive({ user: { name: 'eth' } });
+const { user } = state;   // ❌ user 是那一刻拿到的嵌套代理，但 state.user 被整体换掉后它不会跟着换
+const { name } = state;   // ❌ 更彻底：name 是个字符串，彻底脱钩
+
+// 修法：需要解构时一律经 toRefs / toRef
+const { user, name } = toRefs(state); // 现在它们是 ref，模板里仍可不写 .value
+```
+
+解构丢响应的程度分两级：解构出**对象**还能改内部字段生效（子属性仍是代理），只是"整体替换 state.xxx"时断链；解构出**原始值**当场就断。
+
+**失效场景二：整体替换。** `state = reactive(...)` 换掉的是变量绑定的引用，模板里编译期绑定的是**原代理对象**的读取路径，新对象没有任何订阅者。
+
+```js
+// ❌ 断链
+state = reactive({ list: res.data });
+
+// ✅ 三选一
+Object.assign(state, res.data);       // 保持同一个对象，逐 key 写入
+list.value = res.data;                // 改用 shallowRef / ref，换的是 .value
+resetReactive(state, res.data);       // 自己封装：先清 key 再 assign
+```
+
+**失效场景三：传入非响应式来源。** 响应式只在"代理对象被读"这条路径上成立，一旦值离开这条路径就退化：
+
+- 拿到了原始对象：`reactive(raw)` 之后继续写 `raw.x`，不触发（代理缓存不会知道）。
+- 复制走了：`{ ...state }`、`JSON.parse(JSON.stringify(state))`、`structuredClone`、PostMessage、`localStorage` 存取，得到的都是全新的普通对象。
+- 外部数据源：`props` 里的普通对象、Pinia store 直接解构出来的 state 字段（要用 `storeToRefs`）、第三方 SDK 回调参数，都不因为"你把它存进了响应式变量"就自动联动，除非你显式赋值触发一次 `set`。
+
+**深层响应的代价**：`reactive` 每读一层就生成一层嵌套代理，`ref(大对象)` 首次访问也会把内层包成 `reactive`。开销主要在**内存**（Proxy 缓存 Map）和**首次遍历**，量级取决于对象规模——示例数据里 2000 行 × 20 列的表格全量 `reactive`，首次访问要遍历全部字段。生产上判断要不要 `shallowRef` 的办法不是猜，是**用 Performance 面板对比首帧与"输入后响应"两个指标**，具体量法在第 13 章。
+
+**computed：惰性 + 脏标记**。`computed` 内部也是一个 effect，但它不参与"立刻执行"：
+
+```js
+const fullName = computed(() => `${state.first} ${state.last}`);
+
+fullName.value; // 第一次：运行 getter，_cache = 结果，_dirty = false
+fullName.value; // 第二次：_dirty 为 false → 直接返回 _cache，getter 一次都没跑
+state.first = 'A'; // trigger 时只把下游 computed 标记为 dirty，不重算
+fullName.value; // 直到下一次真正被读，才重算一次
+```
+
+三个要点：
+
+1. **没人读就不算**：这就是它比"在事件里手动算好存起来"更省的原因。
+2. **标记脏，而不是重算**：脏标记沿依赖链向下游传播，重算推迟到读取时刻。
+3. **依赖变了才可能变**：getter 里读到的属性就是它的全部依赖；漏读（比如读了个普通对象字段）就是"computed 不更新"的第一嫌疑。
+
+第 2 点的"读取时才结算"在 `watch` 上表现成 flush 时机问题，是[第 04 章](/blog/posts/vue-roadmap-04-computed-watch/)的主题。
+
+**该用哪个？一张判定表**：
+
+```text
+数据是原始值 / 会被整体替换     → ref（或 shallowRef）
+数据是对象，字段级零散修改多   → reactive
+数据是对象，但只整体换不换内部 → shallowRef + 换 .value（图表实例、大数据快照）
+数据不该被响应式化           → markRaw / 存在闭包普通变量里
+需要跨组件保持同一个活引用     → toRef / toRefs / provide(ref)
+```
+
+`markRaw`（3.0+）的作用是"永久排除"：给对象打上 `__v_skip`，`reactive` 见到它就直接返回原对象，适合组件实例、第三方 SDK 句柄、大数组里的行数据对象。它和 `shallowRef` 的区别是层次——`shallowRef` 只管最外层，`markRaw` 管的是"这个对象本身永远不包代理"。
+
+```js
+import { markRaw, reactive, shallowRef } from 'vue';
+
+const chart = shallowRef(null); // 只认 .value 被换掉
+chart.value = markRaw(echarts.init(el)); // 内部方法/属性一律不包代理
+
+const table = reactive({ rows: markRaw(res.data) }); // 行对象不做深层响应
+```
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 声明一个可变状态 | `ref` / `reactive`，返回的引用可长期持有 | `useState`，值快照 + setter，状态本身不可直接改 |
+| 修改嵌套对象的一个字段 | `state.user.name = 'x'` 直接生效 | 必须造新引用 `setName({ ...user, name: 'x' })`，否则 `Object.is` 判定相同不重渲染 |
+| 谁在订阅这个值 | 运行时依赖收集，读取即订阅（细粒度） | 组件级订阅：state 变 → 该组件函数重跑 → 子组件默认跟着重跑 |
+| 派生值缓存 | `computed`，自动惰性 + 脏标记，无依赖数组 | `useMemo`，需自己写依赖数组，写漏就错 |
+| 把一个状态传给子组件并保持联动 | `toRef` / `storeToRefs` / `provide` ref | props 传值 + 子组件重渲染，或 Context |
+| 判断"改了会不会更新视图" | 问：这次读取有没有被收集，写入有没有换引用 | 问：这次 setState 的新值与旧值是否 `Object.is` 不同 |
+
+一句话概括差异：**React 的不更新通常是"引用没变"，Vue 的不更新通常是"订阅断了"**。所以排查方向也相反——React 顺着 setState 找引用是否新建，Vue 顺着"值是从哪个对象上读出来的"找代理链在哪一层断的。
+
+---
+
+## 翻车现场
+
+**场景一：解构后的表单对象传给子组件，保存后父表格不动。**
+
+- 症状：编辑弹窗里改完点保存，接口 200，数据库改了，但列表页那一行还是旧值；手动 F5 才看到新数据。控制台里直接 `console.log(rows.value[0])` 甚至能看到新值。
+- 根因：`const { row } = props` 或 `const { detail } = reactive(state)` 之后，子组件持有的是**求值那一刻的引用**。列表更新走的是 `rows.value = res.data`（整体替换），而组件里比较用的是被解构出来的旧对象；`console.log` 看到的是 Proxy 惰性求值的当下结果，跟渲染用的依赖不是同一批。加上弹窗把 `detail` 解构出去后 `state.detail = newData` 整体替换，`detail` 变量还指着旧代理。
+- 修法：跨组件传递的"活引用"一律用 `toRef` / `toRefs`；列表更新统一成"整体换 `.value`"而不是原地改子对象；组件里读的是 `props.row.xxx` 而不是解构出来的 `row.xxx`。
+
+**场景二：用 `reactive` 存列表后整体赋值，视图失效。**
+
+```js
+const state = reactive({ list: [], loading: false });
+
+async function load() {
+	state.loading = true;
+	const res = await api.getUsers();
+	state = reactive({ list: res.data, loading: false }); // ❌ 换了引用，模板不认识新对象
+}
+```
+
+- 症状：筛选、翻页后表格不动，但点页面上任何一个别的响应式控件（比如展开一个折叠面板）之后，数据"突然"跳成最新的那一批；调试时 `state.list` 确实是新数组。
+- 根因：赋值给 `state` 只是换了 setup 局部变量的绑定，不会产生任何 `trigger`，所以界面停在旧渲染。下一次由别的状态触发的重渲染里，render effect 读的是新对象，依赖才悄悄迁移过去——这就是"慢一拍、点别的才跳出来"的来源。而在 `setup()` 显式 return 的写法里，返回值是在 setup 结束时一次性快照的，重赋值那个变量永远不会被模板看到。
+- 修法：`Object.assign(state, { list: res.data, loading: false })`；或干脆改成 `const list = ref([])` + `list.value = res.data`。**列表、详情这类"每次都是新数据"的状态，用 `ref` / `shallowRef` 比 `reactive` 更贴合语义。**
+
+**场景三：字典 `Map` 换成新 Map 后不更新。**
+
+- 症状：登录后动态加载字典，第二次登录（或切换租户）后下拉选项还是旧字典。
+- 根因：把 `new Map()` 存在普通变量里（不是响应式），或存进 `reactive` 之后用 `state.dict.clear()` 加 `raw` 引用重设。`Map` 的响应依赖 `get`/`has`/`size` 陷阱被读过，切租户时如果代码走的是原始 Map，则没有任何订阅。
+- 修法：`const dict = shallowRef(new Map())`，加载完整体 `dict.value = new Map(entries)`；组件里读 `dict.value.get(code)`。这样"换字典"这件事就是一次可观察的引用替换。
+
+---
+
+## 复习卡片
+
+- **Q：Proxy 相比 defineProperty 到底多了什么能力？** A：拦截的是"对象上的操作"而非"已知属性的读写"，因此新增/删除属性、数组下标与 `length`、`in`、`Map`/`Set` 方法都能被追踪。
+- **Q：为什么 `reactive` 对象不能解构？** A：解构是一次求值，得到的值/子引用脱离了代理链，之后整体替换原对象的字段时没人通知它；要解构就 `toRefs`。
+- **Q：ref 为什么需要 `.value`，模板里为什么不用写？** A：基本类型无法被 Proxy 包，只能放进对象盒子里；模板里由编译器对 setup 顶层 ref 自动 unwrap，嵌在普通数组/对象里的 ref 不解包。
+- **Q：改了数据视图不动，第一反应查什么？** A：三件事——这次读取有没有被收集（是否被 `v-if` 挡了/搬到异步里了）、写入是不是换了新引用、值有没有在传递路上被复制或解构脱离代理。
+- **Q：`ref` 与 `shallowRef` 的分界线在哪？** A：都要换 `.value` 才触发；差别在内层对象是否递归响应，"变化等于整体换新值"用 `shallowRef`，字段级零散变化用 `ref` / `reactive`。
+- **Q：computed 为什么"读十次和读一次一样便宜"？** A：getter 结果被缓存，依赖变化只把脏标记传播下来，真正的重算推迟到下一次被读取时发生一次。
+
+---
+
+## 小结
+
+- Proxy 的价值在于**覆盖"结构变化"**（新增、删除、数组长度、集合），代价是**只能拦截代理对象本身**，一旦复制、解构、换引用就断链。
+- 依赖收集的本质是 `track`（读时把 `activeSub` 记进 Dep）和 `trigger`（写时唤醒 Dep 里的订阅者）；**没被读过的属性不是响应式失效，是根本没订阅**。
+- `ref` 是值类型的包装盒子，`.value` 是 JS 侧的必然成本，模板里的自动解包是编译器给的；记住"嵌在普通数组/对象里不解包"这一条例外。
+- `reactive` 三大失效：解构、整体替换、值离开代理链（复制/原始对象/外部数据源）。修法分别是 `toRefs`、`Object.assign` 或改 `ref`、显式赋值触发一次 `set`。
+- 深层响应是按读取付费的；大数据用 `shallowRef` + 整体替换，需要原地改再 `triggerRef`。要不要换、换成什么，用数据说话，判定动作见[路线总览第 1 节的尺子](/blog/posts/vue-roadmap-00-overview/)。
+- `computed` = 惰性 + 脏标记 + 依赖收窄。它是响应式系统里"读时才结算"的样例，`watch` 的时机问题从同一处派生。
+
+---
+
+## 练习
+
+1. 造一个 `reactive` 对象，分别用 `state.list[0].name = 'x'`、`Object.assign(state, ...)`、`state = reactive(...)`、`const { list } = state` 四种写法，逐个判断视图是否更新并在纸上写出订阅链断在哪。耗时约 8 分钟。
+2. 把上一题的场景改造成"正确姿势"：`toRefs` 解构 + `ref` 存列表 + 整体替换 `.value`，并给一个 `shallowRef` 版本；用 `triggerRef` 演示一次原地 mutate 后手动唤醒。
+3. **可见交付物**：写一个 `useUserForm(raw)` composable，返回值形如 `{ form, errors, dirty, reset }`，要求：外部传入的 `raw` 是普通对象且可能在任意时刻被整体替换；`form` 必须能安全解构（内部用 `toRefs`）；`dirty` 是一个 `computed`，只在字段被真正改过时为 `true`。附上 3 条断言测试：解构后写入能反映到 `dirty`、整体替换后能反映、未读取的字段不触发任何重新计算。
+
+---
+
+## 面试一句话
+
+> "Vue 3 用 Proxy 把拦截粒度从'属性'提到'操作'，所以新增删除、数组下标和 Map/Set 都能响应；代价是 Proxy 只能拦截代理对象本身，因此响应式失效基本都出在链路上——解构拿到的是求值后的普通值、整体替换换了引用让模板订阅的旧对象无人问津、复制或传给第三方让值离开代理链。排查时我按两条线走：这次读取有没有被 `activeSub` 收集到，这次写入有没有落在被收集过的那个对象上。"

@@ -47,6 +47,14 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 				chips: ["Hooks", "状态管理", "性能"],
 			},
 			{
+				title: "Vue 3 从组合式到工程化",
+				abbr: "Vue",
+				desc: "响应式机制、Composable 契约、Pinia 与动态权限路由，逐章对照 React",
+				url: "/vue-roadmap/",
+				category: "Vue学习路线",
+				chips: ["组合式 API", "Pinia", "Element Plus"],
+			},
+			{
 				title: "Next.js 全栈实战",
 				abbr: "Next",
 				desc: "从 App Router、RSC 到认证、数据库与生产部署，把 React 能力延伸到服务端",

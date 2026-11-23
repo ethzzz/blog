@@ -1,0 +1,365 @@
+---
+title: '08 · 生命周期与 effectScope：谁来清理'
+published: 2026-11-22T16:00:00+08:00
+description: '生命周期与 effectScope：Vue 3 与 Vue 2 的名称差异、setup 对应哪个阶段、组件卸载不会自动清理的六类资源、onScopeDispose 与 effectScope().stop() 的机制、composable 在组件外调用为什么要显式作用域、keep-alive 下 mounted 只跑一次的真实后果。'
+tags: [Vue, 生命周期, effectScope, onScopeDispose, "keep-alive"]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章回答一个非常具体的问题：**我创建的东西，谁负责销毁？**
+> 真实场景：一个带实时预览的编辑页，`useEventSource` 在组件里开了 SSE。测试环境跑两天没问题，
+> 上线后网关报"连接数超限"，排查发现监控图上连接数**随用户开关预览面板的次数线性增长**——组件卸载了，SSE 没关。
+> Vue 的卸载只回收它认识的东西；从外部借来的资源（定时器、事件、订阅、第三方实例）Vue 一个都不认识。
+> 面试里这属于[前端面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)「生命周期」一节（Q8/Q9 顺序题）的进阶版：
+> 能把 `beforeDestroy` 改名、`created` 消失、`effectScope` 三层讲清，才算是真的答完。
+
+---
+
+## 一句话本质
+
+**组件卸载 ≠ 资源释放。** Vue 3 的回收单位是**作用域（effect scope）**，不是组件：每个组件实例内部持有一个作用域，
+`watch` / `watchEffect` / `computed` 创建时登记在"当前作用域"上，卸载时作用域 `stop()`，登记的东西才被停掉。
+而 `addEventListener`、`setInterval`、SSE、第三方图表实例、外部 store 的订阅，**从来就没被登记过**，
+它们只能由你主动挂到 `onScopeDispose` 上，或者由你自己在 `onUnmounted` 里关掉。
+
+---
+
+## 原理拆解
+
+### 1. 先对齐名称：Vue 2 → Vue 3 到底改了什么
+
+| Vue 2 选项 | Vue 3 Options API | Vue 3 Composition API | 变化说明 |
+|---|---|---|---|
+| `beforeCreate` | `beforeCreate` | **无对应钩子** | 3.x 里 setup 的执行点就在这附近，钩子失去意义 |
+| `created` | `created` | **无对应钩子** | setup 同步部分等价于 created：状态已可用、DOM 还没有 |
+| `beforeMount` | `beforeMount` | `onBeforeMount` | 名称统一成动词现在式 |
+| `mounted` | `mounted` | `onMounted` | DOM 可用；**keep-alive 下只执行一次** |
+| `beforeUpdate` | `beforeUpdate` | `onBeforeUpdate` | 一致 |
+| `updated` | `updated` | `onUpdated` | 一致；想"改完 DOM 再做事"用 `nextTick` |
+| `beforeDestroy` | `beforeUnmount` | `onBeforeUnmount` | **改名**：destroy → unmount |
+| `destroyed` | `unmounted` | `onUnmounted` | **改名**；这是清理订阅的主要落点 |
+| `errorCaptured` | `errorCaptured` | `onErrorCaptured` | 错误边界，16 章展开 |
+| `renderTracked` / `renderTriggered` | 同名 | `onRenderTracked` / `onRenderTriggered` | 仅开发调试 |
+| （无） | `serverPrefetch` | `onServerPrefetch` | SSR 数据预取，见第 4 节 |
+| （无） | （无） | `onActivated` / `onDeactivated` | keep-alive 专属 |
+| （无） | （无） | `onScopeDispose` | **不属于组件生命周期**，属于作用域 |
+
+两个高频追问：
+
+**为什么没有 `beforeCreate` / `created`？** 因为 `setup()` 本身就是那段时间。实例被创建出来、
+props 已解析可用、`setup` 同步执行完才开始初始化 Options API 的状态（data/computed/methods）。
+所以"created 里干的活"直接写在 setup 顶层，写钩子反而是多余的一层。**副作用**是：setup 顶层没有"实例还没好"的保护期，
+`this`、`$refs`、DOM 都拿不到，需要 DOM 必须等 `onMounted`。
+
+**`onScopeDispose` 和 `onUnmounted` 有什么不一样？** 前者跟**作用域**走，后者跟**组件实例**走。
+组件内两者时序几乎重合（组件作用域随实例销毁而 stop），差别在组件外：`effectScope().run()` 里没有组件实例，
+`onUnmounted` 会直接告"no active component instance"，`onScopeDispose` 依然有效。**这就是 composable 应该用后者的理由**——
+它让 composable 不假设自己一定住在组件里。
+
+时序细节（父子 + keep-alive），面试常考顺序题：
+
+```text
+首次挂载：
+  父 beforeCreate(setup) → 父 created(=setup 结束) → 父 onBeforeMount
+    → 子 setup → 子 onBeforeMount → 子 onMounted
+  → 父 onMounted
+（子先完成 mounted，父最后 mounted：DOM 是自底向上组装的）
+
+keep-alive 内切换回来：
+  onActivated（onMounted 不再执行）
+切换走：
+  onDeactivated（onUnmounted 不执行）
+
+卸载：
+  父 onBeforeUnmount → 子 onBeforeUnmount → 子 onUnmounted → 父 onUnmounted
+```
+
+### 2. 卸载不会自动清理的六类东西，以及作用域机制
+
+| 类别 | 例子 | Vue 是否自动回收 | 正确落点 |
+|---|---|---|---|
+| 响应式副作用 | `watch` / `watchEffect` / `computed` | ✅ 是（登记在当前作用域） | 无需处理；但要确认创建点在有作用域的地方 |
+| DOM 事件 | `window.addEventListener('resize', fn)` | ❌ 否 | `onScopeDispose` |
+| 定时器 | `setInterval` / 防抖 `setTimeout` | ❌ 否 | `onScopeDispose` |
+| 长连接 | `EventSource`(SSE) / `WebSocket` | ❌ 否 | `onScopeDispose` 里 `close()` |
+| 第三方实例 | ECharts / editor / map / 组件库实例 | ❌ 否 | `dispose()` / `destroy()` |
+| 外部订阅 | `store.$subscribe` / mitt / RxJS | ❌ 否 | `$unsubscribe` / `off` / `subscription.unsubscribe()` |
+
+机制层面，作用域是"可以嵌套、可以整体停掉"的容器：
+
+```ts
+// 概念模型：一个组件实例 ≈ 一个内部 EffectScope
+const scope = effectScope();          // 组件的 setup 跑在 scope.run() 里
+scope.run(() => {
+  watch(a, cb);                       // 登记的 effects: [watcherA]
+  const s2 = effectScope();           // 嵌套子作用域（07 里的显式 scope 就是这个）
+  s2.run(() => watch(b, cb));
+});
+scope.stop();                         // effects 全停 + cleanups 全跑 + 子作用域递归 stop
+```
+
+`onScopeDispose(fn)` 就是往"当前作用域"的 cleanups 数组里塞一个函数，`stop()` 时按注册顺序执行。
+`getCurrentScope()` 可以探测自己是不是在一个活的作用域里——这是写"能在组件外安全使用"的 composable 的关键工具。
+
+组件内的标准写法（注意清理注册在创建旁边，而不是散落到 `onUnmounted`）：
+
+```ts
+// composables/usePolling.ts
+import { onScopeDispose, ref } from 'vue';
+
+export function usePolling(fn: () => Promise<void>, interval = 5000, immediate = true) {
+  const isRunning = ref(false);
+  let id: ReturnType<typeof setInterval> | undefined;
+
+  async function tick() {
+    if (isRunning.value) return;      // 防重入：上一轮没完不发下一轮
+    isRunning.value = true;
+    try { await fn(); } finally { isRunning.value = false; }
+  }
+
+  id = setInterval(tick, interval);
+  if (immediate) void tick();
+
+  onScopeDispose(() => {
+    if (id) clearInterval(id);        // 卸载 or scope.stop() 都会走到这里
+  });
+
+  return { isRunning, tick };
+}
+```
+
+> [!TIP]
+> 判据：**"创建资源"和"释放资源"必须出现在同一个函数体内、相隔不超过几十行。**
+> 把清理写在另一个钩子里（甚至另一个文件），三年后一定有人只改创建不改释放。
+
+补两个必须知道的机制细节，它们决定了写法能不能复用：
+
+```ts
+// 1) 事件总线 / 外部订阅：清理函数是「注册返回的」，别自己重造
+import { onScopeDispose } from 'vue';
+import mitt from 'mitt';
+export const bus = mitt<{ 'dict:changed': string }>();
+
+export function useDictSync(onChanged: (type: string) => void) {
+  bus.on('dict:changed', onChanged);
+  onScopeDispose(() => bus.off('dict:changed', onChanged));  // 必须传同一个函数引用
+}
+
+// 2) 作用域 stop 之后不可复用：再 run() 不生效（开发环境会 warn），
+//    所以「可重开的逻辑」要每次新建 scope，而不是复用同一个
+const scope = effectScope();
+scope.run(() => { /* ... */ });
+scope.stop();
+scope.run(() => { /* 这里创建的 watcher 不会被收集，也不会执行清理 */ });
+```
+
+第二条在"页面级 composable 被反复开关"的场景里最容易撞上（弹窗、抽屉、可折叠面板）：
+`stop()` 过的 scope 再 `run`，watcher 会照建，但**不再被回收**，等于一次性泄漏生成器。
+正确做法是把 `effectScope()` 放在**每次开启时执行**的代码路径里，`stop()` 与创建成对。
+
+### 3. composable 在组件外调用：为什么必须显式 scope
+
+这是 L2 与 L1 的分水岭。composable 不再只在组件里被调用，最常见的三个"组件外宿主"：
+
+```ts
+// 宿主 A：Pinia store（setup store 里的 watch 不会随某个页面卸载）
+export const useUiStore = defineStore('ui', () => {
+  const collapsed = ref(false);
+  // ❌ 直接 watch：它登记在创建 store 时的作用域上，实践中等于"活到进程结束"
+  // ✅ 显式包一层，并且给 store 留出主动停的口子
+  const scope = effectScope();
+  scope.run(() => {
+    watch(collapsed, (v) => localStorage.setItem('ui.collapsed', String(v)));
+  });
+  function $dispose() { scope.stop(); }      // 单测/热更新/HMR 时调用
+  return { collapsed, scope, $dispose };
+});
+
+// 宿主 B：路由守卫 / 应用启动逻辑
+const guardScope = effectScope();
+guardScope.run(() => {
+  watch(() => router.currentRoute.value.meta.title, (t) => { document.title = String(t ?? ''); });
+});
+// 应用卸载/测试 teardown 时 guardScope.stop();
+
+// 宿主 C：普通函数（无组件、无作用域）
+export function startGlobalHeartbeat(url: string) {
+  const scope = getCurrentScope();
+  if (!scope) {
+    // 调用方没给作用域：要么显式创建并要求返回 stop，要么抛错
+    const own = effectScope();
+    own.run(() => { /* watch + setInterval */ });
+    return () => own.stop();
+  }
+  onScopeDispose(() => { /* 清理 */ });
+  return () => {};
+}
+```
+
+三条硬规则：
+
+1. **组件外创建 `watch` 而不 `stop`，它就是进程级的**。表现是内存随操作次数线性上涨、回调重复触发（N 个页面 × M 次进入）。
+2. **`onScopeDispose` 只在有作用域时有效**。在纯函数里裸调它，开发环境会 warn "onScopeDispose() is called when there is no active effect scope to be associated with"，
+   而且**不会报错**——这是最难查的一类泄漏，因为它静默。
+3. **不要靠 `getCurrentInstance()` 判断**，用 `getCurrentScope()`：前者只对组件有效，后者覆盖所有作用域宿主。
+
+### 4. keep-alive 与 SSR：两个改变时机的特性
+
+**keep-alive**：被缓存的组件第一次挂载走 `mounted`，之后每次激活/失活走 `onActivated` / `onDeactivated`，`unmounted` 一次都不走。
+于是"列表页 → 详情页 → 返回列表"这个中后台最高频的路径出现两个后果：
+
+```vue
+<script setup lang="ts">
+// ❌ 只在 mounted 拉数据：从详情页返回时列表还是三天前的
+const { load } = useOrderList();
+onMounted(load);
+
+// ✅ 首次挂载 + 每次激活都能刷新，且避免"首次请求两次"
+let firstDone = false;
+onMounted(async () => { await load(); firstDone = true; });
+onActivated(() => { if (firstDone) void load(); });
+
+// ✅ 更省事的等价写法：只在 onActivated 里拉（keep-alive 下 activated 首次也会触发）
+// 注意：一旦组件不在 keep-alive 里，activated 就永远不触发，所以这种写法依赖宿主
+onActivated(load);
+</script>
+```
+
+选型建议：`onMounted` 做"必须只做一次的昂贵初始化"（建 WebSocket、注册全局监听），`onActivated` 做"每次可见时的数据新鲜度检查"，
+并用一个 `isDirty` 标记（详情页保存成功后由 store 或事件置脏）避免每次返回都发请求。
+失效策略与缓存的完整方案见 [异步数据与缓存](/blog/posts/vue-roadmap-12-async-data-cache/)。
+
+把"哪些钩子在哪个宿主下会跑"写成一张表，比记忆可靠：
+
+| 钩子 / API | 普通组件 | keep-alive 内的组件 | 组件外（store / 守卫 / 纯函数） | SSR 服务端 |
+|---|---|---|---|---|
+| setup 同步段 | 每次实例创建 | 每次实例创建（缓存命中则不再创建） | 取决于宿主调用次数 | ✅ 执行 |
+| `onBeforeMount` / `onMounted` | ✅ | 仅首次 | ❌ 无实例，warn | ❌ |
+| `onBeforeUpdate` / `onUpdated` | ✅ | ✅（失活期间不更新，除非 `include` 变化触发） | ❌ | ❌ |
+| `onActivated` / `onDeactivated` | ❌ 永不 | ✅（首次也触发 activated） | ❌ | ❌ |
+| `onBeforeUnmount` / `onUnmounted` | ✅ | 缓存时不走；被 `max` 淘汰或路由销毁才走 | ❌ | ❌ |
+| `onScopeDispose` | ✅ | ✅ | ✅（前提是有活动作用域） | ✅（作用域随渲染结束释放） |
+| `onServerPrefetch` | 空转 | 空转 | ❌ | ✅ |
+
+最后一列的实用性：`onUnmounted` 里写的清理在服务端永远不会被执行，所以**服务端渲染期间创建的外部资源没人关**。
+纪律是：`window` / `document` / 定时器 / 订阅的创建点要么放进 `onMounted`，要么用 `import.meta.env.SSR`（或 `typeof window === 'undefined'`）先挡住。
+
+**SSR**：服务端只执行到 `beforeCreate` / `created` 这一段语义——也就是 **setup 的同步部分 + `onServerPrefetch`**。
+`onMounted`、`onActivated`、`watch` 的回调、DOM 访问，在服务端**一律不发生**。三条推论：
+
+- setup 顶层直接碰 `window` / `document` / `localStorage` 会在服务端抛错（本地 dev 走客户端渲染看不出来，上线才炸）。
+- 需要在服务端拿数据的，写 `onServerPrefetch`（或走框架的 data loader / Suspense 路径，见 12）。
+- setup 里 `await` 之后注册 `onMounted` 是**无效的**（越过了同步执行段，实例上下文已丢；07 现场 3 从设计角度讲过，这里补时机解释）。
+
+```ts
+// 服务端预取 + 客户端复用同一份 store 状态（10 讲水合）
+onServerPrefetch(async () => {
+  const store = useUserStore();
+  if (!store.profile) await store.fetchProfile();
+});
+```
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| "挂载后跑一次" | `onMounted`（setup 同步注册） | `useEffect(fn, [])` |
+| 卸载清理 | `onScopeDispose` / `onUnmounted` | `useEffect` 返回的 cleanup |
+| 依赖变化时的清理 | watcher 的 `onCleanup` 参数或 `onWatcherCleanup`（3.5+），**跟着数据变** | effect 重跑前调用上次 cleanup，**跟着依赖数组声明变**（[React Hooks 基础](/blog/posts/react-roadmap-05-hooks-basic/) 里那条规则） |
+| 一段逻辑在组件外复用并保留清理能力 | `effectScope().run()` + `scope.stop()` | **没有对应机制**：Hook 离开渲染就没有生命周期，只能自建 `subscribe` / store 或 `useSyncExternalStore` |
+| 返回时刷新（缓存页） | `onActivated` 内建（配合 keep-alive） | 无内建，要自己做（组件不卸载 or 第三方 keep-alive 库 or router state 标记） |
+| 服务端阶段 | setup 同步段 + `onServerPrefetch` | RSC / `getServerSideProps` / Suspense SSR（Next 里由框架代管） |
+
+最本质的一条差异：**React 的 effect 属于"渲染"，Vue 的 effect 属于"作用域"。**
+所以 React 里"清理"这件事只能发生在组件内（组件外你根本没有渲染生命周期可言），
+而 Vue 里可以把 `effectScope` 传给任何宿主，清理语义与组件解耦。
+这也解释了为什么 Vue 社区能自然长出 `vueuse` 这种"脱离组件也能跑"的组合式生态，而 React 生态里同类能力基本都长在 store 层。
+
+还有一个反差值得单独记，因为它决定了你写的清理代码"扛不扛得住开发环境"：
+
+| 现象 | React 18+ StrictMode | Vue 3 |
+|---|---|---|
+| 开发环境挂载两次（mount → unmount → mount） | ✅ 会，effect 跑两遍 | ❌ 不会，组件只挂载一次 |
+| 因此对清理的要求 | **必须幂等**：注册/注销要成对，否则第二次挂载直接暴露重复计数 | 无此约束，但也意味着**写漏清理在开发环境完全看不出来** |
+| 检测泄漏的手段 | 开 StrictMode 就报（计数翻倍） | 只能靠 `onScopeDispose` 纪律 + Memory 快照 + 自建计数器 |
+
+结论有点反直觉：**同一个"忘记清理"的 bug，React 里开发环境就会炸，Vue 里要上线跑两天才被发现。**
+从 React 转到 Vue 的人尤其容易在这一点上失去警觉——因为他过去是被 StrictMode 免费提醒的。
+
+---
+
+## 翻车现场
+
+### 现场 1：SSE 连接数随开合次数线性增长
+
+- **症状**：网关监控里到 `/api/preview/stream` 的活跃连接只涨不降；Node 侧 EventLoop 延迟升高；页面切换后控制台仍在打印旧页面的推送日志。
+- **根因**：`useEventSource` 在 setup 里 `new EventSource(url)`，没有注册任何清理。响应式的 ref 更新了，但连接是外部资源，组件卸载不会关它。
+- **修法**：`onScopeDispose(() => es.close())`。同时把 `watch` 建在正确的宿主里——如果 `url` 来自 `inject`，
+  还要防"父组件换了 url 但旧连接没关"，那属于 watcher 的清理，不是作用域清理（两层都要有）。
+
+### 现场 2：keep-alive 下列表页"数据不刷新"，改成 `onActivated` 后又"多请求一次"
+
+- **症状**：先是详情页改完返回列表看到旧数据；补了 `onActivated` 之后，第一次进入列表页 Network 里出现两次相同请求。
+- **根因**：`onMounted(load)` 与 `onActivated(load)` 同时存在，而 keep-alive 下**首次挂载也会触发 `activated`**，两条路径各发一次。
+- **修法**：二选一，或加 `firstDone` 门槛（见第 4 节代码）。更稳的做法是把"是否需要刷新"做成数据属性：
+  详情页成功后 `store.markListDirty()`，列表页 `onActivated(() => { if (store.isDirty) load(); })`——
+  既不多发请求，也不漏刷新，且这条判断本身就是"缓存失效策略"的最小版本（12）。
+
+### 现场 3：模块级 `watch` + HMR，回调触发次数翻倍
+
+- **症状**：改了 `store/ui.ts` 保存（Vite 热更新）之后，一次操作打出两条副作用日志；生产环境正常，只有本地和预发出现。
+- **根因**：`watch` 写在模块顶层（或写在只创建一次的 store 里），HMR 替换模块时旧作用域没有被 stop，旧 watcher 与新 watcher 并存。
+- **修法**：把这些副作用收进显式 `effectScope()`，并导入 `import.meta.hot?.dispose(() => scope.stop())`；
+  或干脆把 watch 建在组件/setup store 的作用域里。**顺带确立一条纪律：不要在模块顶层创建 watcher。**
+
+---
+
+## 复习卡片
+
+- **Q：Vue 3 里 `created` 去哪了？** A：`setup()` 的同步部分就是 created；Composition API 不给对应钩子，`beforeCreate` 同理消失。
+- **Q：`beforeDestroy` / `destroyed` 改名成什么？** A：`beforeUnmount` / `unmounted`，钩子形态是 `onBeforeUnmount` / `onUnmounted`。
+- **Q：组件卸载会自动回收什么、不会回收什么？** A：只回收登记在当前作用域上的响应式副作用（watch/watchEffect/computed）；事件监听、定时器、SSE、第三方实例、外部订阅一律不回收。
+- **Q：`onScopeDispose` 与 `onUnmounted` 的选型判据？** A：composable 用 `onScopeDispose`（它不假设宿主是组件）；组件自身的、明确只在实例卸载时做的事用 `onUnmounted`。
+- **Q：keep-alive 下 `mounted` 和 `activated` 谁先跑、首次会跑几次？** A：`mounted` 只在首次、`activated` 首次及每次激活都跑（顺序 mounted → activated），所以两边都写加载就会重复请求。
+- **Q：SSR 会执行哪些生命周期？** A：只有 beforeCreate/created 语义，即 setup 同步段 + `onServerPrefetch`；`onMounted` 及其后的钩子全部不执行。
+
+---
+
+## 小结
+
+- 回收单位是**作用域**，不是组件；"卸载了"不等于"关掉了"。
+- 六类外部资源（事件、定时器、长连接、第三方实例、外部订阅、模块级 watcher）必须自己挂 `onScopeDispose`，且**创建与释放写在同一处**。
+- composable 用 `onScopeDispose` + `getCurrentScope()` 探测，才能安全地在 store、守卫、纯函数里运行；`onScopeDispose` 在无作用域时只 warn 不抛错，是最阴的静默泄漏。
+- keep-alive 把"数据新鲜度"责任从 `mounted` 移到 `activated`，用脏标记避免重复请求。
+- SSR 只跑 setup 同步段，数据预取放 `onServerPrefetch`；setup 顶层不要碰 `window`，`await` 之后不要注册生命周期钩子。
+
+---
+
+## 练习
+
+1. 打印一份真实时序：写一个父组件套两个子组件，其中一个在 `keep-alive` 里，父子各注册 `onBeforeMount` / `onMounted` / `onActivated` / `onDeactivated` / `onBeforeUnmount` / `onUnmounted` 并 `console.log` 组件名 + 钩子名。
+   切换路由两次，把输出顺序整理成表格，和第 1 节的时序对照，标出你之前答错的一条。
+2. 把项目里一个 store（或一个启动期的 `watch`）改造成显式 `effectScope`：导出 `$dispose()`，加 `import.meta.hot?.dispose`，
+   并写一个单测断言"`scope.stop()` 之后 watcher 不再触发"。
+3. **可见交付物**：实现 `useInterval(fn, delay)`，要求在**三种宿主**下都不泄漏——组件内、`effectScope()` 手动作用域内、组件外纯函数（返回 stop 函数）。
+   配一个证明脚本或页面：内部维护一个模块级 `activeCount`，每秒 `setInterval` 心跳里 `activeCount++` 并打印；
+   反复挂载/卸载组件 50 次后，断言"心跳次数增长速率回到基线（只剩仍在挂载的实例）"，并在 Chrome DevTools → Memory 里做一次
+   Heap Snapshot 对比（Take snapshot → 循环挂载卸载 50 次 → Take snapshot → 按 `Detached` / 定时器闭包过滤）。
+   怎么读这两张快照（retained size、detached DOM、对比视图的选法）见
+   [浏览器运行时性能](/blog/posts/browser-roadmap-09-runtime-performance/)，别只凭"数字变大了"下结论。
+   交付：三宿主用例 + 一张前后堆快照对比说明（写清 retained size 的量级和你是怎么测的）。
+
+---
+
+## 面试一句话
+
+> "Vue 3 的回收单位是作用域而不是组件：组件实例内部有一个 effect scope，`watch`、`watchEffect`、`computed` 创建时登记在它上面，
+> 卸载时随 `stop()` 一起释放；但事件监听、定时器、SSE、第三方实例这些外部资源 Vue 从来不知道，必须我自己在创建的同一处调 `onScopeDispose`。
+> 所以我写 composable 一律用 `onScopeDispose` 而不是 `onUnmounted`——它不假设宿主是组件，
+> 在 store、路由守卫里也能用；代价是没有活动作用域时它只给开发环境警告、不抛错，属于静默泄漏，所以要用 `getCurrentScope()` 探测并显式建 `effectScope`。
+> 另外两个改时机的点：keep-alive 下 `mounted` 只跑一次、`activated` 每次可见都跑（首次两个都跑，所以加载逻辑只放一处并配脏标记）；
+> SSR 只执行 setup 同步段和 `onServerPrefetch`，`onMounted` 里的事在服务端一定不发生，这就是为什么 setup 顶层不能碰 `window`。"

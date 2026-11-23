@@ -1,0 +1,423 @@
+---
+title: '16 · 错误处理与线上排查：从白屏到 sourcemap'
+published: 2026-11-23T00:00:00+08:00
+description: 'Vue 3 错误处理的三层捕获体系：app.config.errorHandler 全局兜底、onErrorCaptured 局部边界与返回 false 阻断、为什么 Vue 没有一等公民 ErrorBoundary 组件以及如何用局部边界组件加受控 key 重置手写等价物；异步错误为什么接不住、渲染期错误导致白屏的定位路径、生产 sourcemap 上传与栈还原、错误聚合去噪、Loading chunk failed 的完整解法与动态路由叠加场景，附 30 分钟定位 checklist。'
+tags: [Vue, 错误处理, 白屏, sourcemap, 线上排查]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这章解决总览尺子 5 那一件事：**线上白屏时，30 分钟内定位到根因**——并且知道这次到底是错误边界没接住、路由 chunk 404，还是数据把渲染打崩了。
+> 真实场景：某次后台发布 20 分钟后两类反馈同时进来。一批人"点订单页整页空白，导航都没了，刷新也没用"；另一批人"弹窗提示页面加载失败，点确定就好"。前者是渲染期错误没被任何局部边界接住，后者是旧 chunk 被删。两条链路都有固定解法，但这需要**提前埋好三层捕获 + sourcemap + 版本探测**，现场临时补不可能。
+> 同类需求在 React 栈的写法见 [React 路线错误边界篇](/blog/posts/react-roadmap-14-error-boundaries/)，本章的对照表是按那一篇的结构对齐的；问答形态见[面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)的「常见坑速查表」。
+
+---
+
+## 一句话本质
+
+Vue 的错误处理是**沿组件树向上冒泡的钩子体系**（`onErrorCaptured` → `app.config.errorHandler`），不是"包一层组件就安全"的边界模型。所以它的覆盖面比 React 错误边界**更宽**（连 watcher 和模板事件处理都算），但对**异步错误一律无能为力**，那部分只能靠 `window.onerror` 和 `unhandledrejection` 兜。线上能不能救命，取决于你有没有提前把这三件事做完：局部边界、sourcemap 上传、chunk 加载失败恢复。
+
+---
+
+## 原理拆解
+
+### 1. 三层捕获：谁接得住什么
+
+先给这张覆盖表，它是本章所有判断的基础：
+
+| 错误来源 | `onErrorCaptured` | `app.config.errorHandler` | `window.onerror` | `unhandledrejection` |
+|---|---|---|---|---|
+| setup / render 抛错 | 能（注册组件的后代出错时） | 能 | 不能 | 不能 |
+| 生命周期钩子（含 `onMounted` 里同步抛错） | 能 | 能 | 不能 | 不能 |
+| `watch` / `watchEffect` 回调**同步**部分 | 能 | 能 | 不能 | 不能 |
+| 模板里绑定的事件处理（同步部分） | 能 | 能 | 不能 | 不能 |
+| `setTimeout` / `Promise.then` / `async` 函数里抛错 | **不能** | **不能** | 能（同步抛出的） | 能（未 catch 的 rejection） |
+| 第三方库自己的回调（`addEventListener`、SDK onmessage） | 不能 | 不能 | 能 | 能 |
+| 资源加载失败（脚本、chunk、图片） | 不能 | 不能 | 不能 | 不能（要 `error` 捕获阶段监听） |
+
+机制上讲：Vue 在被它管理的调用入口外面包了一层错误处理（render、生命周期、watcher、事件监听都会被包），包里的错误会沿 `parent` 链向上找注册过 `onErrorCaptured` 的组件，一路到根都没人接，就交给 `app.config.errorHandler`；两处都没配，则错误被 `setTimeout` 异步重抛，最终落到 `window.onerror`——**这也是为什么很多人只在控制台看到一行红字，业务代码却毫无感知**。
+
+全局兜底要写成"只上报、不吞异常"：
+
+```ts
+// src/main.ts
+app.config.errorHandler = (err, instance, info) => {
+  reportError(err, {
+    lifecycleHook: info,                                  // 'render'、'watcher'、组件名等上下文
+    component: instance?.$?.type.name ?? 'anonymous',
+    route: router.currentRoute.value.fullPath,
+    release: import.meta.env.VITE_APP_VERSION,
+  })
+  if (import.meta.env.DEV) console.error(err)             // 开发环境保持可见
+}
+```
+
+局部边界靠 `onErrorCaptured`，它的两个语义必须记准：
+
+1. **冒泡顺序是从最近的祖先开始**，一路向上，直到有人返回 `false`；
+2. **返回 `false` 才会阻断**，不返回值（或返回 `undefined`）会继续向上冒泡——所以"每个边界都上报、只有最外层兜底"这种组合是天然支持的；
+3. **它接不住自己所在组件的错误**（自己出错时已经没法靠自己的钩子处理），要接住边界组件自身的错误，得让它的父级也有一层。
+
+### 2. 为什么 Vue 没有一等公民 `ErrorBoundary` 组件
+
+三个原因，面试里说得清就够了：
+
+- **组合式钩子已经够用**：`onErrorCaptured` + 一个 `hasError` 状态 + `v-if` 就能表达"降级 UI"，不需要 class 生命周期（React 那边必须 class，是因为它只有 `getDerivedStateFromError` 这个渲染期钩子能改 state）。
+- **官方没有定义"错误后子树怎么办"的语义**：React 明确会卸载整棵子树并回滚；Vue 的行为是错误冒泡之后，出错组件可能停在**半成品状态**（`setup` 跑了一半、render 返回 `undefined`）。这就是"社区包各写一套"的根源——也解释了为什么很多"看起来兜住了但界面残缺"的现象。
+- **缺少重试/回滚的原生能力**：所以正确写法是**用 `key` 主动重建子树**，把"重置"这件事显式化。
+
+手写一个等价物（这就是本章要交付的可复制件）：
+
+```vue
+<!-- src/components/AppBoundary.vue -->
+<script setup lang="ts">
+import { reportError } from '@/utils/report'
+import { getBoundaryErrorText } from '@/utils/errorText'
+
+const props = defineProps<{ name: string; resetKey?: string }>()
+
+const err = shallowRef<Error | null>(null)
+const attempt = ref(0)
+const showStack = import.meta.env.DEV
+const router = useRouter()
+
+onErrorCaptured((e, instance, info) => {
+  err.value = e instanceof Error ? e : new Error(String(e))
+  reportError(e, { boundary: props.name, info, component: String(instance?.$?.type.name ?? '') })
+  return false                       // 阻断：不再向上冒泡，避免整树被外层兜底卸掉
+})
+
+// 重置：换 key 让子树整个重建，而不是只清 state
+function retry() {
+  err.value = null
+  attempt.value += 1
+}
+
+// 外部上下文变了（换页）就自动清错误，避免"上一跳的错误挡住这一跳"
+watch(() => props.resetKey, () => { err.value = null })
+</script>
+
+<template>
+  <div v-if="err" class="boundary-fallback" role="alert">
+    <p>{{ getBoundaryErrorText(err) }}</p>
+    <el-button size="small" @click="retry">重试</el-button>
+    <el-button size="small" text @click="router.replace('/')">回首页</el-button>
+    <pre v-if="showStack">{{ err.stack }}</pre>
+  </div>
+  <div v-else :key="`${props.resetKey ?? ''}-${attempt}`">
+    <slot />
+  </div>
+</template>
+```
+
+`v-else` 那个 `:key` 是这个组件的全部秘密：**key 变化会让这层 div 连同里面的插槽内容整个卸载重建**，等价于 React 里给边界子树加 `key`。如果只把 `err` 置回 `null`，子组件复用的是旧实例、旧数据，同样的错误会立刻再抛一次。
+
+放的位置和 React 一样讲原则：**边界放在"坏了不影响别人"的分界上**。
+
+```vue
+<template>
+  <AppLayout>
+    <AppBoundary name="main">
+      <RouterView v-slot="{ Component, route }">
+        <AppBoundary :name="route.name as string" :reset-key="route.fullPath">
+          <component :is="Component" />
+        </AppBoundary>
+      </RouterView>
+    </AppBoundary>
+  </AppLayout>
+</template>
+```
+
+`reset-key` 绑 `route.fullPath` 有两个好处：换页自动清错误、同页重试时靠 `attempt` 强制重建。**注意 fallback 里只允许纯静态内容**——在 fallback 里放图表或异步组件，它自己出错时没人接（父层已把冒泡阻断在 `return false`）。
+
+### 3. 异步错误为什么接不住，怎么补
+
+`onErrorCaptured` 与 `errorHandler` 都不覆盖"脱离 Vue 调用栈"的错误：定时器回调、`Promise.then` 链、`addEventListener` 回调、Web Worker 消息、第三方 SDK 的回调。
+
+```ts
+// src/plugins/errorGlobal.ts
+export function installGlobalErrorHooks() {
+  window.addEventListener('unhandledrejection', (event) => {
+    reportError(event.reason, { source: 'unhandledrejection', route: location.pathname })
+    if (isChunkLoadError(event.reason)) markChunkFailure(event.reason)
+  })
+
+  window.onerror = (message, source, line, col, error) => {
+    reportError(error ?? new Error(String(message)), { source: 'window.onerror', sourceUrl: source, line, col })
+    return false                       // 不阻断浏览器默认的控制台输出
+  }
+}
+```
+
+三个实操结论：
+
+1. **请求层的异步错误必须在拦截器里处理成"可预期状态"，而不是抛出去等人接**。axios 响应拦截器 `return Promise.reject(err)` 之后，如果调用方没写 `catch`，就变成一条 `unhandledrejection`——它能被上报接住，但**不会**让你的界面降级。所以列表页的"请求失败要显示空态 + 重试"，靠的是 store 里的 `error` 状态，不是靠错误钩子（呼应第 10 章的 store 错误状态设计）。
+2. **`await` 语法糖下的错误仍然是 Promise rejection**：`async` 函数里 `throw` 不会同步冒到 Vue 的错误处理，除非那个 `async` 函数本身是被 Vue 包住的入口（模板事件处理、生命周期）返回的 Promise——这种情况下 Vue 会挂 `.catch` 并路由到错误处理体系。**这是最容易判断错的边界**：同一个 `throw`，写在 `onMounted(async () => ...)` 里能被接住，写在 `onMounted(() => setTimeout(async () => ...))` 里接不住。
+3. **资源加载失败要单独接**：`window.addEventListener('error', handler, true)`（捕获阶段）能拿到 `<script>`/`<img>` 加载失败事件，这是发现 chunk 404 的最早信号。
+
+### 4. 渲染期错误 → 白屏：表现与定位路径
+
+三种"崩法"的表现差异，用它先做二分：
+
+| 抛出位置 | 用户看到 | 控制台/上报 | 定位方向 |
+|---|---|---|---|
+| `setup` 里同步抛 | 整页白（该组件从未挂载），父级 patch 中断 | 一条 error，栈里能看到 setup | 依赖注入拿不到值 / store 未初始化 / `JSON.parse` 未防护 |
+| `render`/模板里抛（读 undefined 属性） | 首次进入正常，某个数据到达后整块消失 | error 发生在 patch 阶段 | 后端字段缺失、可选链没写、字典值意外为 null |
+| 更新阶段 watcher 里抛 | 交互后局部不更新或整块空白 | error 伴随用户操作 | 副作用互相触发（第 04 章的 `flush` 时机问题） |
+
+**区分"v-if 写错导致局部不渲染"和"真崩溃"**——这个判据能省掉一半无效排查：
+
+```ts
+// 一次性调试函数：贴到控制台里用
+function probe(el: HTMLElement) {
+  return {
+    hasCommentPlaceholder: [...el.childNodes].some((n) => n.nodeType === 8),   // v-if=false 会留注释占位
+    childCount: el.childElementCount,
+    html: el.innerHTML.slice(0, 300),
+  }
+}
+```
+
+- 有注释占位节点（`<!---->`）+ **没有任何 error 上报** → 条件为假：查 `v-if` 表达式、异步数据是否到齐、权限判断（第 11 章的 meta 判定）。
+- DOM 里连占位注释都没有、父节点也不存在 → 组件根本没渲染：路由没匹配 / `component` 是 `undefined`（动态路由组件路径拼错是最常见原因）。
+- 有 error 上报 + 界面空白 → 真崩溃：优先看栈里的字段访问，再用 sourcemap 还原。
+
+---
+
+## 生产 sourcemap 与栈还原
+
+压缩后的 `TypeError: Cannot read properties of undefined (reading 'status') at n.<anonymous> (app.a1b2c3.js:1:294188)` 没有任何诊断价值。三件事必须做成闭环：
+
+```ts
+// vite.config.ts：不公开 map，但要产出给监控平台
+export default defineConfig({
+  build: { sourcemap: 'hidden' },      // 生成 .map 但不在 JS 里加 sourceMappingURL 注释
+})
+```
+
+```bash
+# CI 发布步骤：产物上线 → map 上传到监控平台 → 本地/CDN 不保留 map
+pnpm build
+node scripts/upload-sourcemaps.mjs --release "$BUILD_ID" --dist dist/assets   # 传完即删
+```
+
+- **`hidden` 而不是 `false`**：`false` 时你根本拿不到 map；`true` 会把 map 公开到线上，等于把源码挂出去。
+- **`release` / `BUILD_ID` 必须同时打进产物和 map**，否则版本一多就对不上（我用的做法：`VITE_APP_VERSION` 在构建时写入，同时在 `dist/version.json` 里落一份，见下一节）。
+- **栈还原的坑在文件名匹配**：Vite 产物带 hash，map 里的 `sources` 指向源文件路径；上传时要以 hash 后的文件名做 key。别指望手动 `source-map` 库一次性还原——线上一次发布几十个 chunk，必须靠平台（Sentry/阿里云 ARMS 那类）做符号化。
+- 观测侧的完整做法见[工程化可观测篇](/blog/posts/engineering-roadmap-14-observability/)。
+
+**错误聚合与去噪**（没有这一步，告警会被淹没）：
+
+| 噪声类型 | 例子 | 处理 |
+|---|---|---|
+| 浏览器插件 | `Failed to execute 'removeChild' on 'Node'`、`chrome-extension://` 栈 | 栈里含扩展协议或 DOM 越权错误 → 直接丢弃 |
+| 尺寸类良性报错 | `ResizeObserver loop completed with undelivered notifications` | 丢弃（Element Plus 表格/下拉常见） |
+| 用户中断 | `AbortError: The user aborted a request` / `Network Error` 且 `navigator.onLine === false` | 降级为"网络"指标，不进错误告警 |
+| 跨域脚本 | `Script error.` 无栈 | 给脚本加 `crossorigin`，否则拿不到任何信息 |
+| 同一根因散成多条 | 同一 chunk 名 404 出现 N 次 | 按 `message + 首帧文件名` 生成 fingerprint 聚合 |
+
+聚合键的做法：`fingerprint = hash(message 归一化后的模板 + stack 前 3 帧的文件名（去行列号） + release)`。数字、id、时间戳这类要先归一化成 `*`，否则"订单 123 不存在"和"订单 124 不存在"会分成两条。
+
+## 部署后 `Loading chunk failed`：完整解法
+
+**根因**：Vite 产物文件名带 hash，发布时通常会清掉旧目录。用户手里的 `index.html` 是旧的（或被 CDN 缓存），点进一个还没加载过的路由时，请求的旧 chunk 已经不存在 → 404 → 动态 `import()` 拒绝。所以它的三个特征是：**只在发布后一段时间出现、只出现在"还没访问过的页面"、刷新就好**。
+
+解法分四层，缺一条都不完整：
+
+**第一层：识别。**
+
+```ts
+export function isChunkLoadError(e: unknown): boolean {
+  const msg = String((e as Error)?.message ?? e ?? '')
+  return /Loading chunk|Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i.test(msg)
+}
+```
+
+（不同浏览器文案不同：Chrome 是 `Failed to fetch dynamically imported module`，Firefox/Safari 是 `error loading dynamically imported module`，只测一个必然漏。）
+
+**第二层：重试。**动态 import 失败有时只是网络抖动，先重试两次再走发布流程。
+
+```ts
+export function lazyWithRetry(loader: () => Promise<unknown>, retries = 2) {
+  return async () => {
+    for (let i = 0; ; i++) {
+      try {
+        return await loader()
+      } catch (err) {
+        if (!isChunkLoadError(err) || i >= retries) throw err
+        await new Promise((r) => setTimeout(r, 300 * (i + 1)))
+      }
+    }
+  }
+}
+```
+
+用法上要注意一个细节：`lazyWithRetry(() => import('@/views/order/index.vue'))` —— **重试不会重新拉 `index.html`**，如果 chunk 真的被删了，重试只是白等；所以第三层必须做。
+
+**第三层：版本探测 + 一次性强制刷新。**
+
+```ts
+async function ensureNewVersion(): Promise<boolean> {
+  const remote = await fetch(`/version.json?ts=${Date.now()}`, { cache: 'no-store' })
+    .then((r) => r.json()).catch(() => null)
+  return !!remote && remote.buildId !== import.meta.env.VITE_APP_BUILD_ID
+}
+
+async function recoverFromChunkFailure(to: RouteLocationNormalized) {
+  const KEY = 'chunk-reload-at'
+  const last = Number(sessionStorage.getItem(KEY) ?? 0)
+  if (Date.now() - last < 10_000) return false            // 防死循环：10 秒内不重复刷新
+  if (await ensureNewVersion()) {
+    sessionStorage.setItem(KEY, String(Date.now()))
+    location.href = to.fullPath                           // 带目标路径刷新，用户不丢上下文
+    return true
+  }
+  return false
+}
+```
+
+**为什么必须用 `sessionStorage` 做护栏**：如果服务端本身有问题（网关 5xx、`index.html` 被缓存成旧版），刷新后 `version.json` 依旧对不上，就会陷入"刷新 → 404 → 刷新"的死循环——这是这个方案唯一能把站点搞挂的地方。
+
+**第四层：接进路由与全局。**
+
+```ts
+const chunkBroken = ref(false)                      // 模块级状态：一旦确认是产物缺失就不再重复探测
+
+router.beforeResolve(async (to) => {
+  if (chunkBroken.value) {
+    const ok = await recoverFromChunkFailure(to)
+    if (ok) return false
+  }
+  return true
+})
+
+router.onError(async (err, to) => {
+  if (!isChunkLoadError(err)) { reportError(err, { phase: 'navigation' }); return }
+  const recovered = await recoverFromChunkFailure(to)
+  if (!recovered) {
+    chunkBroken.value = true
+    ElMessageBox.confirm('页面版本已更新，请刷新继续', '提示', { confirmButtonText: '立即刷新' })
+      .then(() => location.reload())
+      .catch(() => {})
+  }
+})
+```
+
+`index.html` 与 `version.json` 都要在 nginx 上配 `no-cache`，静态资源本身配长缓存——这套缓存分工见[浏览器路线的 HTTP 缓存篇](/blog/posts/browser-roadmap-05-http-cache/)。
+
+**与第 11 章动态权限路由叠加的场景**（这才是最难的一档）：路由表是登录后 `addRoute` 进去的，组件路径由后端下发。此时一次失败有三种可能，处置完全不同：
+
+| 症状 | 真因 | 处置 |
+|---|---|---|
+| 只有某几个页面报 chunk 失败，其他人正常 | 旧产物被删（发布问题） | 上面的四层解法 |
+| 所有人、同一个菜单项报失败 | 后端下发的组件路径写错，`import` 直接语法级失败 | 组件装配处要 try/catch 并回退到 404 页，同时把 `component` 原值上报（`loadComponent` 里必须包一层） |
+| 刷新后整站白屏，无 chunk 报错 | 动态路由还没注册就导航（守卫没重放） | 守卫里 `addRoute` 之后 `return { ...to, replace: true }` |
+
+装配时的兜底写法：
+
+```ts
+function loadComponent(name: string) {
+  return lazyWithRetry(async () => {
+    try {
+      return await import(`@/views/${name}/index.vue`)
+    } catch (err) {
+      if (isChunkLoadError(err)) throw err                       // 交给 chunk 恢复流程
+      throw new RouteComponentError(name, err)                   // 路径配置错误：可诊断、可上报
+    }
+  })
+}
+```
+
+两种失败时机要分清：**装配阶段在 `import.meta.glob` 的表里查不到 key**（后端配错了路径，压根没这个文件）属于配置问题，处置是回退到错误页并上报原始 `component` 值，第 17 章的写法就是这么处理的；**运行阶段 `import()` 失败**才是本节的产物缺失问题，处置是重试 + 版本探测。把两者混进同一个 `catch` 不加区分，就会出现"配置错误也去反复刷新页面"的死循环。
+
+## 30 分钟定位 checklist
+
+| 时间 | 动作 | 拿到的证据 | 由此判断 |
+|---|---|---|---|
+| 0–3 分钟 | 确认影响面：全量还是个别用户、发布前后 | 监控平台的用户数曲线 + 最近发布时间 | 个别人 → 数据/权限；全量 + 刚发布 → 产物或代码 |
+| 3–8 分钟 | 看上报的 `release` 与错误类型分布 | fingerprint 列表，`ChunkLoadError` 占比 | chunk 类错误高 → 走上一节；单一 `TypeError` 高 → 代码问题 |
+| 8–12 分钟 | sourcemap 还原栈，定位到源文件与行 | 具体函数与字段名 | 判断是数据缺失还是逻辑错 |
+| 12–18 分钟 | 用出错用户/记录复现，看接口返回体 | 一条真实响应 JSON | 字段缺失/类型变了 → 后端问题；正常 → 前端问题 |
+| 18–22 分钟 | 判断错误层：有没有 error 上报？DOM 有注释占位吗？ | `probe()` 输出 | 无上报 + 有注释 → `v-if` 条件问题，不是崩溃 |
+| 22–27 分钟 | 决定处置：回滚 / 热修 / 降级开关 | 发布记录 + 影响面 | 全量崩 → 回滚；个别数据崩 → 加防护 + 边界降级 |
+| 27–30 分钟 | 加边界或全局兜底防止复发，并记一条事故 | diff + 复盘条目 | 写清"哪一层没接住"，这是复盘的核心一行 |
+
+回滚优先于热修：**线上全量白屏时，先让版本回去再查原因**，不要在生产会话里调试。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue 3 | React 18/19 |
+|---|---|---|
+| 全局兜底 | `app.config.errorHandler`，应用级一处配置 | React 19 才有根级 `createRoot(el, { onUncaughtError })`；18 只能靠边界 + `window.onerror` |
+| 局部错误边界 | 组合式：`onErrorCaptured` + `v-if`，函数组件即可；**核心里没有官方边界组件** | class 组件专属：`getDerivedStateFromError` + `componentDidCatch`，至今没有函数版 |
+| 捕获范围 | 更宽：render、生命周期、`watch`/`watchEffect`、模板事件处理的同步部分 | 更窄：只有 render 与生命周期；事件处理与异步都要自己接 |
+| 阻断冒泡 | 显式：钩子返回 `false` 才停止向上 | 没有对应概念——错误自然停在第一个匹配的边界 |
+| 出错后子树行为 | 未定义：可能停在半成品状态，需要自己用 `key` 重建 | 明确：回滚并卸载子树，边界接管渲染 fallback |
+| 重置 / 重试 | `key` 换值重建子树 + 清本地错误状态（与 React 同一手法） | 同样靠 `key`；只清 state 对"数据引发的错误"无效 |
+| 边界接不住自己 | 是：`onErrorCaptured` 不处理注册组件自身的错误 | 是：边界不捕获自己 fallback 里的错误（两条规则同源） |
+| 异步与 rejection | `window.onerror` + `unhandledrejection` | 完全一致，同一对全局事件 |
+| 水合/SSR 错误 | Nuxt 有自己的 server/error hooks（第 18 章） | `onRecoverableError` 专门报告可恢复的水合不一致 |
+
+一句话总结差异：**React 的错误模型是"组件卸载 + 边界接管"，Vue 的是"钩子冒泡 + 你自己决定降不降级"**。所以 Vue 里"兜住了但界面残缺"是常见事故形态，必须靠 `key` 重建补齐语义。
+
+---
+
+## 翻车现场
+
+**一、加了 `errorHandler` 还是白屏**
+
+- 症状：全局兜底配了，监控里能看到错误，但用户界面整页空白，导航也没了。
+- 根因：`errorHandler` 只负责"通知你"，不做任何 UI 降级；没人接住的渲染错误会让根 patch 中断，整树不可用。
+- 修法：把它当**上报通道**，UI 降级交给分层 `AppBoundary`（布局一层、页面一层）。补完之后，同类问题的用户可见面从"整站白"缩到"一个页面块"。
+- 面试表述：全局兜底 + 局部边界是两件事，缺一不可。
+
+**二、"点确定就好"的加载失败弹了整整一周**
+
+- 症状：发布后部分用户切页面时弹提示，点确定（其实是刷新）就恢复；第二天又出现。
+- 根因：只重试不探测版本；`index.html` 被 CDN 缓存住，用户拿到的入口 HTML 是旧版，引用的是已删除的 chunk。
+- 修法：`index.html` 与 `version.json` 一律 `no-cache`；刷新时带目标路径（`location.href = to.fullPath`）而不是 `reload()`，否则用户在深层页面刷新会丢上下文；发布流程加"保留上一版产物 30 分钟"（nginx 目录不删，只切软链），这条最治本。
+- 结论：**保留旧产物**是这类问题的唯一根治手段，前端的捕获只是把损失压小。
+
+**三、`return false` 之后另一类错误再也不上报了**
+
+- 症状：某个模块上线后，监控里它的错误数量断崖式下降，但用户投诉变多。
+- 根因：局部边界在 `onErrorCaptured` 里无条件 `return false`，而它自己的 `reportError` 调用写在 `if (import.meta.env.DEV)` 分支里；生产环境既不冒泡也不上报。
+- 修法：边界里**先上报再阻断**（顺序也要固定），并给阻断加一个"未知错误类型继续冒泡"的白名单；在测试里加一条断言：边界吞掉的错误必须产生一次上报调用（第 15 章测行为的那套方法在这里正好复用）。
+
+---
+
+## 复习卡片
+
+- **Q：Vue 错误处理的三层分别是什么？** A：`onErrorCaptured`（局部边界，沿祖先链冒泡，返回 `false` 阻断）→ `app.config.errorHandler`（应用级兜底与上报）→ `window.onerror` / `unhandledrejection`（异步与外部回调）。
+- **Q：为什么 Vue 没有官方 ErrorBoundary 组件？** A：钩子加 `v-if` 已能表达降级，但官方没定义"错误后子树怎么处理"，所以要用 `key` 主动重建；React 靠 class 生命周期做成了内建的卸载回滚。
+- **Q：`async` 事件处理里抛错能被 `onErrorCaptured` 接住吗？** A：如果这个 async 函数是 Vue 包住的入口（模板事件、生命周期、watcher）返回的 Promise，能被路由进错误体系；`setTimeout` 里再 async 就接不住。
+- **Q：怎么区分"局部不渲染"和"真崩溃"？** A：看两件事——有没有 error 上报，DOM 里有没有 `v-if` 留下的注释占位。有占位无上报是条件问题。
+- **Q：`Loading chunk failed` 的完整解法？** A：识别（多浏览器文案）→ 重试 → 版本探测 + 带路径刷新（`sessionStorage` 防死循环）→ 接进 `router.onError` 与 `beforeResolve`；根治靠发布时保留旧产物与入口 HTML 不缓存。
+- **Q：生产 sourcemap 用 `true` 还是 `hidden`？** A：`hidden`，产物不上下挂 `sourceMappingURL`，map 只上传给监控平台，并且必须和 `release` 号对齐。
+
+---
+
+## 小结
+
+- Vue 的错误处理是冒泡式钩子：覆盖面比 React 边界宽（含 watcher 和模板事件），但没有"卸载回滚"的语义，降级与重建都得自己做。
+- 三件事缺一不可：分层边界决定**用户看到什么**，全局兜底与 `window` 层决定**你知道什么**，sourcemap 与聚合决定**你能不能定位**。
+- 异步错误是这套体系的天然盲区，只能靠全局两个事件补；请求层的失败应该变成 store 状态，而不是变成异常。
+- chunk 加载失败是中后台最常见的"发布后事故"，方案的四层里版本探测与防死循环最容易被漏，根治在发布策略。
+- 30 分钟 checklist 的价值在于**顺序固定**：先定影响面，再看错误类型分布，再还原栈，最后才决定回滚还是热修。
+
+---
+
+## 练习
+
+1. 把本章的 `AppBoundary.vue` 抄进你的项目，在布局层和页面层各放一个；然后在某个页面的 `setup` 里故意 `throw`，验证"只有这一块坏、导航还在"，并确认监控里同时只有一条上报（不是两条）（30 分钟内可完成）。
+2. 写一个本地可复现的 chunk 失败场景：构建后把 `dist/assets` 里任意一个路由 chunk 改名，跑起静态服务，点进对应页面触发失败，验证"重试 → 探测 → 带路径刷新 → 不会无限刷新"这条链路，并把 `sessionStorage` 护栏去掉复现一次死循环。
+3. 交付物：一份《本项目错误兜底与上报规范》，包含三层捕获各自的职责边界与代码位置、上报字段清单（`release`、`route`、`boundary`、`fingerprint`）、四类噪声的丢弃规则、发布时的 sourcemap 上传与旧产物保留策略，并在 README 里给出"白屏时先看哪三个指标"的顺序。
+
+---
+
+## 面试一句话
+
+> "Vue 的错误处理我分三层：`onErrorCaptured` 做局部边界（返回 `false` 阻断冒泡，并用 `key` 重建子树来补齐 Vue 没有的卸载回滚语义），`app.config.errorHandler` 做应用级兜底与上报，`window.onerror` 和 `unhandledrejection` 补异步盲区——Vue 覆盖不到定时器与自建 Promise 链，这是它和 React 边界最大的差别。线上白屏我按固定顺序判：先看影响面和是不是 `ChunkLoadError`，再用 hidden sourcemap 还原栈，最后用有没有 error 上报加 DOM 有没有 `v-if` 注释占位，区分'条件写错'和'真崩了'。"

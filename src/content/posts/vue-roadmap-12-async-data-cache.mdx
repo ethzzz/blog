@@ -1,0 +1,388 @@
+---
+title: '12 · 异步数据与缓存：请求竞态、Suspense 与 keep-alive 淘汰'
+published: 2026-11-22T20:00:00+08:00
+description: '异步数据与缓存：请求竞态的三种正确解法（请求序号 / AbortController / watch 的 onCleanup）与加载、失败、空态的 UI 表达，Suspense 的真实限制与 async setup 的代价，数据请求分层与 TanStack Query vue 适配器，keep-alive 的 max LRU 淘汰与"返回恢复位置且不重复请求"的完整方案。'
+tags: [Vue, 数据请求, 竞态, Suspense, "keep-alive", TanStackQuery]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章解决"**异步数据在生产里的三种坏结果**"：结果被过期请求覆盖、页面卡在 loading 或白屏、返回时要么数据陈旧要么重复请求。
+> 真实场景：一个搜索框输入 `vue`，用户看到的是 `v` 的结果——因为 `v` 的请求慢、后发先至；
+> 同一个页面切到详情再切回来，接口又打了一次；某天后台列表页整个白屏，
+> 排查发现是有人给 `include` 写了一个和组件名不一致的字符串，缓存根本没生效。
+> 竞态的机制面在 04（watch 的清理）已经埋好，本章把它推到**设计与分层**：谁负责取消、谁负责缓存、谁负责"什么时候算旧"。
+> 问答形态见[前端面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/)「性能优化」一节（Q12b：keep-alive 的实现与 LRU）；
+> **"服务端状态不该进 store"这条结论与 [React 数据请求与缓存](/blog/posts/react-roadmap-09-data-fetching/) 完全互认**，
+> 两栈只是实现载体不同（那边是 TanStack Query 原生，这边是它的 vue 适配器或自建 composable）。
+
+---
+
+## 一句话本质
+
+异步数据的难点不是"怎么发请求"，而是**四份状态 + 一个策略**：
+`loading` / `error`（必须可重试）/ `empty`（要区分"真没数据"和"筛选没命中"）/ `data`，
+加上一个能回答"**这份数据什么时候算旧**"的失效策略。
+`Suspense` 和 `async setup` 只解决"等待时的渲染"，**既不解决竞态，也不解决缓存**——
+把这两个当成数据方案的项目，三个月后一定会回来补。
+
+---
+
+## 原理拆解
+
+### 1. 竞态的三种正确解法，与 UI 状态的表达
+
+竞态的定义：**同一份展示状态被多次请求竞争写入，而后完成的未必是应该展示的那个。**
+"加个 loading 遮罩"不是解法，只是掩盖。
+
+```ts
+// composables/useResource.ts —— 三种解法同时给出，按需选用
+import { onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue';
+
+type State<T> = { data: Ref<T | null>; error: Ref<unknown>; isLoading: Ref<boolean>; isFetching: Ref<boolean> };
+
+export function useResource<T>(
+  fetcher: (signal: AbortSignal, seq: number) => Promise<T>,
+  source: () => unknown,
+  opts: { immediate?: boolean; keepPrevious?: boolean } = {},
+): State<T> & { retry: () => void } {
+  const data = shallowRef<T | null>(null);     // 大对象/列表用 shallowRef，见 13
+  const error = ref<unknown>(null);
+  const isLoading = ref(false);
+  const isFetching = ref(false);
+  let seq = 0;                                  // 解法 1：请求序号
+  let controller: AbortController | undefined;  // 解法 2：取消
+
+  async function run() {
+    controller?.abort();                        // ① 取消上一次（网络层真的停下来）
+    controller = new AbortController();
+    const my = ++seq;                           // ② 序号（UI 层丢弃过期结果）
+    isFetching.value = true;
+    if (!opts.keepPrevious || !data.value) isLoading.value = true;
+    error.value = null;
+    try {
+      const res = await fetcher(controller.signal, my);
+      if (my !== seq) return;                   // 有更新的请求在飞，丢弃这次结果
+      data.value = res;
+    } catch (e) {
+      if (my !== seq) return;
+      if ((e as Error)?.name === 'AbortError') return;   // 主动取消不算失败，别污染 error 态
+      error.value = e;
+    } finally {
+      if (my === seq) { isLoading.value = false; isFetching.value = false; }
+    }
+  }
+
+  // 解法 3：把取消交给侦听器的清理机制 —— 依赖变化时先清理再执行
+  const stop = watch(source, run, { immediate: opts.immediate !== false, flush: 'post' });
+  onScopeDispose(() => { controller?.abort(); stop(); });
+
+  return { data, error, isLoading, isFetching, retry: run };
+}
+```
+
+第三种写法在 3.5+ 有更内聚的形态：`onWatcherCleanup` 可以在回调里任意位置注册清理，不用把 `onCleanup`
+参数一路往下传；回调第三参数 `onCleanup` 更早就有，`watch` / `watchEffect` 都能用：
+
+```ts
+// 防抖要显式做：watch 的选项里没有 debounce（社区提案未落地），别照抄搜到的写法
+const keyword = debouncedRef(rawKeyword, 250);        // 07 的 useDebouncedRef
+watch(keyword, async (kw, _old, onCleanup) => {
+  const controller = new AbortController();
+  onCleanup(() => controller.abort());                // 第三参数 onCleanup 一直可用；3.5+ 也可直接调 onWatcherCleanup
+  const rows = await api.search(kw, { signal: controller.signal });
+  result.value = rows;                                // 有清理兜底，这里不需要序号也能保证正确
+}, { flush: 'post' });
+```
+
+顺带两个真实可用的选项，比"找个 debounce"更解决问题：`once: true`（3.4+，只触发一次后自动停止，
+适合"进入页面拉一次就不管"的场景）、`deep: 2`（3.5+，限制深比较的层数，别对大对象开 `deep: true`，13 有性能讨论）。
+
+三种解法的取舍不是"哪个更先进"，而是由**需求**决定：
+
+| 解法 | 解决什么 | 不解决什么 | 什么时候必须用 |
+|---|---|---|---|
+| 请求序号（seq） | UI 层永远展示最新一次的结果 | **流量没省**：旧请求照样跑完并占带宽、照样触发后端 | 接口不可取消（第三方、上报类）、或要保留旧数据继续展示 |
+| `AbortController` | 真的断流：取消请求、释放连接、后端能感知 | 单靠它不够——`abort` 后的 catch 若混进 error 态会出现"切一下页面就报网络错误" | 大列表、导出、上传下载、SSE/长轮询 |
+| watcher 的 cleanup | 把"取消"绑定在**依赖变化**这个语义上，结构最干净 | 手动 `retry()` 这条路径不在 watcher 里，要自己补取消 | 筛选/分页/详情 id 驱动的请求（中后台 90% 的形态） |
+
+**UI 状态必须四态分明**，这是最容易偷懒且代价最大的一处：
+
+```vue
+<template>
+  <!-- ❌ 常见反模式：error / empty / loading 全挤在 v-else 里 -->
+  <ElTable v-if="data?.length" :data="data" />
+  <ElEmpty v-else description="暂无数据" />
+
+  <!-- ✅ 四态各有表达，且 loading 时保留旧数据（keepPrevious）避免表格高度塌陷 -->
+  <div class="state-host">
+    <ElSkeleton v-if="isLoading" :rows="6" animated />
+
+    <template v-else-if="error">
+      <ElResult icon="error" title="加载失败" :sub-title="String((error as Error).message)" />
+      <ElButton @click="retry">重试</ElButton>            <!-- 失败必须可重试，不能只显示红字 -->
+    </template>
+
+    <ElEmpty v-else-if="!data?.length"
+             :description="hasFilter ? '没有符合筛选条件的数据' : '暂无数据，可新建'"
+             :image-size="80">
+      <ElButton v-if="!hasFilter" type="primary" @click="openCreate">新建</ElButton>
+    </ElEmpty>
+
+    <ElTable v-else v-loading="isFetching && !!data.length" :data="data" />
+  </div>
+</template>
+```
+
+三条硬规矩：**失败态要能重试**；**空态要能区分"库是空的"和"筛选没命中"**（文案不同、行动点不同）；
+**刷新时的加载指示不能把已展示的数据抹掉**（用 `isFetching` 做局部 `v-loading`，`isLoading` 只在首次用骨架屏）。
+
+### 2. `Suspense` 的真实限制，与 `async setup` 的代价
+
+```vue
+<!-- 用法：默认插槽里的任意深度后代有 pending 的 async setup 时，渲染 fallback -->
+<Suspense :timeout="300" @resolve="onResolve">
+  <template #default><OrderDetail :id="id" /></template>
+  <template #fallback><ElSkeleton :rows="8" animated /></template>
+</Suspense>
+```
+
+```vue
+<!-- 被包裹方：setup 顶层 await 之后，组件就是「异步组件」 -->
+<script setup lang="ts">
+const props = defineProps<{ id: string }>();
+const detail = await api.getOrder(props.id);      // ← 这一行让它变成 async setup
+</script>
+```
+
+必须知道的六条限制，前四条是文档明写的，后两条是生产里撞出来的：
+
+| 限制 | 具体后果 | 应对 |
+|---|---|---|
+| **官方仍标为实验性** | API 语义不保证不变（嵌套、resolve 时机），大版本升级要回归这块 | 只把它当"骨架屏容器"，不要把它当数据层 |
+| **不在 boundary 里的 async setup 组件永远 pending** | 白屏且**不报任何错**（最阴的一种） | 组件树里给异步组件统一包一层；或用 `defineAsyncComponent`（它有自己的 loading，不依赖 boundary） |
+| **不捕获错误** | 后代抛错会一路向上，`Suspense` 不接；错误边界要靠父级 `onErrorCaptured`（16） | 每个 `Suspense` 外面套一层错误边界，别裸奔 |
+| **不解决缓存** | fallback 消失不代表数据留下了，切走再切回来**照样重新请求** | 缓存归请求层（第 3 节），`Suspense` 只管"渲染时机" |
+| 嵌套 boundary 的行为 | 内层 pending 时外层若已有内容不会被替换（除非 `suspensible`），容易出现"整页闪一下"或"局部不动"两种相反的观感 | 只放**一个页面级** boundary + 少量局部 boundary，别按组件粒度滥用 |
+| SSR | 服务端等待 async setup 的方式与客户端不同（3.5 起对 SSR 数据流有调整），跨版本差异明显 | SSR 数据优先走 `onServerPrefetch` + store（10），框架层（Nuxt）再考虑 `Suspense`（18） |
+
+`async setup` 的**结构代价**比限制本身更值得说：一旦组件里有 `await`，
+
+- setup 的同步段（`provide`、生命周期注册）必须在 `await` **之前**完成，否则静默失效（07 现场 3、09 现场 2、08 第 4 节是同一个根因的三张脸）；
+- `props` 变化时的行为要重新想：`await` 只跑一次，id 变了不会自动重取，仍然要 `watch`；
+- 组件被迫要求宿主提供 boundary，**可移植性下降**（和 09 里 inject 的代价同构）。
+
+结论：**`Suspense` 是渲染层设施，不是数据层设施。**
+
+### 3. 数据请求分层：三档方案与选型
+
+```text
+档位 A：组件内直接调 api              → 一次性、不可复用的展示（弹窗里查一次详情）
+档位 B：composable 封装（本节 useResource / useListQuery） → 有竞态、有缓存语义、但缓存只在实例内
+档位 C：TanStack Query 的 vue 适配器  → 需要跨页面缓存、去重、失效、后台刷新、分页、乐观更新
+```
+
+档位 B 的"缓存只在实例内"是关键缺陷：列表页缓存了，详情页拿不到，回来又请求一次。要跨页面共享就得上 store
+（10 已论证：**服务端状态塞 store 等于自己重写缓存失效**）或档位 C：
+
+```ts
+// @tanstack/vue-query —— 与 React 侧同一个内核，queryKey/staleTime/gcTime 语义完全一致
+import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
+
+const qc = useQueryClient();
+const { data, isPending, isError, refetch } = useQuery({
+  queryKey: computed(() => ['orders', { page: page.value, status: status.value }]),  // key 用 computed，天然响应
+  queryFn: ({ signal }) => api.list({ page: page.value, status: status.value, signal }),  // 取消由库统一处理
+  staleTime: 30_000,          // 30 秒内切回来不发请求 —— 这就是 keep-alive 场景的失效策略
+});
+
+function onSaved() {
+  qc.invalidateQueries({ queryKey: ['orders'] });   // 变更后的失效，而不是手动 setData
+}
+```
+
+| 能力 | A 直接调 | B 自建 composable | C vue-query | React 对应（互认表） |
+|---|---|---|---|---|
+| 竞态取消 | 自己写 | 自己写 | 内建 `signal` | 同一库，一致 |
+| 请求去重（同 key 并发） | ❌ | ❌（可做但等于重造） | ✅ | ✅ |
+| 跨页面缓存与失效 | ❌ | 需外置 | ✅ | ✅ |
+| 后台刷新（stale-while-revalidate） | ❌ | 手写 | ✅ | ✅ |
+| 分页/无限滚动 | 手写 | 手写 | ✅ 现成 hook | ✅ |
+| 乐观更新 + 回滚 | 手写易错 | 手写易错 | ✅ | ✅ |
+| 依赖体积/心智 | 无 | 无 | +一个库 + QueryClientProvider | 同 |
+| devtools | 无 | 无 | ✅ Query Devtools | ✅ |
+
+判据（与 react 侧同一条，一字不改也成立）：**项目里出现"第二处地方需要知道第一处请求的结果"时，就停止自建、上 C。**
+小规模后台或纯 SSR 页面可以长期停在 B，但**别停在 A**——A 的代价是竞态和三态缺失，这两件事迟早要找回来。
+
+### 4. keep-alive 淘汰、返回不重复请求，与 SSR 数据
+
+```vue
+<!-- 三件套：include 匹配 name、max 触发 LRU 淘汰、key 决定"同组件多实例"是否分别缓存 -->
+<RouterView v-slot="{ Component, route }">
+  <KeepAlive :include="cachedNames" :max="8">
+    <component :is="Component" :key="route.meta.noKey ? 'x' : route.fullPath" />
+  </KeepAlive>
+</RouterView>
+```
+
+| 属性 | 语义 | 生产里要知道的细节 |
+|---|---|---|
+| `include` / `exclude` | 按**组件 name** 匹配（逗号分隔字符串 / 正则 / 数组） | `<script setup>` 会用**文件名**推断 name（可用 `defineOptions` 覆盖，3.3 起稳定）；名字和路由 meta 对不上就"看起来没缓存" |
+| `max` | 缓存实例上限，**LRU** 淘汰最久未使用的 | 淘汰走的是 `unmounted` 语义（[生命周期与 effectScope](/blog/posts/vue-roadmap-08-lifecycle-effect-scope/)）：定时器、watch、SSE 全在这时被清掉；上限太小会退化成"没有缓存" |
+| `key` | 决定缓存的**身份** | 同一组件不同参数（详情 1 / 详情 2）想各留一份就 key by `fullPath`；缓存数量会翻倍，配合 `max` 一起算 |
+
+"返回列表恢复位置 + 不重复请求"是一个完整方案，缺一个环节就不成立：
+
+```vue
+<script setup lang="ts">
+// 列表页
+import { onActivated, nextTick } from 'vue';
+
+const scrollEl = ref<HTMLElement>();
+const savedScroll = ref(0);
+const query = useListQuery();                        // 档位 B/C 的封装，内部已有 staleTime 语义
+
+onActivated(async () => {
+  await query.refetchIfStale();                      // ① 只在过期时请求（或依赖 invalidateQueries 置脏）
+  await nextTick();                                  // ② 等数据回来、DOM 高度稳定
+  scrollEl.value?.scrollTo({ top: savedScroll.value });  // ③ 容器滚动自己恢复（[Vue Router](/blog/posts/vue-roadmap-11-router/) 第 3 节：Router 管不到容器滚动）
+});
+</script>
+
+<template>
+  <div ref="scrollEl" class="list-scroll" @scroll.passive="savedScroll = ($event.target as HTMLElement).scrollTop">
+    <!-- ... -->
+  </div>
+</template>
+```
+
+三个环节的对应关系：**不重复请求**靠失效策略（`staleTime` 或 `isDirty` 脏标记，08 现场 2 的最小版本）；
+**恢复位置**靠失活时记录的容器 `scrollTop`；**时序**靠 `onActivated` 里的 `await nextTick()`。
+`scrollBehavior`（11）在这里只负责"未缓存时滚到顶"，两者要明确分工，否则互相打架。
+
+**SSR 侧的数据获取**：`onMounted` 在服务端不执行（08），所以要么 `onServerPrefetch`，要么把请求放进 `async setup` 并让框架层包 boundary。
+
+```ts
+// 服务端拉一次，灌进 store；客户端水合后跳过首次请求
+onServerPrefetch(async () => {
+  const store = useOrderStore();
+  if (!store.detail) await store.fetchDetail(id.value);       // 幂等：已存在就不重复拉
+});
+
+const { data } = useQuery({
+  queryKey: ['order', id],
+  queryFn: ({ signal }) => api.detail(id.value, { signal }),
+  initialData: () => store.detail ?? undefined,                // 关键：把服务端结果给到缓存层
+  staleTime: 30_000,
+});
+```
+
+**水合后的二次请求**是默认行为而不是 bug（客户端要确认数据可用性），要不要省掉是显式策略：
+给首屏数据 `initialData` / 提高 `staleTime` / 在客户端判断 `if (hydrated) skip`。
+省掉之后必须接受一个后果——**首屏数据可能在服务端与客户端不一致（会话、时间敏感数据）**，
+所以只对项目里"幂等且与用户会话无关"的数据这么做，并在页面级 `provide` 里带上水合标记（09）供调试。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 竞态取消 | watcher 的 cleanup / `onWatcherCleanup`（3.5+），**跟着数据变化触发** | effect cleanup + `AbortController`，**跟着依赖数组触发**（漏写依赖就是泄漏） |
+| 等待异步渲染 | `<Suspense>` + `async setup`，**实验性**、不捕获错误 | `Suspense` 已稳定，与并发特性（`startTransition`、`use`）整合，错误由 ErrorBoundary 接 |
+| 加载态粒度 | 手动 `v-if` 三态 或 boundary fallback | 天然倾向 boundary fallback + transition 保持旧 UI |
+| 请求缓存 | `@tanstack/vue-query`（同一内核）/自建 composable | TanStack Query 原生；`queryKey`/`staleTime`/`invalidateQueries` 概念**逐字对应** |
+| 跨页面缓存与"返回不重复请求" | `queryKey` + `staleTime` + `KeepAlive`（三者分工不同层） | `queryKey` + `staleTime`；**组件缓存没有内建**，要靠路由不卸载或第三方实现 |
+| 组件级缓存 | `<KeepAlive :max>` 内建 LRU | 无对应机制 |
+| 服务端数据 | `onServerPrefetch` + `pinia.state.value` 水合（10） | RSC / loader / `getServerSideProps`，框架统一管序列化 |
+
+对 React 同学的一条具体提醒：Vue 里 `useQuery` 的 `queryKey` **要传 computed 或 getter**，
+传成 `['orders', page.value]` 这种普通数组会让 key 固化、缓存永不失效（等价于 React 里把 queryKey 写成常量）；
+反过来 React 里靠依赖数组驱动重订阅的直觉，在这里要改成"响应式源就是依赖"。
+
+---
+
+## 翻车现场
+
+### 现场 1：搜索结果被旧请求覆盖，用户输入 `vue` 看到 `v` 的结果
+
+- **症状**：搜索联想列表内容"跳回去"一次；分页翻得快点时表格显示的是上一页的数据；导出偶尔导出错条件。
+- **根因**：`watch(keyword, async () => { loading = true; rows.value = await api.search(kw) })`，
+  既没取消也没丢弃过期结果——后发先至直接写同一个 `ref`。
+- **修法**：第 1 节三选一（生产建议"序号 + abort"双保险：abort 省流量，序号保证 UI 判定不依赖网络层是否真的取消了）。
+  同时把 `AbortError` 从 error 态里排除，否则会看到"切一下页面就报网络异常"。
+
+### 现场 2：`include` 名字对不上，keep-alive "配了但没生效"
+
+- **症状**：返回列表页每次都重新请求、位置丢失，但代码明明写了 `<KeepAlive include="OrderList">`。
+- **根因**：组件用 `<script setup>`，name 由**文件名**推断（`OrderList.vue` → `OrderList`），
+  但重构时文件被改名（或路由组件是动态注册的 `index.vue`，name 变成 `Index`），include 匹配不到就完全不缓存。
+- **修法**：显式 `defineOptions({ name: 'OrderList' })`，并把"路由 name / 组件 name / include 列表"三者
+  收敛到**同一个常量表**（由路由 meta 生成 `cachedNames`，10 的领域 store 存一份）。
+  这类"三处字符串必须一致"的结构，最好写一个单测断言集合相等。
+
+### 现场 3：缓存页在 `max` 下被 LRU 淘汰，用户感觉"偶尔会丢状态"
+
+- **症状**：从第 1 个列表跳到详情返回正常；连续开了 9 个页面后返回最早那个，筛选条件、分页、滚动全没了，
+  而且**只在重度使用时复现**，测试同学报"偶发"。
+- **根因**：`max: 8` 触发 LRU 淘汰，被淘汰的组件走完整 `unmounted`（08），内部 `ref` 状态全部销毁；
+  项目把"列表状态"只存在组件局部，没有任何持久层。
+- **修法**：分层——**筛选/分页这类"应该可分享"的状态进 URL**（11 与 10 都强调过），
+  组件局部只留纯 UI 状态；`max` 按"业务上会同时开几个页签"设（Element Plus 后台带 tabs 视图的，通常是 `tabs 数 + 2`）；
+  量级判断方法：缓存 N 个列表页 ≈ N × (数据行数 × 单行字节) + N × DOM 节点，
+  用 Chrome Memory 面板对同一页面做两次堆快照（进 10 个列表 → 快照 → 强制淘汰 → 快照），
+  看 detached DOM 与列表数组的 retained size 是否随 `max` 线性变化。
+
+---
+
+## 复习卡片
+
+- **Q：竞态的三种解法及取舍？** A：请求序号（UI 正确但不省流量）、`AbortController`（真取消，`AbortError` 不能进 error 态）、watcher 的 `onCleanup` / `onWatcherCleanup`（3.5+，语义最干净但覆盖不到手动 retry）。
+- **Q：UI 状态为什么要四态分明？** A：首次 `isLoading` 用骨架、刷新 `isFetching` 保留旧数据、`error` 必须能重试、`empty` 要区分"库空"和"筛选没命中"，挤在一个 `v-else` 里等于把三种用户动作混成一种。
+- **Q：`Suspense` 不解决什么？** A：不解决缓存（切回来还是重新请求）、不捕获错误（要靠 `onErrorCaptured`）、目前仍是实验性；且不在 boundary 里的 `async setup` 组件会永远 pending 且不报错。
+- **Q：请求分层的判据是什么？** A：出现"第二处需要知道第一处请求结果"就停止自建 composable、上 vue-query；服务端状态始终不进 store（10 与 React 侧同结论）。
+- **Q：`keep-alive` 的 `max` 淘汰意味着什么？** A：LRU 淘汰最久未用的实例，被淘汰者走完整 `unmounted`，所有局部状态与副作用一起消失——所以"该可分享"的状态要放 URL 而不是组件局部。
+- **Q：怎么做到"返回恢复位置且不重复请求"？** A：失活时记录容器 `scrollTop` + 激活时按 `staleTime`/脏标记决定是否请求 + `await nextTick()` 后再滚；`scrollBehavior` 只负责未缓存场景。
+
+---
+
+## 小结
+
+- 竞态必须显式解，**"序号 + abort"是双保险**，`AbortError` 不算失败；三态里失败可重试、空态分两种、刷新不清数据。
+- `Suspense` 与 `async setup` 是渲染时机设施，不给缓存、不给错误处理，还会绑架组件的可移植性。
+- 请求分三档，停在 A 是唯一的错误选项；跨页面共享出现就上 vue-query，其语义与 React 侧逐字对应。
+- `keep-alive` 的三件套（include 名字对齐 / max 的 LRU 代价 / key 决定缓存身份）解决"体验"，失效策略解决"新鲜度"，两者不能互相替代。
+- SSR 水合后的二次请求是默认行为，省不省是显式决策，且只对幂等、与会话无关的数据省。
+
+---
+
+## 练习
+
+1. 复现竞态并修：做一个输入框（无防抖），`watch` 里 `await` 一个**人为加了随机延迟**的接口。
+   先观察"输入 vue 显示 v 的结果"，再分别用**序号法**和**abort 法**修复，并在 Network 面板里对比两种修法下请求条数的差异。
+2. 给一个已有详情页加 `Suspense`：先在**没有** boundary 的情况下用 `async setup`（观察白屏且不报错），
+   再补上 boundary 与 `onErrorCaptured`（人为让接口 500），记录"没有 boundary / 有 boundary 无错误边界 / 两者都有"三种表现。
+3. **可见交付物**：实现列表页"返回恢复位置 + 不重复请求"的完整闭环：
+   `KeepAlive` 的 `include` 由路由 meta 生成的 `cachedNames` 提供，`max` 取"页签数 + 2"；
+   筛选与分页写入 URL；`onActivated` 里按脏标记或 `staleTime` 决定是否请求，`await nextTick()` 后恢复容器 `scrollTop`。
+   验收三条：① 从详情返回**不产生新请求**且位置正确；② 详情页改了数据后返回列表**只发一次**请求（失效由 `invalidateQueries` 或 `markDirty` 触发）；
+   ③ 打开超过 `max` 个页面后再返回最旧那个，**筛选条件仍在**（因为它在 URL 里）且位置恢复。
+
+---
+
+## 面试一句话
+
+> "异步数据我按两层设计：**正确性层**保证竞态不出现，**新鲜度层**回答什么时候算旧。
+> 竞态有三种解法——请求序号让 UI 只认最新一次、`AbortController` 真的断流、watch 的 `onCleanup`（3.5+ 起可以直接用 `onWatcherCleanup`）把取消绑在依赖变化上，
+> 生产里我通常序号加 abort 双保险，因为 abort 之后 `AbortError` 如果不排除掉就会污染 error 态。UI 上四态必须分开：首次 `isLoading` 骨架、
+> 刷新 `isFetching` 保留旧数据、`error` 一定给重试、`empty` 要区分库空和筛选没命中。
+> `Suspense` 的定位要说清楚：它只解决等待时的渲染，是实验性的、不捕获错误、也不给缓存，
+> 而且 `async setup` 一旦脱离 boundary 就永远 pending 且不报错，还会绑架组件可移植性——所以我把它当渲染层设施，不当数据层设施。
+> 分层上，'第二处要知道第一处的结果'就停止自建 composable、上 TanStack Query 的 vue 适配器，queryKey 要传 computed；
+> 服务端状态始终不进 store，这和 React 侧的结论是一模一样的。
+> keep-alive 那块我要提醒三件事：`include` 是按组件 name 匹配的、`<script setup>` 用文件名推断所以重构会悄悄失效；
+> `max` 是 LRU，被淘汰的组件走完整 `unmounted`、局部状态一起没了，所以筛选和分页该放 URL 而不是组件里；
+> 返回时'不重复请求'靠失效策略（`staleTime` 或脏标记），'恢复位置'靠自己在失活时记容器 `scrollTop`、激活后 `nextTick` 再滚，
+> `scrollBehavior` 对容器型布局是无效的。"

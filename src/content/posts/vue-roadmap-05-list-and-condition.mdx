@@ -1,0 +1,354 @@
+---
+title: '05 · 条件与列表渲染：key 的复用语义、diff 与 v-memo'
+published: 2026-11-22T13:00:00+08:00
+description: 'Vue 3 列表 diff 的双端指针策略与最长递增子序列、keyed 与 Non-keyed fragment 的 patchFlag 差异、v-if 与 v-for 同标签时 v-if 优先级更高（与 Vue 2 相反）的机制、index 作 key 导致表单串值的故障链，以及 v-memo 与 v-once 各自的适用边界和测量方法。'
+tags: [Vue, 列表渲染, key, diff, v-memo, 最长递增子序列]
+category: Vue学习路线
+draft: false
+---
+
+> [!NOTE]
+> 这一章管的是**"节点还是不是原来那个节点"**。答错这个问题，就会出现三类线上现象：删一行结果另一行的输入框串了值、切换筛选后整表重建（勾选全丢）、加了 `v-memo` 反而更慢。
+> 场景：CRUD 大表格里有一列"备注"是可编辑输入框，用户删掉第一行后，第二行的备注框里留着上一行没保存的半截文字——因为那行根本没被重建，DOM 是复用的。
+> 问答形态见 [面试宝典 · Vue 篇](/blog/posts/interview-guide-04-vue/) 的 Q7、Q7b（Diff 与最长递增子序列）；编译侧的 patchFlag 在[第 02 章](/blog/posts/vue-roadmap-02-template-compiler/)已铺垫，React 侧的对照见 [渲染与 key](/blog/posts/react-roadmap-03-render-and-keys/)。
+
+---
+
+## 一句话本质
+
+`key` 不是"给 Vue 一个提示"，它是**复用合同的身份证号**：同 key 的 vnode 被认为是同一个实例，可以复用 DOM、保留内部状态；不同 key 就是要新建。
+
+由此三条推论贯穿全章：
+
+1. **diff 的全部目标是把"移动次数"压到最少**，Vue 3 用双端指针 + 最长递增子序列（LIS）达成，React 用一次遍历 + index 配对达成，策略差异决定了各自最坏情况。
+2. **key 用 index = 主动放弃身份**，删项/插项/排序时"身份"和"数据"错位，看得见的症状是 DOM 状态串值。
+3. **`v-if` 与 `v-for` 同标签时，`v-if` 先执行**（Vue 3；Vue 2 相反），所以 `v-if` 里根本拿不到 `v-for` 的项变量——这不是语法限制，是执行顺序的结果。
+
+---
+
+## 原理拆解
+
+### 1. 双端 diff：四个指针如何交叉，为什么最后要求 LIS
+
+比较只发生在**同一层的 Fragment 子节点**之间（跨层的移动 Vue 和 React 都不做，直接销毁重建）。Vue 3 的 `patchKeyedChildren` 用四个指针：旧序列 `e1/e2`、新序列 `i1/i2`，按下面顺序推进。
+
+| 步骤 | 比较的指针 | 处理的典型形态 | 命中后动作 |
+|---|---|---|---|
+| 1 头头 | `e1` vs `i1` | 前面若干项没变 | 原地 patch，两个头指针后移 |
+| 2 尾尾 | `e2` vs `i2` | 后面若干项没变 | 原地 patch，两个尾指针前移 |
+| 3 头尾交叉 | `e1` vs `i2` | 旧头节点被移到了末尾 | patch 后把该 DOM 移到 `i2` 之后 |
+| 4 尾头交叉 | `e2` vs `i1` | 旧尾节点被移到了开头 | patch 后把该 DOM 移到 `i1` 之前 |
+| 5 未知序列 | 建 `key → 旧索引` 映射 | 中间乱序、新增、删除 | 新节点按映射找旧节点 patch，找不到就新建 |
+
+第 5 步是重点，也是最容易被讲错的一段：
+
+```text
+旧: A B C D E          新: B A D E C
+前 4 步之后剩下的乱序部分，Vue 做两件事：
+  a) 给每个新节点记录它在旧序列里的索引 → newIndexToOldIndexMap
+  b) 对这个索引数组求「最长递增子序列」
+     例如 [1, 0, 3, 4, 2] → LIS 是 [1, 3, 4]（对应 B、D、E）
+     结论：B、D、E 相对顺序本来就没变，不用动；只移动 A 和 C
+```
+
+**为什么要 LIS**：移动 DOM 是整个 patch 里最贵的动作之一（牵动布局）。LIS 给出的答案是"相对顺序已经正确的最长一批节点保持不动"，因此**移动次数达到理论最小**。
+
+还有一条边界要先说清楚，它是很多"移动后样式乱"的根因：**diff 只处理同层**。跨层移动（把第 2 行的一列挪到另一个容器里、或者切换 DOM 结构层级）在 Vue 和 React 里都是"原位置卸载 + 新位置挂载"，实例状态必然丢。想跨层保留状态，出路只有三条：把状态提到共同祖先（或 store）、用 `Teleport` 而不是搬 DOM、或者用 `keep-alive` 缓存实例。
+
+```vue
+<!-- 拖拽排序：搬的必须是数据顺序，而不是 DOM -->
+<el-table
+	:data="rows"
+	row-key="id"
+	:default-sort="{ prop: 'createTime', order: 'descending' }"
+	@row-drag-end="onReorder"
+/>
+
+<script setup>
+function onReorder(payload) {
+	rows.value = payload.newOrder; // 整体换新引用：一次可观察的替换（第 01 章）
+	emit('change', payload.newOrder.map((r) => r.id));
+}
+</script>
+```
+
+这里 `row-key`（Element Plus 侧）和模板里的 `:key` 是两件事：前者是表格组件自己维护选中/展开/排序的身份证，后者才是 Vue diff 的复用语义。**表格类组件"选中的行不对了"，先看 `row-key` 有没有给对。**
+
+对照 React：单次遍历按位置配对，遇到 key 不同就查旧 key→index 映射，把旧节点标记为移动后继续往前走；不做 LIS，因此"末尾节点移动到开头"这类形态会产生多次移动。两边都是 O(n) 级别，差别在**移动次数**与**最坏形态**。
+
+```vue
+<!-- 触发最坏形态的例子：把最后一项拖到第一项（拖拽排序表格） -->
+<tr v-for="row in sortedRows" :key="row.id">…</tr>
+```
+
+- Vue：尾部交叉比较命中一次，剩余序列走 LIS，通常 1 次移动。
+- React：一次遍历，其余节点全部被标记移动。
+
+这不是"谁更快"的结论，而是"谁在什么形态下更省"。**排序类交互要实测**：用 Performance 面板看一次拖拽后的 scripting 时长（方法见[浏览器运行时性能](/blog/posts/browser-roadmap-09-runtime-performance/)）。
+
+无 key 时走的是另一条路径：`patchUnkeyedChildren`，按位置依次比，长度不够就挂载/卸载多余的，**不建映射、不处理移动**。这是"忘了写 key"的真实代价，而不只是控制台一条警告。
+
+一个完整的手推例子（面试里能画这张表就赢了）：
+
+```text
+旧序列:  A  B  C  D  E
+新序列:  B  A  D  E C
+
+步 1 头头：A vs B → 不等，停止
+步 2 尾尾：E vs C → 不等，停止
+步 3 头尾：A(旧头) vs C(新尾) → 不等
+步 4 尾头：E(旧尾) vs B(新头) → 不等
+   → 规律变化一个都没命中，整体进入第 5 步
+
+步 5 建映射 {A:0, B:1, C:2, D:3, E:4}
+   按新序列逐个查旧索引，并记下"没被用到的旧节点要卸载"：
+   新 B → 旧索引 1      新 A → 0      新 D → 3      新 E → 4      新 C → 2
+   得到索引序列 [1, 0, 3, 4, 2]
+   LIS = [1, 3, 4]（B、D、E 的相对顺序本来就没变）
+   结论：B、D、E 不动；A、C 需要移动（A 前插到 B 前，C 追加到末尾）
+   移动 DOM 次数 = 2；同一形态用 index 作 key 时会退化成"逐个 patch 文本"，
+   看起来更省，但行的身份和内部状态全部错位——省的是 CPU，赔的是正确性
+```
+
+对照同一个例子在 React 里：一次遍历按位置比，第 0 位 key 从 `A` 变 `B` → 查映射找到旧 `B` 在位置 1，标记移动；后面每一位 key 都要查一次映射，最终移动次数通常更多，且没有"保持不动"的批次。
+
+### 2. keyed 与 Non-keyed fragment 在编译产物上的差异
+
+patchFlag 里三个和 Fragment 有关的位（见第 02 章）：
+
+| 场景 | patchFlag | diff 行为 |
+|---|---|---|
+| 静态数量的 Fragment（如 `v-if`/`v-else` 分支组） | `STABLE_FRAGMENT`（64） | 按位置比，但结构稳定，代价低 |
+| `v-for` 写了 `:key` | `KEYED_FRAGMENT`（128） | 建 key→索引映射，双端 + LIS |
+| `v-for` 没写 `:key` | `UNKEYED_FRAGMENT`（256） | 纯按位置比，无移动优化 |
+| 复杂表达式无法优化 | `BAIL`（-1/-2） | 退回完整 diff |
+
+所以"忘写 key"在产物层面是**可见的降级**：从定点匹配变成按位置硬比。带 `v-if` 的分支组编译器会自动补整数 key，这是它们之间"换分支就是换节点"的依据，不需要你写。
+
+`key` 的三个正确用法（第 3 个是刻意用法）：
+
+```vue
+<!-- 1) 常规：业务稳定 id -->
+<tr v-for="row in rows" :key="row.id">
+
+<!-- 2) 强制重建：切换用户时把整个表单的内部状态清零 -->
+<UserForm :key="currentUserId" :user="currentUser" />
+
+<!-- 3) 多根片段要加 key，必须显式用 template 或带 key 的 Fragment -->
+<template v-for="group in groups" :key="group.code">
+	<th>{{ group.name }}</th>
+	<td>{{ group.count }}</td>
+</template>
+```
+
+第 2 条值得单拎出来：`key` 是 Vue 里**最便宜的"重置组件"**手段，比在 `watch` 里逐个把字段清空可靠得多（后者永远会漏一个字段）。第 06 章的编辑弹窗就用它。
+
+**index 作 key 的故障链**（面试要能讲完整链条，不是背结论）：
+
+```text
+数据 [A, B, C] → key 0,1,2
+删除 A → 数据 [B, C] → key 0,1
+匹配结果：key=0 的旧节点（原本是 A）被 patch 成 B —— DOM 复用，输入框里的半截文字、
+         勾选状态、展开状态、动画进度、第三方控件实例的内部状态，全部跟着错位
+```
+
+可见症状：输入框串值、checkbox 勾选错行、展开行状态错位、删除动画乱飞、`el-table` 的选中行跟着位移。
+允许用 index 的三个条件（同时满足）：列表**不增删、不排序、项内没有内部状态**。生产里几乎不满足，所以默认用业务 id；确实没有稳定 id 时，**在数据加载时生成一次**并挂回对象（`row.__k ??= crypto.randomUUID()`），别在模板里算。
+
+把"现象 → 判定"对上，排查列表问题就三步：
+
+| 现象 | 最可能的机制 | 先改什么 |
+|---|---|---|
+| 删/插一行后输入框串值 | index 作 key，同 key 复用 DOM | 换成稳定业务 id |
+| 切筛选后全部重建、勾选丢失 | 逐项 `v-if` 或 key 序列不稳定 | 过滤改 `computed` 数组 |
+| 改数据界面不动 | 依赖没进订阅（第 01 章）或 `v-memo` 依赖写漏 | 先确认响应式，再看 memo |
+| 排序后位置对但内容错位 | key 与数据不是同一来源（例如 key 用了排序前的 index） | key 必须来自行自身标识 |
+| 拖拽后选中行变了 | 组件库的 `row-key` 与 Vue 的 `:key` 混用 | 两处都指向同一个稳定 id |
+
+### 3. `v-if` 与 `v-for` 同标签：优先级、原因与正确写法
+Vue 3 里 **`v-if` 优先级高于 `v-for`**，因此下面这段会直接报错（`item` 未定义）：
+
+```vue
+<!-- ❌ Vue 3：v-if 先求值，作用域里还没有 item -->
+<li v-for="item in list" v-if="item.visible">{{ item.name }}</li>
+```
+
+机制：同一元素上的指令在 transform 阶段有先后，`v-if` 先被处理，它包裹的是整个 `createVNode` 调用，而 `v-for` 的作用域变量（`item`）要到 `renderList` 回调里才存在。Vue 2 正好相反——`v-for` 优先，所以那时代码能跑但语义是"先展开再逐项判断"。
+
+**这就是迁移 Vue 2 → 3 时最容易静默改变行为的一处**：Vue 2 里"能跑的写法"到 Vue 3 变成运行时错误，或在你手动改成外层包 `template` 后语义悄悄变了。
+
+三种正确写法，按用途选：
+
+```vue
+<!-- A) 过滤：派生一个 filtered 列表，渲染端只负责遍历 -->
+<li v-for="item in visibleItems" :key="item.id">{{ item.name }}</li>
+
+<!-- B) 整块开关：v-if 放在外层容器上，与列表项无关 -->
+<ul v-if="list.length">
+	<li v-for="item in list" :key="item.id">{{ item.name }}</li>
+</ul>
+
+<!-- C) 需要逐项不同结构：template 包一层，key 归位 -->
+<template v-for="item in list" :key="item.id">
+	<li v-if="item.type === 'text'">{{ item.value }}</li>
+	<li v-else-if="item.type === 'image'"><img :src="item.url" /></li>
+</template>
+```
+
+选 A 的理由不只是语法：**过滤逻辑放进 `computed` 后，diff 面对的是"过滤后的数组"**，删项、移动都按过滤后的身份走，行为可预测；而逐项 `v-if` 会在同一层交替产出元素节点与注释节点，patchFlag 落在 `STABLE_FRAGMENT` 上却要为每个分支准备 key 与占位注释，节点数量变化更频繁。
+
+顺带一条：`v-if` 的 false 分支产出注释节点占位（`createCommentVNode`），所以"隐藏"和"销毁"是同一件事——组件实例与 DOM 状态会丢。要保留状态用 `v-show`（只切 `display`）或 `keep-alive`（第 08 章）。
+
+还有一条与"位置"相关的复用规则，和 key 一样常考：
+
+```vue
+<!-- ❌ 切换 isEdit 时输入框内容丢失 -->
+<component :is="isEdit ? 'input' : 'span'">{{ text }}</component>
+
+<!-- ✅ 保持同一类型，只改属性；或者把值提到响应式状态里自己管 -->
+<input :value="text" :readonly="!isEdit" @input="text = $event.target.value" />
+```
+
+同类型 + 同 key 才复用，类型不同就直接卸载重建（React 的同位置换类型同理）。`<component :is>` 切换组件时更是如此：**动态组件的"状态保留"要靠外层 `keep-alive`，不是靠少写一个 `key`**。
+
+> [!WARNING]
+> `vue/no-use-v-if-with-v-for` 是 `eslint-plugin-vue` 的推荐规则之一，它拦的就是这一节的情形。老项目里如果这段规则被关掉了，Vue 2 → 3 迁移要专门跑一遍这条规则再改代码，否则你会只看到"能跑"而看不到语义已经变了（规则与落地方式见 [Lint 与格式化](/blog/posts/engineering-roadmap-06-lint-format/)）。
+
+### 4. `v-memo` 与 `v-once`：两种"跳过"的边界
+
+两者都让 Vue 跳过 patch，但机制完全不同，用错方向比不用更糟。
+
+**`v-once`**：编译期把子树标成"渲染一次后不再 patch"。适合真正不变的静态内容（协议文案、表头说明）。**不适合**任何带动态绑定或指令的子树——一旦依赖变化，它不会更新，你只能靠外层 `key` 强制重建。
+
+**`v-memo="[deps]"`**：运行时浅比较依赖数组，全等则**跳过整个子树的 patch**。
+
+```vue
+<li v-for="row in rows" :key="row.id" v-memo="[row.updatedAt, selectedId === row.id]">
+	<span>{{ row.name }}</span>
+	<el-checkbox :model-value="selectedId === row.id" @change="select(row.id)" />
+	<el-input v-model="row.remark" size="small" />
+</li>
+```
+
+三条必须写对的规则：
+
+1. 在 `v-for` 内用时，依赖数组**必须包含所有会影响该行的变化**，漏一个就是"界面不更新"。文档明确提醒：`v-for` 项内的 `v-memo` 若依赖项本身，需要显式列出来。
+2. 依赖要"少而稳定"。写成 `v-memo="[row]"`（对象每次刷新都是新引用）等于每次都重渲染，还白付了一次浅比较；写 `v-memo="[true]"` 等于 `v-once`。
+3. **`v-memo` 不省 vnode 创建**。它省的是"比较与 DOM patch"，`v-for` 展开时那一行的 vnode 仍然每次新建。所以：行内节点越多、越常触发父级更新，收益越大；行内容极简（一两列纯文本）时收益接近 0，甚至因为多一次依赖比较而略亏。
+
+量级与测量口径（**不要引用别人的固定数字**）。可比的做法是把"一次更新"框起来测：
+
+```ts
+// 录三次取中位数，而不是取最好看的那次
+async function bench(label: string, run: () => Promise<void>, times = 3) {
+	const list: number[] = [];
+	for (let i = 0; i < times; i++) {
+		const t0 = performance.now();
+		await run();
+		await nextTick(); // 等这一次提交真正完成
+		list.push(performance.now() - t0);
+	}
+	console.log(label, list.sort((a, b) => a - b)[1]?.toFixed(1), 'ms（中位）');
+}
+
+await bench('筛选更新-基线', () => applyFilter('vue3'));
+await bench('筛选更新-v-memo', () => applyFilter('vue3'));
+```
+
+这段测的是"从触发到 DOM 提交"的脚本墙钟时间，不含样式计算与绘制；渲染侧成本要看 Performance 面板（指标含义见 [性能指标](/blog/posts/browser-roadmap-07-metrics/)）。口径按下面这份清单执行，**只报"感觉变快了"的 `v-memo`，在评审里等同于没做**：
+
+```text
+适用形态：单行 8 个以上子节点 / 含表单控件或第三方控件 / 更新频率高于 1 次/秒
+测法：Chrome Performance 录一次"输入关键字→列表更新"
+     对比两个指标的 scripting 总时长与 minor GC 次数（开/关 v-memo 各录 3 次取中位）
+     同时记录 First/Interaction 相关指标，见 browser-roadmap-07
+判定：中位数下降不足 10% 就撤掉 v-memo，别为看不见的收益留一行难懂的代码
+示例数据：约 1000 行、每行含输入框的列表，开启 v-memo 后一次筛选更新的脚本耗时
+         从约 40ms 降到约 15ms；换成每行只有两列文本后两者差异在噪声范围内
+```
+
+`v-memo` 也能用在非 `v-for` 的位置，语义是"这段子树只在依赖变了时 patch"，适合**展开面板 / 抽屉里一大块表单**这种"父级一直在更新、内容基本不动"的形态：
+
+```vue
+<section v-memo="[activeTab, detail?.id]">
+	<HeavyChart :data="series" />
+	<DetailForm :record="detail" />
+</section>
+```
+
+这种写法比列表里更安全：依赖数组短、语义直白（"这块只在切页签或换记录时才需要重画"）。但也更容易踩同一个雷——`series` / `detail` 每次都是新引用却没进依赖，界面就停在旧数据。**`v-memo` 的依赖数组本质上是你手写的一次 `shouldComponentUpdate`，写漏的代价是"看不到更新"，比性能损失更难查。**
+
+真实项目里更稳的顺序是：**先让引用稳定（第 02 章的对象 props）→ 再拆组件边界（每行一个子组件 + props 收窄）→ 最后才上 `v-memo`**。跳过前两步直接 `v-memo`，通常只是在给烂结构打补丁。
+
+---
+
+## 与 React 的对照
+
+| 需求 | Vue | React |
+|---|---|---|
+| 同层列表比较 | 双端四指针 + key 映射 + LIS，追求最少移动 | 一次遍历按 index 配对，key 用于查旧位置并标记移动 |
+| 忘记写 key | 编译产物退化为 `UNKEYED_FRAGMENT`，按位置比；无控制台强制报错 | 按 index 配对，开发环境警告 |
+| index 作 key 的后果 | 完全一致：DOM 复用导致内部状态串位 | 完全一致 |
+| 条件 + 列表同标签 | `v-if` 优先，拿不到 `v-for` 变量（Vue 2 相反） | 无优先级概念，`map` 里写 `&&` 天然是逐项判断 |
+| 手动跳过子树更新 | `v-memo` / `v-once`（模板内，编译期/运行期两种机制） | `memo` + 引用稳定（组件级），无 JSX 内联等价语法 |
+| 隐藏 vs 销毁 | `v-show`（CSS 隐藏）与 `v-if`（销毁）两种明确选项 | 只有"渲不渲染"，CSS 隐藏要自己写 |
+| 组件实例复用 | 同类型 + 同 key 才复用；换类型必重建（状态丢） | 组件函数标识相同且同位置才复用；位置变了就重建 |
+
+值得单独记住的差异：**React 的优化单位是组件，Vue 的优化单位可以是节点**。所以 React 里"拆一个 memo 子组件"能解决的事，在 Vue 里既可以拆组件、也可以直接给节点加 `v-memo`；反过来说，Vue 里拆组件不是免费操作（多一层 props 与渲染 effect），大列表里"每行一个组件"要先测再定（第 13 章）。
+
+---
+
+## 翻车现场
+
+**一、删一行，另一行的备注框里出现别人的半截文字。**
+
+- 症状：表格 `:key="index"`，用户删掉第一行后，第二行备注框显示刚被删掉那行没保存的内容；`row.remark` 数据本身是对的。
+- 根因：key 用 index → 删除后 `key=0` 的旧节点被 patch 成新的第二行数据，`el-input` 的 DOM 与内部草稿状态被复用；数据层没串，UI 层串了。
+- 修法：`:key="row.id"`（无 id 时加载阶段生成一次）；若这列是可编辑草稿，把草稿存在数据对象里而不是让控件自己持有。**判据：只要行内有输入框、勾选、展开、动画，index 就不能作 key。**
+
+**二、把过滤写在 `v-for` 里的 `v-if`，切一次筛选整表重建。**
+
+- 症状：从 Vue 2 迁过来的老代码，筛选后所有行都重新挂载，`el-table` 的滚动位置、行内输入草稿、展开行全丢，性能也差。
+- 根因：Vue 3 下 `v-if` 优先级更高，这种写法在语法上就不可用，于是被机械改成了"外层 `template v-for` + 内层逐项 `v-if`"。逐项 `v-if` 让同一层在元素节点与注释节点间反复横跳，key 序列不稳定 → 大量卸载/新建。
+- 修法：改成写法 A（`computed` 过滤后的数组），key 用 id。过滤规则与渲染彻底解耦，diff 面对的是"过滤后的稳定身份"。
+
+**三、`v-memo="[row]"`，加了之后更慢。**
+
+- 症状：刷新一次列表后每次输入都更卡，Performance 里比较逻辑的调用次数上升，渲染耗时没有下降。
+- 根因：接口返回的行对象每次都是新引用，浅比较必然不等 → `v-memo` 从没生效；但依赖数组的分配与比较照付，净增开销。
+- 修法：依赖写成真正会影响渲染的原始值（`row.updatedAt`、`selectedId === row.id`），或直接放弃 `v-memo` 改为"行拆组件 + props 收窄"。**验收方式：先确认依赖数组元素是原始值或稳定引用，再谈收益。**
+
+---
+
+## 复习卡片
+
+- **Q：Vue 3 的列表 diff 分几步？** A：头头、尾尾、头尾/尾头交叉四步先解决规律变化，剩下的未知序列建 key→旧索引映射，再对索引数组求最长递增子序列，只移动不在 LIS 上的节点。
+- **Q：为什么要 LIS？** A：移动 DOM 代价最高，LIS 保证"相对顺序本来就对的那批节点完全不动"，使移动次数达到最小；React 单遍遍历在乱序形态下会产生更多移动。
+- **Q：`v-if` 和 `v-for` 同标签谁先执行？** A：Vue 3 是 `v-if` 先，所以拿不到 `v-for` 的项变量（Vue 2 相反，`v-for` 优先）；过滤要用 computed 派生数组。
+- **Q：index 作 key 为什么一定会出事？** A：删除/插入后 index 与数据的对应关系整体位移，同 key 被判定为同一节点从而复用 DOM，控件内部状态跟着错位。
+- **Q：`v-memo` 省掉了什么、没省什么？** A：依赖浅比较全等时省掉整棵子树的 patch；不省 vnode 创建，也不省 `v-for` 本身的展开，所以行内容很薄时收益接近 0。
+- **Q：`v-once` 和 `v-memo="[true]"` 有何区别？** A：`v-once` 在编译期就放弃优化，子树只渲染一次；`v-memo="[true]"` 是运行时依赖恒等，效果接近但仍走正常渲染路径。`v-once` 只配纯静态内容，`v-memo` 才用于有动态绑定、且绑定依赖可枚举的子树。
+
+---
+
+## 小结
+
+- key 是复用的身份证：同 key 同类型才允许复用 DOM 与实例；`v-for` 忘写 key 在编译产物里是明确的降级（`UNKEYED_FRAGMENT`），不是警告那么轻。
+- Vue 3 的 diff 是"双端四步 + key 映射 + LIS"，目标是把移动次数压到最少；React 是单遍 index 配对，最坏形态不同但同为 O(n)。
+- `v-if` 与 `v-for` 同标签：Vue 3 里 `v-if` 优先，这是必考的行为反转，也是 Vue 2 迁移里最常见的静默改写点。正确姿势是过滤交给 `computed`、整块开关放外层、逐项分支配 `template + key`。
+- 隐藏与销毁是两件事：`v-if` 销毁（状态丢）、`v-show` 只切 CSS、`keep-alive` 缓存实例；`key` 变更则是"手动销毁重建"，比手写 reset 更可靠。
+- `v-memo` 是最后手段：先稳定引用、再划组件边界，最后才在薄节点上用；收益必须有前后 Performance 记录支撑，否则撤掉。
+
+---
+
+## 练习
+
+1. 造一个 500 行的表格数据，分别用 `:key="index"` 和 `:key="row.id"`：在第三行输入框里打几个字，删除第一行，记录两种 key 下输入框内容如何变化；再补一个 `v-if` 分支切换，观察 Vue Devtools 里组件实例是否被重建。约 10 分钟。
+2. 手推一次 LIS：旧序列 `A B C D E F` → 新序列 `B C E A D F`，写出双端四步各消掉了哪些位置、剩下的索引数组是什么、LIS 选了哪几个、最终移动几个节点。
+3. **可见交付物**：给一个 1000 行、每行含输入框和复选框的列表加 `v-memo`，产出三份证据：依赖数组元素类型说明（必须是原始值或稳定引用）、开启前后各录 3 次的 Performance 脚本耗时中位数、以及"改成每行拆一个子组件"的对照组数据；最后用一段话写下你选择哪一种并说明为什么。
+
+---
+
+## 面试一句话
+
+> "Vue 3 的列表 diff 是双端四指针：先头头、尾尾消掉两端规律变化，再交叉比较处理'头变尾、尾变头'，剩下的未知序列建 key 到旧索引的映射，然后对索引数组求最长递增子序列—— LIS 上的节点一律不动，只移动不在序列里的，所以移动次数最少；React 是单遍按 index 配对、用 key 找回旧节点并标记移动，两者同为 O(n) 但最坏形态不同。key 的语义是复用合同：用 index 就是把身份让给了位置，删一项之后同 key 命中旧节点、DOM 和控件内部状态一起错位，这是看得见的串值。另外 Vue 3 里 `v-if` 优先级高于 `v-for`，和 Vue 2 相反，所以过滤必须放在 computed 里派生数组，而不是逐项 `v-if`；`v-memo` 跳过的只是 patch，不跳过 vnode 创建，行很薄时没有收益，要用前后 Performance 中位数决定留不留。"
