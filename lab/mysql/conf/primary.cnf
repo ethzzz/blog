@@ -1,0 +1,24 @@
+# 参考文档：本目录的 .cnf 不参与挂载。
+# drvfs（/mnt/e）上的文件是 0777，mysqld 会静默忽略 world-writable 配置文件，
+# 实际配置改由 docker-compose.yml 的 command 参数下发。原因详见 compose 头部注释。
+[mysqld]
+server-id                       = 1
+log_bin                         = mysql-bin
+binlog_format                   = ROW
+binlog_row_image                = FULL
+gtid_mode                       = ON
+enforce_gtid_consistency        = ON
+
+# 「双一」配置：既保证掉电不丢事务，也保证 binlog 与 redo 不会一方缺页
+sync_binlog                     = 1
+innodb_flush_log_at_trx_commit  = 1
+
+transaction_isolation           = REPEATABLE-READ
+innodb_buffer_pool_size         = 256M
+innodb_log_buffer_size          = 16M
+max_connections                 = 200
+
+# 让慢日志与执行计划实验看得见数据
+slow_query_log                  = ON
+long_query_time                 = 0.1
+slow_query_log_file             = /var/lib/mysql/slow.log

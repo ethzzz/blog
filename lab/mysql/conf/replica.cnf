@@ -1,0 +1,22 @@
+# 参考文档：本目录的 .cnf 不参与挂载。
+# drvfs（/mnt/e）上的文件是 0777，mysqld 会静默忽略 world-writable 配置文件，
+# 实际配置改由 docker-compose.yml 的 command 参数下发。原因详见 compose 头部注释。
+[mysqld]
+server-id                       = 2
+log_bin                         = mysql-bin
+binlog_format                   = ROW
+gtid_mode                       = ON
+enforce_gtid_consistency        = ON
+
+# 从库自己要落 binlog：实验「级联复制」和「故障后从库提升为主」时需要它有自己的日志
+log_replica_updates             = ON
+
+# 从库默认不可写（root 仍可写，方便做「误写从库」这个经典事故的复现）
+read_only                       = ON
+super_read_only                 = OFF
+
+sync_relay_log                  = 1
+innodb_flush_log_at_trx_commit  = 1
+innodb_buffer_pool_size         = 256M
+transaction_isolation           = REPEATABLE-READ
+max_connections                 = 200

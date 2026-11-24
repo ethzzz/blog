@@ -1,0 +1,87 @@
+name: dblab-redis
+
+# Redis 实验环境：主从 + 哨兵（默认）／ 三主三从 Cluster（profile=cluster）
+# 全部只在容器网络内访问（宿主 WSL 是 NAT 模式，没开 localhost 转发），
+# 所以所有实验都用 `docker compose exec` 进容器跑 redis-cli，不映射任何端口。
+
+x-redis-defaults: &redis-defaults
+  image: redis:7-alpine
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  # ---------- 主从 + 哨兵 ----------
+  redis-master:
+    <<: *redis-defaults
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 64mb
+      --maxmemory-policy allkeys-lru
+      --enable-debug-command local
+
+  redis-replica-a:
+    <<: *redis-defaults
+    command: redis-server --appendonly yes --replicaof redis-master 6379
+    depends_on: [redis-master]
+
+  redis-replica-b:
+    <<: *redis-defaults
+    command: redis-server --appendonly yes --replicaof redis-master 6379
+    depends_on: [redis-master]
+
+  # 三个哨兵必须各自独立成服务：用 deploy.replicas: 3 复制出来的实例共用主机名 redis-sentinel，
+  # 而配置里 resolve-hostnames=yes，Docker DNS 对这个名字只会返回其中一个 IP ——
+  # 哨兵互看会以为彼此是同一台，导致选举无法收敛（实测 sdown→odown 拖到 70s 且无 +try-failover，
+  # 日志里出现 -failover-abort-not-elected）。分开服务名后每个哨兵有唯一主机名。
+  sentinel-a: &sentinel
+    image: redis:7-alpine
+    restart: unless-stopped
+    hostname: sentinel-1
+    # 各自 cp 一份模板：哨兵会重写自己的配置文件（记录已发现副本、epoch），
+    # 三个容器共享同一个 bind-mount 文件会互相覆盖。
+    command: >
+      sh -c "cp /template/sentinel.conf /etc/sentinel.conf &&
+             exec redis-server /etc/sentinel.conf --sentinel"
+    volumes:
+      - ./sentinel.conf:/template/sentinel.conf:ro
+    depends_on: [redis-master, redis-replica-a, redis-replica-b]
+
+  sentinel-b:
+    <<: *sentinel
+    hostname: sentinel-2
+
+  sentinel-c:
+    <<: *sentinel
+    hostname: sentinel-3
+
+  # ---------- Cluster（--profile cluster 时才起） ----------
+  redis-c1:
+    <<: *redis-defaults
+    profiles: ["cluster"]
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+  redis-c2:
+    <<: *redis-defaults
+    profiles: ["cluster"]
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+  redis-c3:
+    <<: *redis-defaults
+    profiles: ["cluster"]
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+  redis-c4:
+    <<: *redis-defaults
+    profiles: ["cluster"]
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+  redis-c5:
+    <<: *redis-defaults
+    profiles: ["cluster"]
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+  redis-c6:
+    <<: *redis-defaults
+    profiles: ["cluster"]
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes

@@ -1,0 +1,68 @@
+name: dblab-mysql
+
+# MySQL 实验环境：一主一从，GTID + ROW binlog + log_replica_updates。
+#
+# ⚠️ 配置必须走 command 参数，不能 bind-mount .cnf：
+#    这个仓库在 Windows 上，compose 文件位于 /mnt/e（drvfs）。从 drvfs 挂进去的文件权限是 0777，
+#    mysqld 会以「World-writable config file ... is ignored」**静默忽略整个配置文件**，
+#    结果是 gtid_mode 仍是 OFF、binlog 参数全是默认，而复制建立时报
+#    「CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION = 1 cannot be executed because @@GLOBAL.GTID_MODE = OFF」。
+#    后续每个实验都会拿到空结果，却没有任何一处直接说「配置没生效」——这就是最典型的假就绪。
+#    conf/ 目录保留为参考文档（*.reference），不参与挂载。
+#
+# 只在容器网络内使用（WSL NAT 模式无宿主端口转发），实验一律 docker exec 进容器跑客户端。
+
+x-mysql-defaults: &mysql-defaults
+  image: mysql:8.4
+  restart: unless-stopped
+  environment:
+    MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 lab/mysql/.env 里设置}
+    MYSQL_DATABASE: ${MYSQL_DATABASE:-lab}
+    MYSQL_USER: ${MYSQL_USER:-lab}
+    MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 lab/mysql/.env 里设置}
+  healthcheck:
+    test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p\"\$$MYSQL_ROOT_PASSWORD\""]
+    interval: 5s
+    timeout: 5s
+    retries: 40
+
+services:
+  mysql-primary:
+    <<: *mysql-defaults
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --sync-binlog=1
+      - --innodb-flush-log-at-trx-commit=1
+      - --transaction-isolation=REPEATABLE-READ
+      - --innodb-buffer-pool-size=256M
+      - --slow-query-log=ON
+      - --long-query-time=0.1
+    volumes:
+      - primary-data:/var/lib/mysql
+
+  mysql-replica:
+    <<: *mysql-defaults
+    command:
+      - --server-id=2
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-replica-updates=ON
+      - --read-only=ON
+      - --sync-relay-log=1
+      - --innodb-flush-log-at-trx-commit=1
+      - --transaction-isolation=REPEATABLE-READ
+      - --innodb-buffer-pool-size=256M
+    volumes:
+      - replica-data:/var/lib/mysql
+    depends_on: [mysql-primary]
+
+volumes:
+  primary-data:
+  replica-data:
