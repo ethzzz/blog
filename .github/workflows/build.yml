@@ -32,6 +32,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # 内容门禁：frontmatter 引号 / MDX 裸标签与花括号 / 内链有效性 / 模块归属。
+      # 放在装依赖之前——纯 node 脚本、秒级返回，而它抓的三类问题会让 `astro build` 直接崩，
+      # 等 pnpm install 跑完才发现纯属浪费。
+      # 只挂 Check 不挂 deploy.yml：新门禁先别拿生产发布当试验品，观察一阵无误报再升级成部署阻断。
+      - name: Content gate
+        run: node scripts/check-content.js
+
       - name: Setup pnpm
         uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:

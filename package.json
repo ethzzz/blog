@@ -12,6 +12,8 @@
     "type-check": "tsc --noEmit --isolatedDeclarations",
     "new-post": "node scripts/new-post.js",
     "new-solution": "node scripts/new-solution.js",
+    "check:content": "node scripts/check-content.js",
+    "check:content:self": "node scripts/check-content.js --self-test",
     "format": "biome format --write ./src",
     "lint": "biome check --write ./src"
   },
