@@ -37,6 +37,12 @@ cd /mnt/e/code/astro-blog-fuwari/lab/mysql  && docker compose up -d && bash 00-s
 
 ## 已经证到的（可直接引用）
 
+- **MySQL 8.4 的 `read_only` 连 root 也挡**：实测 `--read-only=ON` 后 root 执行
+  `CREATE TABLE` 报 `ERROR 1290 (HY000) ... running with the --read-only option`。
+  原因是 8.4 移除了 `SUPER` 特权，而旧豁免正是挂在 SUPER 上。
+  这纠正了站内和大量旧文章里「root 不受 read_only 限制」的说法——正文必须按 8.4 行为写，
+  并且把「误写从库」这个经典事故改成「在 8.4 上已被结构性堵住，但 8.0 及以前依然存在」。
+
 - 主从基线与偏移量对齐方式（`master_repl_offset` / `slave_repl_offset` 逐字节可比）。
 - **异步复制的已确认写入丢失**：摘掉全部副本后 pipeline 写 2000 条（`errors: 0, replies: 2000`），
   副本侧一条没有；旧主自己的 AOF 里 2000 条都在 —— 丢的不是数据，是「谁当主」的决定权。
