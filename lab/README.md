@@ -75,3 +75,14 @@ cd /mnt/e/code/astro-blog-fuwari/lab/mysql  && docker compose up -d && bash 00-s
    于是往只读副本写入，拿到 `READONLY` 却误以为在验证 `NOREPLICAS` —— 两种错误长得几乎一样。
 3. `SHOW REPLICA STATUS` 的 `Seconds_Behind_Source` 是 SQL 线程相对 IO 线程的秒级取整差值，
    不含网络传输，不能当「读己之写」的依据；那要用 GTID 等待。
+4. **compose 改了配置但容器还是旧的**，而且不报"你没生效"。这次是 YAML 里 `"mysqladmin ... -p\"$$PWD\""`
+   的 `\"` 属于非法转义 → go-yaml 直接拒绝解析整个文件，`down`/`up` 全部没执行，
+   旧容器继续跑着上一版 `--defaults-extra-file=/etc/mysql/conf.d/lab.cnf`。
+   症状是"我明明改了 command，gtid_mode 还是 OFF"。
+   两条硬规矩：改完 compose 先 `docker compose config` 过一遍（错误进 stderr，别 `2>/dev/null` 吞掉），
+   再 `docker inspect -f '{{.Config.Cmd}}'` 肉眼确认新参数真的落在容器上；
+   healthcheck.test 用**列表 + 明文标量**写法（`- CMD-SHELL` / `- mysqladmin ping ... -p"$$VAR"`），
+   双引号在明文标量里是普通字符，不需要转义。
+5. **不要在吞掉输出的前提下判断部署成功**：本轮所有"环境就绪"的误判，
+   都发生在 `>/dev/null 2>&1` 之后。要么看输出，要么在脚本里加预检查断言（run-experiments.sh 已加）。
+

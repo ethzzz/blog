@@ -20,8 +20,14 @@ x-mysql-defaults: &mysql-defaults
     MYSQL_DATABASE: ${MYSQL_DATABASE:-lab}
     MYSQL_USER: ${MYSQL_USER:-lab}
     MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 lab/mysql/.env 里设置}
+  # 三种写法都会踩雷：双引号标量里 \" 是非法转义（go-yaml 直接拒绝整个文件）；
+  # 而纯字符串形式的 healthcheck.test 又必须以 CMD/CMD-SHELL/NONE 开头。
+  # 用列表 + 明文标量：双引号在明文标量里就是普通字符，不需要任何转义。
+  # $$ 是 compose 的转义，表示把 $VAR 原样交给容器内 shell 展开。
   healthcheck:
-    test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p\"\$$MYSQL_ROOT_PASSWORD\""]
+    test:
+      - CMD-SHELL
+      - mysqladmin ping -h 127.0.0.1 -p"$$MYSQL_ROOT_PASSWORD"
     interval: 5s
     timeout: 5s
     retries: 40
