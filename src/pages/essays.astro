@@ -1,5 +1,6 @@
 ---
 import { getCollection } from "astro:content";
+import { INTERVIEW_RECORD_CATEGORY } from "@constants/constants";
 import { ROADMAP_GROUPS } from "@constants/roadmap-modules";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { getPostUrlBySlug } from "@utils/url-utils";
@@ -11,6 +12,7 @@ const seriesCategories = new Set([
 	),
 	"前端面试宝典",
 	"notelab",
+	INTERVIEW_RECORD_CATEGORY,
 ]);
 
 // 散篇内容聚合（PROD 下排除草稿）

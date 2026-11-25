@@ -1,3 +1,4 @@
+import { INTERVIEW_RECORD_CATEGORY } from "./constants/constants";
 import { ROADMAP_GROUPS } from "./constants/roadmap-modules";
 import type {
 	ExpressiveCodeConfig,
@@ -64,6 +65,10 @@ export const navBarConfig: NavBarConfig = {
 		{
 			name: "面试宝典",
 			url: "/interview-guide/",
+		},
+		{
+			name: INTERVIEW_RECORD_CATEGORY,
+			url: "/interview-records/",
 		},
 		{
 			name: "NoteLab 实战",

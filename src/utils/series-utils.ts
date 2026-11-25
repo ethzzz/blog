@@ -1,4 +1,5 @@
 import type { CollectionEntry } from "astro:content";
+import { INTERVIEW_RECORD_CATEGORY } from "../constants/constants";
 import { ROADMAP_GROUPS } from "../constants/roadmap-modules";
 
 /**
@@ -78,13 +79,15 @@ export function buildSeriesBySlug(
 	const result = new Map<string, SeriesInfo>();
 
 	for (const [name, list] of groups) {
-		const orders = list.map((e) => seriesOrderOf(e.slug));
-		const everyPostNumbered = orders.every((o) => o !== null);
+		// 面试记录的 slug 后缀是日期，按发布日期排序。
+		const orderOf = (entry: PostEntry) =>
+			name === INTERVIEW_RECORD_CATEGORY ? null : seriesOrderOf(entry.slug);
+		const everyPostNumbered = list.every((entry) => orderOf(entry) !== null);
 
 		const sorted = [...list].sort((a, b) => {
 			if (everyPostNumbered) {
-				const oa = seriesOrderOf(a.slug) ?? 0;
-				const ob = seriesOrderOf(b.slug) ?? 0;
+				const oa = orderOf(a) ?? 0;
+				const ob = orderOf(b) ?? 0;
 				if (oa !== ob) return oa - ob;
 			}
 			return (
@@ -97,7 +100,7 @@ export function buildSeriesBySlug(
 			slug: e.slug,
 			title: e.data.title,
 			label: stripTitleOrder(e.data.title),
-			order: seriesOrderOf(e.slug),
+			order: orderOf(e),
 		}));
 
 		const roadmapUrl = ROADMAP_URL_BY_CATEGORY.get(name) ?? null;

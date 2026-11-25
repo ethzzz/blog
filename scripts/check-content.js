@@ -28,7 +28,7 @@ const SOLUTIONS = path.join(root, "src/content/solutions");
 const PAGES = path.join(root, "src/pages");
 
 /** 有独立导航入口、但不在路线注册表里的系列 */
-const STANDALONE = new Set(["前端面试宝典", "notelab"]);
+const STANDALONE = new Set(["前端面试宝典", "notelab", "面试记录"]);
 
 function registeredCategories() {
 	const src = fs.readFileSync(
