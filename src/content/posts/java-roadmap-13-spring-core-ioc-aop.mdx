@@ -556,6 +556,8 @@ public class OperationLogAspect {
 
 切面的 order 是 `LOWEST_PRECEDENCE - 10`，比事务拦截器更靠外。`@EnableTransactionManagement` 的 `order` 默认就是 `Ordered.LOWEST_PRECEDENCE`，所以成功那条日志写在业务事务提交之后；失败时业务已经回滚，日志由 `REQUIRES_NEW` 独立提交。顺序写死，不依赖 Bean 的注册先后。
 
+下面只展示构造器和 `complete` 的改动。保留阶段十二的 `get`、`page`、`create`、`update`、`delete` 和 `getForUpdate` 方法。
+
 ```java title="task-center/src/main/java/com/demo/taskcenter/task/TaskService.java"
 package com.demo.taskcenter.task;
 
@@ -579,10 +581,7 @@ public class TaskService {
     @OperationLogging(action = "TASK_COMPLETE")
     @Transactional(rollbackFor = Exception.class)
     public void complete(long id) {
-        Task task = mapper.findById(id);
-        if (task == null) {
-            throw new BusinessException(404, "任务不存在");
-        }
+        Task task = getForUpdate(id);
         if (Boolean.TRUE.equals(task.getDone())) {
             // 独立事务：下面这行 409 会让外层回滚，但这条日志必须留下
             operationLogService.record("TASK_COMPLETE_SKIP", id, "已经完成，拒绝重复操作");
@@ -594,7 +593,7 @@ public class TaskService {
 }
 ```
 
-在 `complete` 这条路径上，与 12 相比只有两处变化：构造器多了 `OperationLogService` 依赖，方法里出现了一次跨 Bean 调用。12 提醒过「同类内部调用不走代理」，这里把它变成具体改法：审计逻辑必须拆到独立 Bean，不能留在同一个类里。
+这里给 `complete` 加上审计切面和重复完成检查，并将独立审计事务交给 `OperationLogService`。阶段十二的回滚测试依赖模拟异常，适用于阶段十二快照。本阶段按下面的重复请求与审计查询验证新行为。
 
 Controller 只加一个方法（片段，加在 12 的 `TaskController` 里）：
 
@@ -615,18 +614,20 @@ public ApiResponse<Void> complete(@PathVariable long id) {
 </dependency>
 ```
 
-启动后验证两次：
+启动后用阶段十二的创建请求生成一条未完成任务，将下面的 `id` 换成返回的 `data.id`，再验证两次。
 
 ```bash
 # 第一次：成功，返回 code 0
-curl -s -X POST http://localhost:8081/api/tasks/1/complete
+id=1
+curl -s -X POST "http://localhost:8081/api/tasks/$id/complete"
 # 第二次：重复完成，返回 code 409
-curl -s -X POST http://localhost:8081/api/tasks/1/complete
+curl -s -X POST "http://localhost:8081/api/tasks/$id/complete"
 ```
 
 输出：第一条返回的 `code` 是 0、`message` 是 `ok`、`data` 是 null；第二条返回的 `code` 是 409、`message` 是「任务已经完成」。12 的 `GlobalExceptionHandler` 会按 `BusinessException.code` 设置 HTTP 状态。
 
 ```sql
+-- 1 换成刚才验证的任务 ID
 SELECT id, action, task_id, detail, created_at
 FROM operation_log
 WHERE task_id = 1

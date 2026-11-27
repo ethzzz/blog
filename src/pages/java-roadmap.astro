@@ -11,22 +11,44 @@ const allPosts = await getCollection("posts", ({ data }) => {
 	);
 });
 
-// 按 slug 中的阶段编号排序
-const sortedPosts = allPosts.sort((a, b) => {
-	const numA = Number.parseInt(
-		a.slug.match(/java-roadmap-(\d+)/)?.[1] ?? "0",
-		10,
-	);
-	const numB = Number.parseInt(
-		b.slug.match(/java-roadmap-(\d+)/)?.[1] ?? "0",
-		10,
-	);
-	return numA - numB;
-});
+const overviewPost = allPosts.find(
+	(post) => post.slug === "java-roadmap-00-overview",
+);
+const chapters = allPosts
+	.filter((post) => post !== overviewPost)
+	.map((post) => {
+		const label = post.slug.match(/^java-roadmap-(\d+[a-z]*)-/)?.[1] ?? "";
+		return { post, stage: Number.parseInt(label, 10), label: label.toUpperCase() };
+	})
+	.sort((a, b) => a.label.localeCompare(b.label, "en", { numeric: true }));
 
-// 分离总览和阶段文章
-const overviewPost = sortedPosts.find((p) => p.slug.includes("00-overview"));
-const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
+const groups = [
+	{
+		title: "语法与面向对象",
+		description: "编译和调试一个命令行程序，用类和接口表达任务行为。",
+		chapters: chapters.filter(({ stage }) => stage >= 1 && stage <= 7),
+	},
+	{
+		title: "语言进阶与工程预备",
+		description: "练习集合、异常、Stream 和并发，再用 Maven 和 JUnit 验证任务文件导入。",
+		chapters: chapters.filter(({ stage }) => stage >= 8 && stage <= 11),
+	},
+	{
+		title: "后端工程",
+		description: "从任务 CRUD 做起，逐步加入接口契约、数据库优化、权限、测试、缓存和部署。",
+		chapters: chapters.filter(({ stage }) => stage >= 12 && stage <= 19),
+	},
+	{
+		title: "毕业项目",
+		description: "交付任务工单服务，验证工单流转、数据权限、审计与回滚。",
+		chapters: chapters.filter(({ stage }) => stage === 20),
+	},
+	{
+		title: "独立速成教程",
+		description: "按主题复习 Java 和 Spring Boot，数据库示例使用 Spring Data JPA。",
+		chapters: chapters.filter(({ stage }) => stage >= 21 || Number.isNaN(stage)),
+	},
+].filter(({ chapters }) => chapters.length > 0);
 ---
 
 <MainGridLayout title="Java 学习路线合集">
@@ -34,12 +56,12 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 		<!-- 页面标题 -->
 		<div class="mb-8">
 			<h1 class="text-3xl font-bold text-90 mb-2">Java 学习路线</h1>
-			<p class="text-75 text-lg">前端工程师的 Java 重学笔记 · 共 {sortedPosts.length} 篇</p>
+			<p class="text-75 text-lg">从 Java 基础到交付 Spring Boot 工单服务 · 共 {allPosts.length} 篇</p>
 		</div>
 
 		<!-- 总览卡片 -->
 		{overviewPost && (
-			<a href={getPostUrlBySlug(overviewPost.slug)} 
+			<a href={getPostUrlBySlug(overviewPost.slug)}
 			   class="block card-base card-shadow p-6 mb-6 hover:shadow-lg transition-all group">
 				<div class="flex items-start justify-between">
 					<div class="flex-1">
@@ -68,55 +90,55 @@ const stagePosts = sortedPosts.filter((p) => !p.slug.includes("00-overview"));
 		)}
 
 		<!-- 阶段文章列表 -->
-		<div class="space-y-4">
-			{stagePosts.map((post, index) => (
-				<a href={getPostUrlBySlug(post.slug)} 
-				   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
-					<div class="flex items-start gap-4">
-						<!-- 阶段编号 -->
-						<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
-							{index + 1}
-						</div>
-						
-						<!-- 文章内容 -->
-						<div class="flex-1 min-w-0">
-							<div class="flex items-center gap-2 mb-1">
-								<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
-									{post.data.title}
-								</h3>
-							</div>
-							<p class="text-75 text-sm mb-2 line-clamp-2">
-								{post.data.description}
-							</p>
-							<div class="flex items-center gap-3 text-xs text-50">
-								<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
-								{post.data.tags && post.data.tags.length > 0 && (
-									<span class="flex items-center gap-1">
-										{post.data.tags.slice(0, 3).map(tag => (
-											<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
-												#{tag}
-											</span>
-										))}
-									</span>
-								)}
-							</div>
-						</div>
-						
-						<!-- 箭头 -->
-						<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
-							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-								<path d="M5 12h14M12 5l7 7-7 7"/>
-							</svg>
-						</div>
-					</div>
-				</a>
-			))}
-		</div>
+		{groups.map((group) => (
+			<section class="mt-8">
+				<h2 class="text-xl font-bold text-90 mb-1">{group.title}</h2>
+				<p class="text-75 text-sm mb-4">{group.description}</p>
+				<div class="space-y-4">
+					{group.chapters.map(({ post, label }) => (
+						<a href={getPostUrlBySlug(post.slug)}
+						   class="block card-base card-shadow p-5 hover:shadow-lg transition-all group">
+							<div class="flex items-start gap-4">
+								<!-- 阶段编号 -->
+								<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+									{label}
+								</div>
 
-		<!-- 底部说明 -->
-		<div class="mt-8 p-4 rounded-lg bg-[var(--btn-regular-bg)] text-75 text-sm">
-			<p class="font-medium mb-1">💡 学习建议</p>
-			<p>从 Java 语法走到能上线的任务工单服务，按阶段逐步完善 task-center。每篇结束都运行示例、完成练习并核对自检标准；八个工程阶段覆盖 Spring、数据库、权限、测试、缓存与部署。已有基础可按总览选读，但不要跳过权限、测试与回滚验收。</p>
-		</div>
+								<!-- 文章内容 -->
+								<div class="flex-1 min-w-0">
+									<div class="flex items-center gap-2 mb-1">
+										<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors">
+											{post.data.title}
+										</h3>
+									</div>
+									<p class="text-75 text-sm mb-2 line-clamp-2">
+										{post.data.description}
+									</p>
+									<div class="flex flex-wrap items-center gap-3 text-xs text-50">
+										<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+										{post.data.tags && post.data.tags.length > 0 && (
+											<span class="flex items-center gap-1">
+												{post.data.tags.slice(0, 3).map(tag => (
+													<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+														#{tag}
+													</span>
+												))}
+											</span>
+										)}
+									</div>
+								</div>
+
+								<!-- 箭头 -->
+								<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+									<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<path d="M5 12h14M12 5l7 7-7 7"/>
+									</svg>
+								</div>
+							</div>
+						</a>
+					))}
+				</div>
+			</section>
+		))}
 	</div>
 </MainGridLayout>

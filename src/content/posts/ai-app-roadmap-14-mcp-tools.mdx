@@ -8,7 +8,7 @@ draft: false
 ---
 
 > [!NOTE]
-> 前 13 篇里，模型调工具靠的是 **function calling**：每个应用自己定义 schema、自己执行、自己拼回上下文。
+> 模型通过 **function calling** 表达工具调用意图，应用负责参数校验、执行和回填结果。想直接体验同一个待办工具如何给外部客户端复用，可以跟做 [实战 03 · Agent 工具循环、人工确认和 MCP](/blog/posts/ai-app-workshop-03-agent-mcp/)。
 > 一旦「工具」需要被多个客户端复用（编辑器、IDE、聊天端、自动化脚本），这套做法就会退化成 M×N 的重复集成。
 > **MCP（Model Context Protocol）** 就是把这个接口标准化：工具写一次，任何支持 MCP 的宿主都能用。
 >

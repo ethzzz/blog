@@ -1,0 +1,104 @@
+---
+import { getCollection } from "astro:content";
+import { PROJECT_GROUP } from "@constants/roadmap-modules";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug, url } from "@utils/url-utils";
+
+const workshop = PROJECT_GROUP.modules.find((module) => module.url === "/ai-app-workshop/");
+
+const allPosts = await getCollection("posts", ({ data }) => {
+	return import.meta.env.PROD ? data.draft !== true : true;
+});
+
+const workshopPosts = allPosts
+	.filter((post) => workshop?.slugPrefix && post.data.category === workshop.category &&
+		post.slug.startsWith(workshop.slugPrefix))
+	.sort((a, b) => a.slug.localeCompare(b.slug));
+const graduation = allPosts.find((post) => post.slug === "ai-app-roadmap-13-project-ai-app");
+
+const postNo = (slug: string) =>
+	slug.match(/ai-app-workshop-(\d+)/)?.[1] ?? "-";
+---
+
+<MainGridLayout title="AI 应用工作坊">
+	<div class="onload-animation">
+		<div class="mb-8">
+			<h1 class="text-3xl font-bold text-90 mb-2">AI 应用工作坊</h1>
+			<p class="text-75 text-lg">
+				五关从流式对话做到评测发布 · 共 {workshopPosts.length} 篇
+			</p>
+			<p class="text-50 text-sm mt-2">
+				每篇都对应 <code>lab/ai-app-workshop/</code> 里的可运行源码，可按文件单独下载，跟着跑一遍再改。
+			</p>
+		</div>
+
+		{workshopPosts.length === 0 ? (
+			<div class="card-base p-8 text-center text-75">还没有文章，第一篇在路上。</div>
+		) : (
+			<div class="space-y-4">
+				{
+					workshopPosts.map((post) => (
+						<a
+							href={getPostUrlBySlug(post.slug)}
+							class="block card-base card-shadow p-5 hover:shadow-lg transition-all group"
+						>
+							<div class="flex items-start gap-4">
+								<div class="flex-shrink-0 w-12 h-12 rounded-full bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-lg group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+									{postNo(post.slug)}
+								</div>
+
+								<div class="flex-1 min-w-0">
+									<h3 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
+										{post.data.title}
+									</h3>
+									<p class="text-75 text-sm mb-2 line-clamp-2">
+										{post.data.description}
+									</p>
+									<div class="flex items-center gap-3 text-xs text-50">
+										<span>{post.data.published.toLocaleDateString("zh-CN")}</span>
+										{post.data.tags && post.data.tags.length > 0 && (
+											<span class="flex items-center gap-1">
+												{post.data.tags.slice(0, 3).map((tag) => (
+													<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
+														#{tag}
+													</span>
+												))}
+											</span>
+										)}
+									</div>
+								</div>
+
+								<div class="flex-shrink-0 text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity self-center">
+									<svg
+										width="20"
+										height="20"
+										viewBox="0 0 24 24"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="2"
+									>
+										<path d="M5 12h14M12 5l7 7-7 7" />
+									</svg>
+								</div>
+							</div>
+						</a>
+					))
+				}
+			</div>
+		)}
+
+		<div class="card-base card-shadow p-5 text-sm text-75 mt-6">
+			<p class="font-bold text-90 mb-2">怎么用这个工作坊</p>
+			<p class="mb-2">
+				先按 01 到 05 的顺序搭建，每关先跑通示例，再读代码并完成练习。
+				{graduation && (
+					<>完成后按 <a class="link text-[var(--primary)]" href={getPostUrlBySlug(graduation.slug)}>毕业验收</a> 演示完整应用。</>
+				)}
+			</p>
+			<p>
+				配套路线：<a class="link text-[var(--primary)]" href={url("/ai-app-roadmap/")}>AI 应用开发</a>
+				（讲原理与设计，工作坊负责动手）
+			</p>
+		</div>
+	</div>
+</MainGridLayout>

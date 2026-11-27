@@ -233,7 +233,28 @@ const objRef = ref({ deep: 1 });
 | `toRefs(obj)` | 每个字段都转成 `toRef` | 解构 `reactive` 且不丢响应式 |
 | `shallowRef(x)` | 只有 `.value` 被替换才触发 | 大对象、第三方实例、频繁整体替换 |
 
-`ref` 和 `shallowRef` 的差别在**对内层对象是否递归响应**，而不是"有没有 `.value`"：两者都必须换 `.value` 才触发；差别在于 `state.value.a.b = 1` 这种深层写入，`ref` 触发，`shallowRef` 不触发。
+`ref` 和 `shallowRef` 都通过 `.value` 访问值，也都能在替换 `.value` 时触发更新。`ref` 会把普通对象转换成深层响应式代理，所以读取过的 `state.value.a.b` 被修改时也能通知订阅者。`shallowRef` 保留原始内部值，原始对象的深层修改需要替换 `.value` 或调用 `triggerRef` 才通知订阅者。 [Vue 官方深层响应说明](https://vuejs.org/guide/essentials/reactivity-fundamentals.html#deep-reactivity)
+
+```js
+import { ref, shallowRef, watchEffect, triggerRef, nextTick } from 'vue'
+
+const deep = ref({ count: 0 })
+const shallow = shallowRef({ count: 0 })
+const seenDeep = []
+const seenShallow = []
+const stopDeep = watchEffect(() => seenDeep.push(deep.value.count))
+const stopShallow = watchEffect(() => seenShallow.push(shallow.value.count))
+deep.value.count++
+shallow.value.count++
+await nextTick()
+console.assert(seenDeep.join(',') === '0,1')
+console.assert(seenShallow.join(',') === '0')
+triggerRef(shallow)
+await nextTick()
+console.assert(seenShallow.join(',') === '0,1')
+stopDeep()
+stopShallow()
+```
 
 ```js
 const rows = shallowRef(bigListFromApi.value); // 大表格：只认整体替换
@@ -374,7 +395,7 @@ async function load() {
 - **Q：为什么 `reactive` 对象不能解构？** A：解构是一次求值，得到的值/子引用脱离了代理链，之后整体替换原对象的字段时没人通知它；要解构就 `toRefs`。
 - **Q：ref 为什么需要 `.value`，模板里为什么不用写？** A：基本类型无法被 Proxy 包，只能放进对象盒子里；模板里由编译器对 setup 顶层 ref 自动 unwrap，嵌在普通数组/对象里的 ref 不解包。
 - **Q：改了数据视图不动，第一反应查什么？** A：三件事——这次读取有没有被收集（是否被 `v-if` 挡了/搬到异步里了）、写入是不是换了新引用、值有没有在传递路上被复制或解构脱离代理。
-- **Q：`ref` 与 `shallowRef` 的分界线在哪？** A：都要换 `.value` 才触发；差别在内层对象是否递归响应，"变化等于整体换新值"用 `shallowRef`，字段级零散变化用 `ref` / `reactive`。
+- **Q：`ref` 与 `shallowRef` 的分界线在哪？** A：替换 `.value` 都能触发。`ref` 内部的普通对象是深层响应式，`shallowRef` 保留内部值本身，修改原始对象的字段后可用 `triggerRef` 显式通知。
 - **Q：computed 为什么"读十次和读一次一样便宜"？** A：getter 结果被缓存，依赖变化只把脏标记传播下来，真正的重算推迟到下一次被读取时发生一次。
 
 ---
@@ -394,7 +415,7 @@ async function load() {
 
 1. 造一个 `reactive` 对象，分别用 `state.list[0].name = 'x'`、`Object.assign(state, ...)`、`state = reactive(...)`、`const { list } = state` 四种写法，逐个判断视图是否更新并在纸上写出订阅链断在哪。耗时约 8 分钟。
 2. 把上一题的场景改造成"正确姿势"：`toRefs` 解构 + `ref` 存列表 + 整体替换 `.value`，并给一个 `shallowRef` 版本；用 `triggerRef` 演示一次原地 mutate 后手动唤醒。
-3. **可见交付物**：写一个 `useUserForm(raw)` composable，返回值形如 `{ form, errors, dirty, reset }`，要求：外部传入的 `raw` 是普通对象且可能在任意时刻被整体替换；`form` 必须能安全解构（内部用 `toRefs`）；`dirty` 是一个 `computed`，只在字段被真正改过时为 `true`。附上 3 条断言测试：解构后写入能反映到 `dirty`、整体替换后能反映、未读取的字段不触发任何重新计算。
+3. **可见交付物**：写一个 `useUserForm(source)` composable，`source` 为保存普通表单对象的 ref，调用者通过 `source.value = next` 传入新对象。返回 `{ form, errors, dirty, reset }`，表单字段用 `toRefs` 暴露，`dirty` 对照基线值计算。自检要求字段编辑会置脏、reset 恢复基线、替换 source 后可以显式重新载入新表单。调用者普通局部变量的重新赋值需要先通过 ref 或 getter 建立可观察的输入。
 
 ---
 

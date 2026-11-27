@@ -1,0 +1,12 @@
+{
+  "document": {
+    "title": "评测样本 · 发布流程",
+    "text": "发布流程：先运行冒烟测试，再申请发布。回滚负责人是测试账号小周。"
+  },
+  "cases": [
+    { "name": "流程", "text": "发布流程", "expected": "冒烟测试" },
+    { "name": "负责人", "text": "回滚负责人", "expected": "小周" },
+    { "name": "库外问题", "text": "今日食堂菜单", "expected": null },
+    { "name": "访客隔离", "text": "发布流程", "expected": null, "otherUser": true }
+  ]
+}

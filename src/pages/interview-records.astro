@@ -1,0 +1,55 @@
+---
+import { getCollection } from "astro:content";
+import { INTERVIEW_RECORD_CATEGORY } from "@constants/constants";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug } from "@utils/url-utils";
+
+const posts = await getCollection("posts", ({ data }) => {
+	return (
+		data.category === INTERVIEW_RECORD_CATEGORY &&
+		(import.meta.env.PROD ? data.draft !== true : true)
+	);
+});
+posts.sort((a, b) => b.data.published.valueOf() - a.data.published.valueOf());
+
+const dateFormat = new Intl.DateTimeFormat("zh-CN", {
+	timeZone: "Asia/Shanghai",
+	year: "numeric",
+	month: "long",
+	day: "numeric",
+});
+---
+
+<MainGridLayout title={INTERVIEW_RECORD_CATEGORY}>
+	<div class="onload-animation">
+		<header class="mb-8">
+			<h1 class="mb-2 text-3xl font-bold text-90">{INTERVIEW_RECORD_CATEGORY}</h1>
+			<p class="text-75">全栈偏前端模拟面试的每日复盘。</p>
+		</header>
+
+		{posts.length === 0 ? (
+			<p class="card-base card-shadow p-5 text-75">暂无面试记录。</p>
+		) : (
+			<ul class="space-y-4">
+				{posts.map(({ slug, data }) => (
+					<li>
+						<a
+							href={getPostUrlBySlug(slug)}
+							class="group block card-base card-shadow p-5 transition-shadow hover:shadow-lg"
+						>
+							<time class="text-sm text-75" datetime={data.published.toISOString()}>
+								{dateFormat.format(data.published)}
+							</time>
+							<h2 class="mt-1 text-lg font-bold text-90 group-hover:text-[var(--primary)]">
+								{data.title}
+							</h2>
+							{data.description && (
+								<p class="mt-2 text-sm text-75">{data.description}</p>
+							)}
+						</a>
+					</li>
+				))}
+			</ul>
+		)}
+	</div>
+</MainGridLayout>

@@ -40,6 +40,7 @@ draft: false
 | [11–15](/blog/posts/node-roadmap-20-community-week-3/) | NestJS 管理/BFF + 异步治理 | 审核/举报/RabbitMQ/可观测 |
 | [16–18](/blog/posts/node-roadmap-21-community-week-4/) | 可观测、容器化与上线 | Docker/Nginx/指标/压测 |
 | [19–21](/blog/posts/node-roadmap-22-community-graduation/) | K8s、搜索与毕业验收 | Helm/Meilisearch/AI 后端 |
+| [迭代 01](/blog/posts/community-fullstack-iteration-01-profiles-and-follows/) | 个人主页、资料编辑与关注管理 | 公开边界、分页、状态与通知 |
 
 ---
 

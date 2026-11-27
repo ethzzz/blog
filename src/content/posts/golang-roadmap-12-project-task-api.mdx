@@ -1,7 +1,7 @@
 ---
 title: '12 · 毕业项目：用标准库写一个能上线的任务 API（与前端同一份契约）'
 published: 2026-10-24T21:04:00+08:00
-description: '前 11 篇是零件，这篇是装机：用 net/http + database/sql + slog 写一个任务 API，分 3 阶段交付——内存版跑通契约、换成 SQLite 数据层、补测试与部署。契约与 React/Node 两篇完全一致，前端改一个 baseURL 就能直连，你可以横向对比三种语言写同一个服务。'
+description: '前 11 篇是零件，这篇是装机：用 net/http + database/sql + slog 写一个任务 API，分 3 阶段交付——内存版跑通契约、换成 SQLite 数据层、补测试与部署。契约与 React/Node 两篇完全一致，React 端使用同一组任务字段和分页协议，便于横向对照。'
 tags: [Go, 项目实战, 标准库, SQLite, 部署]
 category: Go学习路线
 draft: false
@@ -11,7 +11,7 @@ draft: false
 > 这是本模块的毕业项目，也是**同一份契约的第三个实现**：
 > [React 篇](/blog/posts/react-roadmap-17-project-task-board/) 写前端、[Node 篇](/blog/posts/node-roadmap-13-project-task-api/) 写 NestJS 版、这一篇用 **Go 标准库**写。
 >
-> 三份代码的接口形状完全一样，所以你能直接对比：同一个需求，三种语言在**分层、错误处理、并发模型**上的差异。
+> 任务资源使用字符串 ID，列表返回分页对象，删除成功返回 204。React API 层兼容 json-server 数组和正式分页响应，TypeScript SDK 使用正式分页契约。Go 示例先在本机验证，Node 的认证版本需要额外携带登录令牌。
 
 ---
 
@@ -21,14 +21,14 @@ draft: false
 2. 分页、筛选、搜索的入参解析有边界保护（负数、超上限、非数字都不会 500）。
 3. 错误统一：404 / 422 / 500 三种情形返回同一结构的 JSON，且带 `requestId`。
 4. 数据层从内存换到 SQLite，**业务层代码不用改**（靠接口隔离）。
-5. `go test ./... -race -cover` 全绿，覆盖率 ≥ 60%，且错误分支有测试。
+5. 内存与 SQLite 共用一份 HTTP 契约测试，包含字段错误、404、分页与删除后的查询。
 6. 用 `CGO_ENABLED=0 go build` 出一个静态二进制，扔到服务器能直接跑。
-7. 优雅关闭：Ctrl+C 后在途请求不丢、进程 1 秒内退出。
+7. 优雅关闭时停止接收新连接，等待在途请求完成，超过 10 秒再强制关闭。
 8. 前端（React 那篇）把 base 指过来，列表/新建/删除全部可用，**前端零改动**。
 
 ---
 
-## 契约（与另外两篇一字不差）
+## 共享的任务资源契约
 
 | 方法 | 路径 | 入参 | 返回 |
 |---|---|---|---|
@@ -43,26 +43,45 @@ draft: false
 
 ---
 
-## 阶段 1：内存版跑通契约（1 小时）
+## 先保存完整工程
 
-### 目录
+语言与 HTTP 层使用标准库，SQLite 层引入纯 Go 驱动 `modernc.org/sqlite`。使用 Go 1.24 或更高版本，在独立 `task-api` 目录按文件名保存全部源码。首次运行 `go mod tidy` 会生成 `go.sum`，把它与工程一起保留。
 
-```
+```text
 task-api/
+├── go.mod
 ├── cmd/api/main.go
-├── internal/
-│   ├── httpx/{respond.go,apperror.go,middleware.go}
-│   └── task/{model.go,store.go,service.go,handler.go}
-└── go.mod
+└── internal/task/
+    ├── model.go
+    ├── memory.go
+    ├── sqlite.go
+    ├── handler.go
+    └── task_test.go
 ```
 
-### 模型与仓储接口
+```go title="go.mod"
+module example.com/task-api
 
-```go
-// internal/task/model.go
+go 1.24.0
+
+require modernc.org/sqlite v1.36.3
+```
+
+### 模型、仓储边界与字段校验
+
+创建时补 todo、mid 和服务端 UTC 时间。PATCH 只修改传入字段，在仓储的锁或事务内读取当前数据、合并和校验，因此同时修改不同字段时能保留两次变更。标题长度按 Unicode 码点计算，组合字形可能由多个码点构成。
+
+```go title="internal/task/model.go"
 package task
 
-import "time"
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
 
 type Task struct {
 	ID        string    `json:"id"`
@@ -75,26 +94,86 @@ type Task struct {
 }
 
 type Query struct {
-	Page    int
-	Limit   int
-	Status  string
-	Keyword string
+	Page, Limit     int
+	Status, Keyword string
+}
+type Page struct {
+	Items   []Task `json:"items"`
+	Total   int    `json:"total"`
+	HasNext bool   `json:"hasNext"`
+}
+type APIError struct {
+	Status  int
+	Message string
+	Fields  map[string][]string
 }
 
-// 仓储接口定义在业务层（使用方），实现可以在内存、SQLite、Postgres 之间换
+func (e *APIError) Error() string { return e.Message }
+func missing() error              { return &APIError{Status: 404, Message: "任务不存在"} }
+
 type Repo interface {
-	List(ctx context.Context, q Query) ([]Task, int, error)
-	Get(ctx context.Context, id string) (Task, error)
-	Create(ctx context.Context, t Task) (Task, error)
-	Update(ctx context.Context, id string, patch map[string]any) (Task, error)
-	Delete(ctx context.Context, id string) error
+	List(context.Context, Query) (Page, error)
+	Get(context.Context, string) (Task, error)
+	Create(context.Context, map[string]string) (Task, error)
+	Update(context.Context, string, map[string]string) (Task, error)
+	Delete(context.Context, string) error
+}
+
+func NewID() string {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(id[:])
+}
+
+func apply(t Task, fields map[string]string) (Task, error) {
+	for key, value := range fields {
+		switch key {
+		case "title":
+			t.Title = strings.TrimSpace(value)
+		case "status":
+			t.Status = value
+		case "priority":
+			t.Priority = value
+		case "assignee":
+			t.Assignee = strings.TrimSpace(value)
+		case "desc":
+			t.Desc = value
+		}
+	}
+	errors := map[string][]string{}
+	if n := utf8.RuneCountInString(t.Title); n < 4 || n > 60 {
+		errors["title"] = []string{"标题应为 4 到 60 个 Unicode 码点"}
+	}
+	if t.Assignee == "" {
+		errors["assignee"] = []string{"请填写负责人"}
+	}
+	if utf8.RuneCountInString(t.Desc) > 500 {
+		errors["desc"] = []string{"描述最多 500 个 Unicode 码点"}
+	}
+	if t.Status != "todo" && t.Status != "doing" && t.Status != "done" {
+		errors["status"] = []string{"状态只能是 todo/doing/done"}
+	}
+	if t.Priority != "low" && t.Priority != "mid" && t.Priority != "high" {
+		errors["priority"] = []string{"优先级只能是 low/mid/high"}
+	}
+	if len(errors) > 0 {
+		return Task{}, &APIError{422, "提交的数据不合法", errors}
+	}
+	return t, nil
+}
+
+func create(fields map[string]string) (Task, error) {
+	return apply(Task{ID: NewID(), Status: "todo", Priority: "mid", CreatedAt: time.Now().UTC()}, fields)
 }
 ```
 
-### 内存实现（阶段 1 够用，阶段 2 会被替换）
+### 内存仓储
 
-```go
-// internal/task/store.go
+列表按创建时间和 ID 排序，空列表序列化为 `[]`。写入和更新在锁内完成，读取返回值对象。
+
+```go title="internal/task/memory.go"
 package task
 
 import (
@@ -102,9 +181,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
-
-	"example.com/task-api/internal/httpx"
 )
 
 type MemoryStore struct {
@@ -112,303 +188,634 @@ type MemoryStore struct {
 	items map[string]Task
 }
 
-func NewMemoryStore() *MemoryStore { return &MemoryStore{items: make(map[string]Task)} }
+func NewMemoryStore() *MemoryStore { return &MemoryStore{items: map[string]Task{}} }
 
-func (s *MemoryStore) List(ctx context.Context, q Query) ([]Task, int, error) {
+func (s *MemoryStore) List(_ context.Context, q Query) (Page, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	matched := make([]Task, 0, len(s.items))
+	items := []Task{}
 	for _, t := range s.items {
-		if q.Status != "" && q.Status != "all" && t.Status != q.Status {
-			continue
+		if (q.Status == "" || t.Status == q.Status) && strings.Contains(t.Title, q.Keyword) {
+			items = append(items, t)
 		}
-		if q.Keyword != "" && !strings.Contains(t.Title, q.Keyword) {
-			continue
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].ID > items[j].ID
 		}
-		matched = append(matched, t)
-	}
-	sort.Slice(matched, func(i, j int) bool { return matched[i].CreatedAt.After(matched[j].CreatedAt) })
-
-	total := len(matched)
-	start := (q.Page - 1) * q.Limit
-	if start > total {
-		start = total
-	}
-	end := start + q.Limit
-	if end > total {
-		end = total
-	}
-	return matched[start:end], total, nil
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+	total := len(items)
+	start := min((q.Page-1)*q.Limit, total)
+	end := min(start+q.Limit, total)
+	return Page{items[start:end], total, end < total}, nil
 }
-
-func (s *MemoryStore) Get(ctx context.Context, id string) (Task, error) {
+func (s *MemoryStore) Get(_ context.Context, id string) (Task, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.items[id]
 	if !ok {
-		return Task{}, httpx.NotFound("任务不存在")
+		return Task{}, missing()
 	}
 	return t, nil
 }
-
-func (s *MemoryStore) Create(ctx context.Context, t Task) (Task, error) {
+func (s *MemoryStore) Create(_ context.Context, fields map[string]string) (Task, error) {
+	t, err := create(fields)
+	if err != nil {
+		return Task{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t.ID = newID()
-	t.CreatedAt = time.Now().UTC()
 	s.items[t.ID] = t
 	return t, nil
 }
-
-func (s *MemoryStore) Update(ctx context.Context, id string, patch map[string]any) (Task, error) {
+func (s *MemoryStore) Update(_ context.Context, id string, fields map[string]string) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.items[id]
 	if !ok {
-		return Task{}, httpx.NotFound("任务不存在")
+		return Task{}, missing()
 	}
-	if v, ok := patch["title"].(string); ok {
-		t.Title = v
-	}
-	if v, ok := patch["status"].(string); ok {
-		t.Status = v
-	}
-	if v, ok := patch["assignee"].(string); ok {
-		t.Assignee = v
+	t, err := apply(t, fields)
+	if err != nil {
+		return Task{}, err
 	}
 	s.items[id] = t
 	return t, nil
 }
-
-func (s *MemoryStore) Delete(ctx context.Context, id string) error {
+func (s *MemoryStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.items[id]; !ok {
-		return httpx.NotFound("任务不存在")
+		return missing()
 	}
 	delete(s.items, id)
 	return nil
 }
 ```
 
-### 校验：入参边界在这一层挡住
+### SQLite 仓储
 
-```go
-// internal/task/handler.go（片段）
-type createInput struct {
-	Title    string `json:"title"`
-	Status   string `json:"status"`
-	Priority string `json:"priority"`
-	Assignee string `json:"assignee"`
-	Desc     string `json:"desc"`
-}
+启动时建表，单连接串行写事务，列表用同一读事务读取 total 和 items。生产环境的结构变更应改用版本化迁移。这里的单连接配置适用于本地单进程实验，跨进程写入仍需 busy timeout、重试与容量验证。筛选统一使用区分大小写的子串匹配，SQL 通过参数绑定传值。
 
-func (in *createInput) validate() map[string]string {
-	errs := map[string]string{}
-	title := strings.TrimSpace(in.Title)
-	switch {
-	case title == "":
-		errs["title"] = "标题不能为空"
-	case len([]rune(title)) < 4:
-		errs["title"] = "标题至少 4 个字"
-	case len([]rune(title)) > 60:
-		errs["title"] = "标题不要超过 60 个字"
-	}
-	if strings.TrimSpace(in.Assignee) == "" {
-		errs["assignee"] = "请填写负责人"
-	}
-	if in.Status == "" {
-		in.Status = "todo"
-	}
-	if in.Status != "todo" && in.Status != "doing" && in.Status != "done" {
-		errs["status"] = "状态只能是 todo/doing/done"
-	}
-	if len(errs) > 0 {
-		return errs
-	}
-	return nil
-}
-```
-
-> `len([]rune(s))` 才是"字符数"；`len(s)` 是字节数，中文一个字占 3 字节——**这是 Go 里最容易写错的长度判断**。
-
-### ✅ 阶段 1 验收清单
-
-- [ ] `curl "localhost:8080/tasks?_page=1&_limit=5"` 返回 `{"items":[...],"total":N,"hasNext":true}`。
-- [ ] `_page=-1`、`_limit=9999`、`_page=abc` 都不会 500（回落到默认值）。
-- [ ] `POST /tasks` 传 3 个字标题 → 422，body 里 `errors.title` 有中文提示。
-- [ ] `GET /tasks/不存在` → 404，且响应结构与 422 完全一致（含 `requestId`）。
-- [ ] `DELETE` 后再 `GET` → 404。
-- [ ] 响应头有 `X-Request-Id`，日志里能用同一个 ID 搜到这次请求。
-
----
-
-## 阶段 2：换 SQLite，业务层零改动（2 小时）
-
-### 建表迁移
-
-```sql
--- migrations/001_init.sql
-create table if not exists tasks (
-	id         text primary key,
-	title      text not null,
-	status     text not null default 'todo',
-	priority   text not null default 'mid',
-	assignee   text not null,
-	descr      text not null default '',
-	created_at timestamp not null,
-	updated_at timestamp not null,
-	deleted_at timestamp
-);
-create index if not exists idx_tasks_status_created on tasks(status, created_at desc);
-```
-
-> 列名用 `descr` 而不是 `desc`：`desc` 是 SQL 关键字，很多库要加引号，容易踩坑。
-
-### 用同一个 `Repo` 接口实现 SQLite 版
-
-```go
-// internal/task/sqlstore.go
+```go title="internal/task/sqlite.go"
 package task
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	_ "modernc.org/sqlite"
+	"time"
+)
 
 type SQLStore struct{ db *sql.DB }
 
-func NewSQLStore(db *sql.DB) *SQLStore { return &SQLStore{db: db} }
-
-func (s *SQLStore) List(ctx context.Context, q Query) ([]Task, int, error) {
-	where := "where deleted_at is null"
-	args := []any{}
-	if q.Status != "" && q.Status != "all" {
-		where += " and status = ?"
-		args = append(args, q.Status)
-	}
-	if q.Keyword != "" {
-		where += " and title like ?"
-		args = append(args, "%"+q.Keyword+"%")
-	}
-
-	var total int
-	if err := s.db.QueryRowContext(ctx, "select count(*) from tasks "+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-
-	rows, err := s.db.QueryContext(ctx,
-		"select id, title, status, priority, assignee, descr, created_at from tasks "+where+
-			" order by created_at desc limit ? offset ?",
-		append(args, q.Limit, (q.Page-1)*q.Limit)...)
+func OpenSQLite(ctx context.Context, dsn string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
+	}
+	// 本实验单进程单连接，将写事务串行化。跨进程写入仍需 busy timeout 等策略。
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err = db.PingContext(ctx); err == nil {
+		_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS tasks (
+id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+priority TEXT NOT NULL, assignee TEXT NOT NULL, descr TEXT NOT NULL,
+created_at TEXT NOT NULL, deleted_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks(status,created_at DESC,id DESC);`)
+	}
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+func NewSQLStore(db *sql.DB) *SQLStore { return &SQLStore{db} }
+
+const columns = "id,title,status,priority,assignee,descr,created_at"
+const storedTime = "2006-01-02T15:04:05.000000000Z"
+
+type scanner interface{ Scan(...any) error }
+
+func scanTask(row scanner) (Task, error) {
+	var t Task
+	var created string
+	err := row.Scan(&t.ID, &t.Title, &t.Status, &t.Priority, &t.Assignee, &t.Desc, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return t, missing()
+	}
+	if err != nil {
+		return t, err
+	}
+	t.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	return t, err
+}
+func (s *SQLStore) Get(ctx context.Context, id string) (Task, error) {
+	return scanTask(s.db.QueryRowContext(ctx, "SELECT "+columns+" FROM tasks WHERE id=? AND deleted_at IS NULL", id))
+}
+func (s *SQLStore) List(ctx context.Context, q Query) (Page, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Page{}, err
+	}
+	defer tx.Rollback()
+	where := " WHERE deleted_at IS NULL AND (?='' OR status=?) AND instr(title,?)>0"
+	args := []any{q.Status, q.Status, q.Keyword}
+	page := Page{Items: []Task{}}
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM tasks"+where, args...).Scan(&page.Total); err != nil {
+		return Page{}, err
+	}
+	args = append(args, q.Limit, (q.Page-1)*q.Limit)
+	rows, err := tx.QueryContext(ctx, "SELECT "+columns+" FROM tasks"+where+" ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?", args...)
+	if err != nil {
+		return Page{}, err
 	}
 	defer rows.Close()
-
-	var out []Task
 	for rows.Next() {
-		var t Task
-		if err := rows.Scan(&t.ID, &t.Title, &t.Status, &t.Priority, &t.Assignee, &t.Desc, &t.CreatedAt); err != nil {
-			return nil, 0, err
+		t, err := scanTask(rows)
+		if err != nil {
+			return Page{}, err
 		}
-		out = append(out, t)
+		page.Items = append(page.Items, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, 0, err
+		return Page{}, err
 	}
-	return out, total, nil
+	if err := rows.Close(); err != nil {
+		return Page{}, err
+	}
+	page.HasNext = (q.Page-1)*q.Limit+len(page.Items) < page.Total
+	return page, tx.Commit()
 }
-
+func (s *SQLStore) Create(ctx context.Context, fields map[string]string) (Task, error) {
+	t, err := create(fields)
+	if err != nil {
+		return Task{}, err
+	}
+	_, err = s.db.ExecContext(ctx, "INSERT INTO tasks("+columns+") VALUES(?,?,?,?,?,?,?)", t.ID, t.Title, t.Status, t.Priority, t.Assignee, t.Desc, t.CreatedAt.Format(storedTime))
+	return t, err
+}
+func (s *SQLStore) Update(ctx context.Context, id string, fields map[string]string) (Task, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, err
+	}
+	defer tx.Rollback()
+	t, err := scanTask(tx.QueryRowContext(ctx, "SELECT "+columns+" FROM tasks WHERE id=? AND deleted_at IS NULL", id))
+	if err != nil {
+		return Task{}, err
+	}
+	t, err = apply(t, fields)
+	if err != nil {
+		return Task{}, err
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE tasks SET title=?,status=?,priority=?,assignee=?,descr=? WHERE id=? AND deleted_at IS NULL", t.Title, t.Status, t.Priority, t.Assignee, t.Desc, id)
+	if err != nil {
+		return Task{}, err
+	}
+	return t, tx.Commit()
+}
 func (s *SQLStore) Delete(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx,
-		"update tasks set deleted_at = ? where id = ? and deleted_at is null", time.Now().UTC(), id)
+	result, err := s.db.ExecContext(ctx, "UPDATE tasks SET deleted_at=? WHERE id=? AND deleted_at IS NULL", time.Now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return httpx.NotFound("任务不存在")
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return missing()
 	}
 	return nil
 }
 ```
 
-`main` 里只改一行装配：
+### HTTP 与统一错误
 
-```go
-// 阶段 1：svc := task.NewService(task.NewMemoryStore())
-db, err := openDB(cfg.DSN)          // 见 10 篇：Open + Ping + 连接池三参数
-if err != nil { slog.Error("db", "err", err); os.Exit(1) }
-if err := migrate(ctx, db); err != nil { slog.Error("migrate", "err", err); os.Exit(1) }
-svc := task.NewService(task.NewSQLStore(db))
+分页参数先解析再限制范围，最大页码为一百万，页大小最多一百。非法 JSON 返回 400，字段校验返回 422，找不到任务返回 404。PATCH 的 null 或非字符串值返回 400。CORS 允许配置的单个前端 origin，浏览器预检也能通过。
+
+```go title="internal/task/handler.go"
+package task
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"mime"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+func ParsePaging(r *http.Request) Query {
+	page, err := strconv.Atoi(r.URL.Query().Get("_page"))
+	if err != nil || page < 1 || page > 1000000 {
+		page = 1
+	}
+	limit, err := strconv.Atoi(r.URL.Query().Get("_limit"))
+	if err != nil || limit < 1 {
+		limit = 20
+	}
+	limit = min(limit, 100)
+	status := r.URL.Query().Get("status")
+	if status == "all" {
+		status = ""
+	}
+	return Query{page, limit, status, r.URL.Query().Get("q")}
+}
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		slog.Error("write response", "err", err)
+	}
+}
+func writeError(w http.ResponseWriter, err error) {
+	e := &APIError{Status: 500, Message: "服务器内部错误"}
+	if !errors.As(err, &e) {
+		slog.Error("request failed", "err", err)
+		e = &APIError{Status: 500, Message: "服务器内部错误"}
+	}
+	writeJSON(w, e.Status, struct {
+		Status    int                 `json:"statusCode"`
+		Message   string              `json:"message"`
+		Errors    map[string][]string `json:"errors,omitempty"`
+		RequestID string              `json:"requestId"`
+	}{e.Status, e.Message, e.Fields, w.Header().Get("X-Request-Id")})
+}
+func decodeInput(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		return nil, &APIError{Status: 415, Message: "需要 application/json"}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 65536)
+	decoder := json.NewDecoder(r.Body)
+	var fields map[string]json.RawMessage
+	if err := decoder.Decode(&fields); err != nil || fields == nil {
+		return nil, &APIError{Status: 400, Message: "请求 JSON 不合法"}
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, &APIError{Status: 400, Message: "请求只能包含一个 JSON 对象"}
+	}
+	values := map[string]string{}
+	for key, raw := range fields {
+		switch key {
+		case "title", "status", "priority", "assignee", "desc", "createdAt":
+		default:
+			return nil, &APIError{Status: 400, Message: "未知字段 " + key}
+		}
+		if key == "createdAt" {
+			continue
+		} // 接受旧 mock 的创建时间字段，最终时间由服务端生成。
+		var value string
+		if string(raw) == "null" || json.Unmarshal(raw, &value) != nil {
+			return nil, &APIError{Status: 400, Message: key + " 必须是字符串"}
+		}
+		values[key] = value
+	}
+	return values, nil
+}
+
+func NewHandler(repo Repo, origin string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
+	mux.HandleFunc("GET /tasks", func(w http.ResponseWriter, r *http.Request) {
+		page, err := repo.List(r.Context(), ParsePaging(r))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, page)
+	})
+	mux.HandleFunc("GET /tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+		t, err := repo.Get(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, t)
+	})
+	save := func(w http.ResponseWriter, r *http.Request) {
+		fields, err := decodeInput(w, r)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		var t Task
+		status := http.StatusOK
+		if r.Method == "POST" {
+			t, err = repo.Create(r.Context(), fields)
+			status = http.StatusCreated
+		} else {
+			t, err = repo.Update(r.Context(), r.PathValue("id"), fields)
+		}
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, status, t)
+	}
+	mux.HandleFunc("POST /tasks", save)
+	mux.HandleFunc("PATCH /tasks/{id}", save)
+	mux.HandleFunc("DELETE /tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := repo.Delete(r.Context(), r.PathValue("id")); err != nil {
+			writeError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", NewID())
+		defer func() {
+			if err := recover(); err != nil {
+				slog.Error("panic", "err", err)
+				writeError(w, errors.New("panic"))
+			}
+		}()
+		if r.Header.Get("Origin") == origin && origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Request-Id")
+		}
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(204)
+			return
+		}
+		slog.Info("request", "requestId", w.Header().Get("X-Request-Id"), "method", r.Method, "path", r.URL.Path)
+		// Go 1.22 的 ServeMux 原生处理方法路由和路径参数。
+		if strings.HasSuffix(r.URL.Path, "/") && r.URL.Path != "/" {
+			r.URL.Path = strings.TrimSuffix(r.URL.Path, "/")
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
 ```
 
-**业务层（service/handler）一行没改**——这就是阶段 1 定义接口的回报。
+### 装配与优雅关闭
 
-### ✅ 阶段 2 验收清单
+未设置 DATABASE_URL 时使用内存，有值时使用 SQLite。HTTP 处理层接收同一个 Repo 接口。收到退出信号后最多等待 10 秒，然后关闭连接，数据库连接在 HTTP 服务退出后释放。
 
-- [ ] 启动时自动建表（删掉 `.db` 文件再启动，能自己恢复）。
-- [ ] 重启进程后数据还在（内存版会丢）。
-- [ ] 删除是软删：`sqlite3 test.db "select id, deleted_at from tasks"` 能看到 `deleted_at` 有值。
-- [ ] 列表查询里 `total` 与 `items` 数量自洽（最后一页 `hasNext=false`）。
-- [ ] 连接池参数已设（`SetMaxOpenConns/SetConnMaxLifetime`），压 50 并发不出 `database is locked`。
-- [ ] 业务层文件（`service.go`）在这个阶段**没有 diff**（`git diff` 验证）。
+```go title="cmd/api/main.go"
+package main
 
----
+import (
+	"context"
+	"errors"
+	"example.com/task-api/internal/task"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
 
-## 阶段 3：测试 + 部署 + 联调（2 小时）
-
-### 1. 三类测试，各管一段
-
-```go
-// ① 纯函数：分页解析
-func TestParsePaging(t *testing.T) { /* 见 11 篇的 table-driven 写法 */ }
-
-// ② handler：不碰数据库（用 fakeRepo）
-func TestCreateTask_InvalidTitle(t *testing.T) {
-	h := NewHandler(NewService(&fakeRepo{}))
-	body := strings.NewReader(`{"title":"ab","assignee":""}`)
-	req := httptest.NewRequest(http.MethodPost, "/tasks", body)
-	rec := httptest.NewRecorder()
-
-	h.create(rec, req)
-
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var repo task.Repo = task.NewMemoryStore()
+	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+		db, err := task.OpenSQLite(ctx, dsn)
+		if err != nil {
+			slog.Error("database", "err", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+		repo = task.NewSQLStore(db)
 	}
-	var got httpx.ErrorBody
-	_ = json.Unmarshal(rec.Body.Bytes(), &got)
-	if got.Errors["title"] == "" {
-		t.Errorf("missing title error, got %+v", got)
+	addr := os.Getenv("APP_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8080"
 	}
-}
-
-// ③ 集成：真 SQLite（临时文件），跑完整链路
-func TestList_Integration(t *testing.T) {
-	db := openTempDB(t) // t.TempDir + migrate
-	svc := NewService(NewSQLStore(db))
-	h := NewHandler(svc)
-
-	for i := 0; i < 3; i++ {
-		if _, err := svc.Create(context.Background(), Task{Title: "任务内容", Assignee: "皓"}); err != nil {
-			t.Fatal(err)
+	origin := os.Getenv("CORS_ORIGIN")
+	if origin == "" {
+		origin = "http://localhost:5173"
+	}
+	server := &http.Server{Addr: addr, Handler: task.NewHandler(repo, origin), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	failed := make(chan error, 1)
+	go func() { failed <- server.ListenAndServe() }()
+	slog.Info("listening", "addr", addr)
+	select {
+	case err := <-failed:
+		if !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server", "err", err)
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		slog.Info("shutting down")
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdown); err != nil {
+			slog.Error("shutdown", "err", err)
+			server.Close()
 		}
 	}
+}
+```
 
-	req := httptest.NewRequest(http.MethodGet, "/tasks?_page=1&_limit=2", nil)
-	rec := httptest.NewRecorder()
-	h.list(rec, req)
+## 阶段 1：先验证内存版
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), `"hasNext":true`) {
-		t.Errorf("want hasNext true, got %s", rec.Body.String())
+保存完全部源码后执行以下命令，示例 shell 为 Git Bash。已有 DATABASE_URL 时先用 `unset DATABASE_URL` 清除本终端设置，避免误连旧库。
+
+```bash
+go mod tidy
+unset DATABASE_URL
+go run ./cmd/api
+```
+
+另开终端用 curl 和 jq 验证创建、分页、局部修改与删除，始终使用创建结果的 ID。
+
+```bash
+BASE=http://127.0.0.1:8080
+TASK=$(curl -fsS -X POST "$BASE/tasks" -H 'Content-Type: application/json' \
+  -d '{"title":"验证任务接口","assignee":"test","priority":"low","desc":"待处理"}')
+ID=$(printf '%s' "$TASK" | jq -er .id)
+curl -i "$BASE/tasks?_page=1&_limit=1"
+curl -i -X PATCH "$BASE/tasks/$ID" -H 'Content-Type: application/json' \
+  -d '{"status":"doing","priority":"high","desc":"已受理"}'
+curl -i -X DELETE "$BASE/tasks/$ID"
+curl -i "$BASE/tasks/$ID"
+```
+
+- [ ] 列表响应包含 items、total、hasNext，空查询的 items 为数组。
+- [ ] PATCH 更新状态、优先级和描述，未传入的标题与负责人保留。
+- [ ] 删除为 HTTP 204 且响应体为空，再查同一 ID 得到 404。
+- [ ] 输入过大的页码不会导致数组切片越界，短标题得到 422。
+
+## 阶段 2：切换 SQLite 并验证重启
+
+停止内存版，在同一工程目录执行以下命令。启动后创建任务，记录 ID，Ctrl+C 后重启，再查该 ID。
+
+```bash
+DATABASE_URL=./task.db go run ./cmd/api
+```
+
+- [ ] 新建空文件路径会自动初始化数据库。
+- [ ] 重启后任务仍可查询，删除后该 ID 返回 404。
+- [ ] 数据库中 deleted_at 有值的记录不出现在列表，total 也排除它。
+- [ ] 切换存储只改变环境变量，HTTP 与字段校验代码共用。
+
+## 阶段 3：测试、部署与联调
+
+### 同一份契约测试覆盖两种仓储
+
+```go title="internal/task/task_test.go"
+package task
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func TestPaging(t *testing.T) {
+	for _, tc := range []struct {
+		query       string
+		page, limit int
+	}{
+		{"", 1, 20}, {"?_page=-1&_limit=9999", 1, 100},
+		{"?_page=abc&_limit=0", 1, 20}, {"?_page=9999999999999999999999", 1, 20},
+		{"?_page=2&_limit=2", 2, 2},
+	} {
+		got := ParsePaging(httptest.NewRequest("GET", "/tasks"+tc.query, nil))
+		if got.Page != tc.page || got.Limit != tc.limit {
+			t.Fatalf("%s: %+v", tc.query, got)
+		}
 	}
 }
+func TestHTTPContract(t *testing.T) {
+	for _, kind := range []string{"memory", "sqlite"} {
+		t.Run(kind, func(t *testing.T) {
+			var repo Repo = NewMemoryStore()
+			if kind == "sqlite" {
+				db, err := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "tasks.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				repo = NewSQLStore(db)
+			}
+			handler := NewHandler(repo, "http://localhost:5173")
+			call := func(method, path, body string, status int) *httptest.ResponseRecorder {
+				t.Helper()
+				req := httptest.NewRequest(method, path, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Origin", "http://localhost:5173")
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != status {
+					t.Fatalf("%s %s: status=%d body=%s", method, path, rec.Code, rec.Body.String())
+				}
+				if rec.Header().Get("X-Request-Id") == "" {
+					t.Fatal("missing request ID")
+				}
+				return rec
+			}
+			call("POST", "/tasks", `{"title":"短","assignee":"test"}`, 422)
+			call("POST", "/tasks", `{"title":null}`, 400)
+			call("POST", "/tasks", `{} {}`, 400)
+			call("POST", "/tasks", `{"extra":"x"}`, 400)
+			first := call("POST", "/tasks", `{"title":"学习任务中心","assignee":"test","priority":"low","desc":"initial"}`, 201)
+			var created Task
+			if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+				t.Fatal(err)
+			}
+			call("POST", "/tasks", `{"title":"第二条任务","assignee":"test"}`, 201)
+			list := call("GET", "/tasks?_limit=1", "", 200)
+			var page Page
+			if err := json.Unmarshal(list.Body.Bytes(), &page); err != nil {
+				t.Fatal(err)
+			}
+			if page.Total != 2 || len(page.Items) != 1 || !page.HasNext {
+				t.Fatalf("bad page %+v", page)
+			}
+			call("PATCH", "/tasks/"+created.ID, `{"priority":"high","desc":"changed"}`, 200)
+			call("PATCH", "/tasks/"+created.ID, `{"status":"archived"}`, 422)
+			get := call("GET", "/tasks/"+created.ID, "", 200)
+			var updated Task
+			json.Unmarshal(get.Body.Bytes(), &updated)
+			if updated.Priority != "high" || updated.Desc != "changed" || updated.Status != "todo" {
+				t.Fatalf("bad patch %+v", updated)
+			}
+			call("GET", "/tasks?q=不存在", "", 200)
+			deleted := call("DELETE", "/tasks/"+created.ID, "", 204)
+			if deleted.Body.Len() != 0 {
+				t.Fatal("204 must be empty")
+			}
+			call("GET", "/tasks/"+created.ID, "", 404)
+			call("DELETE", "/tasks/"+created.ID, "", 404)
+			call("GET", "/healthz", "", 200)
+			preflight := call("OPTIONS", "/tasks", "", 204)
+			if preflight.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" {
+				t.Fatal("CORS")
+			}
+		})
+	}
+}
+func TestSQLitePersistenceAndConcurrentPatch(t *testing.T) {
+	ctx := context.Background()
+	dsn := filepath.Join(t.TempDir(), "persistent.db")
+	db, err := OpenSQLite(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := NewSQLStore(db)
+	task, err := repo.Create(ctx, map[string]string{"title": "验证持久任务", "assignee": "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var group sync.WaitGroup
+	for _, patch := range []map[string]string{{"priority": "high"}, {"desc": "concurrent"}} {
+		group.Add(1)
+		go func(fields map[string]string) {
+			defer group.Done()
+			if _, err := repo.Update(ctx, task.ID, fields); err != nil {
+				t.Error(err)
+			}
+		}(patch)
+	}
+	group.Wait()
+	db.Close()
+	db, err = OpenSQLite(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := NewSQLStore(db).Get(ctx, task.ID)
+	if err != nil || got.Priority != "high" || got.Desc != "concurrent" {
+		t.Fatalf("reopen %+v %v", got, err)
+	}
+	if err := NewSQLStore(db).Delete(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM tasks WHERE deleted_at IS NOT NULL").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("soft delete %d %v", count, err)
+	}
+}
+
+var _ http.Handler = NewHandler(NewMemoryStore(), "")
 ```
 
 ```bash
-go test ./... -race -cover
+go test ./... -coverprofile=cover.out
+go tool cover -func=cover.out
 go tool cover -html=cover.out
 ```
+
+测试覆盖正常增删改查、分页边界、非法 JSON、无效状态、空 ID 查询、204 空响应、CORS 预检，以及 SQLite 重启和并发 PATCH。竞态检查另执行 `go test -race ./...`，它需要当前平台支持 race detector 并配置 C 工具链，Windows 可在配置好 GCC 后运行，也可在 Linux CI 中运行。
 
 ### 2. 部署：静态二进制 + systemd
 
@@ -427,7 +834,7 @@ After=network.target
 
 [Service]
 ExecStart=/opt/task-api/task-api
-Environment=APP_ADDR=:8080
+Environment=APP_ADDR=127.0.0.1:8080
 Environment=DATABASE_URL=/opt/task-api/task.db
 Restart=always
 RestartSec=2
@@ -444,7 +851,7 @@ curl -s localhost:8080/healthz
 journalctl -u task-api -f      # 日志直接进 journal
 ```
 
-> Go 服务的好处在这里体现：**没有 node_modules、没有 npm ci、没有运行时版本问题**。一个 10MB 的二进制 + 一个 service 文件就完事。
+服务目录需要允许 www-data 写入 SQLite 数据文件与 journal。先创建 /opt/task-api 并授予运行账号所需的目录权限，再安装二进制与 service 文件。构建产物的大小、动态链接情况按实际机器验证。
 
 ### 3. 与前端的联调
 
@@ -454,7 +861,7 @@ echo 'VITE_API_BASE=http://localhost:8080' > .env.local
 npm run dev
 ```
 
-前端代码**一行不改**：列表出来、新建成功、删除后消失。此时你手里有同一个服务的三种实现，可以对比：
+使用修订后的 React API 层，分页对象能被正常读取。将 CORS_ORIGIN 设置为浏览器实际的 scheme、host 和 port，localhost 与 127.0.0.1 按不同 origin 处理。此时可以比较两种服务端实现。
 
 | 维度 | NestJS 版 | Go 版 |
 |---|---|---|
@@ -466,7 +873,7 @@ npm run dev
 
 ### ✅ 阶段 3 验收清单
 
-- [ ] `go test ./... -race -cover` 全绿，`-cover` 不低于 60%。
+- [ ] 契约测试全部通过，coverage 报告存在，能够指出没有覆盖的失败分支。
 - [ ] 把"标题最小长度 4 改成 8"→ 至少两个测试变红（说明测试真的在守契约）。
 - [ ] `curl -s localhost:8080/healthz` 返回 `{"status":"ok"}`。
 - [ ] `kill -TERM` 后日志出现 `shutting down`，且有在途请求时会被等服务完（不超过 10 秒）。
@@ -480,12 +887,12 @@ npm run dev
 
 1. **`len(s)` 当字符数**：中文一个字 3 字节，长度校验会误判。用 `len([]rune(s))` 或 `utf8.RuneCountInString(s)`。
 2. **`json.Marshal` 出来的时间是 RFC3339**：前端如果按 `yyyy-MM-dd` 解析会失败，要么前端兼容，要么自定义 `MarshalJSON`。
-3. **内存版排序不稳定**：`sort.Slice` 不是稳定排序，同一时间创建的元素顺序会变；需要稳定就用 `sort.SliceStable` 或加 `id` 兜底排序。
+3. **分页排序不确定**：同一时间创建的任务使用 ID 兜底排序。Map 遍历本身无序，单独换稳定排序算法无法固定输入顺序。
 4. **SQLite 并发写**：默认单写锁，高并发会 `database is locked`。用 WAL 模式（`?_pragma=journal_mode(WAL)`）或换 Postgres。
 5. **`desc` 是 SQL 关键字**：列名改用 `descr`，或每次查询都加引号（更容易忘）。
 6. **忘了 `rows.Close()`**：连接池耗尽，症状是"跑一会儿就卡住"。
 7. **`Shutdown` 之前没停止后台任务**：定时任务还在跑，进程退不掉。先 `cancel()` 再 `Shutdown`。
-8. **`-ldflags="-s -w"` 后无法 pprof 定位**：需要排障的构建版本别加，或用 `-buildvcs` 保留信息。
+8. **构建信息不完整**：保留与发布版本匹配的二进制、源码 commit 和构建参数，以便分析 profile。DWARF 调试信息与 pprof 的 Go 符号信息用途不同。
 
 ---
 

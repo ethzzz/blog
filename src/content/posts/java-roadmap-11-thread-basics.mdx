@@ -878,22 +878,11 @@ Executors.newVirtualThreadPerTaskExecutor();
 
 ## 结语
 
-到这里整个 Java 学习路线就走完了。回头看看这十一个阶段：
+到这里完成了语言基础和语言进阶。回头看看这十一个阶段：
 
 - **一 ~ 四**：语法地基（环境、类型、流程、数组字符串）
 - **五 ~ 七**：OOP 三件套（类、继承多态、接口抽象类）
 - **八 ~ 十**：日常业务代码的核心工具（集合、异常泛型、Lambda Stream）
 - **十一**：并发入门
 
-一个前端工程师从零到能写业务 Java 代码，走完这些大概需要 **2~3 周**认真投入的时间。之后就是靠写项目、读源码、看《Effective Java》持续深化。
-
-**接下来的方向**（不在这个系列里）：
-
-- **构建工具**：Maven / Gradle，项目结构与依赖管理
-- **单元测试**：JUnit 5、Mockito、AssertJ
-- **主流框架**：Spring Boot（后端）、Android（移动端）
-- **JVM 深入**：内存模型、GC、类加载、性能调优
-- **JUC 深入**：`java.util.concurrent` 剩余部分、AQS、锁优化
-- **虚拟线程**：Project Loom 完整用法
-
-祝学习顺利。有代码可跑，有笔记可查，就不算白学。
+继续做 [11A 工程预备实验](/blog/posts/java-roadmap-11a-maven-io-lab/)，把读文件、校验和测试收进一个 Maven 项目，再用 [Spring Boot + MyBatis](/blog/posts/java-roadmap-12-springboot-mybatis/) 把任务写入数据库。此处练过的线程池、异常传递和任务取消，会在 [Redis 与异步任务](/blog/posts/java-roadmap-18-redis-cache-async/) 的导出流程中用到。

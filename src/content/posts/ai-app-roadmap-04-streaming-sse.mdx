@@ -35,9 +35,9 @@ data: [DONE]
 
 关键点：
 
-- 每个 chunk 以 `data: ` 开头，**chunk 之间用空行分隔**——这不是装饰，是 SSE 帧边界，解析全靠它
+- 数据行以 `data:` 开头，冒号后可有一个空格。事件由空行分隔，网络读取的 chunk 可以包含半个或多个事件。
 - 增量内容在 `choices[0].delta.content`（非流式在 `message.content`），可能是空字符串（首尾常有心跳帧），要判空
-- `data: [DONE]` 是结束哨兵，收到后停止解析
+- 本文的 OpenAI 兼容聊天协议用 `data: [DONE]` 表示完成，收到后停止解析。SSE 标准本身允许应用定义自己的事件数据。
 
 为什么用 SSE 而不是 WebSocket？**单向场景 SSE 够用且更简单**：HTTP 语义、自动重连（浏览器 EventSource 内建）、过代理/网关不容易被掐。LLM 输出本来就是单向流，WebSocket 属于杀鸡用牛刀。
 
@@ -45,49 +45,80 @@ data: [DONE]
 
 有个前提先说清楚：如果前端直连 LLM API（本地工具可以，生产不行——Key 会暴露），直接 fetch 即可。生产架构是前端 → 自己的服务端 → LLM，服务端把上游 SSE 原样透传给前端（Node 的 `res.write()` 逐块转发即可，注意关掉缓冲）。
 
-浏览器端解析代码，这是我精简了两轮后的版本：
+浏览器端先解析 SSE 的行和事件边界，再解析模型 JSON。CR、LF、CRLF 都是合法换行，多行 data 要用换行连接，注释行需忽略。网络读取的分块边界与事件边界无关。 [HTML SSE 标准](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream)
 
-```ts
-async function streamChat(
-  messages: ChatMessage[],
-  onDelta: (text: string) => void,
-  signal?: AbortSignal,
-): Promise<string> {
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages }),
-    signal,
-  });
-  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-
-  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buf = "";
-  let full = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += value;
-
-    // 按空行切帧，最后一段可能是半帧，留在 buf
-    const frames = buf.split("\n\n");
-    buf = frames.pop() ?? "";
-
-    for (const frame of frames) {
-      for (const line of frame.split("\n")) {
-        if (!line.startsWith("data: ")) continue;
-        const payload = line.slice(6);
-        if (payload === "[DONE]") return full;
-        const json = JSON.parse(payload);
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta) {
-          full += delta;
-          onDelta(delta);
+```ts title="stream-chat.ts"
+export async function readSse(
+  body: ReadableStream<Uint8Array>, onData: (data: string) => boolean | void,
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let data: string[] = [];
+  let eventSize = 0;
+  let firstLine = true;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break; // EOF 不补发缺少空行终止符的事件。
+      buffer += decoder.decode(value, { stream: true });
+      while (true) {
+        const index = buffer.search(/[\r\n]/);
+        if (index < 0) break;
+        // CRLF 可能跨两次 read，等下一块再判断。
+        if (buffer[index] === "\r" && index === buffer.length - 1) break;
+        let line = buffer.slice(0, index);
+        const width = buffer.slice(index, index + 2) === "\r\n" ? 2 : 1;
+        buffer = buffer.slice(index + width);
+        if (firstLine) { line = line.replace(/^\uFEFF/, ""); firstLine = false; }
+        if (line === "") {
+          if (data.length > 0 && onData(data.join("\n")) === false) return;
+          data = [];
+          eventSize = 0;
+          continue;
         }
+        if (line.startsWith(":")) continue;
+        const colon = line.indexOf(":");
+        const field = colon < 0 ? line : line.slice(0, colon);
+        let content = colon < 0 ? "" : line.slice(colon + 1);
+        if (content.startsWith(" ")) content = content.slice(1);
+        if (field === "data") {
+          data.push(content);
+          eventSize += content.length + 1;
+        }
+        if (eventSize > 1024 * 1024) throw new Error("SSE event too large");
       }
+      if (buffer.length > 1024 * 1024) throw new Error("SSE line too large");
     }
+    // 单独 CR 也能终止空行。最后一块保留的 CR 需要按行终止符处理。
+    if (buffer === "\r" && data.length > 0) onData(data.join("\n"));
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
+}
+
+type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+export async function streamChat(
+  messages: ChatMessage[], onDelta: (text: string) => void, signal?: AbortSignal,
+): Promise<string> {
+  const init: RequestInit = {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+  };
+  if (signal) init.signal = signal;
+  const res = await fetch("/api/chat", init);
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  let full = "";
+  let completed = false;
+  await readSse(res.body, (payload) => {
+    if (payload === "[DONE]") { completed = true; return false; }
+    const json = JSON.parse(payload);
+    const delta = json.choices?.[0]?.delta?.content;
+    if (typeof delta === "string") { full += delta; onDelta(delta); }
+  });
+  if (!completed) throw new Error("流在结束标记之前断开");
   return full;
 }
 ```
@@ -183,38 +214,64 @@ stopBtn.onclick = () => controller.abort();
 
 前端代码写好只是半件事，生产链路里你的 Node 服务端要负责"从 LLM 拉流、转发给浏览器"这个中间环节。这段代码不长，但坑都藏在配置里：
 
-```ts
-// Node/Express 侧：透传上游 SSE
+保存为 `server.mjs`，执行 `npm install express` 后设置 `LLM_URL`、`LLM_MODEL`、`QWEN_API_KEY`，再运行 `node server.mjs`。浏览器开发服务器将 `/api` 代理到本机 3001。
+
+```js title="server.mjs"
+import express from "express";
+import { once } from "node:events";
+
+const app = express();
+app.use(express.json({ limit: "128kb" }));
 app.post("/api/chat", async (req, res) => {
-  const upstream = await fetch(LLM_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${process.env.QWEN_API_KEY}` },
-    body: JSON.stringify(buildBody(req.body)),
-  });
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // 关键：告诉 Nginx 别缓冲
-
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  req.on("close", () => controller.abort()); // 客户端断开 → 取消上游
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    res.write(decoder.decode(value, { stream: true }));
+  const controller = new AbortController();
+  let reader;
+  const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+  res.on("close", disconnect);
+  try {
+    const upstream = await fetch(process.env.LLM_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.QWEN_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: process.env.LLM_MODEL, messages: req.body.messages, stream: true }),
+      signal: controller.signal,
+    });
+    if (!upstream.ok || !upstream.body) {
+      await upstream.body?.cancel();
+      res.status(502).json({ message: "模型服务暂时不可用" });
+      return;
+    }
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    reader = upstream.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!res.write(value)) await once(res, "drain", { signal: controller.signal });
+    }
+    res.end();
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    console.error("chat upstream failed", error);
+    if (!res.headersSent) res.status(502).json({ message: "模型服务连接失败" });
+    else res.destroy();
+  } finally {
+    if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    res.off("close", disconnect);
   }
-  res.end();
 });
+app.listen(3001, "127.0.0.1");
 ```
+
 
 四个我用真实故障换来的要点：
 
 1. **`X-Accel-Buffering: no` 是最容易漏的一个**。Nginx 默认会缓冲代理响应，表现是本地开发一切正常，部署到生产后用户的聊天框要等几十秒一次性蹦出全文——流式变成了伪流式。我上线第一天就栽在这里，查了两小时才发现是代理层缓冲。
 2. **压缩协商要小心**。如果 Nginx 开了 gzip 对 event-stream 压缩，同样会引入缓冲。SSE 场景直接禁用该 location 的压缩即可。
-3. **客户端断开的传导**（`req.on("close")`）是 4.1 节"别白烧 token"的具体实现，忘了这行，用户关掉页面后服务端还在傻傻地拉完整条流。
+3. **客户端断开的传导**（`res.on("close")`）是 4.1 节"别白烧 token"的具体实现，POST 请求体读完也可能触发请求对象的 close。这里监听响应连接关闭，并将同一个 AbortSignal 传给 fetch 和背压等待。
 4. **长连接超时**：部分网关/负载均衡对 HTTP 连接有 60s 空闲超时，流式响应如果某段时间没有字节（模型在长推理），连接会被掐断。对策是服务端每隔 15 秒发一帧 SSE 注释（`: keepalive\n\n`，以冒号开头的帧是合法的 SSE 注释，客户端解析时会忽略）作为心跳。
 
 ## 6. 异常恢复的 UI 设计：流式断了之后
@@ -238,7 +295,7 @@ type StreamState =
 
 每个状态转移都显式定义，UI 只渲染 `kind`。我最早用三四个 ref 布尔值管理这套逻辑，出了一个"停止后立刻重连导致双流写入"的诡异 bug，重构成状态机之后同类问题再没出现过。流式 UI 的复杂度足以配得上一个正式的状态机，这不是过度设计。
 
-### 3.4 一个渲染性能的实测参考
+### 一个渲染性能的实测参考
 
 给节流策略一个真实数据支撑。我的聊天框在未优化版本（每个 delta 都 setState + 全量 Markdown 重解析）下，长回答渲染到 3000 字时掉帧明显，Performance 面板里 Markdown 解析占了主线程的 40% 以上。引入 50ms 节流 + 未闭合语法轻量修正后，同一篇内容的解析次数从 400+ 降到 60 左右，全程流畅。
 
@@ -258,6 +315,14 @@ type StreamState =
 ## 练习
 
 1. 抓一次真实流式响应（curl -N 或浏览器 Network 面板 EventStream），画出前 5 个 chunk 的原始格式。
-2. 实现 `streamChat`，故意把 `frames.pop()` 那行删掉，观察什么情况下报错。
+2. 将同一段 SSE 按每次一个字节输入，再用 CRLF 和无空格 data 字段重跑。自检要求三种输入都得到相同文本。
 3. 给打字机加"停止"按钮，验证中断后已生成文本被保留并入库。
 4. 手动断网再恢复（DevTools 的 offline 模拟），体验静默重发方案的差距，然后决定你的产品要不要做续传。
+
+## 验收清单
+
+- [ ] LF、CR、CRLF 的事件均可解析，CRLF 跨块时不多发事件。
+- [ ] 多行 data 只产生一个完整事件，注释和无 data 的事件被忽略。
+- [ ] 中文 UTF-8 拆在字节中间仍能还原。
+- [ ] 收到 [DONE] 后读取器释放，缺结束标记时报告中断。
+- [ ] 浏览器取消请求时，服务端的上游 signal 也被取消。

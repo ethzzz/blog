@@ -1,16 +1,15 @@
 ---
 import { getCollection } from "astro:content";
-import { ROADMAP_GROUPS } from "@constants/roadmap-modules";
+import { INTERVIEW_RECORD_CATEGORY } from "@constants/constants";
+import { CONTENT_MODULES } from "@constants/roadmap-modules";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { getPostUrlBySlug } from "@utils/url-utils";
 
 // 有独立聚合页的系列 category，其余一律算散篇（新增 category 不会被漏掉）
 const seriesCategories = new Set([
-	...ROADMAP_GROUPS.flatMap((group) =>
-		group.modules.map((module) => module.category),
-	),
+	...CONTENT_MODULES.map((module) => module.category),
 	"前端面试宝典",
-	"notelab",
+	INTERVIEW_RECORD_CATEGORY,
 ]);
 
 // 散篇内容聚合（PROD 下排除草稿）

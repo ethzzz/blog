@@ -117,7 +117,7 @@ draft: false
 
 **① `display: none` 的节点不进渲染树；`visibility: hidden` 进，但不绘制。**
 
-前者在 Style 之后就被排除，后续 Layout/Paint 完全不带它；后者仍占位置，只是绘制时跳过。所以「隐藏一大堆节点」用 `display:none` 更省，但会丢失滚动位置与焦点；`visibility:hidden` 保留布局，能被 Tab 聚焦（可访问性问题）。
+`display:none` 让该子树不生成布局盒，`visibility:hidden` 保留布局空间并隐藏绘制。保持 `visibility:hidden` 的元素无法通过 Tab 聚焦，通常也从无障碍树中移除。若后代显式设置 `visibility:visible`，需要单独检查该后代的交互。可以用带链接的示例切换两种隐藏方式，观察占位并通过 Tab 验证焦点顺序。 [CSS visibility 标准](https://www.w3.org/TR/css-display-3/#visibility)
 
 **② Layout 不是每次都发生。**
 

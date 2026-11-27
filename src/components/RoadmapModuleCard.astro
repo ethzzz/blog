@@ -1,0 +1,32 @@
+---
+import type { RoadmapModule } from "@constants/roadmap-modules";
+import { url } from "@utils/url-utils";
+
+interface Props {
+	module: RoadmapModule;
+	count: number;
+}
+
+const { module, count } = Astro.props;
+---
+
+<a href={url(module.url)}
+	class="card-base card-shadow p-5 flex items-start gap-4 hover:shadow-lg transition-all group">
+	<div class="shrink-0 w-12 h-12 rounded-lg bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
+		{module.abbr}
+	</div>
+	<div class="flex-1 min-w-0">
+		<div class="flex items-start justify-between gap-2 mb-1">
+			<h3 class="text-base font-bold text-90 group-hover:text-[var(--primary)] transition-colors">
+				{module.title}
+			</h3>
+			<span class="shrink-0 text-xs text-50">{count} 篇</span>
+		</div>
+		<p class="text-75 text-sm mb-2">{module.desc}</p>
+		<div class="flex flex-wrap gap-1.5 text-xs">
+			{module.chips.map((chip) => (
+				<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">{chip}</span>
+			))}
+		</div>
+	</div>
+</a>

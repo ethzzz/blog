@@ -1,0 +1,204 @@
+---
+title: 'Java 工程预备实验：Maven、文件 I/O 与 JUnit'
+published: 2026-11-24T09:00:00+08:00
+description: '在接触 Spring Boot 前，用 Maven 组织一个离线任务导入实验，练习 UTF-8 文件读取、日期校验、错误定位与可重复的 JUnit 测试。'
+tags: [Java, Maven, JUnit, 文件IO, 学习路线]
+category: Java学习路线
+draft: false
+---
+
+[回到路线总览](/blog/posts/java-roadmap-00-overview/) · [上一节：多线程入门](/blog/posts/java-roadmap-11-thread-basics/) · [下一节：Spring Boot + MyBatis](/blog/posts/java-roadmap-12-springboot-mybatis/)
+
+接到一份待导入的任务清单后，先在本地检查格式。每行包含优先级、截止日期和标题，用 `|` 分隔，文件编码为 UTF-8。第一处错误要带行号，方便修改原文件。全部读完且通过校验才返回任务列表。
+
+## 一、建立独立的 Maven 实验
+
+在自己的 `task-center/labs/` 内创建 `task-import` 并保存下面三个文件。Maven 3.9 和 JDK 21 已准备好时，直接在 `task-import` 目录执行 `mvn test`。首次构建需要能访问所配置的 Maven 仓库。
+
+```text
+task-import/
+├── pom.xml
+└── src/
+    ├── main/java/com/demo/taskimport/TaskFileImport.java
+    └── test/java/com/demo/taskimport/TaskFileImportTest.java
+```
+
+```xml title="pom.xml"
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.demo</groupId>
+  <artifactId>task-import</artifactId>
+  <version>0.1.0</version>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.4</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.3</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+```
+
+`mvn test` 先编译生产和测试源码，再由 Surefire 执行测试。`mvn package` 会先经过 `test`，然后在 `target/` 生成普通 JAR。`test` 作用域让 JUnit 只在测试编译与运行时可用。遇到 `release version 21 not supported` 时先执行 `mvn -v`，确认 Maven 使用的 JDK。 [Maven 构建生命周期](https://maven.apache.org/guides/introduction/introduction-to-the-lifecycle.html)
+
+## 二、逐行读文件并校验
+
+```java title="src/main/java/com/demo/taskimport/TaskFileImport.java"
+package com.demo.taskimport;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
+
+public class TaskFileImport {
+    public record TaskDraft(String title, int priority, LocalDate dueDate) {}
+
+    public static List<TaskDraft> read(Path source, Clock clock) throws IOException {
+        LocalDate today = LocalDate.now(clock);
+        var drafts = new ArrayList<TaskDraft>();
+        try (var reader = Files.newBufferedReader(source, StandardCharsets.UTF_8)) {
+            String line;
+            int lineNumber = 0;
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+                if (line.isBlank()) {
+                    continue;
+                }
+                try {
+                    drafts.add(parse(line, today));
+                } catch (IllegalArgumentException | java.time.format.DateTimeParseException e) {
+                    throw new IllegalArgumentException("第 " + lineNumber + " 行：" + e.getMessage(), e);
+                }
+            }
+        }
+        return List.copyOf(drafts);
+    }
+
+    private static TaskDraft parse(String line, LocalDate today) {
+        String[] fields = line.split("\\|", 3);
+        if (fields.length != 3) {
+            throw new IllegalArgumentException("需要优先级、截止日期和标题");
+        }
+        int priority = Integer.parseInt(fields[0].strip());
+        LocalDate dueDate = LocalDate.parse(fields[1].strip());
+        String title = fields[2].strip();
+        if (priority < 1 || priority > 5) {
+            throw new IllegalArgumentException("优先级应在 1 到 5 之间");
+        }
+        if (dueDate.isBefore(today)) {
+            throw new IllegalArgumentException("截止日期不能早于今天");
+        }
+        if (title.isEmpty() || title.length() > 120) {
+            throw new IllegalArgumentException("标题不能为空或超过 120 个 UTF-16 代码单元");
+        }
+        return new TaskDraft(title, priority, dueDate);
+    }
+}
+```
+
+- `Path` 表达文件位置，`Files.newBufferedReader` 使用指定字符集解码。`try-with-resources` 在读取成功、校验失败或 I/O 异常时都会关闭 reader。逐行读取避免一次性加载原始文件，这个示例仍会在内存里保留所有解析成功的任务。 [JDK 21 Files API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html)
+- 截止日期是业务日历上的一天，用 `LocalDate`。创建时间若表示全球可比较的发生时刻，内部可用 `Instant`。从 `Clock` 取今天时会使用它的时区，调用方可以明确传入 `Clock.system(ZoneId.of("Asia/Shanghai"))`。
+- `split` 的上限是 3，所以标题内部的 `|` 会保留。空行不产生任务，但占据物理行号。读不到文件时传播 `IOException`，字段错误时保留原异常和行号，调用方可据此给出不同反馈。
+
+## 三、让失败条件可以重跑
+
+```java title="src/test/java/com/demo/taskimport/TaskFileImportTest.java"
+package com.demo.taskimport;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class TaskFileImportTest {
+    private static final Clock CLOCK = Clock.fixed(
+            Instant.parse("2026-11-23T16:00:00Z"), ZoneId.of("Asia/Shanghai"));
+
+    @TempDir
+    Path directory;
+
+    @Test
+    void importsUtf8AndAcceptsToday() throws Exception {
+        Path file = directory.resolve("tasks.txt");
+        Files.writeString(file, "2|2026-11-24|打印机 | 三楼\n", StandardCharsets.UTF_8);
+
+        assertEquals(List.of(new TaskFileImport.TaskDraft("打印机 | 三楼", 2,
+                LocalDate.of(2026, 11, 24))), TaskFileImport.read(file, CLOCK));
+    }
+
+    @Test
+    void reportsPhysicalLineNumberForPastDueDate() throws Exception {
+        Path file = directory.resolve("tasks.txt");
+        Files.writeString(file, "2|2026-11-24|打印机\n\n3|2026-11-23|网络\n", StandardCharsets.UTF_8);
+
+        var error = assertThrows(IllegalArgumentException.class, () -> TaskFileImport.read(file, CLOCK));
+        assertTrue(error.getMessage().startsWith("第 3 行"));
+    }
+
+    @Test
+    void reportsMissingFileSeparately() {
+        assertThrows(NoSuchFileException.class,
+                () -> TaskFileImport.read(directory.resolve("missing.txt"), CLOCK));
+    }
+}
+```
+
+固定时钟在上海对应 11 月 24 日零点。执行 `mvn test` 后在 `target/surefire-reports/` 查看报告，预期执行 3 条测试且全部通过。把第二条测试的 `第 3 行` 临时改成 `第 2 行`，看到失败后再复原，确认这条断言能捕获行号错误。
+
+## 常见坑
+
+| 现象 | 根因 | 解法 |
+| :-- | :-- | :-- |
+| 中文乱码 | 编辑器保存编码与 reader 不一致 | 将输入另存为 UTF-8 并重跑中文测试 |
+| 同一份数据今天能过，明天失败 | 直接读取了运行日期 | 测试传入固定 `Clock`，业务传入约定时区 |
+| 构建成功但显示 Tests run: 0 | 文件未放进测试目录或测试未被发现 | 核对目录、`*Test` 文件名及 JUnit 依赖 |
+
+## 验收与练习
+
+- [ ] 在命令行运行 `mvn test`，核对三个用例都执行了。
+- [ ] 增加一条日期格式错误用例，例如 `2026-02-30`。自检要求报第 1 行，异常原因是日期解析失败。
+- [ ] 增加一条空标题用例。自检要求 `2|2026-11-24|` 被识别为标题为空，含 `|` 的非空标题仍能通过。
+- [ ] 运行 `mvn package`，找到 `target/task-import-0.1.0.jar`。这个 JAR 是实验类库，没有 `main` 入口。阶段十二会用 Spring Boot 插件生成可经 `java -jar` 启动的应用。
+
+进入 [Spring Boot + MyBatis](/blog/posts/java-roadmap-12-springboot-mybatis/) 时，保留这个实验作为独立模块。在主工程里继续练习同一组边界：外部输入如何转换，失败怎样被定位，以及如何证明任务确实写进了数据库。

@@ -91,6 +91,7 @@ services:
     build: .
     environment:
       SPRING_PROFILES_ACTIVE: prod
+      SERVER_ADDRESS: 0.0.0.0
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/taskcenter
       SPRING_DATASOURCE_USERNAME: taskcenter
       SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:?}

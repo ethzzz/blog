@@ -1,8 +1,4 @@
-/**
- * 学习路线模块注册表——单一数据源。
- * 「学习路线」总览页（src/pages/roadmaps.astro）和导航栏下拉子菜单
- * （src/config.ts 的学习路线 children）都从这里取数据，改模块只改这里。
- */
+/** 学习路线和项目系列共用的模块注册表，导航与合集页从这里取数据。 */
 
 export type RoadmapModule = {
 	title: string;
@@ -11,6 +7,8 @@ export type RoadmapModule = {
 	url: string;
 	category: string;
 	chips: string[];
+	/** 同一分类中的子系列，用文章 slug 前缀限定范围。 */
+	slugPrefix?: string;
 };
 
 export type RoadmapGroup = {
@@ -84,14 +82,6 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 		name: "进阶方向",
 		modules: [
 			{
-				title: "社区全栈实战",
-				abbr: "社",
-				desc: "Express 公共 API + NestJS 管理/BFF + Next.js 前台：后端/前端双系列完整社区项目",
-				url: "/community-fullstack-roadmap/",
-				category: "社区全栈实战",
-				chips: ["Next.js", "NestJS", "社区"],
-			},
-			{
 				title: "Node.js 全栈开发",
 				abbr: "Node",
 				desc: "前端向后端延伸的最短路径：NestJS / 数据库 / 部署",
@@ -100,17 +90,9 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 				chips: ["NestJS", "MySQL", "Redis"],
 			},
 			{
-				title: "全栈进阶 12 周",
-				abbr: "12W",
-				desc: "路径层计划：12 周把前端 + Node 基本盘推到全栈，每周一个可进作品集的交付物",
-				url: "/fullstack-12w/",
-				category: "全栈进阶12周",
-				chips: ["周计划", "NestJS", "交付物"],
-			},
-			{
 				title: "AI 应用开发",
 				abbr: "AI",
-				desc: "用前端工程能力把大模型做成真实产品：API / 流式 / RAG / Agent",
+				desc: "按阶段做完团队知识库助手，覆盖流式对话、RAG、Agent、多模态、评测与部署",
 				url: "/ai-app-roadmap/",
 				category: "AI应用开发学习路线",
 				chips: ["LLM", "SSE 流式", "RAG"],
@@ -129,9 +111,9 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 		name: "后端与运维",
 		modules: [
 			{
-				title: "Java 入门",
+				title: "Java 后端学习路线",
 				abbr: "Java",
-				desc: "从语法、集合、并发到 Spring Boot、MySQL、Redis 与部署，含任务工单毕业项目",
+				desc: "从 Java 语法、Maven 和 JUnit 到 Spring Boot、MySQL、Redis 与任务工单交付",
 				url: "/java-roadmap/",
 				category: "Java学习路线",
 				chips: ["Spring Boot", "MySQL", "Redis", "部署"],
@@ -178,4 +160,48 @@ export const ROADMAP_GROUPS: RoadmapGroup[] = [
 			},
 		],
 	},
+];
+
+export const PROJECT_GROUP: RoadmapGroup = {
+	name: "项目实践",
+	modules: [
+		{
+			title: "社区全栈实战",
+			abbr: "社",
+			desc: "用 Express、NestJS 和 Next.js 做围炉社区，涵盖帖子、审核、搜索与功能迭代。",
+			url: "/community-fullstack-roadmap/",
+			category: "社区全栈实战",
+			chips: ["Next.js", "NestJS", "Express"],
+		},
+		{
+			title: "NoteLab 实战",
+			abbr: "NL",
+			desc: "从本地搭建到上线，记录知识库的三仓协同、AI 功能、发布和排障。",
+			url: "/notelab/",
+			category: "notelab",
+			chips: ["Spring Boot", "三仓协同", "部署"],
+		},
+		{
+			title: "AI 应用工作坊",
+			abbr: "AI",
+			desc: "跟着五章教程做团队知识库助手，包含流式对话、引用、工具调用、多模态和发布验收。",
+			url: "/ai-app-workshop/",
+			category: "AI应用开发学习路线",
+			slugPrefix: "ai-app-workshop-",
+			chips: ["MySQL", "RAG", "MCP"],
+		},
+		{
+			title: "全栈进阶 12 周",
+			abbr: "12W",
+			desc: "按周练习全栈开发，每周完成一项可验收的交付物。",
+			url: "/fullstack-12w/",
+			category: "全栈进阶12周",
+			chips: ["Node.js", "NestJS", "周计划"],
+		},
+	],
+};
+
+export const CONTENT_MODULES = [
+	...ROADMAP_GROUPS.flatMap((group) => group.modules),
+	...PROJECT_GROUP.modules,
 ];

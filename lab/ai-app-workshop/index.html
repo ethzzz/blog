@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>团队知识库助手</title>
+<style>
+  :root { font: 16px/1.6 system-ui, sans-serif; color-scheme: light dark; }
+  body { max-width: 70rem; margin: auto; padding: 1.5rem; }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 28rem), 1fr)); gap: 1rem; align-items: start; }
+  section { border: 1px solid GrayText; border-radius: .6rem; padding: 1rem; min-width: 0; }
+  form, .controls { display: flex; flex-wrap: wrap; gap: .5rem; margin-block: .75rem; align-items: center; }
+  input, textarea, button, select { font: inherit; }
+  button { cursor: pointer; }
+  textarea { flex-basis: 100%; }
+  pre, #answer, #messages { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #messages { max-height: 24rem; overflow: auto; }
+  h1, h2 { margin: 0; }
+  [hidden] { display: none !important; }
+</style>
+<header>
+  <h1>团队知识库助手</h1>
+  <form id="auth"><label>工作台访问密钥 <input id="key" type="password" required autocomplete="off"></label><button>进入工作台</button></form>
+  <p id="status" role="status"></p>
+</header>
+<main id="workspace" hidden>
+  <section>
+    <h2>对话</h2>
+    <form id="new-chat"><label>标题 <input name="title" required maxlength="80"></label><button>新建会话</button></form>
+    <label>会话 <select id="conversations"></select></label>
+    <div id="messages"></div>
+    <form id="chat">
+      <label for="question">消息</label>
+      <textarea id="question" name="text" required maxlength="2000" rows="3"></textarea>
+      <button id="send">发送</button><button type="button" id="stop" disabled>停止</button>
+    </form>
+  </section>
+  <section data-stage="2" hidden>
+    <h2>知识库</h2>
+    <form id="import-doc">
+      <label>标题 <input name="title" required maxlength="100"></label>
+      <label for="doc-text">文档正文</label>
+      <textarea id="doc-text" name="text" required maxlength="20000" rows="3"></textarea>
+      <button>导入</button>
+    </form>
+    <div id="documents" class="controls"></div>
+    <form id="ask"><label>查资料 <input name="text" required maxlength="1000"></label><button>查询</button></form>
+    <p id="answer"></p><ol id="citations"></ol><pre id="source"></pre>
+  </section>
+  <section data-stage="3" hidden>
+    <h2>待办助手</h2>
+    <form id="agent"><label>任务指令 <input name="text" required maxlength="1000"></label><button>运行</button></form>
+    <p id="plan"></p><button id="confirm" hidden>确认创建</button><ul id="tasks"></ul>
+  </section>
+  <section data-stage="4" hidden>
+    <h2>图片与语音</h2>
+    <form id="media">
+      <label>PNG、JPEG 或 WAV <input name="file" type="file" required accept=".png,.jpg,.jpeg,.wav"></label>
+      <label>图片问题 <input name="question" maxlength="300" value="描述这张图片。"></label>
+      <button>分析</button>
+    </form>
+    <pre id="media-result"></pre><button id="use-media" hidden>填入对话</button>
+  </section>
+  <section data-stage="5" hidden>
+    <h2>用量与反馈</h2>
+    <button id="refresh-usage">刷新</button><p id="usage-summary"></p><div id="runs"></div>
+  </section>
+</main>
+<script type="module" src="/app.mjs"></script>
+</html>

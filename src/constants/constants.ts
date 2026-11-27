@@ -1,4 +1,5 @@
 export const PAGE_SIZE = 8;
+export const INTERVIEW_RECORD_CATEGORY = "面试记录";
 
 export const LIGHT_MODE = "light",
 	DARK_MODE = "dark",

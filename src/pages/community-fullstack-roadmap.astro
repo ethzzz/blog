@@ -15,14 +15,18 @@ const sortedPosts = allPosts.sort(
 );
 
 const sharedPost = sortedPosts.find((post) => post.data.tags.includes("总览"));
-const backendPosts = sortedPosts.filter((post) =>
+const iterationPosts = sortedPosts.filter((post) =>
+	post.slug.startsWith("community-fullstack-iteration-"),
+);
+const coursePosts = sortedPosts.filter((post) => post !== sharedPost && !iterationPosts.includes(post));
+const backendPosts = coursePosts.filter((post) =>
 	post.data.tags.includes("后端"),
 );
-const frontendPosts = sortedPosts.filter((post) =>
+const frontendPosts = coursePosts.filter((post) =>
 	post.data.tags.includes("前端"),
 );
 const totalPosts =
-	backendPosts.length + frontendPosts.length + (sharedPost ? 1 : 0);
+	backendPosts.length + frontendPosts.length + iterationPosts.length + (sharedPost ? 1 : 0);
 ---
 
 <MainGridLayout title="社区全栈实战">
@@ -30,7 +34,7 @@ const totalPosts =
 		<div class="mb-8">
 			<h1 class="text-3xl font-bold text-90 mb-2">社区全栈实战</h1>
 			<p class="text-75 text-lg">
-				一个完整社区项目，拆成后端 / 前端两套系列 · 共 {totalPosts} 篇
+				从前后端搭建到功能迭代 · 共 {totalPosts} 篇
 			</p>
 		</div>
 
@@ -139,6 +143,22 @@ const totalPosts =
 				</div>
 			</section>
 		</div>
+
+		{iterationPosts.length > 0 && (
+			<section aria-labelledby="community-iterations" class="mb-8">
+				<h2 id="community-iterations" class="text-lg font-bold text-90 mb-3">项目迭代</h2>
+				<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+					{iterationPosts.map((post) => (
+						<a href={getPostUrlBySlug(post.slug)} class="block card-base card-shadow p-4 hover:shadow-lg transition-all group">
+							<h3 class="text-base font-bold text-90 group-hover:text-[var(--primary)] transition-colors mb-1">
+								{post.data.title}
+							</h3>
+							<p class="text-75 text-sm">{post.data.description}</p>
+						</a>
+					))}
+				</div>
+			</section>
+		)}
 
 		<div class="card-base card-shadow p-5 text-sm text-75">
 			<p class="font-bold text-90 mb-2">阅读顺序</p>

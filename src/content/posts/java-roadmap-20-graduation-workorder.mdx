@@ -1,7 +1,7 @@
 ---
 title: '毕业项目：任务工单系统'
 published: 2026-11-12T16:00:00+08:00
-description: '把前面十九篇的能力收成一个可交付的任务工单系统：六张表、状态机、权限、审计、通知、测试与容器化，附 25 条验收。'
+description: '按里程碑交付任务工单系统，完成六张表、状态机、权限、审计、通知、测试与容器化，附 25 条验收。'
 tags: [Java, 毕业项目, SpringBoot, 工单系统, 学习路线]
 category: Java学习路线
 draft: false
@@ -14,17 +14,25 @@ draft: false
 
 ## 一、先跑起来
 
-目标：alice 建单、bob 受理、carol 读不到、bob 重复受理拿 409。
+目标是让 alice 建单，bob 受理，carol 查单得到 403，bob 重复受理得到 409。第一次读到这里，先按下表完成实现，再从空开发库运行本节命令。保留 12–19 的任务接口实验库，单独验证工单迁移和初始数据。
+
+| 里程碑 | 实现内容 | 提交时附上的验证结果 |
+| :-- | :-- | :-- |
+| 建单与查询 | Flyway 建表、开发环境账号、创建和查询接口 | 新库能启动，alice 建单后能读到 `PENDING` |
+| 流转与授权 | 状态机、角色、数据归属、并发更新 | bob 受理为 `IN_PROGRESS`，carol 得到 403，重复受理得到 409 |
+| 审计与通知 | 成功流转的审计、通知落表、失败和重试 | 查询结果能核对操作者和状态变化，重试后没有重复业务记录 |
+| 测试与交付 | 三层测试、镜像、健康检查、回滚 | 保存测试报告和 25 条验收记录，旧镜像在兼容的数据结构上跑通核心接口 |
 
 ```bash
-docker run -d --name wo-mysql -p 3306:3306 -e MYSQL_DATABASE=taskcenter \
-  -e MYSQL_USER=demo -e MYSQL_PASSWORD=demo -e MYSQL_ROOT_PASSWORD=root mysql:8.0
-docker run -d --name wo-redis -p 6379:6379 redis:7.2
+docker run -d --name wo-mysql -p 127.0.0.1:3306:3306 -e MYSQL_DATABASE=taskcenter \
+  -e MYSQL_USER=demo -e MYSQL_PASSWORD=demo -e MYSQL_RANDOM_ROOT_PASSWORD=yes mysql:8.0
+docker run -d --name wo-redis -p 127.0.0.1:6379:6379 redis:7.2
 export DB_PASSWORD=demo JWT_SECRET=$(openssl rand -base64 48)
-cd task-center && mvn -q spring-boot:run
+# 等 MySQL 可以执行 SELECT 1 后再启动应用
+cd task-center && SPRING_PROFILES_ACTIVE=dev mvn -q spring-boot:run
 ```
 
-Flyway 建表与角色，dev 配置的 `DemoDataInitializer` 再建 alice、bob、carol、admin 四个账号，密码都是 `s3cret-pass`，角色依次是 REPORTER、AGENT、AGENT、ADMIN。散列由 `BCryptPasswordEncoder(12)` 现算，仓库里不存散列字面量。
+启用 `dev` 配置后，Flyway 建表与角色，`DemoDataInitializer` 再建 alice、bob、carol、admin 四个账号，密码都是 `s3cret-pass`，角色依次是 REPORTER、AGENT、AGENT、ADMIN。散列由 `BCryptPasswordEncoder(12)` 现算，仓库里不存散列字面量。用 `jq` 读取下面的响应，将创建结果里的 `data.id` 填入 `ORDER_ID`，后续都用同一个实际 ID。
 
 ```bash
 BASE=http://127.0.0.1:8081
@@ -34,16 +42,17 @@ ALICE=$(tok alice); BOB=$(tok bob); CAROL=$(tok carol); H='Content-Type: applica
 
 curl -s -X POST $BASE/api/work-orders -H "Authorization: Bearer $ALICE" -H "$H" \
   -d '{"title":"三楼打印机卡纸","description":"A3 纸盒进纸即卡","priority":2}' | jq -c .data
-# {"id":"1001","status":"PENDING","reporterId":"1","assigneeId":null,"version":0,...}
+# 预期 status=PENDING、assigneeId=null、version=0
+ORDER_ID=1001 # 换成上一步返回的 data.id
 
-curl -s -X POST $BASE/api/work-orders/1001/transitions -H "Authorization: Bearer $BOB" \
+curl -s -X POST "$BASE/api/work-orders/$ORDER_ID/transitions" -H "Authorization: Bearer $BOB" \
   -H "$H" -d '{"action":"ACCEPT"}' | jq -c .data
-# {"id":"1001","status":"IN_PROGRESS","assigneeId":"2","version":1,...}
+# 预期 status=IN_PROGRESS、assigneeId 为受理人、version=1
 
-curl -s -o /dev/null -w '%{http_code}\n' $BASE/api/work-orders/1001 -H "Authorization: Bearer $CAROL"
+curl -s -o /dev/null -w '%{http_code}\n' "$BASE/api/work-orders/$ORDER_ID" -H "Authorization: Bearer $CAROL"
 # 403：carol 既不是提交人，也不是处理人
 
-curl -s -X POST $BASE/api/work-orders/1001/transitions -H "Authorization: Bearer $BOB" \
+curl -s -X POST "$BASE/api/work-orders/$ORDER_ID/transitions" -H "Authorization: Bearer $BOB" \
   -H "$H" -d '{"action":"ACCEPT"}' | jq -c '{code,message}'
 # {"code":40911,"message":"当前状态不允许该操作"}
 ```
@@ -434,6 +443,7 @@ services:
     environment:
       DB_PASSWORD: ${DB_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
+      SERVER_ADDRESS: 0.0.0.0
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/taskcenter
       SPRING_DATA_REDIS_HOST: redis
     depends_on:

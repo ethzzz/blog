@@ -1,5 +1,6 @@
 ---
 import { getCollection } from "astro:content";
+import RoadmapModuleCard from "@components/RoadmapModuleCard.astro";
 import { ROADMAP_GROUPS } from "@constants/roadmap-modules";
 import MainGridLayout from "@layouts/MainGridLayout.astro";
 import { url } from "@utils/url-utils";
@@ -48,38 +49,8 @@ const articleCount = groupData.reduce(
 					{group.name}
 				</h2>
 				<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-					{group.modules.map((m) => (
-						<a href={url(m.url)}
-						   class="card-base card-shadow p-5 flex items-start gap-4 hover:shadow-lg transition-all group">
-							<div class="flex-shrink-0 w-12 h-12 rounded-lg bg-[var(--btn-regular-bg)] flex items-center justify-center text-[var(--btn-content)] font-bold text-base group-hover:bg-[var(--primary)] group-hover:text-white dark:group-hover:text-black/70 transition-colors">
-								{m.abbr}
-							</div>
-							<div class="flex-1 min-w-0">
-								<div class="flex items-center justify-between gap-2 mb-1">
-									<h3 class="text-base font-bold text-90 group-hover:text-[var(--primary)] transition-colors truncate">
-										{m.title}
-									</h3>
-									<span class="flex-shrink-0 text-xs text-50">
-										{m.count} 篇
-									</span>
-								</div>
-								<p class="text-75 text-sm mb-2 line-clamp-2">
-									{m.desc}
-								</p>
-								<div class="flex flex-wrap gap-1.5 text-xs">
-									{m.chips.map((chip) => (
-										<span class="px-1.5 py-0.5 rounded bg-[var(--btn-regular-bg)] text-[var(--btn-content)]">
-											{chip}
-										</span>
-									))}
-								</div>
-							</div>
-							<div class="flex-shrink-0 self-center text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
-								<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-									<path d="M5 12h14M12 5l7 7-7 7"></path>
-								</svg>
-							</div>
-						</a>
+					{group.modules.map((module) => (
+						<RoadmapModuleCard module={module} count={module.count} />
 					))}
 				</div>
 			</div>
@@ -92,8 +63,7 @@ const articleCount = groupData.reduce(
 				每条路线都按「总览 → 阶段」编号排序，从 00-overview 进入即可按序阅读；
 				已经熟悉的部分可以直接当速查表。				面试冲刺优先刷「算法与手写题」+
 				<a href={url("/interview-guide/")} class="link text-[var(--primary)]">面试宝典</a>；
-				想看真实项目怎么落地，移步
-				<a href={url("/notelab/")} class="link text-[var(--primary)]">NoteLab 实战</a>。
+				想跟做完整应用，可以浏览 <a href={url("/projects/")} class="link text-[var(--primary)]">项目实践</a>。
 			</p>
 		</div>
 	</div>

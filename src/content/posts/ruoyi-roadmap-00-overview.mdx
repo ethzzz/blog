@@ -1,7 +1,7 @@
 ---
 title: 'RuoYi 学习路线总览：从 0 到 1 拆解若依后台管理系统'
 published: 2026-09-07T10:00:00+08:00
-description: '一个前端工程师视角的 RuoYi（若依）项目拆解笔记，12 个阶段带你从环境搭建到核心功能实现，每篇都有真实代码片段和架构图。'
+description: '13 个阶段拆解若依后台管理系统：01–12 学习 Shiro 经典版，13 单独切换 RuoYi-Vue 后端与 Vue 3 前端，明确仓库、认证方式和联调边界。'
 tags: [Java, SpringBoot, RuoYi, 学习路线, 后台管理]
 category: RuoYi学习路线
 draft: false
@@ -9,7 +9,17 @@ draft: false
 
 写了几年前端，最近想系统学习 Java 后台开发。选了 **RuoYi（若依）** 作为切入点——它是一个基于 Spring Boot 的轻量级后台管理系统，核心技术采用 Spring + MyBatis + Shiro，没有过度封装，代码结构清晰，非常适合学习。
 
-这个系列不是"RuoYi 使用手册"，而是一份**项目拆解笔记**：把若依的 18 个功能模块拆成 12 个学习阶段，每个阶段聚焦一个核心技术点，配上项目中的真实代码片段，方便日后回来快速回忆。
+这个系列把若依功能模块拆成 13 个学习阶段。01–12 使用经典 RuoYi 的 Shiro、Session 与服务端页面，第 13 篇在独立工作目录切换到 RuoYi-Vue 后端和 RuoYi-Vue3 前端，学习前后端分离的请求与路由。
+
+## 先确认自己使用的版本
+
+| 阶段 | 仓库 | 页面与认证 | 启动前核对 |
+| :-- | :-- | :-- | :-- |
+| 01–12 | `yangzongzhuan/RuoYi` | 服务端模板、Bootstrap/Hplus、Shiro Session | 当前 checkout 的 POM、配置和 SQL |
+| 13 后端 | `yangzongzhuan/RuoYi-Vue` | Spring Security、Token、JSON API | 后端独立 MySQL 库、Redis、允许前端调用的地址 |
+| 13 前端 | `yangzongzhuan/RuoYi-Vue3` | Vue 3、Vite、Pinia、Element Plus | `package.json` 的 Node 要求、锁文件和 `.env.development` |
+
+每个练习记录 `git rev-parse HEAD`，同一阶段使用该 checkout 自带的数据库脚本。第 13 篇的 `/getInfo`、`/getRouters` 与 Bearer Token 对应 RuoYi-Vue 后端。官方分别维护经典版与前后端分离版，环境配置按所用版本核对。 [若依官方入口](https://ruoyi.vip/) · [经典版部署文档](https://doc.ruoyi.vip/ruoyi/document/hjbs.html)
 
 > [!NOTE]
 > 阅读顺序建议按下面的阶段编号从头到尾走一遍；已经熟悉的阶段可以直接跳到对应文章当作速查表使用。
@@ -22,7 +32,7 @@ draft: false
 | 维度 | 内容 |
 |:--|:--|
 | **项目名称** | RuoYi（若依）|
-| **当前版本** | v4.8.3 |
+| **本文经典版参考版本** | v4.8.3，实际练习同时记录 commit |
 | **技术栈** | Spring Boot + Spring + MyBatis + Shiro |
 | **前端** | Hplus (H+) 后台主题 UI |
 | **JDK 版本** | 支持 8+ / 17+（多版本分支）|
@@ -58,7 +68,7 @@ RuoYi 提供了 18 个开箱即用的功能模块：
 
 RuoYi 的验收标准是"能接手并改造"，不是"能跑起来"。五条：
 
-1. 能跑起来并说清结构：前端（Vue）+ 后端（Spring Boot）+ MySQL + Redis 各自在哪、怎么通信。
+1. 能说明经典版模板渲染与第 13 篇 Vue 前后端分离的区别，分别画出请求、认证和数据源的调用路径。
 2. 能新增一张业务表并走通全链路：**建表 → 代码生成 → 菜单 → 权限 → 前端页面**。
 3. 能改权限：角色、菜单、数据权限（部门/自定义），并**验证越权被拒**。
 4. 能定位一个"菜单看不到 / 接口 403 / 数据查不到"的问题，知道卡在哪一层（角色-菜单、权限字符、数据范围）。

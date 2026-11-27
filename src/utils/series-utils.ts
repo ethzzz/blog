@@ -1,5 +1,7 @@
 import type { CollectionEntry } from "astro:content";
-import { ROADMAP_GROUPS } from "../constants/roadmap-modules";
+import { INTERVIEW_RECORD_CATEGORY } from "../constants/constants";
+import { CONTENT_MODULES } from "../constants/roadmap-modules";
+import { AI_APP_CATEGORY, aiAppRoadmapOrder } from "./ai-app-roadmap";
 
 /**
  * 系列（= 同一 category）的划分与排序。
@@ -34,12 +36,17 @@ export type SeriesInfo = {
 	next: SeriesItem | null;
 };
 
-/** category → 路线总览页，单一数据源仍是 roadmap-modules.ts */
+/**
+ * category → 路线总览页，单一数据源仍是 roadmap-modules.ts。
+ *
+ * 带 slugPrefix 的模块（与别的模块共用 category，例如 AI 应用工作坊）不参与映射：
+ * 它只是该 category 下的一个子系列，让位给真正拥有这个 category 的主路线，
+ * 否则后注册的子模块会把「AI应用开发学习路线」的文章指到子页面上。
+ */
 const ROADMAP_URL_BY_CATEGORY = new Map<string, string>(
-	ROADMAP_GROUPS.flatMap((group) => group.modules).map((m) => [
-		m.category,
-		m.url,
-	]),
+	CONTENT_MODULES
+		.filter((m) => !m.slugPrefix)
+		.map((m) => [m.category, m.url]),
 );
 
 /**
@@ -78,13 +85,18 @@ export function buildSeriesBySlug(
 	const result = new Map<string, SeriesInfo>();
 
 	for (const [name, list] of groups) {
-		const orders = list.map((e) => seriesOrderOf(e.slug));
-		const everyPostNumbered = orders.every((o) => o !== null);
+		// 面试记录的 slug 后缀是日期，按发布日期排序。
+		const orderOf = (entry: PostEntry) =>
+			name === INTERVIEW_RECORD_CATEGORY ? null : seriesOrderOf(entry.slug);
+		const everyPostNumbered = list.every((entry) => orderOf(entry) !== null);
 
 		const sorted = [...list].sort((a, b) => {
+			if (name === AI_APP_CATEGORY) {
+				return aiAppRoadmapOrder(a.slug) - aiAppRoadmapOrder(b.slug);
+			}
 			if (everyPostNumbered) {
-				const oa = seriesOrderOf(a.slug) ?? 0;
-				const ob = seriesOrderOf(b.slug) ?? 0;
+				const oa = orderOf(a) ?? 0;
+				const ob = orderOf(b) ?? 0;
 				if (oa !== ob) return oa - ob;
 			}
 			return (
@@ -97,7 +109,7 @@ export function buildSeriesBySlug(
 			slug: e.slug,
 			title: e.data.title,
 			label: stripTitleOrder(e.data.title),
-			order: seriesOrderOf(e.slug),
+			order: orderOf(e),
 		}));
 
 		const roadmapUrl = ROADMAP_URL_BY_CATEGORY.get(name) ?? null;

@@ -1,4 +1,5 @@
-import { ROADMAP_GROUPS } from "./constants/roadmap-modules";
+import { INTERVIEW_RECORD_CATEGORY } from "./constants/constants";
+import { PROJECT_GROUP, ROADMAP_GROUPS } from "./constants/roadmap-modules";
 import type {
 	ExpressiveCodeConfig,
 	LicenseConfig,
@@ -57,6 +58,14 @@ export const navBarConfig: NavBarConfig = {
 			children: roadmapChildren,
 		},
 		{
+			name: PROJECT_GROUP.name,
+			url: "/projects/",
+			children: [{
+				title: "项目系列",
+				items: PROJECT_GROUP.modules.map(({ title, url }) => ({ name: title, url })),
+			}],
+		},
+		{
 			name: "练习实践",
 			shortName: "练习",
 			url: "/solutions/",
@@ -66,9 +75,8 @@ export const navBarConfig: NavBarConfig = {
 			url: "/interview-guide/",
 		},
 		{
-			name: "NoteLab 实战",
-			shortName: "NoteLab",
-			url: "/notelab/",
+			name: INTERVIEW_RECORD_CATEGORY,
+			url: "/interview-records/",
 		},
 		{
 			name: "随笔与教程",

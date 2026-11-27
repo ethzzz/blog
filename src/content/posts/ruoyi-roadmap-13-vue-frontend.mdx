@@ -9,7 +9,7 @@ draft: false
 
 > [!NOTE]
 > 前面 12 个阶段几乎都在讲后端：Shiro、用户、角色、菜单、部门、字典、日志、定时任务、代码生成、监控。
-> 但 RuoYi 是前后端分离项目，**一半的坑在 Vue 前端**：刷新 404、菜单不出现、按钮权限不生效、字典不更新，大多不是后端问题。
+> 本篇切换到 RuoYi-Vue 后端与 RuoYi-Vue3 前端。先建立独立工作目录、数据库和 Redis 配置，再开始联调。经典版的 Shiro Session 与本篇的 Token 认证分别按各自工程验证。
 > 这一篇按「请求 → 路由 → 权限 → 页面 → 二次开发流程」把前端这条线补齐。
 
 > [!TIP]
@@ -18,6 +18,27 @@ draft: false
 > [大型项目架构与组件库二次封装](/blog/posts/vue-roadmap-14-architecture-library/) 对应第 6 节的页面骨架与通用组件层。
 
 ## 知识地图
+
+### 从经典版切到 Vue 3 的准备
+
+```bash
+git clone https://github.com/yangzongzhuan/RuoYi-Vue.git ruoyi-vue-api
+git clone https://github.com/yangzongzhuan/RuoYi-Vue3.git ruoyi-vue-ui
+git -C ruoyi-vue-api rev-parse HEAD
+git -C ruoyi-vue-ui rev-parse HEAD
+```
+
+先按 `ruoyi-vue-api` 的 README、POM 和 SQL 脚本配置 JDK、MySQL 与 Redis，单独建开发库。修改 `ruoyi-admin` 的数据源和 Redis 配置后，从后端根目录打包并启动。
+
+```bash
+cd ruoyi-vue-api
+mvn clean package -DskipTests
+java -jar ruoyi-admin/target/ruoyi-admin.jar
+```
+
+另开终端进入 `ruoyi-vue-ui`。使用所检出仓库的包管理器与锁文件安装依赖。npm 项目存在 `package-lock.json` 时运行 `npm ci`，首次没有该锁文件时运行 `npm install`。核对 `.env.development` 中 `VITE_APP_BASE_API`，以及 `vite.config.js` 的代理 target 指向后端启动地址，执行 `npm run dev`。
+
+登录后在浏览器 Network 核对 `/login`、`/getInfo`、`/getRouters`。保存两个仓库 commit、后端端口、代理 target 和三次响应作为本篇起点。 [RuoYi-Vue 官方仓库](https://github.com/yangzongzhuan/RuoYi-Vue) · [Vue 3 前端仓库](https://github.com/yangzongzhuan/RuoYi-Vue3)
 
 ```
 ruoyi-ui/
@@ -34,7 +55,7 @@ ruoyi-ui/
 │   │   ├── auth.js        Token 存取
 │   │   └── permission.js  路由守卫
 │   └── views/             业务页面（system/user、system/role…）
-├── .env.development       开发环境变量（VUE_APP_BASE_API）
+├── .env.development       开发环境变量（VITE_APP_BASE_API）
 ├── .env.production
 └── vite.config.js         代理 / 别名 / 构建
 ```
@@ -152,7 +173,7 @@ router.beforeEach(async (to, from, next) => {
 
 ## 4. 权限：路由级 + 按钮级
 
-RuoYi 的权限字符形如 `system:user:add`、`system:role:edit`。后端用 Shiro 校验，前端做两层：
+RuoYi 的权限字符形如 `system:user:add`、`system:role:edit`。本篇的 RuoYi-Vue 后端通过 Spring Security 与方法权限表达式校验，前端做两层。
 
 **路由级**：后端 `/getRouters` 只下发当前角色可见的菜单，前端不用再判断。
 
@@ -319,7 +340,7 @@ export function delItem(id) {
 - RuoYi 前端不是「Element Plus 拼页面」，核心是**请求封装 + 后端下发路由 + 权限指令 + 字典**这四件基础设施；
 - 刷新 404、菜单不出现、按钮权限失效，三类问题各有固定排查顺序，先看 Token/路由注册，再看权限字符；
 - 二次开发的最短路径是「建表 → 代码生成 → 菜单 → 角色授权 → 前端补 API → 四件验证」；
-- 前端权限只负责体验，接口越权必须由后端 Shiro 拦。
+- 前端权限控制显示与交互，接口越权由 RuoYi-Vue 后端的 Spring Security 和数据权限逻辑拒绝。
 
 ## 练习
 

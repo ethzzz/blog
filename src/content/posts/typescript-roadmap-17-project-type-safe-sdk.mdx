@@ -21,13 +21,13 @@ draft: false
 
 项目结束时，你要能拿出一个 `task-sdk` 包，并逐条演示：
 
-- [ ] 调用 `client.get("/tasks/:id", { params: { id: 1 } })` 时，`id` 只能是 `number`；传 `"1"` 编译失败。
+- [ ] 调用 `client.get("/tasks/:id", { params: { id: "1" } })` 时，`id` 只能是 `string`，传数字编译失败。
 - [ ] 响应的类型由路由契约自动推导，不需要手写 `as Task`。
-- [ ] 后端返回缺字段 / 多字段 / 类型错误的数据时，SDK 在**运行期**抛出可读错误，而不是把脏数据交给业务。
+- [ ] 响应缺字段或字段类型错误时得到带路径的 parse 错误，服务端附带的额外元数据由 schema 过滤。
 - [ ] 非 2xx 响应被收敛成可辨识联合，`switch` 处理错误分支时漏掉一种，编译器报 `never` 错误。
 - [ ] `npm pack` 后装进一个独立的 consumer 项目，`import` 有完整类型提示，`tsc --noEmit` 通过。
 - [ ] 修改契约字段（如 `title` → `name`）后，consumer 未同步修改的地方**全部编译失败**。
-- [ ] `strict: true` 全程开启，代码里没有 `any` 和裸 `as`（`unknown` + 守卫除外）。
+- [ ] `strict: true` 全程开启，类型关联的必要断言有注释，响应通过 schema 校验后才返回。
 
 这份清单就是验收标准。做不到就回去补，不要用 `as any` 蒙混过去——那等于把这个项目唯一的价值扔掉。
 
@@ -40,7 +40,7 @@ draft: false
 | TypeScript 5.x，`strict: true` | 本项目就是练类型系统，关掉 strict 等于没做 | `noImplicitAny: false` |
 | Zod | 一份 schema 同时产出运行时校验和 `z.infer` 类型，避免类型与校验两套定义漂移 | 手写两个版本（一定漂移） |
 | Vitest | 跑得快，`expectTypeOf` 能做编译期断言 | Jest + ts-jest（配置更重） |
-| tsup 或 `tsc` | 前者打包省事，后者只用标准能力；两版都给 | 复杂 bundler 配置 |
+| `tsc` | 生成 ESM 文件和声明文件，NodeNext 检查相对导入路径 | 复杂 bundler 配置 |
 | `npm pack` + 本地安装 | 真实验证 `exports` / `types` 字段，而不是只在自己仓库里自嗨 | 只在 monorepo 内相对引用 |
 
 **不引入**：OpenAPI 代码生成器、请求库（fetch 就够）、状态管理。这个项目要看清每一层，不要被生成代码遮住。
@@ -54,34 +54,37 @@ draft: false
 ```ts
 // 任务资源
 type Task = {
-  id: number;
+  id: string;
   title: string;
   status: "todo" | "doing" | "done";
+  priority: "low" | "mid" | "high";
+  assignee: string;
+  desc: string;
   createdAt: string; // ISO 8601
 };
 
 // 路由表：key 是「方法 + 路径」，value 描述入参与响应
-type Routes = {
+export type Routes = {
   "GET /tasks": {
-    query?: { status?: Task["status"] };
-    response: Task[];
+    query?: { _page?: number; _limit?: number; status?: Task["status"]; q?: string };
+    response: { items: Task[]; total: number; hasNext: boolean };
   };
   "GET /tasks/:id": {
-    params: { id: number };
+    params: { id: string };
     response: Task;
   };
   "POST /tasks": {
-    body: { title: string; status?: Task["status"] };
+    body: { title: string; assignee: string; status?: Task["status"]; priority?: Task["priority"]; desc?: string };
     response: Task;
   };
   "PATCH /tasks/:id": {
-    params: { id: number };
-    body: { title?: string; status?: Task["status"] };
+    params: { id: string };
+    body: { title?: string; assignee?: string; status?: Task["status"]; priority?: Task["priority"]; desc?: string };
     response: Task;
   };
   "DELETE /tasks/:id": {
-    params: { id: number };
-    response: { ok: true };
+    params: { id: string };
+    response: undefined;
   };
 };
 ```
@@ -100,8 +103,9 @@ type Routes = {
 ```bash
 mkdir task-sdk && cd task-sdk
 npm init -y
-npm i zod
-npm i -D typescript vitest @types/node
+npm pkg set type=module
+npm i zod@3.25.76
+npm i -D typescript@5.9.3 vitest@3.2.4 @types/node@22
 npx tsc --init
 ```
 
@@ -111,8 +115,8 @@ npx tsc --init
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -140,7 +144,7 @@ tests/
 └── types.test-d.ts  # 只做类型断言，不产出运行时用例
 ```
 
-✅ **阶段 0 验收**：`npx tsc --noEmit` 通过；`npx vitest run` 能跑（哪怕只有一个空用例）。
+✅ **阶段 0 验收**：`npx tsc --noEmit` 通过；`npx vitest run` 执行下一节的真实断言。
 
 ---
 
@@ -155,15 +159,23 @@ import { z } from "zod";
 export const TaskStatusSchema = z.enum(["todo", "doing", "done"]);
 
 export const TaskSchema = z.object({
-  id: z.number().int().positive(),
-  title: z.string().min(1).max(80),
+  id: z.string().min(1),
+  title: z.string().min(4).max(60),
   status: TaskStatusSchema,
+  priority: z.enum(["low", "mid", "high"]),
+  assignee: z.string().min(1),
+  desc: z.string().max(500),
   createdAt: z.string().datetime(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
 
-export const TaskListSchema = z.array(TaskSchema);
+export const TaskListSchema = z.object({
+  items: z.array(TaskSchema),
+  total: z.number().int().nonnegative(),
+  hasNext: z.boolean(),
+});
+export type TaskPage = z.infer<typeof TaskListSchema>;
 ```
 
 关键点：**类型从 schema 推导，不要反过来手写一份再让 schema 去对齐**。两份定义迟早漂移，而漂移发生在运行时边界上，最难发现。
@@ -174,6 +186,8 @@ export const TaskListSchema = z.array(TaskSchema);
 
 ```ts
 // src/errors.ts
+import { z } from "zod";
+
 export type ApiError =
   | { kind: "http"; status: number; message: string }
   | { kind: "network"; message: string }
@@ -197,14 +211,15 @@ export function toParseError(error: unknown): ApiError {
 ```ts
 // tests/contract.test.ts
 import { describe, expect, it } from "vitest";
-import { TaskSchema } from "../src/contract";
+import { TaskSchema } from "../src/contract.js";
 
 describe("TaskSchema", () => {
   it("接受合法数据", () => {
     expect(() =>
       TaskSchema.parse({
-        id: 1,
-        title: "写文档",
+        id: "1",
+        title: "编写项目文档",
+        priority: "mid", assignee: "test", desc: "",
         status: "todo",
         createdAt: "2026-10-25T02:00:00.000Z",
       }),
@@ -212,7 +227,7 @@ describe("TaskSchema", () => {
   });
 
   it("拒绝缺失字段并指出路径", () => {
-    const result = TaskSchema.safeParse({ id: 1, status: "todo" });
+    const result = TaskSchema.safeParse({ id: "1", status: "todo" });
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error.issues.map((i) => i.path.join("."))).toContain("title");
@@ -222,7 +237,7 @@ describe("TaskSchema", () => {
   it("拒绝非法枚举值", () => {
     expect(
       TaskSchema.safeParse({
-        id: 1,
+        id: "1",
         title: "x",
         status: "archived",
         createdAt: "2026-10-25T02:00:00.000Z",
@@ -269,7 +284,7 @@ type B = ExtractParams<"/orgs/:orgId/tasks/:id">;
 // { orgId: string } & { id: string }
 ```
 
-`ExtractParams` 只负责"有哪些参数"，参数类型（`id: number`）仍以 `Routes` 里的 `params` 为准。两者在调用签名处合并。
+`ExtractParams` 只负责"有哪些参数"，参数类型（`id: string`）仍以 `Routes` 里的 `params` 为准。两者在调用签名处合并。
 
 ### 6.3 推导调用入参
 
@@ -291,109 +306,126 @@ type RouteResponse<K extends RouteKey> =
 
 ### 6.4 唯一的请求出口
 
-```ts
-// src/request.ts
-import { z } from "zod";
-import type { Routes } from "./contract";
-import type { ApiError } from "./errors";
-import { toParseError } from "./errors";
+将第 3 节的路由表保存为 `contract.ts` 中的 `export type Routes`，任务类型使用第 5 节的 `z.infer`。请求函数负责路径编码、分页参数、HTTP 错误与响应校验。
 
-type RouteKey = keyof Routes;
-type RouteInput<K extends RouteKey> = /* 同上 */;
-type RouteResponse<K extends RouteKey> = /* 同上 */;
+```ts title="src/request.ts"
+import type { z } from "zod";
+import type { Routes } from "./contract.js";
+import type { ApiError } from "./errors.js";
+import { toParseError } from "./errors.js";
 
-export type ApiResult<T> =
-  | { ok: true; data: T }
-  | { ok: false; error: ApiError };
-
+export type RouteKey = keyof Routes;
+export type RouteInput<K extends RouteKey> =
+  Routes[K] extends { body: infer B }
+    ? { body: B } & (Routes[K] extends { params: infer P } ? { params: P } : {})
+    : Routes[K] extends { params: infer P }
+      ? { params: P }
+      : Routes[K] extends { query?: infer Q }
+        ? { query?: Q }
+        : Record<string, never>;
+export type RouteResponse<K extends RouteKey> = Routes[K]["response"];
+export type ResponseSchemas = { [K in RouteKey]: z.ZodType<RouteResponse<K>> };
+export type ApiResult<T> = { ok: true; data: T } | { ok: false; error: ApiError };
 export type ClientOptions = {
   baseUrl: string;
   fetch?: typeof fetch;
   headers?: Record<string, string>;
 };
 
-export function createRequest(options: ClientOptions) {
+type WireInput = {
+  params?: Record<string, string>;
+  query?: Record<string, string | number | undefined>;
+  body?: unknown;
+};
+
+export function createRequest(options: ClientOptions, schemas: ResponseSchemas) {
   const doFetch = options.fetch ?? fetch;
-
   return async function request<K extends RouteKey>(
-    key: K,
-    input: RouteInput<K>,
+    key: K, input: RouteInput<K>,
   ): Promise<ApiResult<RouteResponse<K>>> {
-    const [method, rawPath] = key.split(" ") as [string, string];
-    const { path, query } = buildPath(rawPath, input);
+    const [method, rawPath = ""] = key.split(" ");
+    // 路由表限定了各字段形状，此处恢复条件类型的结构信息。
+    const wire = input as WireInput;
+    const path = rawPath.replace(/:([A-Za-z][A-Za-z0-9_]*)/g, (_, name: string) => {
+      const value = wire.params?.[name];
+      if (value === undefined) throw new Error("缺少路径参数 " + name);
+      return encodeURIComponent(value);
+    });
     const url = new URL(path, options.baseUrl);
-    if (query) {
-      for (const [k, v] of Object.entries(query)) {
-        if (v !== undefined) url.searchParams.set(k, String(v));
-      }
+    for (const [name, value] of Object.entries(wire.query ?? {})) {
+      if (value !== undefined) url.searchParams.set(name, String(value));
     }
-
+    const headers = new Headers(options.headers);
+    const init: RequestInit = { method: method ?? "GET", headers };
+    if ("body" in wire) {
+      headers.set("Content-Type", "application/json");
+      init.body = JSON.stringify(wire.body);
+    }
     let response: Response;
     try {
-      response = await doFetch(url, {
-        method,
-        headers: {
-          "content-type": "application/json",
-          ...options.headers,
-        },
-        body: "body" in input ? JSON.stringify(input.body) : undefined,
-      });
+      response = await doFetch(url, init);
     } catch (cause) {
       return { ok: false, error: { kind: "network", message: String(cause) } };
     }
-
     if (!response.ok) {
-      return {
-        ok: false,
-        error: {
-          kind: "http",
-          status: response.status,
-          message: await response.text().catch(() => response.statusText),
-        },
-      };
+      return { ok: false, error: {
+        kind: "http", status: response.status,
+        message: await response.text().catch(() => response.statusText),
+      } };
     }
-
-    const json: unknown = await response.json().catch(() => undefined);
-    return { ok: true, data: json as RouteResponse<K> };
+    try {
+      // DELETE 204 没有 JSON 响应体，交给 z.undefined() 校验。
+      const json: unknown = response.status === 204 ? undefined : await response.json();
+      const parsed = schemas[key].safeParse(json);
+      if (!parsed.success) return { ok: false, error: toParseError(parsed.error) };
+      // 映射表已经逐路由检查过，断言只恢复 TS 在泛型索引处丢失的关联。
+      return { ok: true, data: parsed.data as RouteResponse<K> };
+    } catch (cause) {
+      return { ok: false, error: toParseError(cause) };
+    }
   };
 }
 ```
 
-注意两处**故意保留的断言**：`json as RouteResponse<K>` 和 `key.split(" ") as [...]`。它们不是偷懒，而是把 `unknown` 收窄到泛型的必要接缝；真正的运行期安全由下一步的 schema 校验补上。
-
 ### 6.5 把校验挂到调用上
 
-为每个路由配一个响应 schema，请求函数在返回前校验：
-
-```ts
-// src/client.ts
+```ts title="src/client.ts"
 import { z } from "zod";
-import { TaskListSchema, TaskSchema } from "./contract";
-import { createRequest } from "./request";
+import { TaskListSchema, TaskSchema } from "./contract.js";
+import { createRequest } from "./request.js";
+import type { ClientOptions, ResponseSchemas, RouteInput, RouteKey } from "./request.js";
 
-const responseSchemas = {
+const responseSchemas: ResponseSchemas = {
   "GET /tasks": TaskListSchema,
   "GET /tasks/:id": TaskSchema,
   "POST /tasks": TaskSchema,
   "PATCH /tasks/:id": TaskSchema,
-  "DELETE /tasks/:id": z.object({ ok: z.literal(true) }),
-} satisfies { [K in keyof Routes]: z.ZodType<Routes[K]["response"]> };
-```
+  "DELETE /tasks/:id": z.undefined(),
+};
 
-`satisfies` 这一行是双保险：schema 与契约任何一方漂移，这里编译失败。
+type Paths<M extends string> = RouteKey extends infer K
+  ? K extends `${M} ${infer P}` ? P : never
+  : never;
 
-在 `request` 末尾接上：
-
-```ts
-const schema = responseSchemas[key];
-const parsed = schema.safeParse(json);
-if (!parsed.success) {
-  return { ok: false, error: toParseError(parsed.error) };
+export function createClient(options: ClientOptions) {
+  const request = createRequest(options, responseSchemas);
+  function method<M extends "GET" | "POST" | "PATCH" | "DELETE">(name: M) {
+    return <P extends Paths<M>>(
+      path: P, input: RouteInput<Extract<RouteKey, `${M} ${P}`>>,
+    ) => request(`${name} ${path}` as Extract<RouteKey, `${M} ${P}`>, input);
+  }
+  return { get: method("GET"), post: method("POST"), patch: method("PATCH"), delete: method("DELETE") };
 }
-return { ok: true, data: parsed.data };
 ```
 
-`parsed.data` 的类型是 `z.infer<typeof schema>`。当 schema 用 `satisfies` 绑定到 `Routes` 后，它与 `RouteResponse<K>` 对齐——**编译期和运行期第一次真正握上了手**。
+```ts title="src/index.ts"
+export { createClient } from "./client.js";
+export type { Task, TaskPage, Routes } from "./contract.js";
+export type { ApiResult, ClientOptions } from "./request.js";
+export type { ApiError } from "./errors.js";
+```
+
+Node/Go 的列表响应都是分页对象，消费端读取 `list.data.items`。React 篇保留了 json-server 数组适配，正式服务与此处 SDK 共用分页契约。删除成功返回 204，SDK 的成功数据为 `undefined`。
 
 ### 6.6 错误分支必须穷尽
 
@@ -418,10 +450,10 @@ function describe(error: ApiError): string {
 
 ✅ **阶段 2 验收**：
 
-- `client.get("/tasks/:id", { params: { id: 1 } })` 返回 `ApiResult<Task>`。
-- `params: { id: "1" }` 编译失败。
+- `client.get("/tasks/:id", { params: { id: "1" } })` 返回 `ApiResult<Task>`。
+- `params: { id: 1 }` 编译失败。
 - 缺 `body` 调用 `POST /tasks` 编译失败。
-- 后端返回 `{ id: 1 }` 时得到 `parse` 错误，路径指向 `title`。
+- 后端返回 `{ id: "1" }` 时得到 `parse` 错误，路径指向 `title`。
 
 ---
 
@@ -434,14 +466,15 @@ function describe(error: ApiError): string {
 ```ts
 // tests/types.test-d.ts
 import { describe, expectTypeOf, it } from "vitest";
-import type { ApiResult } from "../src/request";
-import type { Task } from "../src/contract";
+import { createClient } from "../src/client.js";
+import type { ApiResult } from "../src/request.js";
+import type { TaskPage } from "../src/contract.js";
 
 describe("类型契约", () => {
   it("响应类型可推导", () => {
-    type R = ApiResult<Task[]>;
+    type R = ApiResult<TaskPage>;
     expectTypeOf<R>().toEqualTypeOf<
-      | { ok: true; data: Task[] }
+      | { ok: true; data: TaskPage }
       | {
           ok: false;
           error:
@@ -450,6 +483,8 @@ describe("类型契约", () => {
             | { kind: "parse"; path: string; message: string };
         }
     >();
+    const client = createClient({ baseUrl: "https://example.test" });
+    expectTypeOf(client.get("/tasks", {})).toEqualTypeOf<Promise<ApiResult<TaskPage>>>();
   });
 });
 ```
@@ -461,6 +496,7 @@ describe("类型契约", () => {
 ```json
 {
   "name": "task-sdk",
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "vitest run --typecheck" },
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -471,7 +507,8 @@ describe("类型契约", () => {
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"]
+  "files": ["dist"],
+  "dependencies": { "zod": "3.25.76" }
 }
 ```
 
@@ -491,7 +528,9 @@ ls dist
 npm pack                 # 产出 task-sdk-0.1.0.tgz
 mkdir ../consumer && cd ../consumer
 npm init -y
+npm pkg set type=module
 npm i ../task-sdk/task-sdk-0.1.0.tgz
+npm i -D typescript@5.9.3 @types/node@22
 ```
 
 ```ts
@@ -502,19 +541,19 @@ const client = createClient({ baseUrl: "http://127.0.0.1:8001" });
 
 const list = await client.get("/tasks", { query: { status: "todo" } });
 if (list.ok) {
-  for (const task of list.data) {
+  for (const task of list.data.items) {
     console.log(task.title.toUpperCase()); // 有补全、有类型
   }
 }
 
-const one = await client.get("/tasks/:id", { params: { id: 1 } });
+const one = await client.get("/tasks/:id", { params: { id: "1" } });
 if (!one.ok) {
   console.log(one.error.kind); // "http" | "network" | "parse"
 }
 ```
 
 ```bash
-npx tsc --noEmit   # 必须通过
+npx tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext --target ES2022 index.ts
 ```
 
 ### 7.4 故意改错，证明类型真的在工作
@@ -526,12 +565,12 @@ npx tsc --noEmit   # 必须通过
 再试三种错误，确认都被编译期拦住：
 
 ```ts
-client.get("/tasks/:id", { params: { id: "1" } });      // id 类型错
+client.get("/tasks/:id", { params: { id: 1 } });        // id 类型错
 client.post("/tasks", {});                              // 缺 body
 client.get("/tasks", { query: { status: "archived" } }); // 枚举越界
 ```
 
-最后把后端改成返回 `{ id: 1, name: "x" }`（旧契约），运行期应得到 `parse` 错误而不是崩溃。
+最后把后端改成返回 `{ id: "1", name: "x" }`（旧契约），运行期应得到 `parse` 错误而不是崩溃。
 
 ✅ **阶段 3 验收**：`npm pack` 安装可用、类型提示完整、改字段 consumer 必报错、脏响应必被拦住。
 
@@ -607,6 +646,6 @@ client.get("/tasks", { query: { status: "archived" } }); // 枚举越界
 > [!TIP]
 > 做完别删仓库——把它当自己的第一个可发布工具，后续接入真实后端时只改 `schema.ts` 与 `Routes`，其余调用点由编译器带你迁移。
 >
-> 🎉 **至此 TypeScript 学习路线 16 篇全部完成。**
+> 🎉 主线 01–17 已完成，继续阅读 [18 现代 TypeScript 扩展](/blog/posts/typescript-roadmap-18-modern-ts5/)。
 >
 > 返回 [TypeScript 学习路线总览](/blog/posts/typescript-roadmap-00-overview/) | [合集页](/blog/typescript-roadmap/) | 上一篇：[16 与框架/运行时集成](/blog/posts/typescript-roadmap-16-framework-integration/)

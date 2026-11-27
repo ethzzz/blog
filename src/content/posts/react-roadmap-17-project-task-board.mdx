@@ -138,12 +138,21 @@ export class ApiError extends Error {
 	}
 }
 
+let accessToken: string | undefined;
+export function setAccessToken(value: string | undefined) {
+	accessToken = value;
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	let res: Response;
 	try {
 		res = await fetch(`${BASE}${path}`, {
 			...init,
-			headers: { "Content-Type": "application/json", ...init?.headers },
+			headers: {
+				"Content-Type": "application/json",
+				...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+				...init?.headers,
+			},
 		});
 	} catch {
 		// fetch 只在网络层失败时 reject —— 这是"断网/后端没起"
@@ -201,6 +210,7 @@ export interface TaskQuery {
 
 export interface TaskPage {
 	items: Task[];
+	total?: number;
 	hasNext: boolean;
 }
 
@@ -212,10 +222,10 @@ export async function listTasks(q: TaskQuery): Promise<TaskPage> {
 	if (q.status !== "all") params.set("status", q.status);
 	if (q.keyword.trim()) params.set("q", q.keyword.trim());
 
-	const items = await request<Task[]>(`/tasks?${params.toString()}`);
-	// json-server 0.17 的 total 在响应头里，浏览器读不到（CORS 未暴露），
-	// 这里用"本页是否取满"判断有没有下一页。真实后端请返回 total。
-	return { items, hasNext: items.length === q.limit };
+	const result = await request<Task[] | TaskPage>(`/tasks?${params.toString()}`);
+	if (!Array.isArray(result)) return result;
+	// json-server 0.17 返回数组，无法从响应体得到 total。
+	return { items: result, hasNext: result.length === q.limit };
 }
 
 export const getTask = (id: string) => request<Task>(`/tasks/${id}`);
@@ -225,7 +235,7 @@ export type TaskInput = Pick<Task, "title" | "status" | "priority" | "assignee" 
 export const createTask = (input: TaskInput) =>
 	request<Task>("/tasks", {
 		method: "POST",
-		body: JSON.stringify({ ...input, createdAt: new Date().toISOString() }),
+		body: JSON.stringify(input),
 	});
 
 export const updateTask = (id: string, patch: Partial<TaskInput>) =>
@@ -234,6 +244,8 @@ export const updateTask = (id: string, patch: Partial<TaskInput>) =>
 export const removeTask = (id: string) =>
 	request<void>(`/tasks/${id}`, { method: "DELETE" });
 ```
+
+Node/Go 服务返回带 `items/total/hasNext` 的分页对象，SDK 也使用这个形状。json-server 0.17 的数组响应由此函数兼容，刚好满页时仍允许再请求下一页。接入真实服务后使用服务端的 `hasNext`。
 
 ### 3. `features/tasks/useTasks.ts`：queryKey 工厂 + 四个 hook
 
@@ -1014,6 +1026,12 @@ curl -s -X POST http://localhost:4000/tasks \
   -H 'Content-Type: application/json' \
   -d '{"title":"用 curl 建的任务","status":"todo","priority":"low","assignee":"test","desc":"","createdAt":"2026-10-23T00:00:00.000Z"}'
 ```
+
+### 接入 Node 的认证服务
+
+将 `VITE_API_BASE` 指向 Node 服务，重启 Vite。先用已初始化的演示账号调用 `POST /auth/login`，把响应的 `accessToken` 传给 `api/client.ts` 的 `setAccessToken(token)`。登录 UI 的成功处理与这个入口一致，退出时调用 `setAccessToken(undefined)`。当前令牌保存在模块内存里，刷新页面后重新登录。Node 服务启用认证时，单独更换 baseURL 后的首次业务请求会得到 401。TS SDK 使用 `createClient({ baseUrl, headers: { Authorization: "Bearer " + token } })` 注入同一令牌。
+
+联调自检要求列表响应为 `{ items, total, hasNext }`，列表能显示数据，创建后能获取字符串 ID，删除成功状态为 204。json-server 的数组响应继续由 `listTasks` 适配。
 
 ### ✅ 阶段 3 验收清单
 

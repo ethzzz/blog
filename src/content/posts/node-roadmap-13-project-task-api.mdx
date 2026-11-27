@@ -11,7 +11,7 @@ draft: false
 > **这个项目的特别之处**：它的接口契约和 [React 毕业项目](/blog/posts/react-roadmap-17-project-task-board/) **完全一致**
 > （`GET /tasks?_page&_limit&status&q` → `{ items, total, hasNext }`）。
 >
-> 也就是说：前端那篇的代码**不用改一行**，只要把 `VITE_API_BASE` 指向这个服务就能跑起来。
+> React 的 API 层支持此处分页对象，任务 ID 使用字符串，删除成功返回 204。阶段一可核对 CRUD，启用阶段二的认证后还需登录并在请求头注入 access token，步骤见 React 毕业篇的联调说明。
 > 你会第一次体会到"契约先行"到底省了什么。
 
 ---
@@ -192,14 +192,14 @@ export class QueryTaskDto {
 	@Type(() => Number)
 	@IsInt()
 	@Min(1)
-	page: number = 1;
+	_page: number = 1;
 
 	@IsOptional()
 	@Type(() => Number)
 	@IsInt()
 	@Min(1)
 	@Max(100)
-	limit: number = 5;
+	_limit: number = 5;
 
 	@IsOptional()
 	@IsIn(["all", "todo", "doing", "done"])
@@ -211,7 +211,7 @@ export class QueryTaskDto {
 }
 ```
 
-> `_page`/`_limit`（前端契约）与 `page`/`limit`（代码里更好写）之间做一次映射，写在一个 `@Transform` 或 controller 里都行——**但只在一处做**，别散落。
+DTO 直接接收约定的 `_page` 与 `_limit`。通过全局 ValidationPipe 的 `transform: true` 转成数字后，再交给 service 计算偏移量。
 
 ### 4. service：查询、软删、返回契约
 
@@ -233,14 +233,14 @@ export class TasksService {
 			...(query.status !== "all" ? { status: query.status } : {}),
 			...(query.q ? { title: { contains: query.q } } : {}),
 		};
-		const skip = (query.page - 1) * query.limit;
+		const skip = (query._page - 1) * query._limit;
 
 		// 一次事务拿两样东西：当前页 + 总数，保证 total 与 items 对得上
 		const [items, total] = await this.prisma.$transaction([
 			this.prisma.task.findMany({
 				where,
 				skip,
-				take: query.limit,
+				take: query._limit,
 				orderBy: { createdAt: "desc" },
 			}),
 			this.prisma.task.count({ where }),
@@ -275,7 +275,7 @@ export class TasksService {
 
 ```ts
 // src/tasks/tasks.controller.ts
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
 import { JwtGuard } from "../auth/jwt.guard";
 import { CurrentUser } from "../auth/current-user.decorator";
 import { TasksService } from "./tasks.service";
@@ -309,6 +309,7 @@ export class TasksController {
 	}
 
 	@Delete(":id")
+	@HttpCode(204)
 	async remove(@Param("id") id: string) {
 		await this.tasks.remove(id);
 	}
@@ -607,7 +608,7 @@ describe("TasksService.list", () => {
 		}).compile();
 
 		const service = moduleRef.get(TasksService);
-		const res = await service.list({ page: 3, limit: 5, status: "all" } as never);
+		const res = await service.list({ _page: 3, _limit: 5, status: "all" } as never);
 
 		expect(prisma.task.findMany).toHaveBeenCalledWith(
 			expect.objectContaining({ skip: 10, take: 5 }),
@@ -738,7 +739,7 @@ curl -s -X POST "$BASE/tasks" -H "Authorization: Bearer $TOKEN" -H 'Content-Type
 - [ ] 手动触发一次清理（把 cron 改成 `*/1 * * * *`）→ 日志出现 `purged N`，数据库里过期数据消失。
 - [ ] `GET /health` 返回 `{status:"ok"}`；把数据库文件改名后再请求 → 健康检查返回 503。
 - [ ] `pm2 logs task-api` 能按 `requestId` 串起一次请求。
-- [ ] 前端（React 那篇）把 `VITE_API_BASE` 指到 `http://localhost:3100`，登录后列表/新建/删除全部可用，**前端代码零改动**。
+- [ ] 前端（React 那篇）把 `VITE_API_BASE` 指到 `http://localhost:3100`，登录后列表/新建/删除全部可用，**请求层携带登录得到的 access token**。
 - [ ] 关掉服务后，前端列表页显示"网络异常…"并可重试（错误分类真的生效了）。
 
 ---
@@ -776,7 +777,7 @@ curl -s -X POST "$BASE/tasks" -H "Authorization: Bearer $TOKEN" -H 'Content-Type
 ## 做完之后
 
 - 你有了一个**能上线**的服务，而不是一堆"跑得起来"的示例。
-- 你体验了"契约先行 → 前后端并行 → 联调零改动"的完整循环。
+- 你体验了"契约先行 → 前后端并行 → 按契约联调"的完整循环。
 - 下一步：加缓存（Redis 缓存列表第一页）、加队列（导出大 CSV 走 `@nestjs/bull`）、换 Postgres 并开多实例、把日志接到 Loki/ELK。
 
 > 判断一个后端项目"能不能交付"，看的不是代码量，而是：**契约稳定、错误统一、有测试、能部署、能回滚**。这五条你都有了。
