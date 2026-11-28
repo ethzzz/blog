@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 运营物料投放工作台</title>
+<style>
+  :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+  body { max-width: 72rem; margin: 0 auto; padding: 1rem; }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 31rem), 1fr)); gap: 1rem; align-items: start; }
+  section { border: 1px solid GrayText; border-radius: .6rem; padding: 1rem; min-width: 0; }
+  form, .controls { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-block: .6rem; }
+  label { display: inline-flex; gap: .4rem; align-items: center; }
+  label:has(input[type="text"]), .wide { width: 100%; }
+  input, select, textarea, button { font: inherit; max-width: 100%; }
+  textarea { width: 100%; }
+  td, th { padding: .3rem; text-align: left; border-bottom: 1px solid GrayText; }
+  table { width: 100%; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  h1, h2 { margin: 0; }
+  [hidden] { display: none !important; }
+</style>
+<header>
+  <h1>AI 运营物料投放工作台</h1>
+  <form id="login"><label>工作台密钥 <input id="secret" type="password" required autocomplete="off"></label><button>切换身份</button></form>
+  <p id="status" role="status"></p>
+</header>
+<main id="workspace" hidden>
+  <section>
+    <h2>首页 Banner</h2>
+    <div class="controls">
+      <label>活动 <select id="selection"></select></label><button id="new" type="button">新草稿</button><button id="refresh" type="button">刷新</button>
+    </div>
+    <p id="revision"></p>
+    <form id="config">
+      <label>活动名称 <input name="name" type="text" required maxlength="80"></label>
+      <label>文案 <input name="headline" type="text" required maxlength="60"></label>
+      <label>素材 <select name="assetId"></select></label>
+      <label>适用机型 <select name="models" multiple size="3"></select></label>
+      <label>最低版本 <input name="minAppVersion" required></label>
+      <label>优先级 <input name="priority" type="number" min="1" max="99" required></label>
+      <label><input name="activatedOnly" type="checkbox">仅已激活</label>
+      <label><input name="unguidedOnly" type="checkbox">仅未完成引导</label>
+      <label>开始 UTC <input name="startsAt" required></label>
+      <label>结束 UTC <input name="endsAt" required></label>
+      <button id="save">保存草稿</button>
+    </form>
+    <div id="actions" class="controls"></div>
+  </section>
+  <section>
+    <h2>AI 草稿</h2>
+    <form id="assistant"><label for="brief">投放需求</label><textarea id="brief" rows="4" maxlength="1600" required></textarea><button>生成建议</button></form>
+    <pre id="suggestion"></pre>
+    <button id="apply" hidden>应用到表单</button>
+  </section>
+  <section>
+    <h2>投放预演</h2>
+    <div class="controls"><label>时点 UTC <input id="preview-time"></label><button id="preview">预演</button><button id="diff">对比改动</button></div>
+    <p id="summary"></p>
+    <table><thead><tr><th>用户</th><th>候选</th><th>预计获胜</th><th>未命中原因</th></tr></thead><tbody id="preview-rows"></tbody></table>
+    <div class="controls"><label>模拟用户 <select id="user"></select></label><button id="resolve">查看线上结果</button></div>
+    <p id="winner"></p>
+  </section>
+  <section><h2>修改与审核记录</h2><pre id="audit"></pre></section>
+</main>
+<script type="module" src="/app.mjs"></script>
+</html>

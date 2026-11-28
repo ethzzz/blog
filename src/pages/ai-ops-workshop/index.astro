@@ -1,0 +1,32 @@
+---
+import { getCollection } from "astro:content";
+import { PROJECT_GROUP } from "@constants/roadmap-modules";
+import MainGridLayout from "@layouts/MainGridLayout.astro";
+import { getPostUrlBySlug, url } from "@utils/url-utils";
+
+const module = PROJECT_GROUP.modules.find((entry) => entry.url === "/ai-ops-workshop/");
+const posts = (await getCollection("posts", ({ data }) =>
+	data.category === module?.category && (!import.meta.env.PROD || !data.draft),
+)).sort((a, b) => a.slug.localeCompare(b.slug));
+const title = module?.title ?? "AI 运营物料投放";
+---
+
+<MainGridLayout title={title}>
+	<div class="onload-animation">
+		<header class="mb-6">
+			<a href={url("/projects/")} class="link text-sm text-[var(--primary)]">项目实践</a>
+			<h1 class="text-3xl font-bold text-90 mt-2 mb-2">{title}</h1>
+			<p class="text-75">把一句运营需求变成可核对、可预演、可审核的 App 首页 Banner 投放方案。</p>
+		</header>
+		<ol class="space-y-3">
+			{posts.map((post) => (
+				<li>
+					<a href={getPostUrlBySlug(post.slug)} class="block card-base card-shadow p-5 group hover:shadow-lg transition-all">
+						<h2 class="text-lg font-bold text-90 group-hover:text-[var(--primary)] mb-1">{post.data.title}</h2>
+						<p class="text-75 text-sm">{post.data.description}</p>
+					</a>
+				</li>
+			))}
+		</ol>
+	</div>
+</MainGridLayout>

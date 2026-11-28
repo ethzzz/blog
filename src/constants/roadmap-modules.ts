@@ -191,6 +191,14 @@ export const PROJECT_GROUP: RoadmapGroup = {
 			chips: ["MySQL", "RAG", "MCP"],
 		},
 		{
+			title: "AI 运营物料投放",
+			abbr: "运营",
+			desc: "从零做 App 首页 Banner 投放后台，逐章实现规则预演、AI 草稿、人工审核发布和回归评测。",
+			url: "/ai-ops-workshop/",
+			category: "AI运营投放实战",
+			chips: ["MySQL", "运营后台", "结构化输出"],
+		},
+		{
 			title: "全栈进阶 12 周",
 			abbr: "12W",
 			desc: "按周练习全栈开发，每周完成一项可验收的交付物。",

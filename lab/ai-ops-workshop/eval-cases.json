@@ -1,0 +1,33 @@
+[
+  {
+    "name": "完整 Link 2 教程",
+    "brief": "Link 2 教程，仅已激活，未完成新手引导，App 至少 2.5.0，开始 2026-12-01T00:00:00Z，下线 2026-12-04T12:00:00Z",
+    "expected": { "models": ["LINK2"], "assetId": "guide-link2", "minAppVersion": "2.5.0", "activatedOnly": true, "unguidedOnly": true, "startsAt": "2026-12-01T00:00:00Z", "endsAt": "2026-12-04T12:00:00Z" }
+  },
+  {
+    "name": "相对时间待确认",
+    "brief": "Link 2 教程，本周五下线",
+    "expected": { "models": ["LINK2"], "assetId": "guide-link2" },
+    "missing": ["startsAt", "endsAt", "minAppVersion"],
+    "question": "下线时间"
+  },
+  {
+    "name": "相似机型",
+    "brief": "Link 2C 教程，最低 2.10.0，含未激活，不限制引导",
+    "expected": { "models": ["LINK2C"], "assetId": "guide-all", "minAppVersion": "2.10.0", "activatedOnly": false, "unguidedOnly": false }
+  },
+  {
+    "name": "倒序时间重新确认",
+    "brief": "Link 3 教程，开始 2026-12-04T12:00:00Z，结束 2026-12-01T00:00:00Z",
+    "expected": { "models": ["LINK3"], "assetId": "guide-all" },
+    "missing": ["startsAt", "endsAt"],
+    "question": "开始时间"
+  },
+  {
+    "name": "全模糊需求",
+    "brief": "做一个宣传活动，下周上线，周末结束",
+    "expected": {},
+    "missing": ["models", "assetId", "minAppVersion", "activatedOnly", "unguidedOnly", "startsAt", "endsAt"],
+    "question": "适用机型"
+  }
+]
